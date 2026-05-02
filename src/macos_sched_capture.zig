@@ -66,6 +66,34 @@ pub const Stats = struct {
     drain_calls: u64,
 };
 
+/// xnu emits each context switch as TWO kdebug events on the same CPU:
+///   1. MACH_SCHED (or MACH_STACK_HANDOFF) — fired in `thread_invoke` BEFORE
+///      the register switch. Carries timestamp, both TIDs, and both
+///      priorities, but NOT the outgoing thread's finalized `thread->state`.
+///   2. MACH_DISPATCH — fired in `thread_dispatch` AFTER the switch, from
+///      the incoming thread's stack. Carries the outgoing TID and its
+///      finalized state bits (TH_WAIT/TH_SUSP/TH_UNINT/...).
+///
+/// To recover the correct off-CPU state we buffer the MACH_SCHED half here
+/// keyed by `cpuid`; the matching MACH_DISPATCH on the same CPU completes
+/// the pair. The buffer is per-CPU (not per-TID) because the kdebug stream
+/// guarantees per-CPU ordering and at most one switch is in flight per CPU.
+/// Persisting across drain batches matters: a drain can land between the
+/// two events.
+pub const PendingSwitch = struct {
+    valid: bool = false,
+    timestamp: u64 = 0,
+    outgoing_tid: u64 = 0,
+    outgoing_pri: u32 = 0,
+    incoming_tid: u64 = 0,
+    incoming_pri: u32 = 0,
+};
+
+/// Cap of distinct cpuids we track. macOS surfaces ~32 logical CPUs at the
+/// extreme high end (e.g. M2 Ultra) plus a handful of IOP cpuids, so 256 is
+/// comfortably oversized. Events on out-of-range cpuids are dropped.
+pub const MAX_CPUS: usize = 256;
+
 pub const Capture = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -103,6 +131,8 @@ pub const Capture = struct {
     events_emitted: std.atomic.Value(u64),
     drain_calls: std.atomic.Value(u64),
 
+    pending_switches: [MAX_CPUS]PendingSwitch,
+
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -138,6 +168,7 @@ pub const Capture = struct {
             .tb_d = 1,
             .events_emitted = std.atomic.Value(u64).init(0),
             .drain_calls = std.atomic.Value(u64).init(0),
+            .pending_switches = [_]PendingSwitch{.{}} ** MAX_CPUS,
         };
         self.thread = try std.Thread.spawn(.{}, workerEntry, .{self});
         return self;
@@ -285,6 +316,7 @@ fn drainOnce(self: *Capture) void {
         self.ds,
         self.tb_n,
         self.tb_d,
+        &self.pending_switches,
     );
     _ = self.events_emitted.fetchAdd(emitted, .monotonic);
     _ = self.drain_calls.fetchAdd(1, .monotonic);
@@ -308,7 +340,9 @@ fn lookupComm(threads: []const kdebug.KdThreadMap, tid: u64) []const u8 {
 /// states during teardown. Mapping them to DEAD poisons
 /// trace_processor's per-thread state machine — DEAD is terminal,
 /// every later sched event becomes generic_task_state_invalid_order.
-/// state_bits == 0 is "preempted, still on the runqueue" → RUNNABLE.
+/// state_bits == 0 (TH_RUN cleared, no other bits) is "preempted, still
+/// on the runqueue" → RUNNABLE. TH_RUN alone (0x04) is the same case
+/// before `thread_dispatch` clears it for waiters; treat as RUNNABLE.
 fn outgoingTaskState(state_bits: u32) perfetto.SismoTaskState {
     if (state_bits & 0x02 != 0) return perfetto.SISMO_TASK_STATE_STOPPED;
     if (state_bits & 0x01 != 0) {
@@ -326,50 +360,83 @@ fn emitBatch(
     ds: *perfetto.struct_PerfettoDs,
     tb_n: u64,
     tb_d: u64,
+    pending: *[MAX_CPUS]PendingSwitch,
 ) u64 {
     var emitted: u64 = 0;
     for (events) |*e| {
-        // Two event types describe a context switch:
-        //   MACH_SCHED          (code 0x0) — preempted / scheduler choice
-        //   MACH_STACK_HANDOFF  (code 0x2) — voluntary yield (sync prims,
-        //                                    fast IPC). Outgoing state is
-        //                                    implicit RUNNABLE.
+        // We care about exactly three DBG_MACH_SCHED codes:
+        //   MACH_SCHED          (0x00) — preempted / scheduler choice
+        //   MACH_STACK_HANDOFF  (0x02) — voluntary yield (sync prims,
+        //                                fast IPC).
+        //   MACH_DISPATCH       (0x20) — context switch completed; carries
+        //                                the OUTGOING thread's finalized
+        //                                `thread->state`.
+        // MACH_SCHED/STACK_HANDOFF give us the timestamp + both TIDs +
+        // priorities, MACH_DISPATCH gives us the outgoing state. They're
+        // emitted strictly in that order on the same cpuid, so we buffer
+        // the first half per-CPU and emit the Perfetto pair when the
+        // second half arrives.
         const code = kdebug.extractCode(e.debugid);
-        if (code != 0 and code != 0x2) continue;
-        const args = kdebug.MachSchedArgs.fromBuf(e);
-        // Idle-loop self-switch — accounting marker that would
-        // otherwise produce two emits at the same ts on the same
-        // thread, tripping ThreadStateTracker.
-        if (args.outgoing_tid == args.incoming_tid) continue;
+        if (e.cpuid >= MAX_CPUS) continue;
 
-        const ts_ns = e.timestamp *% tb_n / tb_d;
-        const off_comm = lookupComm(thread_map, args.outgoing_tid);
-        const off_state: perfetto.SismoTaskState = if (code == 0x2)
-            perfetto.SISMO_TASK_STATE_RUNNABLE
-        else
-            outgoingTaskState(args.outgoing_state);
-        _ = perfetto.sismo_perfetto_ds_emit_kernel_task_state(
-            ds,
-            ts_ns,
-            @intCast(e.cpuid),
-            off_comm.ptr,
-            off_comm.len,
-            @intCast(@as(i64, @intCast(args.outgoing_tid))),
-            off_state,
-            @intCast(args.outgoing_pri),
-        );
-        const on_comm = lookupComm(thread_map, args.incoming_tid);
-        _ = perfetto.sismo_perfetto_ds_emit_kernel_task_state(
-            ds,
-            ts_ns,
-            @intCast(e.cpuid),
-            on_comm.ptr,
-            on_comm.len,
-            @intCast(@as(i64, @intCast(args.incoming_tid))),
-            perfetto.SISMO_TASK_STATE_RUNNING,
-            0,
-        );
-        emitted += 2;
+        switch (code) {
+            0x00, 0x02 => {
+                const args = kdebug.MachSchedArgs.fromBuf(e);
+                // Idle-loop self-switch — accounting marker that would
+                // otherwise produce two emits at the same ts on the same
+                // thread, tripping ThreadStateTracker.
+                if (args.outgoing_tid == args.incoming_tid) continue;
+                pending[e.cpuid] = .{
+                    .valid = true,
+                    .timestamp = e.timestamp,
+                    .outgoing_tid = args.outgoing_tid,
+                    .outgoing_pri = args.outgoing_pri,
+                    .incoming_tid = args.incoming_tid,
+                    .incoming_pri = args.incoming_pri,
+                };
+            },
+            0x20 => {
+                const args = kdebug.MachDispatchArgs.fromBuf(e);
+                const slot = &pending[e.cpuid];
+                if (!slot.valid) continue;
+                // TID mismatch means the MACH_SCHED/MACH_DISPATCH pair on
+                // this CPU got broken (e.g. capture started mid-switch,
+                // or our drain dropped events). Discard the stale
+                // MACH_SCHED rather than mis-attribute state.
+                if (slot.outgoing_tid != args.outgoing_tid) {
+                    slot.valid = false;
+                    continue;
+                }
+
+                const ts_ns = slot.timestamp *% tb_n / tb_d;
+                const off_comm = lookupComm(thread_map, slot.outgoing_tid);
+                const off_state = outgoingTaskState(args.outgoing_state);
+                _ = perfetto.sismo_perfetto_ds_emit_kernel_task_state(
+                    ds,
+                    ts_ns,
+                    @intCast(e.cpuid),
+                    off_comm.ptr,
+                    off_comm.len,
+                    @intCast(@as(i64, @intCast(slot.outgoing_tid))),
+                    off_state,
+                    @intCast(slot.outgoing_pri),
+                );
+                const on_comm = lookupComm(thread_map, slot.incoming_tid);
+                _ = perfetto.sismo_perfetto_ds_emit_kernel_task_state(
+                    ds,
+                    ts_ns,
+                    @intCast(e.cpuid),
+                    on_comm.ptr,
+                    on_comm.len,
+                    @intCast(@as(i64, @intCast(slot.incoming_tid))),
+                    perfetto.SISMO_TASK_STATE_RUNNING,
+                    @intCast(slot.incoming_pri),
+                );
+                slot.valid = false;
+                emitted += 2;
+            },
+            else => {},
+        }
     }
     return emitted;
 }

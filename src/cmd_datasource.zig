@@ -1,14 +1,29 @@
-//! `sismo datasource <name>` — daemonized producer.
+//! `sismo datasource <id> [<id>...]` — daemonized producer hosting one
+//! or more sismo data sources in this single process.
 //!
 //! Connects to PERFETTO_PRODUCER_SOCK_NAME (set by whoever's hosting
-//! traced — typically `sismo record` in a future distributed mode,
-//! or a stock `traced` binary), registers exactly one of the
-//! `sismo.*` data sources, and blocks until killed (SIGINT /
-//! SIGTERM).
+//! traced — typically `sismo record` in privsep mode), registers each
+//! requested data source, and blocks until killed (SIGINT / SIGTERM).
 //!
-//! Config (target_pid for macos_cpu_samples/heap, sizing knobs for macos_sched)
-//! arrives via the on_setup callback when a session enables our DS,
-//! decoded from `DataSourceConfig.sismo_config` (field 2000) — see
+//! Identifiers are **platform-independent** — sismo maps them to the
+//! actual `sismo.*` data source name for the running OS:
+//!
+//!   sched         macOS → sismo.macos_sched   Linux → (TBD)
+//!   cpu           macOS → sismo.macos_cpu_samples   Linux → (TBD)
+//!   heap          macOS → sismo.heap          Linux → sismo.heap
+//!   all-privileged
+//!                 expands per-platform to the full set of data sources
+//!                 that need elevation on this OS. On macOS:
+//!                 sched + cpu + heap.
+//!
+//! Bundling many data sources in one invocation matters because each
+//! one needs a sudo prompt; one process = one prompt. The companion
+//! flag set on `sismo record` is `--external-{sched,cpu,heap}` (or
+//! `--all-external` for the common case).
+//!
+//! Config (target_pid for cpu/heap, sizing knobs for sched) arrives via
+//! the on_setup callback when a session enables our DS, decoded from
+//! `DataSourceConfig.sismo_config` (field 2000) — see
 //! `src/sismo_config.zig`. The producer's CLI doesn't take any
 //! tracing-config flags; a session is what configures the producer.
 
@@ -55,117 +70,203 @@ fn installStopHandlers() void {
 }
 
 const usage =
-    \\usage: sismo datasource <name>
+    \\usage: sismo datasource <id> [<id>...]
     \\
-    \\  <name>: macos_sched | macos_cpu_samples | heap
-    \\          ("sismo." prefix accepted for symmetry with the
-    \\          DataSourceConfig.name on the wire.)
+    \\  <id>: sched | cpu | heap | all-privileged
     \\
-    \\  Connects to PERFETTO_PRODUCER_SOCK_NAME, registers exactly
-    \\  one data source, blocks until SIGINT/SIGTERM. Config arrives
-    \\  via on_setup from the consumer's TraceConfig.
+    \\  Connects to PERFETTO_PRODUCER_SOCK_NAME, registers the requested
+    \\  data source(s) in this single process, blocks until SIGINT/SIGTERM.
+    \\  Multiple ids in one invocation share the sudo prompt.
+    \\
+    \\  Identifiers are platform-independent — sismo picks the right
+    \\  `sismo.*` data source name for the running OS internally.
     \\
 ;
 
-const Kind = enum { macos_sched, macos_cpu_samples, heap };
+const Kind = enum { sched, cpu, heap };
 
+/// Platform-independent identifier → Kind. Returns null on unknown.
+/// "all-privileged" is handled separately (it expands to N kinds, not 1).
 fn parseKind(name: []const u8) ?Kind {
-    const stripped = if (std.mem.startsWith(u8, name, "sismo.")) name[6..] else name;
-    if (std.mem.eql(u8, stripped, "macos_sched")) return .macos_sched;
-    if (std.mem.eql(u8, stripped, "macos_cpu_samples")) return .macos_cpu_samples;
-    if (std.mem.eql(u8, stripped, "heap")) return .heap;
+    if (std.mem.eql(u8, name, "sched")) return .sched;
+    if (std.mem.eql(u8, name, "cpu")) return .cpu;
+    if (std.mem.eql(u8, name, "heap")) return .heap;
     return null;
+}
+
+/// Per-platform expansion of `all-privileged`. macOS: all three need
+/// elevation (kdebug for sched, task_for_pid for cpu + heap).
+fn allPrivileged() []const Kind {
+    return switch (builtin.os.tag) {
+        .macos => &.{ .sched, .cpu, .heap },
+        else => &.{}, // No Linux/Windows producers wired in this binary yet.
+    };
 }
 
 pub fn runDatasource(init: std.process.Init) !void {
     var iter = init.minimal.args.iterate();
     _ = iter.next(); // exe path
     _ = iter.next(); // "datasource" subcommand token
-    const name = iter.next() orelse {
+
+    // Collect requested kinds, deduplicating. Eight slots is well
+    // above any plausible request count (we only have three kinds today).
+    var kinds_buf: [8]Kind = undefined;
+    var n_kinds: usize = 0;
+
+    const addKind = struct {
+        fn f(buf: *[8]Kind, n: *usize, k: Kind) void {
+            for (buf[0..n.*]) |existing| {
+                if (existing == k) return; // already added
+            }
+            if (n.* >= buf.len) return;
+            buf[n.*] = k;
+            n.* += 1;
+        }
+    }.f;
+
+    while (iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "all-privileged")) {
+            for (allPrivileged()) |k| addKind(&kinds_buf, &n_kinds, k);
+            continue;
+        }
+        const kind = parseKind(arg) orelse {
+            std.debug.print("sismo datasource: unknown identifier '{s}'\n\n{s}", .{ arg, usage });
+            return;
+        };
+        addKind(&kinds_buf, &n_kinds, kind);
+    }
+
+    if (n_kinds == 0) {
         std.debug.print("{s}", .{usage});
         return;
-    };
-    const kind = parseKind(name) orelse {
-        std.debug.print("sismo datasource: unknown data source '{s}'\n\n{s}", .{ name, usage });
-        return;
-    };
+    }
 
     if (comptime builtin.os.tag == .macos) {
-        return runDatasourceMacos(init, kind);
+        return runDatasourceMacos(init, kinds_buf[0..n_kinds]);
     }
     std.debug.print(
-        "sismo datasource: '{s}' is not yet implemented on {s}\n",
-        .{ name, @tagName(builtin.os.tag) },
+        "sismo datasource: not yet implemented on {s}\n",
+        .{@tagName(builtin.os.tag)},
     );
 }
 
-fn runDatasourceMacos(init: std.process.Init, kind: Kind) !void {
+/// One slot per registered data source. Holds whichever Capture pointer
+/// applies + the C-side DS handle so we can free both at shutdown.
+const Slot = struct {
+    kind: Kind,
+    ds: *c.struct_PerfettoDs,
+    sched: ?*macos_sched_capture.Capture = null,
+    cpu: ?*macos_cpu_samples_capture.Capture = null,
+    heap: ?*heap_capture.Capture = null,
+};
+
+fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
     c.sismo_perfetto_init();
 
-    const ds = c.sismo_perfetto_ds_alloc() orelse return error.PerfettoDsAllocFailed;
-    defer c.sismo_perfetto_ds_free(ds);
+    var slots_buf: [8]Slot = undefined;
+    var n_slots: usize = 0;
 
     installStopHandlers();
 
-    switch (kind) {
-        .macos_sched => {
-            const cap = try macos_sched_capture.Capture.init(init.gpa, init.io, ds, .{});
-            if (!c.sismo_perfetto_ds_register_with_callbacks(
-                ds,
-                "sismo.macos_sched",
-                macos_sched_capture.Capture.onSetupTrampoline,
-                macos_sched_capture.Capture.onStartTrampoline,
-                macos_sched_capture.Capture.onStopTrampoline,
-                macos_sched_capture.Capture.onFlushTrampoline,
-                cap,
-            )) return error.PerfettoDsRegisterFailed;
-            std.debug.print("sismo datasource: sismo.macos_sched registered; blocking until SIGINT/SIGTERM\n", .{});
-            blockUntilStopped();
-            const stats = cap.shutdown();
+    // Register each requested kind. If any single registration fails,
+    // we bail out and free what we already set up — partial state isn't
+    // useful since the user expected the full set.
+    errdefer {
+        var i: usize = n_slots;
+        while (i > 0) {
+            i -= 1;
+            shutdownSlot(slots_buf[i]);
+        }
+    }
+
+    for (kinds) |kind| {
+        const ds = c.sismo_perfetto_ds_alloc() orelse return error.PerfettoDsAllocFailed;
+        var slot: Slot = .{ .kind = kind, .ds = ds };
+        switch (kind) {
+            .sched => {
+                slot.sched = try macos_sched_capture.Capture.init(init.gpa, init.io, ds, .{});
+                if (!c.sismo_perfetto_ds_register_with_callbacks(
+                    ds,
+                    "sismo.macos_sched",
+                    macos_sched_capture.Capture.onSetupTrampoline,
+                    macos_sched_capture.Capture.onStartTrampoline,
+                    macos_sched_capture.Capture.onStopTrampoline,
+                    macos_sched_capture.Capture.onFlushTrampoline,
+                    slot.sched.?,
+                )) return error.PerfettoDsRegisterFailed;
+                std.debug.print("sismo datasource: sismo.macos_sched registered\n", .{});
+            },
+            .cpu => {
+                slot.cpu = try macos_cpu_samples_capture.Capture.init(init.gpa, init.io, ds, .{});
+                if (!c.sismo_perfetto_ds_register_with_callbacks(
+                    ds,
+                    "sismo.macos_cpu_samples",
+                    macos_cpu_samples_capture.Capture.onSetupTrampoline,
+                    macos_cpu_samples_capture.Capture.onStartTrampoline,
+                    macos_cpu_samples_capture.Capture.onStopTrampoline,
+                    macos_cpu_samples_capture.Capture.onFlushTrampoline,
+                    slot.cpu.?,
+                )) return error.PerfettoDsRegisterFailed;
+                std.debug.print("sismo datasource: sismo.macos_cpu_samples registered\n", .{});
+            },
+            .heap => {
+                slot.heap = try heap_capture.Capture.init(init.gpa, init.io, ds, .{});
+                if (!c.sismo_perfetto_ds_register_with_callbacks(
+                    ds,
+                    "sismo.heap",
+                    heap_capture.Capture.onSetupTrampoline,
+                    heap_capture.Capture.onStartTrampoline,
+                    heap_capture.Capture.onStopTrampoline,
+                    heap_capture.Capture.onFlushTrampoline,
+                    slot.heap.?,
+                )) return error.PerfettoDsRegisterFailed;
+                std.debug.print("sismo datasource: sismo.heap registered\n", .{});
+            },
+        }
+        slots_buf[n_slots] = slot;
+        n_slots += 1;
+    }
+
+    std.debug.print(
+        "sismo datasource: {d} data source(s) registered; blocking until SIGINT/SIGTERM\n",
+        .{n_slots},
+    );
+    blockUntilStopped();
+
+    // Shutdown reverses registration order so each Capture sees its
+    // workers torn down before its DS handle is freed.
+    var i: usize = n_slots;
+    while (i > 0) {
+        i -= 1;
+        shutdownSlot(slots_buf[i]);
+    }
+}
+
+fn shutdownSlot(slot: Slot) void {
+    switch (slot.kind) {
+        .sched => if (slot.sched) |s| {
+            const stats = s.shutdown();
             std.debug.print(
                 "sismo datasource: sismo.macos_sched stopped — {d} events / {d} drains\n",
                 .{ stats.events_emitted, stats.drain_calls },
             );
         },
-        .macos_cpu_samples => {
-            const cap = try macos_cpu_samples_capture.Capture.init(init.gpa, init.io, ds, .{});
-            if (!c.sismo_perfetto_ds_register_with_callbacks(
-                ds,
-                "sismo.macos_cpu_samples",
-                macos_cpu_samples_capture.Capture.onSetupTrampoline,
-                macos_cpu_samples_capture.Capture.onStartTrampoline,
-                macos_cpu_samples_capture.Capture.onStopTrampoline,
-                macos_cpu_samples_capture.Capture.onFlushTrampoline,
-                cap,
-            )) return error.PerfettoDsRegisterFailed;
-            std.debug.print("sismo datasource: sismo.macos_cpu_samples registered; blocking until SIGINT/SIGTERM\n", .{});
-            blockUntilStopped();
-            const stats = cap.shutdown();
+        .cpu => if (slot.cpu) |s| {
+            const stats = s.shutdown();
             std.debug.print(
                 "sismo datasource: sismo.macos_cpu_samples stopped — {d} samples ({d} active)\n",
                 .{ stats.samples, stats.active_samples },
             );
         },
-        .heap => {
-            const cap = try heap_capture.Capture.init(init.gpa, init.io, ds, .{});
-            if (!c.sismo_perfetto_ds_register_with_callbacks(
-                ds,
-                "sismo.heap",
-                heap_capture.Capture.onSetupTrampoline,
-                heap_capture.Capture.onStartTrampoline,
-                heap_capture.Capture.onStopTrampoline,
-                heap_capture.Capture.onFlushTrampoline,
-                cap,
-            )) return error.PerfettoDsRegisterFailed;
-            std.debug.print("sismo datasource: sismo.heap registered; blocking until SIGINT/SIGTERM\n", .{});
-            blockUntilStopped();
-            const stats = cap.shutdown();
+        .heap => if (slot.heap) |s| {
+            const stats = s.shutdown();
             std.debug.print(
                 "sismo datasource: sismo.heap stopped — {d} records / ~{d} bytes / {d} sites\n",
                 .{ stats.records, stats.bytes_alloc_estimated, stats.sites },
             );
         },
     }
+    c.sismo_perfetto_ds_free(slot.ds);
 }
 
 fn blockUntilStopped() void {

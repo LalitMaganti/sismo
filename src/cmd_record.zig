@@ -138,6 +138,166 @@ fn handleSigint(sig: std.c.SIG) callconv(.c) void {
 
 const ExitMode = enum { spawn, attach };
 
+/// Per-data-source mode. Default is `in_process` (this binary hosts
+/// the producer; needs sudo for kdebug / task_for_pid). `external`
+/// means a sidecar `sudo sismo datasource <name>` is expected to
+/// provide it. `off` skips the data source entirely.
+pub const SourceMode = enum { in_process, external, off };
+
+extern "c" fn geteuid() c_uint;
+
+/// Walk a serialized `TracingServiceState` proto looking for
+/// data_sources[*].ds_descriptor.name. Calls `cb` once per name found.
+/// Returns true on clean parse, false on truncated/malformed input.
+///
+/// Schema (`protos/perfetto/common/tracing_service_state.proto`):
+///   TracingServiceState.data_sources = field 2, repeated DataSource
+///   DataSource.ds_descriptor         = field 1, DataSourceDescriptor
+///   DataSourceDescriptor.name        = field 1, string
+///
+/// Inline parser instead of pulling in sismo_config.zig's primitives —
+/// keeps this self-contained and the parser's tiny.
+fn forEachRegisteredDataSource(
+    bytes: []const u8,
+    user: anytype,
+    cb: *const fn (@TypeOf(user), name: []const u8) void,
+) bool {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const tag = readVarintAt(bytes, &i) orelse return false;
+        const fnum = tag >> 3;
+        const wt = tag & 0x07;
+        if (fnum == 2 and wt == 2) {
+            // DataSource sub-message.
+            const len = readVarintAt(bytes, &i) orelse return false;
+            const end = i + @as(usize, @intCast(len));
+            if (end > bytes.len) return false;
+            // Within DataSource, find ds_descriptor (field 1).
+            var j = i;
+            while (j < end) {
+                const t2 = readVarintAt(bytes, &j) orelse return false;
+                const fnum2 = t2 >> 3;
+                const wt2 = t2 & 0x07;
+                if (fnum2 == 1 and wt2 == 2) {
+                    const len2 = readVarintAt(bytes, &j) orelse return false;
+                    const desc_end = j + @as(usize, @intCast(len2));
+                    if (desc_end > end) return false;
+                    // Within DataSourceDescriptor, find name (field 1).
+                    var k = j;
+                    while (k < desc_end) {
+                        const t3 = readVarintAt(bytes, &k) orelse return false;
+                        const fnum3 = t3 >> 3;
+                        const wt3 = t3 & 0x07;
+                        if (fnum3 == 1 and wt3 == 2) {
+                            const len3 = readVarintAt(bytes, &k) orelse return false;
+                            const name_end = k + @as(usize, @intCast(len3));
+                            if (name_end > desc_end) return false;
+                            cb(user, bytes[k..name_end]);
+                            k = name_end;
+                        } else if (!skipFieldAt(bytes, &k, wt3, desc_end)) {
+                            return false;
+                        }
+                    }
+                    j = desc_end;
+                } else if (!skipFieldAt(bytes, &j, wt2, end)) {
+                    return false;
+                }
+            }
+            i = end;
+        } else if (!skipFieldAt(bytes, &i, wt, bytes.len)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn readVarintAt(bytes: []const u8, i: *usize) ?u64 {
+    var value: u64 = 0;
+    var shift: u6 = 0;
+    while (i.* < bytes.len) {
+        const b = bytes[i.*];
+        i.* += 1;
+        value |= @as(u64, b & 0x7f) << shift;
+        if (b & 0x80 == 0) return value;
+        shift +%= 7;
+        if (shift >= 64) return null;
+    }
+    return null;
+}
+
+fn skipFieldAt(bytes: []const u8, i: *usize, wire_type: u64, hard_end: usize) bool {
+    switch (wire_type) {
+        0 => _ = readVarintAt(bytes, i) orelse return false,
+        1 => {
+            if (i.* + 8 > hard_end) return false;
+            i.* += 8;
+        },
+        2 => {
+            const len = readVarintAt(bytes, i) orelse return false;
+            const end = i.* + @as(usize, @intCast(len));
+            if (end > hard_end) return false;
+            i.* = end;
+        },
+        5 => {
+            if (i.* + 4 > hard_end) return false;
+            i.* += 4;
+        },
+        else => return false,
+    }
+    return true;
+}
+
+/// Poll QueryServiceState until every name in `expected` is registered,
+/// or `timeout_ms` elapses. Returns true if all appeared, false on
+/// timeout. Polls every 100 ms — the registration round-trip is
+/// dominated by IPC latency, sub-100ms typically.
+fn waitForExternalDataSources(
+    session: *c.struct_SismoConsumerSession,
+    expected: []const []const u8,
+    timeout_ms: u64,
+) bool {
+    if (expected.len == 0) return true;
+
+    var buf: [16 * 1024]u8 = undefined;
+    var elapsed_ms: u64 = 0;
+    const poll_ms: u64 = 100;
+
+    while (true) {
+        var written: usize = 0;
+        const rc = c.sismo_consumer_query_service_state(session, &buf, buf.len, &written);
+        if (rc == 0) {
+            const Ctx = struct {
+                expected: []const []const u8,
+                seen: []bool,
+            };
+            var seen_buf: [8]bool = .{false} ** 8;
+            const seen = seen_buf[0..expected.len];
+            var ctx: Ctx = .{ .expected = expected, .seen = seen };
+            _ = forEachRegisteredDataSource(buf[0..written], &ctx, struct {
+                fn cb(c_ctx: *Ctx, name: []const u8) void {
+                    for (c_ctx.expected, 0..) |want, idx| {
+                        if (std.mem.eql(u8, want, name)) c_ctx.seen[idx] = true;
+                    }
+                }
+            }.cb);
+
+            var all = true;
+            for (seen) |s| if (!s) { all = false; break; };
+            if (all) return true;
+        }
+        // rc != 0 (RPC fail / buffer too small) → just retry; transient
+        // errors during connect are normal at startup.
+
+        if (elapsed_ms >= timeout_ms) return false;
+        const ts: std.c.timespec = .{
+            .sec = 0,
+            .nsec = @intCast(poll_ms * std.time.ns_per_ms),
+        };
+        _ = std.c.nanosleep(&ts, null);
+        elapsed_ms += poll_ms;
+    }
+}
+
 const WaitCtx = struct {
     pid: c_int,
     write_fd: c_int,
@@ -390,12 +550,32 @@ fn runRecordMacos(init: std.process.Init) !void {
     // plan number — comfortable for typical desktop workloads).
     var buffer_kb: u32 = 128 * 1024;
     var buffer_set = false;
-    var no_sched = false;
-    var no_cpu = false;
-    var no_heap = false;
+    // Privileged data sources have three states: in_process (default —
+    // sismo runs the producer in this process; needs sudo), external
+    // (--external-X — sismo expects a sidecar `sudo sismo datasource X`
+    // to provide it), or off (--no-X — disabled).
+    var sched_mode: SourceMode = .in_process;
+    var cpu_mode: SourceMode = .in_process;
+    var heap_mode: SourceMode = .in_process;
     var no_instrumentation = false;
     var workload_argv: std.ArrayList([]const u8) = .empty;
     defer workload_argv.deinit(gpa);
+
+    // setSourceMode: error if the user passed conflicting flags for the
+    // same data source (e.g. --no-sched and --external-sched).
+    const setSourceMode = struct {
+        fn f(slot: *SourceMode, slot_name: []const u8, flag_name: []const u8, want: SourceMode) bool {
+            if (slot.* != .in_process and slot.* != want) {
+                std.debug.print(
+                    "sismo record: conflicting flags for '{s}' ({s} vs already-set {s})\n",
+                    .{ slot_name, flag_name, @tagName(slot.*) },
+                );
+                return false;
+            }
+            slot.* = want;
+            return true;
+        }
+    }.f;
 
     while (iter.next()) |arg| {
         if (workload_argv.items.len == 0 and std.mem.startsWith(u8, arg, "--")) {
@@ -441,19 +621,37 @@ fn runRecordMacos(init: std.process.Init) !void {
                     return;
                 };
             } else if (std.mem.eql(u8, arg, "--no-sched")) {
-                no_sched = true;
+                if (!setSourceMode(&sched_mode, "sched", "--no-sched", .off)) return;
             } else if (std.mem.eql(u8, arg, "--no-cpu")) {
-                no_cpu = true;
+                if (!setSourceMode(&cpu_mode, "cpu", "--no-cpu", .off)) return;
             } else if (std.mem.eql(u8, arg, "--no-heap")) {
-                no_heap = true;
+                if (!setSourceMode(&heap_mode, "heap", "--no-heap", .off)) return;
+            } else if (std.mem.eql(u8, arg, "--external-sched")) {
+                if (!setSourceMode(&sched_mode, "sched", "--external-sched", .external)) return;
+            } else if (std.mem.eql(u8, arg, "--external-cpu")) {
+                if (!setSourceMode(&cpu_mode, "cpu", "--external-cpu", .external)) return;
+            } else if (std.mem.eql(u8, arg, "--external-heap")) {
+                if (!setSourceMode(&heap_mode, "heap", "--external-heap", .external)) return;
+            } else if (std.mem.eql(u8, arg, "--all-external")) {
+                // Convenience: every privileged data source not already
+                // explicitly configured becomes external.
+                if (sched_mode == .in_process) sched_mode = .external;
+                if (cpu_mode == .in_process) cpu_mode = .external;
+                if (heap_mode == .in_process) heap_mode = .external;
             } else if (std.mem.eql(u8, arg, "--no-instrumentation")) {
                 no_instrumentation = true;
             } else if (std.mem.eql(u8, arg, "--help")) {
                 std.debug.print(
                     "usage: sismo record [--output <path>] [--duration <dur>]\n" ++
                     "                    [--flight-recorder [--buffer <size>]]\n" ++
-                    "                    [--no-sched] [--no-cpu] [--no-heap] [--no-instrumentation]\n" ++
-                    "                    (--pid <pid> | <command> [args...])\n",
+                    "                    [--no-{{sched,cpu,heap,instrumentation}}]\n" ++
+                    "                    [--external-{{sched,cpu,heap}} | --all-external]\n" ++
+                    "                    (--pid <pid> | <command> [args...])\n" ++
+                    "\n" ++
+                    "  --no-X         disable data source X entirely.\n" ++
+                    "  --external-X   data source X comes from a sidecar\n" ++
+                    "                 `sudo sismo datasource X` (no sudo on this process).\n" ++
+                    "  --all-external shorthand for --external-{{sched,cpu,heap}}.\n",
                     .{},
                 );
                 return;
@@ -491,6 +689,37 @@ fn runRecordMacos(init: std.process.Init) !void {
         if (std.c.kill(pid, @enumFromInt(0)) != 0) {
             std.debug.print("sismo record: pid {d} not found (or not signalable)\n", .{pid});
             return;
+        }
+    }
+
+    // Privilege check: every privileged data source still in the
+    // in_process state needs root. Warn early so the user can ctrl-C
+    // and re-launch with sudo (or pass --external-X / --no-X) before
+    // we tear into spawning workloads, sockets, etc.
+    if (geteuid() != 0) {
+        var unmet_buf: [3][]const u8 = undefined;
+        var n_unmet: usize = 0;
+        if (sched_mode == .in_process) { unmet_buf[n_unmet] = "sched"; n_unmet += 1; }
+        if (cpu_mode == .in_process)   { unmet_buf[n_unmet] = "cpu";   n_unmet += 1; }
+        if (heap_mode == .in_process)  { unmet_buf[n_unmet] = "heap";  n_unmet += 1; }
+        if (n_unmet > 0) {
+            std.debug.print(
+                "sismo record: WARNING — running unprivileged. The following data\n" ++
+                "  sources need root and will fail to capture:\n",
+                .{},
+            );
+            for (unmet_buf[0..n_unmet]) |name| {
+                std.debug.print("    {s}\n", .{name});
+            }
+            std.debug.print(
+                "  options:\n" ++
+                "    1. re-run with `sudo`     (simple — everything in one process as root)\n" ++
+                "    2. pass --external-{{X}}    + run `sudo sismo datasource X` in another\n" ++
+                "                                  shell (or --all-external + `sudo sismo\n" ++
+                "                                  datasource all-privileged`)\n" ++
+                "    3. pass --no-{{X}}          to skip the data source silently\n",
+                .{},
+            );
         }
     }
 
@@ -594,21 +823,21 @@ fn runRecordMacos(init: std.process.Init) !void {
     //    flows in, via SismoXxxConfig embedded at field 2000 of each
     //    DataSourceConfig.
     const sched = blk: {
-        if (no_sched) break :blk null;
+        if (sched_mode != .in_process) break :blk null;
         break :blk macos_sched_capture.Capture.init(gpa, io, ds_sched, .{}) catch |err| {
             std.debug.print("sismo record: macos_sched_capture.init failed: {s}\n", .{@errorName(err)});
             break :blk null;
         };
     };
     const cpu = blk: {
-        if (no_cpu) break :blk null;
+        if (cpu_mode != .in_process) break :blk null;
         break :blk macos_cpu_samples_capture.Capture.init(gpa, io, ds_cpu, .{}) catch |err| {
             std.debug.print("sismo record: macos_cpu_samples_capture.init failed: {s}\n", .{@errorName(err)});
             break :blk null;
         };
     };
     const heap = blk: {
-        if (no_heap) break :blk null;
+        if (heap_mode != .in_process) break :blk null;
         // In attach mode, heap requires the target was launched via
         // `sismo prepare` (DYLD_INSERT_LIBRARIES'd the dormant client,
         // which binds /tmp/sismo-heap-{pid}.sock from its listener
@@ -682,28 +911,53 @@ fn runRecordMacos(init: std.process.Init) !void {
     const sched_cfg = try sismo_config.macos_sched.encode(gpa, .{});
     defer gpa.free(sched_cfg);
 
-    // Build the entries array dynamically from the source toggles.
+    // Build the entries array dynamically from the per-source modes.
     // `track_event` (the user's instrumentation surface) is gated by
-    // --no-instrumentation; the three sismo.* entries follow the
-    // capture nullability we set above (which already folds in the
-    // matching --no-* flag and the heap-not-prepared case).
+    // --no-instrumentation. Each privileged data source enters the
+    // TraceConfig if its mode is != .off — both in_process and external
+    // modes need the name registered in the consumer's config; only
+    // in_process gates the local Capture init above.
+    //
+    // For external entries we also collect the on-the-wire data source
+    // names so we can poll for their producer registration before
+    // calling StartBlocking (otherwise the session would start without
+    // the external producer ever connecting).
     var entries_buf: [4]c.SismoDsConfigEntry = undefined;
     var n_entries: usize = 0;
+    var external_names_buf: [3][]const u8 = undefined;
+    var n_external: usize = 0;
     if (!no_instrumentation) {
         entries_buf[n_entries] = .{ .name = "track_event", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = 0 };
         n_entries += 1;
     }
-    if (heap != null) {
+    // Heap: in-process when `heap` capture exists; external when caller
+    // asked for it AND heap_mode says external (the in-process branch
+    // may have failed on attach-without-prepare, in which case the
+    // capture is null but mode is still in_process — don't promote
+    // those to external silently).
+    if (heap != null or heap_mode == .external) {
         entries_buf[n_entries] = .{ .name = "sismo.heap", .extra_bytes = heap_cfg.ptr, .extra_bytes_size = heap_cfg.len, .target_pid = 0 };
         n_entries += 1;
+        if (heap_mode == .external) {
+            external_names_buf[n_external] = "sismo.heap";
+            n_external += 1;
+        }
     }
-    if (cpu != null) {
+    if (cpu != null or cpu_mode == .external) {
         entries_buf[n_entries] = .{ .name = "sismo.macos_cpu_samples", .extra_bytes = cpu_cfg.ptr, .extra_bytes_size = cpu_cfg.len, .target_pid = 0 };
         n_entries += 1;
+        if (cpu_mode == .external) {
+            external_names_buf[n_external] = "sismo.macos_cpu_samples";
+            n_external += 1;
+        }
     }
-    if (sched != null) {
+    if (sched != null or sched_mode == .external) {
         entries_buf[n_entries] = .{ .name = "sismo.macos_sched", .extra_bytes = if (sched_cfg.len > 0) sched_cfg.ptr else null, .extra_bytes_size = sched_cfg.len, .target_pid = 0 };
         n_entries += 1;
+        if (sched_mode == .external) {
+            external_names_buf[n_external] = "sismo.macos_sched";
+            n_external += 1;
+        }
     }
     if (n_entries == 0) {
         std.debug.print(
@@ -713,6 +967,7 @@ fn runRecordMacos(init: std.process.Init) !void {
         return;
     }
     const entries = entries_buf[0..n_entries];
+    const external_names = external_names_buf[0..n_external];
 
     // FILE mode auto-writes — pre-clear the output. Flight mode
     // writes nothing automatically; --output is meaningless there
@@ -754,6 +1009,31 @@ fn runRecordMacos(init: std.process.Init) !void {
         std.debug.print("sismo record: session_setup rc={d} (TraceConfig failed to parse)\n", .{setup_rc});
         return;
     }
+
+    // Wait for sidecar `sismo datasource` producers to register before
+    // starting the session. Without this, StartBlocking proceeds
+    // immediately and traced records nothing for any data source whose
+    // producer hasn't connected yet — silently producing an incomplete
+    // trace.
+    if (external_names.len > 0) {
+        std.debug.print(
+            "sismo record: waiting up to 5s for external producers ({d}) — start them with `sudo sismo datasource ...`\n",
+            .{external_names.len},
+        );
+        if (!waitForExternalDataSources(session, external_names, 5_000)) {
+            std.debug.print(
+                "sismo record: timed out waiting for external producer(s):\n",
+                .{},
+            );
+            for (external_names) |n| std.debug.print("    {s}\n", .{n});
+            std.debug.print(
+                "  start a sidecar with `sudo sismo datasource <name>` (or `all-privileged`) and re-run.\n",
+                .{},
+            );
+            return;
+        }
+    }
+
     c.sismo_consumer_session_start_blocking(session);
     if (flight_recorder) {
         std.debug.print(

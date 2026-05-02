@@ -30,7 +30,10 @@ zig build >/dev/null
 echo "==> priming sudo (password may be asked once)"
 sudo -v
 
-rm -f "$TRACE"
+# Trace from prior runs was written under sudo (sismo record needs root
+# for kdebug/task_for_pid), so unlinking it needs sudo too — /tmp's
+# sticky bit blocks regular-user rm of root-owned files.
+sudo rm -f "$TRACE"
 echo
 echo "==> sismo record (workload runs ${DURATION_MS}ms) -> $TRACE"
 RUNLOG=/tmp/sismo-e2e-run.log

@@ -247,6 +247,29 @@ int sismo_consumer_clone_and_stream(const char* source_session_name,
                                     SismoTraceChunkCb cb,
                                     void* user_arg);
 
+// Query the tracing service for its current state — list of connected
+// producers + registered data sources. Returns serialized
+// `TracingServiceState` proto bytes (schema in
+// `protos/perfetto/common/tracing_service_state.proto`).
+//
+// The session may be in any state (post-create, post-setup, etc.); this
+// is read-only.
+//
+// `out_buf` is provided by the caller; on success `*written` is set to
+// the byte count written. If the state doesn't fit (`out_buf_size` too
+// small), returns 3 and `*written` is set to the required size so the
+// caller can retry with a larger buffer.
+//
+// Returns 0 on success, non-zero on RPC failure / serialize failure /
+// buffer too small.
+//
+// Used by `sismo record --external-...` to poll for the appearance of
+// expected data source names before starting the session.
+int sismo_consumer_query_service_state(struct SismoConsumerSession* session,
+                                       void* out_buf,
+                                       size_t out_buf_size,
+                                       size_t* written);
+
 #ifdef __cplusplus
 }
 #endif

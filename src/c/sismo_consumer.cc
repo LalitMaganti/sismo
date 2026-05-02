@@ -31,6 +31,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -101,6 +102,22 @@ extern "C" void sismo_consumer_session_destroy(SismoConsumerSession* s) {
 // stays on the Zig side: this function never opens, writes, or closes
 // a file.
 // ---------------------------------------------------------------------------
+
+extern "C" int sismo_consumer_query_service_state(SismoConsumerSession* s,
+                                                  void* out_buf,
+                                                  size_t out_buf_size,
+                                                  size_t* written) {
+    if (!s || !s->session || !written) return 1;
+    auto args = s->session->QueryServiceStateBlocking();
+    if (!args.success) return 2;
+    *written = args.service_state_data.size();
+    if (out_buf_size < args.service_state_data.size()) return 3;
+    if (out_buf && !args.service_state_data.empty()) {
+        std::memcpy(out_buf, args.service_state_data.data(),
+                    args.service_state_data.size());
+    }
+    return 0;
+}
 
 extern "C" int sismo_consumer_clone_and_stream(const char* source_session_name,
                                                SismoTraceChunkCb cb,

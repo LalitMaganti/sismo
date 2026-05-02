@@ -86,21 +86,26 @@ pub const KdCpuMapHeader = extern struct {
 
 pub const KDBG_CPUMAP_IS_IOP: u32 = 0x1;
 
-/// MACH_SCHED event arguments.
-/// Source: xnu `osfmk/kern/sched_prim.c`, function `thread_dispatch`.
-/// Argument order has been stable since the arm64 transition; verify against
-/// `xnu-*/osfmk/kern/sched_prim.c` for the macOS version you ship against.
+/// MACH_SCHED / MACH_STACK_HANDOFF event arguments.
+/// Source: xnu `osfmk/kern/sched_prim.c`, `thread_invoke` (the emit fires
+/// BEFORE the actual register switch, so `current_thread()` — and therefore
+/// `kd_buf.arg5` — is still the OUTGOING thread).
 ///   - arg1 = AST reason the outgoing thread is leaving (`AST_PREEMPT`,
 ///     `AST_QUANTUM`, etc. — see `osfmk/kern/ast.h`).
 ///   - arg2 = TID of the **incoming** thread (the one coming on-CPU).
 ///   - arg3 = sched_pri of the **outgoing** thread.
-///   - arg4 = state bits of the outgoing thread (TH_RUN/TH_WAIT/...).
-///   - arg5 = TID of the **outgoing** thread (`kd_buf.arg5`, generic field).
+///   - arg4 = sched_pri of the **incoming** thread.
+///     NOTE: this is NOT the outgoing thread's state bits — the outgoing
+///     `thread->state` is finalized later in `thread_dispatch` and is only
+///     emitted via `MACH_DISPATCH` (see `MachDispatchArgs`). Pair the two
+///     events per-CPU to recover the off-CPU state.
+///   - kd_buf.arg5 = TID of the **outgoing** thread (current_thread() at
+///     trace time, before the switch).
 pub const MachSchedArgs = struct {
     outgoing_tid: u64,
     incoming_tid: u64,
     outgoing_pri: u32,
-    outgoing_state: u32,
+    incoming_pri: u32,
     reason: u32,
 
     pub fn fromBuf(e: *const KdBuf) MachSchedArgs {
@@ -108,8 +113,37 @@ pub const MachSchedArgs = struct {
             .outgoing_tid = e.arg5,
             .incoming_tid = e.arg2,
             .outgoing_pri = @truncate(e.arg3),
-            .outgoing_state = @truncate(e.arg4),
+            .incoming_pri = @truncate(e.arg4),
             .reason = @truncate(e.arg1),
+        };
+    }
+};
+
+/// MACH_DISPATCH event arguments.
+/// Source: xnu `osfmk/kern/sched_prim.c`, `thread_dispatch`. This emit fires
+/// AFTER the context switch from the new thread's stack, so
+/// `current_thread()` (and `kd_buf.arg5`) is the INCOMING thread; the
+/// outgoing thread's identity and finalized state are explicit args.
+///   - arg1 = TID of the **outgoing** thread (the one that just left CPU).
+///   - arg2 = `thread->reason` of the outgoing thread (or 0 in the IDLE
+///     case).
+///   - arg3 = `thread->state` of the outgoing thread, **after**
+///     `thread_dispatch` has cleared `TH_RUN` for the wait-bound case. This
+///     is the bitfield to feed into `outgoingTaskState`
+///     (`TH_WAIT=0x01`, `TH_SUSP=0x02`, `TH_RUN=0x04`, `TH_UNINT=0x08`,
+///     etc., per `osfmk/kern/thread.h`).
+///   - arg4 = run-count snapshot (uninteresting for sched-state mapping).
+///   - kd_buf.arg5 = TID of the **incoming** thread.
+pub const MachDispatchArgs = struct {
+    outgoing_tid: u64,
+    outgoing_state: u32,
+    incoming_tid: u64,
+
+    pub fn fromBuf(e: *const KdBuf) MachDispatchArgs {
+        return .{
+            .outgoing_tid = e.arg1,
+            .outgoing_state = @truncate(e.arg3),
+            .incoming_tid = e.arg5,
         };
     }
 };
