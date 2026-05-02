@@ -1033,7 +1033,21 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         }
     }
     if (sched != null or sched_mode == .external) {
-        entries_buf[n_entries] = .{ .sismo_vendor = .{ .name = "sismo.macos_sched", .sismo_config = sched_cfg } };
+        // ProtoVM is enabled for sched so that `GenericKernelProcessTree`
+        // packets evicted from the ring in flight-recorder mode get
+        // mirrored into a maintained DST and surfaced at trace-read
+        // time. The DST consumes ~450 B per Process or Thread node
+        // (allocator bookkeeping + per-field sub-nodes + cmdline
+        // bytes — measured against the C++ Vm with synthetic
+        // patches): ~5000 entries fit in 4 MB, comfortably above what
+        // a busy macOS system surfaces (~200 procs × ~5 threads/proc).
+        // Below ~512 KB, ApplyPatch starts aborting with allocator
+        // exhaustion mid-merge.
+        entries_buf[n_entries] = .{ .sismo_vendor = .{
+            .name = "sismo.macos_sched",
+            .sismo_config = sched_cfg,
+            .protovm_memory_limit_kb = 4 * 1024,
+        } };
         n_entries += 1;
         if (sched_mode == .external) {
             external_names_buf[n_external] = "sismo.macos_sched";

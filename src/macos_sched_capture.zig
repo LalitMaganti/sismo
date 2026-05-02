@@ -30,14 +30,64 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const kdebug = @import("macos/kdebug.zig");
+const process_tree = @import("macos/process_tree.zig");
 const sismo_config = @import("sismo_config.zig");
 const perfetto_proto = @import("perfetto_proto.zig");
+const ProtoWriter = @import("proto_writer.zig").ProtoWriter;
 
 const perfetto = @cImport({
     @cInclude("perfetto_shim.h");
 });
 
 const DS_NAME = "sismo.macos_sched";
+
+// Per-tid cache entry. `thread_pid` identifies the owning process at the
+// time the cache was populated; if a later threadmap snapshot reports a
+// different pid for the same tid we invalidate (pid reuse — mach tids
+// themselves don't reuse, but the (tid, pid) pair can if the owning
+// process exits + the pid is reassigned + a new thread happens to land
+// on the same tid value, which is vanishingly rare but not impossible).
+const ThreadEntry = struct {
+    pid: i32,
+    name_buf: [64]u8,
+    name_len: u8,
+
+    fn name(self: *const ThreadEntry) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+// Per-pid cache entry. cmdline_buf holds the proc_pidpath result;
+// cmdline_len is its byte length. Empty cmdline = pidpath failed
+// (kernel-only or zombie pid) — still cache so we don't keep retrying.
+const ProcessEntry = struct {
+    ppid: i32,
+    cmdline_buf: [process_tree.MAXPATHLEN]u8,
+    cmdline_len: u16,
+
+    fn cmdline(self: *const ProcessEntry) []const u8 {
+        return self.cmdline_buf[0..self.cmdline_len];
+    }
+};
+
+// First-seen timestamp accumulator: we only emit a Thread / Process
+// entry into the GenericKernelProcessTree packet on the drain that
+// first observed it; subsequent drains hit the cache and skip the
+// emit. trace_processor's process tree is incremental — repeating
+// entries is harmless but wasteful.
+const ProcessTreeCache = struct {
+    threads: std.AutoHashMapUnmanaged(u64, ThreadEntry),
+    processes: std.AutoHashMapUnmanaged(i32, ProcessEntry),
+
+    fn init() ProcessTreeCache {
+        return .{ .threads = .empty, .processes = .empty };
+    }
+
+    fn deinit(self: *ProcessTreeCache, gpa: std.mem.Allocator) void {
+        self.threads.deinit(gpa);
+        self.processes.deinit(gpa);
+    }
+};
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("macos_sched_capture is macOS-only");
@@ -57,8 +107,15 @@ pub const Config = struct {
     /// it wakes earlier on any signal.
     drain_interval_ns: u64 = 100 * std.time.ns_per_ms,
 
-    /// Per-drain user-space staging buffer, in events.
-    drain_capacity_events: usize = 16 * 1024,
+    /// Per-drain user-space staging buffer, in events. Sized to match
+    /// `kernel_buffer_events` so a single `KDREADTR` always pulls
+    /// every queued event in one call. Anything smaller leaves a
+    /// residue that grows when the worker is slow (per-emit allocator
+    /// + SDK Trace() costs), and once the residue exceeds
+    /// kernel_buffer_events the kernel overwrites our oldest queued
+    /// events mid-cycle — manifests as 100s-of-ms gaps in the
+    /// timeline between otherwise normal-looking sched stretches.
+    drain_capacity_events: usize = 256 * 1024,
 
     /// Capacity for the per-drain thread-map snapshot.
     thread_map_capacity: usize = 16 * 1024,
@@ -138,6 +195,22 @@ pub const Capture = struct {
 
     pending_switches: [MAX_CPUS]PendingSwitch,
 
+    /// Process / thread name cache, populated lazily from
+    /// `proc_pidinfo` and emitted as `GenericKernelProcessTree`
+    /// deltas. Owned by the worker thread — never accessed from
+    /// trampolines or shutdown caller.
+    pt_cache: ProcessTreeCache,
+
+    /// Reusable scratch buffers for the per-event encode path. After
+    /// warm-up these grow to peak event/packet size and stay there;
+    /// each emit is `clear()` + writes-into instead of an
+    /// alloc/free pair through the gpa. With 50K+ events/s and
+    /// DebugAllocator's stack-trace tracking, the alloc churn alone
+    /// was costing 200 µs per event and letting the kernel kdebug
+    /// ring overflow.
+    event_scratch: ProtoWriter,
+    packet_scratch: ProtoWriter,
+
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -172,15 +245,30 @@ pub const Capture = struct {
             .events_emitted = std.atomic.Value(u64).init(0),
             .drain_calls = std.atomic.Value(u64).init(0),
             .pending_switches = [_]PendingSwitch{.{}} ** MAX_CPUS,
+            .pt_cache = .init(),
+            .event_scratch = .init(allocator),
+            .packet_scratch = .init(allocator),
         };
 
         // Register the data source via the new C++-SDK-backed shim.
         // Zig builds the descriptor; C++ parses + Register's it. The
         // returned slot index is what every later `sismo_ds_emit` call
         // identifies us by.
+        //
+        // The descriptor carries a ProtoVM program that mirrors our
+        // GenericKernelProcessTree packets into the per-buffer DST
+        // state. Traced applies the program on overwritten packets in
+        // ring/flight mode; the DST is surfaced to the consumer at
+        // trace-read time. Inert in file mode (no overwrites).
+        const protovm_program = try perfetto_proto.macosSchedVmProgram(allocator);
+        defer allocator.free(protovm_program);
         const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
             allocator,
-            .{ .name = DS_NAME, .will_notify_on_stop = true },
+            .{
+                .name = DS_NAME,
+                .will_notify_on_stop = true,
+                .protovm_program = protovm_program,
+            },
         );
         defer allocator.free(desc_bytes);
         const slot = perfetto.sismo_ds_register(
@@ -255,6 +343,9 @@ pub const Capture = struct {
         }
         self.allocator.free(self.event_buf);
         self.allocator.free(self.thread_map_buf);
+        self.pt_cache.deinit(self.allocator);
+        self.event_scratch.deinit();
+        self.packet_scratch.deinit();
         self.allocator.destroy(self);
         return stats;
     }
@@ -332,25 +423,213 @@ fn workerEntry(self: *Capture) void {
 }
 
 fn drainOnce(self: *Capture) void {
+    var t0: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t0);
+
     const n_evt = kdebug.Capture.drain(self.event_buf) catch 0;
+    var t_drain: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t_drain);
+
     const n_thr = kdebug.Capture.readThreadMap(self.thread_map_buf) catch 0;
+    const thread_map = self.thread_map_buf[0..n_thr];
+
+    // Refresh process / thread name cache from the threadmap and emit a
+    // GenericKernelProcessTree delta for any newly-observed pids/tids.
+    // Done before emitBatch so the emitted sched events can use the
+    // freshly cached pth_name in their `comm` field.
+    refreshAndEmitTree(self, thread_map);
+    var t_refresh: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t_refresh);
+
     const emitted = emitBatch(
-        self.allocator,
         self.event_buf[0..n_evt],
-        self.thread_map_buf[0..n_thr],
+        thread_map,
+        &self.pt_cache,
         self.ds_slot,
+        &self.event_scratch,
+        &self.packet_scratch,
         self.tb_n,
         self.tb_d,
         &self.pending_switches,
     );
+    var t_end: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t_end);
+
     _ = self.events_emitted.fetchAdd(emitted, .monotonic);
-    _ = self.drain_calls.fetchAdd(1, .monotonic);
+    const drain_idx = self.drain_calls.fetchAdd(1, .monotonic);
+
+    // Diagnostic logging: first cycle only (the cold-cache warm-up that
+    // exercises every proc_pidinfo lookup), plus any cycle where the
+    // kernel ring saturated (`n_evt` near the buffer cap = events were
+    // overwritten before we could read them — the failure mode that
+    // produces multi-hundred-ms gaps in the timeline). Steady-state
+    // cycles are silent.
+    const overflow_threshold = @as(usize, @intCast(self.config.kernel_buffer_events)) * 9 / 10;
+    if (drain_idx == 0 or n_evt >= overflow_threshold) {
+        const drain_ns = nsBetween(t0, t_drain);
+        const refresh_ns = nsBetween(t_drain, t_refresh);
+        const emit_ns = nsBetween(t_refresh, t_end);
+        const tag: []const u8 = if (n_evt >= overflow_threshold) "[ring near-full]" else "";
+        std.debug.print(
+            "macos_sched: drain[{d}] evt={d} thr={d} emit={d}  drain={d}us refresh={d}us emit={d}us {s}\n",
+            .{ drain_idx, n_evt, n_thr, emitted, drain_ns / 1000, refresh_ns / 1000, emit_ns / 1000, tag },
+        );
+    }
 }
 
-fn lookupComm(threads: []const kdebug.KdThreadMap, tid: u64) []const u8 {
-    // Iterate by pointer — capturing by value would copy the entry onto
-    // the local stack, and the returned `sliceTo(&t.command, 0)` would
-    // alias that local copy and dangle once we return.
+fn nsBetween(a: std.c.timespec, b: std.c.timespec) u64 {
+    const a_ns: i128 = @as(i128, a.sec) * std.time.ns_per_s + a.nsec;
+    const b_ns: i128 = @as(i128, b.sec) * std.time.ns_per_s + b.nsec;
+    if (b_ns <= a_ns) return 0;
+    return @intCast(b_ns - a_ns);
+}
+
+/// Walk the kdebug threadmap, populate the per-tid + per-pid name cache
+/// for any new entries via `proc_pidinfo`, and emit a single
+/// `GenericKernelProcessTree` packet listing the deltas.
+///
+/// Cache key = mach thread id (`KdThreadMap.thread`). Mach tids do
+/// not reuse system-wide (xnu allocates from a 64-bit monotonic
+/// counter), so a hit always points at the same thread that owned the
+/// id when we cached it. Pids do reuse, but only after the previous
+/// owner is fully reaped — within a typical sismo recording window
+/// (~minutes) that's rare enough to ignore for v0. A future patch can
+/// subscribe to `BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXIT)` events for
+/// fast invalidation; today we accept the accuracy gap.
+fn refreshAndEmitTree(self: *Capture, thread_map: []const kdebug.KdThreadMap) void {
+    const gpa = self.allocator;
+
+    // Per-emit arena. Each new entry's name/cmdline gets dup'd into
+    // this arena so the slices in new_threads_buf / new_processes_buf
+    // outlive the loop iteration that produced them. Without this, the
+    // slices alias `entry`/`pe` — local variables whose stack slot the
+    // compiler reuses each iteration — so by emit time every slice
+    // points at the LAST iteration's stack content. (Caught in the
+    // wild by traceconv showing wildly cross-contaminated cmdlines:
+    // pid=1 emitting "/usr/libexec/", sample-target emitting
+    // "UserEventAgent", thread comms reading "mds\xAA\xAA…" past the
+    // real 3-char name.) The arena is freed at function exit.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two stack-bounded staging buffers for new entries this drain.
+    // Threadmap is bounded by `thread_map_capacity` (16K by default);
+    // a drain rarely surfaces more than a few new threads, so 256 is
+    // a comfortable cap. Anything beyond that we silently truncate
+    // — the next drain picks them up.
+    var new_threads_buf: [256]perfetto_proto.ThreadEntry = undefined;
+    var n_new_threads: usize = 0;
+    var new_processes_buf: [128]perfetto_proto.ProcessEntry = undefined;
+    var n_new_processes: usize = 0;
+
+    for (thread_map) |*t| {
+        if (t.thread == 0 or t.pid <= 0) continue;
+        const tid = t.thread;
+        const pid: i32 = @intCast(t.pid);
+
+        const t_gop = self.pt_cache.threads.getOrPut(gpa, tid) catch continue;
+        if (t_gop.found_existing and t_gop.value_ptr.pid == pid) continue;
+
+        // New tid (or stale tid where pid changed under us — pid reuse).
+        // Re-query proc_pidinfo for the pth_name. Fallback comm comes
+        // from the threadmap if proc_pidinfo gives us nothing.
+        var name_buf: [64]u8 = undefined;
+        const fetched = process_tree.threadName(pid, tid, &name_buf);
+        const name: []const u8 = if (fetched) |n|
+            n
+        else
+            std.mem.sliceTo(&t.command, 0);
+
+        var entry: ThreadEntry = .{
+            .pid = pid,
+            .name_buf = undefined,
+            .name_len = 0,
+        };
+        const cap_n: u8 = @intCast(@min(name.len, entry.name_buf.len));
+        entry.name_len = cap_n;
+        @memcpy(entry.name_buf[0..cap_n], name[0..cap_n]);
+        t_gop.value_ptr.* = entry;
+
+        if (n_new_threads < new_threads_buf.len) {
+            const comm_dup = a.dupe(u8, name[0..cap_n]) catch continue;
+            new_threads_buf[n_new_threads] = .{
+                .tid = @intCast(tid),
+                .pid = pid,
+                .comm = comm_dup,
+            };
+            n_new_threads += 1;
+        }
+
+        // New pid? Look up its bsdinfo (ppid) and proc_pidpath (cmdline).
+        const p_gop = self.pt_cache.processes.getOrPut(gpa, pid) catch continue;
+        if (p_gop.found_existing) continue;
+
+        var pe: ProcessEntry = .{ .ppid = 0, .cmdline_buf = undefined, .cmdline_len = 0 };
+        if (process_tree.bsdinfo(pid)) |bi| pe.ppid = @intCast(bi.pbi_ppid);
+        if (process_tree.pidPath(pid, &pe.cmdline_buf)) |path| {
+            // proc_pidpath's return length includes the NUL
+            // terminator; drop it (and any other trailing NULs)
+            // before storing so trace_processor renders the cmdline
+            // cleanly.
+            const trimmed = std.mem.sliceTo(path, 0);
+            pe.cmdline_len = @intCast(trimmed.len);
+        }
+        p_gop.value_ptr.* = pe;
+
+        if (n_new_processes < new_processes_buf.len) {
+            const cmdline_dup = a.dupe(u8, pe.cmdline()) catch continue;
+            new_processes_buf[n_new_processes] = .{
+                .pid = pid,
+                .ppid = pe.ppid,
+                .cmdline = cmdline_dup,
+            };
+            n_new_processes += 1;
+        }
+    }
+
+    if (n_new_threads == 0 and n_new_processes == 0) return;
+
+    const tree_bytes = perfetto_proto.encodeKernelProcessTree(
+        gpa,
+        new_processes_buf[0..n_new_processes],
+        new_threads_buf[0..n_new_threads],
+    ) catch return;
+    defer gpa.free(tree_bytes);
+
+    const body = perfetto_proto.encodeTracePacketBody(
+        gpa,
+        0, // no per-packet timestamp; trace_processor reads ProcessTree
+           // entries as time-independent metadata.
+        perfetto_proto.TP_FIELD_GENERIC_KERNEL_PROCESS_TREE,
+        tree_bytes,
+    ) catch return;
+    defer gpa.free(body);
+    perfetto.sismo_ds_emit(self.ds_slot, body.ptr, body.len);
+}
+
+/// Resolve a tid → comm. Cache hit (populated by `refreshAndEmitTree`)
+/// returns the proc_pidinfo `pth_name` if available, otherwise the
+/// kdebug threadmap's 16-char `command`. Cache miss falls back to a
+/// linear scan of the threadmap (slow path, only hit during the first
+/// drain after a thread spawned mid-recording).
+///
+/// Uses `getPtr` (not `get`) so the returned slice aliases the
+/// hashmap's stable storage rather than a freshly-copied local that
+/// would die at return — which is what produced the corrupt
+/// "\000\000…" / 0xAA-padded comms in early tracing runs.
+fn lookupComm(
+    threads: []const kdebug.KdThreadMap,
+    cache: *ProcessTreeCache,
+    tid: u64,
+) []const u8 {
+    if (cache.threads.getPtr(tid)) |entry| {
+        if (entry.name_len > 0) return entry.name();
+    }
+    // Cache miss — fall back to the kdebug threadmap. Iterate by
+    // pointer; capturing by value would copy the entry onto the local
+    // stack, and the returned `sliceTo(&t.command, 0)` would alias
+    // that local copy and dangle once we return.
     for (threads) |*t| {
         if (t.thread == tid) return std.mem.sliceTo(&t.command, 0);
     }
@@ -376,13 +655,15 @@ fn outgoingTaskState(state_bits: u32) perfetto_proto.TaskState {
     return .runnable;
 }
 
-/// Build the GenericKernelTaskStateEvent payload + wrap in a TracePacket
-/// body, then emit via the public C++ SDK shim. Caller must pass the
-/// allocator that backs the temp encoders (allocations are bounded
-/// per-event and freed before return).
+/// Build the GenericKernelTaskStateEvent payload + TracePacket wrapper
+/// using the caller's persistent scratch writers, then emit via the
+/// public C++ SDK shim. Both writers are `clear()`-ed at entry; after
+/// warm-up their backing buffers are sized to the peak event/packet
+/// size and incur zero allocations per call.
 fn emitTaskState(
-    gpa: std.mem.Allocator,
     slot: u32,
+    event_w: *ProtoWriter,
+    packet_w: *ProtoWriter,
     timestamp_ns: u64,
     cpu: i32,
     comm: []const u8,
@@ -390,28 +671,31 @@ fn emitTaskState(
     state: perfetto_proto.TaskState,
     prio: i32,
 ) void {
-    const event_bytes = perfetto_proto.encodeKernelTaskStateEvent(gpa, .{
+    event_w.clear();
+    perfetto_proto.encodeKernelTaskStateEventInto(event_w, .{
         .cpu = cpu,
         .comm = comm,
         .tid = tid,
         .state = state,
         .prio = prio,
     }) catch return;
-    defer gpa.free(event_bytes);
-    const body = perfetto_proto.encodeTracePacketBody(
-        gpa, timestamp_ns,
+    packet_w.clear();
+    perfetto_proto.encodeTracePacketBodyInto(
+        packet_w,
+        timestamp_ns,
         perfetto_proto.TP_FIELD_GENERIC_KERNEL_TASK_STATE,
-        event_bytes,
+        event_w.bytes(),
     ) catch return;
-    defer gpa.free(body);
-    perfetto.sismo_ds_emit(slot, body.ptr, body.len);
+    perfetto.sismo_ds_emit(slot, packet_w.bytes().ptr, packet_w.bytes().len);
 }
 
 fn emitBatch(
-    gpa: std.mem.Allocator,
     events: []const kdebug.KdBuf,
     thread_map: []const kdebug.KdThreadMap,
+    cache: *ProcessTreeCache,
     ds_slot: u32,
+    event_w: *ProtoWriter,
+    packet_w: *ProtoWriter,
     tb_n: u64,
     tb_d: u64,
     pending: *[MAX_CPUS]PendingSwitch,
@@ -463,19 +747,19 @@ fn emitBatch(
                 }
 
                 const ts_ns = slot.timestamp *% tb_n / tb_d;
-                const off_comm = lookupComm(thread_map, slot.outgoing_tid);
+                const off_comm = lookupComm(thread_map, cache, slot.outgoing_tid);
                 const off_state = outgoingTaskState(args.outgoing_state);
                 emitTaskState(
-                    gpa, ds_slot, ts_ns,
+                    ds_slot, event_w, packet_w, ts_ns,
                     @intCast(e.cpuid),
                     off_comm,
                     @intCast(slot.outgoing_tid),
                     off_state,
                     @intCast(slot.outgoing_pri),
                 );
-                const on_comm = lookupComm(thread_map, slot.incoming_tid);
+                const on_comm = lookupComm(thread_map, cache, slot.incoming_tid);
                 emitTaskState(
-                    gpa, ds_slot, ts_ns,
+                    ds_slot, event_w, packet_w, ts_ns,
                     @intCast(e.cpuid),
                     on_comm,
                     @intCast(slot.incoming_tid),

@@ -31,6 +31,15 @@ pub const ProtoWriter = struct {
         self.buf.deinit(self.gpa);
     }
 
+    /// Reset for reuse, retaining the underlying capacity. Lets a
+    /// hot-path caller hold one persistent `ProtoWriter`, clear it
+    /// between iterations, and avoid per-message alloc churn — once
+    /// the buffer has grown to the peak message size it never
+    /// reallocates.
+    pub fn clear(self: *ProtoWriter) void {
+        self.buf.clearRetainingCapacity();
+    }
+
     pub fn bytes(self: *const ProtoWriter) []const u8 {
         return self.buf.items;
     }
