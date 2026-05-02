@@ -68,10 +68,42 @@ const heap_capture = switch (builtin.os.tag) {
     else => struct {},
 };
 
+// Linux uses upstream Perfetto producers (traced_probes + traced_perf)
+// embedded as in-process worker threads — same pattern as
+// `sismo_traced` for the service. No Zig-side capture wrappers needed;
+// the producers self-register their data sources when the consumer's
+// TraceConfig requests them.
+const linux_traced_probes = switch (builtin.os.tag) {
+    .linux => @import("sismo_traced_probes.zig"),
+    else => struct {},
+};
+const linux_traced_perf = switch (builtin.os.tag) {
+    .linux => @import("sismo_traced_perf.zig"),
+    else => struct {},
+};
+
 // `setenv` has no idiomatic Zig wrapper — env mutation goes through libc
 // so it stays in sync with the libc-side environ that posix_spawnp
 // inherits.
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+// `std.c.posix_spawnp` only exposes the Darwin variant in zig 0.16; on
+// Linux it's a libc symbol not surfaced through std.c. Declare locally
+// with `?*const anyopaque` for the file_actions / attrp pointers since
+// we only ever pass null for both — the actual struct types differ
+// per-OS but never get instantiated here.
+extern "c" fn posix_spawnp(
+    pid: *c_int,
+    path: [*:0]const u8,
+    file_actions: ?*const anyopaque,
+    attrp: ?*const anyopaque,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+) c_int;
+
+// `std.c.environ` exists on every libc target but is declared in
+// std.c's per-OS section; redeclare locally so the access is uniform.
+extern "c" var environ: [*:null]const ?[*:0]const u8;
 
 const EVFILT_PROC: i16 = -5;
 const EV_ADD: u16 = 0x0001;
@@ -115,9 +147,22 @@ const WaitCtx = struct {
 fn exitWatchThread(ctx: *const WaitCtx) void {
     switch (ctx.mode) {
         .spawn => waitpidExitWatch(ctx),
-        .attach => kqueueExitWatch(ctx),
+        .attach => attach_watcher.watch(ctx),
     }
 }
+
+// macOS uses kqueue NOTE_EXIT to watch a non-child pid for exit.
+// Linux would need pidfd_open + poll (or a busy-poll on /proc/<pid>);
+// not wired today because runRecordLinux rejects --pid before reaching
+// here. Comptime-selected so kqueue references never reach the
+// semantic analyzer on Linux.
+const attach_watcher = if (builtin.os.tag == .macos) struct {
+    pub const watch = kqueueExitWatch;
+} else struct {
+    pub fn watch(_: *const WaitCtx) void {
+        @panic("attach mode not supported on this platform");
+    }
+};
 
 // Spawn-mode exit watcher: blocks on waitpid for the child we own.
 fn waitpidExitWatch(ctx: *const WaitCtx) void {
@@ -292,13 +337,13 @@ fn maybeSpawnInner(
     }
 
     var pid: c_int = 0;
-    const rc = std.c.posix_spawnp(
+    const rc = posix_spawnp(
         &pid,
         path_z.ptr,
         null,
         null,
         @ptrCast(argv.ptr),
-        @ptrCast(std.c.environ),
+        environ,
     );
     if (rc != 0) {
         std.debug.print("sismo record: posix_spawnp({s}) rc={d}\n", .{ path, rc });
@@ -314,6 +359,9 @@ fn maybeSpawnInner(
 pub fn runRecord(init: std.process.Init) !void {
     if (comptime builtin.os.tag == .macos) {
         return runRecordMacos(init);
+    }
+    if (comptime builtin.os.tag == .linux) {
+        return runRecordLinux(init);
     }
     std.debug.print(
         "sismo record: not yet implemented on {s}\n",
@@ -642,19 +690,19 @@ fn runRecordMacos(init: std.process.Init) !void {
     var entries_buf: [4]c.SismoDsConfigEntry = undefined;
     var n_entries: usize = 0;
     if (!no_instrumentation) {
-        entries_buf[n_entries] = .{ .name = "track_event", .extra_bytes = null, .extra_bytes_size = 0 };
+        entries_buf[n_entries] = .{ .name = "track_event", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = 0 };
         n_entries += 1;
     }
     if (heap != null) {
-        entries_buf[n_entries] = .{ .name = "sismo.heap", .extra_bytes = heap_cfg.ptr, .extra_bytes_size = heap_cfg.len };
+        entries_buf[n_entries] = .{ .name = "sismo.heap", .extra_bytes = heap_cfg.ptr, .extra_bytes_size = heap_cfg.len, .target_pid = 0 };
         n_entries += 1;
     }
     if (cpu != null) {
-        entries_buf[n_entries] = .{ .name = "sismo.macos_cpu_samples", .extra_bytes = cpu_cfg.ptr, .extra_bytes_size = cpu_cfg.len };
+        entries_buf[n_entries] = .{ .name = "sismo.macos_cpu_samples", .extra_bytes = cpu_cfg.ptr, .extra_bytes_size = cpu_cfg.len, .target_pid = 0 };
         n_entries += 1;
     }
     if (sched != null) {
-        entries_buf[n_entries] = .{ .name = "sismo.macos_sched", .extra_bytes = if (sched_cfg.len > 0) sched_cfg.ptr else null, .extra_bytes_size = sched_cfg.len };
+        entries_buf[n_entries] = .{ .name = "sismo.macos_sched", .extra_bytes = if (sched_cfg.len > 0) sched_cfg.ptr else null, .extra_bytes_size = sched_cfg.len, .target_pid = 0 };
         n_entries += 1;
     }
     if (n_entries == 0) {
@@ -828,5 +876,336 @@ fn runRecordMacos(init: std.process.Init) !void {
     }
 
     // 12. Stop the embedded traced thread.
+    traced.stop(svc);
+}
+
+// -----------------------------------------------------------------------------
+// Linux record path
+//
+// Same self-pipe wait-loop + lock + spawn skeleton as the macOS path,
+// but the data sources live inside upstream Perfetto producers we
+// embed as in-process threads (`linux_traced_probes` for ftrace +
+// procfs, `linux_traced_perf` for perf_event_open CPU sampling) rather
+// than bespoke Zig captures. The producers self-register their data
+// sources when the consumer's TraceConfig enables `linux.ftrace` /
+// `linux.perf`; sismo's only job is to spawn + tear down the threads.
+//
+// What this branch does NOT do today:
+//   - --pid attach: would need a pidfd-based exit watcher (Linux's
+//     equivalent of the macOS kqueue path); skipped for v0.
+//   - heap profiling: Linux LD_PRELOAD heap interception is its own
+//     task (master plan §"Heap (libc malloc)"), not wired here.
+// -----------------------------------------------------------------------------
+fn runRecordLinux(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    _ = init.io;
+
+    var iter = init.minimal.args.iterate();
+    _ = iter.next(); // exe path
+    _ = iter.next(); // "record" subcommand token
+    var output_path: []const u8 = "./sismo.pftrace";
+    var duration_secs: ?c_uint = null;
+    var flight_recorder = false;
+    var buffer_kb: u32 = 128 * 1024;
+    var buffer_set = false;
+    var no_sched = false;
+    var no_cpu = false;
+    var no_instrumentation = false;
+    var workload_argv: std.ArrayList([]const u8) = .empty;
+    defer workload_argv.deinit(gpa);
+
+    while (iter.next()) |arg| {
+        if (workload_argv.items.len == 0 and std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.eql(u8, arg, "--output")) {
+                output_path = iter.next() orelse {
+                    std.debug.print("sismo record: --output needs a value\n", .{});
+                    return;
+                };
+            } else if (std.mem.eql(u8, arg, "--flight-recorder")) {
+                flight_recorder = true;
+            } else if (std.mem.eql(u8, arg, "--buffer")) {
+                const v = iter.next() orelse {
+                    std.debug.print("sismo record: --buffer needs a value (e.g. 256MB)\n", .{});
+                    return;
+                };
+                buffer_kb = parseBufferKb(v) orelse {
+                    std.debug.print(
+                        "sismo record: invalid --buffer '{s}' (use 256MB / 1GB / 512KB)\n",
+                        .{v},
+                    );
+                    return;
+                };
+                buffer_set = true;
+            } else if (std.mem.eql(u8, arg, "--duration")) {
+                const v = iter.next() orelse {
+                    std.debug.print("sismo record: --duration needs a value (e.g. 30s, 5m, 1h)\n", .{});
+                    return;
+                };
+                duration_secs = parseDurationSeconds(v) orelse {
+                    std.debug.print(
+                        "sismo record: invalid --duration '{s}' (use 30s, 5m, 1h or a positive integer of seconds)\n",
+                        .{v},
+                    );
+                    return;
+                };
+            } else if (std.mem.eql(u8, arg, "--no-sched")) {
+                no_sched = true;
+            } else if (std.mem.eql(u8, arg, "--no-cpu")) {
+                no_cpu = true;
+            } else if (std.mem.eql(u8, arg, "--no-instrumentation")) {
+                no_instrumentation = true;
+            } else if (std.mem.eql(u8, arg, "--no-heap")) {
+                // Heap profiling not wired on Linux yet; accept the
+                // flag silently so users can share invocations across
+                // platforms.
+            } else if (std.mem.eql(u8, arg, "--pid")) {
+                std.debug.print("sismo record: --pid attach not yet supported on Linux\n", .{});
+                return;
+            } else if (std.mem.eql(u8, arg, "--help")) {
+                std.debug.print(
+                    "usage: sismo record [--output <path>] [--duration <dur>]\n" ++
+                    "                    [--flight-recorder [--buffer <size>]]\n" ++
+                    "                    [--no-sched] [--no-cpu] [--no-instrumentation]\n" ++
+                    "                    <command> [args...]\n" ++
+                    "\n" ++
+                    "Linux requires CAP_PERFMON for perf_event_open and read access\n" ++
+                    "to /sys/kernel/tracing for ftrace; running with sudo is the\n" ++
+                    "easiest path.\n",
+                    .{},
+                );
+                return;
+            } else {
+                std.debug.print("sismo record: unknown flag '{s}'\n", .{arg});
+                return;
+            }
+        } else {
+            try workload_argv.append(gpa, arg);
+        }
+    }
+
+    if (workload_argv.items.len == 0) {
+        std.debug.print(
+            "sismo record: need a workload <command> on Linux (--pid attach not yet supported)\n",
+            .{},
+        );
+        return;
+    }
+
+    if (flight_recorder and !buffer_set) buffer_kb = 256 * 1024;
+
+    const lock_fd = paths.acquireSessionLock(std.c.getpid()) catch |err| switch (err) {
+        error.AlreadyHeld => {
+            std.debug.print(
+                "sismo record: another sismo session is already running (lock held on {s})\n",
+                .{paths.session_lock_path},
+            );
+            return;
+        },
+        error.OpenFailed => {
+            std.debug.print(
+                "sismo record: failed to open session lock at {s}\n",
+                .{paths.session_lock_path},
+            );
+            return;
+        },
+    };
+    defer paths.releaseSessionLock(lock_fd);
+
+    const my_pid = std.c.getpid();
+    const prod_sock = paths.producer_sock;
+    const cons_sock = paths.consumer_sock;
+
+    std.debug.print(
+        "sismo record: pid={d} output={s}\n  producer sock: {s}\n  consumer sock: {s}\n",
+        .{ my_pid, output_path, prod_sock, cons_sock },
+    );
+
+    _ = setenv("PERFETTO_PRODUCER_SOCK_NAME", prod_sock.ptr, 1);
+    _ = setenv("PERFETTO_CONSUMER_SOCK_NAME", cons_sock.ptr, 1);
+
+    // 1. Embed traced (the IPC service host) on a worker thread.
+    const svc = try traced.create(prod_sock, cons_sock);
+    defer traced.destroy(svc);
+
+    // 2. Embed traced_probes (ftrace + procfs) and traced_perf
+    //    (perf_event_open) as in-process producer threads. They both
+    //    connect to the in-process traced over the producer socket the
+    //    service just bound. defer LIFO order tears them down before
+    //    the service.
+    const probes = if (no_sched)
+        null
+    else linux_traced_probes.create(prod_sock) catch |err| blk: {
+        std.debug.print(
+            "sismo record: traced_probes attach failed: {s} — sched events disabled\n",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
+    defer if (probes) |p| linux_traced_probes.destroy(p);
+
+    const perf = if (no_cpu)
+        null
+    else linux_traced_perf.create(prod_sock) catch |err| blk: {
+        std.debug.print(
+            "sismo record: traced_perf attach failed: {s} — CPU samples disabled\n",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
+    defer if (perf) |p| linux_traced_perf.destroy(p);
+
+    // 3. Spawn the workload. No DYLD_INSERT_LIBRARIES — that's macOS.
+    //    The Linux LD_PRELOAD heap interceptor is a separate pillar.
+    const workload_cmd = workload_argv.items[0];
+    const workload_args = workload_argv.items[1..];
+    const target = maybeSpawn(gpa, workload_cmd, workload_args, &.{
+        "PERFETTO_PRODUCER_SOCK_NAME", prod_sock,
+    }) orelse {
+        std.debug.print("sismo record: failed to spawn '{s}' — exiting\n", .{workload_cmd});
+        return;
+    };
+    std.debug.print("sismo record: spawned '{s}' pid={d}\n", .{ workload_cmd, target.pid });
+
+    // 4. Build the TraceConfig. Linux producers don't need sismo's
+    //    vendor extension at field 2000 — their config lives in the
+    //    Perfetto-native FtraceConfig / PerfEventConfig nested
+    //    submessages, which sismo_perfetto_build_config hand-rolls
+    //    when it sees the entry names "linux.ftrace" / "linux.perf".
+    var entries_buf: [3]c.SismoDsConfigEntry = undefined;
+    var n_entries: usize = 0;
+    if (!no_instrumentation) {
+        entries_buf[n_entries] = .{ .name = "track_event", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = 0 };
+        n_entries += 1;
+    }
+    if (probes != null) {
+        // ftrace stays system-wide because traced_probes can't filter
+        // by pid. trace_processor handles separating the workload's
+        // events out post-hoc.
+        entries_buf[n_entries] = .{ .name = "linux.ftrace", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = 0 };
+        n_entries += 1;
+    }
+    if (perf != null) {
+        entries_buf[n_entries] = .{ .name = "linux.perf", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = target.pid };
+        n_entries += 1;
+    }
+    if (n_entries == 0) {
+        std.debug.print(
+            "sismo record: no data sources enabled — recording would be empty. Drop one of the --no-* flags.\n",
+            .{},
+        );
+        return;
+    }
+    const entries = entries_buf[0..n_entries];
+
+    if (!flight_recorder) _ = std.c.unlink(@ptrCast(output_path.ptr));
+    var cfg: ?*anyopaque = null;
+    var cfg_len: usize = 0;
+    const path_z = try gpa.dupeZ(u8, output_path);
+    defer gpa.free(path_z);
+    const mode: c.SismoMode = if (flight_recorder) c.SISMO_MODE_RING else c.SISMO_MODE_FILE;
+    const out_for_shim: ?[*:0]const u8 = if (flight_recorder) null else path_z.ptr;
+    const cfg_rc = c.sismo_perfetto_build_config(
+        mode,
+        entries.ptr,
+        entries.len,
+        buffer_kb,
+        0,
+        1024 * 1024 * 1024,
+        out_for_shim,
+        &cfg,
+        &cfg_len,
+    );
+    if (cfg_rc != 0) {
+        std.debug.print("sismo record: build_config rc={d}\n", .{cfg_rc});
+        return;
+    }
+    defer c.sismo_perfetto_free_config(cfg);
+
+    const session = c.sismo_consumer_session_create() orelse {
+        std.debug.print("sismo record: session_create failed\n", .{});
+        return;
+    };
+    defer c.sismo_consumer_session_destroy(session);
+    const setup_rc = c.sismo_consumer_session_setup(session, cfg, cfg_len);
+    if (setup_rc != 0) {
+        std.debug.print("sismo record: session_setup rc={d} (TraceConfig failed to parse)\n", .{setup_rc});
+        return;
+    }
+    c.sismo_consumer_session_start_blocking(session);
+    if (flight_recorder) {
+        std.debug.print(
+            "sismo record: flight-recorder started ({d} KB buffer); take snapshots via `sismo snapshot` while running\n",
+            .{buffer_kb},
+        );
+    } else {
+        std.debug.print("sismo record: session started, recording until workload exits (or SIGINT)\n", .{});
+    }
+
+    // 5. Self-pipe wait loop, identical to the macOS path.
+    var pipe_fds: [2]c_int = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) {
+        std.debug.print("sismo record: pipe() failed\n", .{});
+        return;
+    }
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    g_pipe_write_fd = pipe_fds[1];
+    const sigint_act: std.c.Sigaction = .{
+        .handler = .{ .handler = handleSigint },
+        .mask = std.mem.zeroes(std.c.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &sigint_act, null);
+
+    const wait_ctx: WaitCtx = .{
+        .pid = target.pid,
+        .write_fd = pipe_fds[1],
+        .mode = .spawn,  // attach mode not yet supported on Linux
+    };
+    const wait_thr = try std.Thread.spawn(.{}, exitWatchThread, .{&wait_ctx});
+    defer wait_thr.join();
+
+    var duration_ctx: DurationCtx = undefined;
+    var duration_thr: ?std.Thread = null;
+    if (duration_secs) |secs| {
+        duration_ctx = .{ .seconds = secs, .write_fd = pipe_fds[1] };
+        duration_thr = try std.Thread.spawn(.{}, durationTimerThread, .{&duration_ctx});
+    }
+    defer if (duration_thr) |t| t.detach();
+
+    var read_buf: [16]u8 = undefined;
+    var workload_done: bool = false;
+    while (!workload_done) {
+        const n = std.c.read(pipe_fds[0], &read_buf, read_buf.len);
+        if (n <= 0) continue;
+        for (read_buf[0..@intCast(n)]) |b| switch (b) {
+            'I' => {
+                std.debug.print("sismo record: SIGINT — sending SIGTERM to workload pid={d}\n", .{target.pid});
+                _ = std.c.kill(target.pid, .TERM);
+            },
+            'T' => {
+                std.debug.print("sismo record: --duration reached — sending SIGTERM to workload pid={d}\n", .{target.pid});
+                _ = std.c.kill(target.pid, .TERM);
+            },
+            'X' => workload_done = true,
+            else => {},
+        };
+    }
+
+    // 6. Stop the session. The producers' on_stop callbacks fire on
+    //    their own threads; once stop_blocking returns, the trace is
+    //    flushed (FILE mode) or sitting in the ring (flight mode).
+    c.sismo_consumer_session_stop_blocking(session);
+    if (flight_recorder) {
+        std.debug.print("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)\n", .{});
+    } else {
+        std.debug.print("sismo record: trace saved to {s}\n", .{output_path});
+    }
+
+    // 7. Tear-down via Zig defer LIFO:
+    //      perf.destroy → probes.destroy → traced.destroy
+    //    Each destroy() Quits the producer's TaskRunner and joins the
+    //    worker thread, so producers fully detach before the service
+    //    tears down.
     traced.stop(svc);
 }

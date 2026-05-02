@@ -167,10 +167,18 @@ int sismo_perfetto_ds_emit_payload(
 // `src/sismo_config.zig`). Pass `extra_bytes = NULL`,
 // `extra_bytes_size = 0` for data sources that don't need
 // sismo-specific config (e.g. Perfetto's stock `track_event`).
+//
+// `target_pid` is consulted only for the Linux producer entries
+// `linux.perf` and `linux.ftrace`. Zero means system-wide capture; a
+// positive value scopes the producer to the given pid (samples for
+// linux.perf via PerfEventConfig.callstack_sampling.scope.target_pid;
+// process state ftrace events stay system-wide because traced_probes
+// can't filter ftrace by pid). Ignored for sismo-vendor data sources.
 typedef struct SismoDsConfigEntry {
     const char* name;
     const void* extra_bytes;
     size_t extra_bytes_size;
+    int32_t target_pid;
 } SismoDsConfigEntry;
 
 // Allocate a serialized `TraceConfig` proto for the given mode. Each

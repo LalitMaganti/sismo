@@ -116,6 +116,7 @@ extra_target_cxxflags = "-target $SISMO_TARGET"
 extra_target_ldflags = "-target $SISMO_TARGET -fuse-ld=lld"
 
 enable_perfetto_traced_perf = true
+enable_perfetto_traced_probes = true
 enable_perfetto_trace_processor_sqlite = true
 enable_perfetto_trace_processor_json = false
 enable_perfetto_ui = false
@@ -133,9 +134,11 @@ target_os = "$TARGET_OS"
 # We need:
 #   - traced + ServiceIPCHost (linkable as in-process)
 #   - traced_perf (Linux CPU sampler, in-process thread)
+#   - traced_probes (Linux ftrace + procfs producer, in-process thread)
 #   - trace_processor_shell (validation in tools/e2e_all_sources.sh)
 #   - libperfetto.a (data source registration in sismo's bespoke producers)
 enable_perfetto_traced_perf = true
+enable_perfetto_traced_probes = true
 enable_perfetto_trace_processor_sqlite = true
 enable_perfetto_trace_processor_json = false
 enable_perfetto_ui = false

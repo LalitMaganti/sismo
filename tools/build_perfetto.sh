@@ -52,6 +52,10 @@ fi
 #   trace_processor_shell           — standalone for E2E validation.
 #   //src/profiling/perf:producer   — Linux-only traced_perf source set,
 #                                     linked in-process on Linux.
+#   //src/traced/probes:probes_src  — Linux-only traced_probes source set
+#                                     (ftrace + procfs); the :probes_src
+#                                     target excludes probes.cc's main()
+#                                     which is what we want for embedding.
 TARGETS=("traced")
 
 # Native builds also pull in trace_processor_shell (E2E validation).
@@ -61,12 +65,15 @@ if [[ -z "$SISMO_TARGET" ]]; then
     TARGETS+=("trace_processor_shell")
 fi
 
-# traced_perf (the Linux perf_event producer in-process source set)
-# pulls in buildtools/android-unwinding for stack unwinding. We need
-# this on every Linux build (native and cross) so sismo's perf-event
-# producer wired up.
+# traced_perf and traced_probes are Linux-only producers we link in
+# process. traced_perf pulls in buildtools/android-unwinding for stack
+# unwinding; traced_probes pulls in the ftrace + procfs machinery. Both
+# need to be built on every Linux build (native and cross).
 case "${SISMO_TARGET:-$(uname -s)}" in
-    *linux*|Linux) TARGETS+=("src/profiling/perf:producer") ;;
+    *linux*|Linux)
+        TARGETS+=("src/profiling/perf:producer")
+        TARGETS+=("src/traced/probes:probes_src")
+        ;;
 esac
 
 echo "==> building Perfetto targets in $OUT_NAME: ${TARGETS[*]}"

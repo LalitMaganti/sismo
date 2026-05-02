@@ -251,7 +251,30 @@ fn addUnixPipeline(
             .flags = cpp_flags,
             .language = .cpp,
         });
+        // Linux-only: embedded Perfetto producers run in-process as
+        // worker threads (mirroring sismo_traced.cc). traced_probes
+        // covers ftrace + procfs; traced_perf covers perf_event_open
+        // CPU sampling. Both are gated `is_linux` upstream — their
+        // source sets aren't built on macOS.
+        if (!is_macos) {
+            sismo_mod.addCSourceFile(.{
+                .file = b.path("src/c/sismo_traced_probes.cc"),
+                .flags = cpp_flags,
+                .language = .cpp,
+            });
+            sismo_mod.addCSourceFile(.{
+                .file = b.path("src/c/sismo_traced_perf.cc"),
+                .flags = cpp_flags,
+                .language = .cpp,
+            });
+        }
         sismo_mod.addIncludePath(perfetto_root.path(b, "include"));
+        // Linux producer shims include "src/profiling/perf/perf_producer.h"
+        // and "src/traced/probes/probes_producer.h" — both are
+        // non-public headers that resolve from Perfetto's repo root.
+        if (!is_macos) {
+            sismo_mod.addIncludePath(perfetto_root);
+        }
         sismo_mod.addIncludePath(perfetto_out.path(b, "gen"));
         sismo_mod.addIncludePath(perfetto_out.path(b, "gen/build_config"));
         sismo_mod.addLibraryPath(b.path(b.fmt("rust-bridge/target/{s}", .{cargo_target_subdir})));

@@ -360,6 +360,90 @@ int sismo_perfetto_ds_emit_kernel_task_state(
 // DataSourceConfig — see src/sismo_config.zig and protos/sismo_config.proto.
 #define SISMO_DSC_SISMO_CONFIG_FIELD 2000
 
+// DataSourceConfig nested-message field numbers for the Linux producer
+// configs. Confirmed against
+// third_party/src/perfetto/protos/perfetto/config/data_source_config.proto.
+#define DSC_FTRACE_CONFIG_FIELD 100        // optional FtraceConfig ftrace_config
+#define DSC_PERF_EVENT_CONFIG_FIELD 111    // optional PerfEventConfig perf_event_config
+
+// Build the inner FtraceConfig nested message into `dsc.msg`. We
+// hand-roll the encoding because the Perfetto C SDK doesn't generate
+// .pzc.h headers for FtraceConfig.
+//
+// What we emit:
+//   ftrace_events = ["sched/sched_switch", "sched/sched_waking",
+//                    "sched/sched_wakeup", "sched/sched_process_exit"]
+//   compact_sched.enabled = true
+//
+// Field numbers (FtraceConfig):
+//   ftrace_events = 1   (repeated string)
+//   compact_sched = 12  (CompactSchedConfig submsg)
+// Field numbers (CompactSchedConfig):
+//   enabled = 1         (bool, varint)
+static void AppendFtraceConfigContent(struct PerfettoPbMsg* ftrace_msg) {
+    static const char* const kSchedEvents[] = {
+        "sched/sched_switch",
+        "sched/sched_waking",
+        "sched/sched_wakeup",
+        "sched/sched_process_exit",
+    };
+    for (size_t i = 0; i < sizeof(kSchedEvents) / sizeof(kSchedEvents[0]); i++) {
+        PerfettoPbMsgAppendCStrField(ftrace_msg, /*field_id=*/1, kSchedEvents[i]);
+    }
+    {
+        struct PerfettoPbMsg compact;
+        PerfettoPbMsgBeginNested(ftrace_msg, &compact, /*field_id=*/12);
+        PerfettoPbMsgAppendType0Field(&compact, /*field_id=*/1, /*enabled=*/1);
+        PerfettoPbMsgEndNested(ftrace_msg);
+    }
+}
+
+// Build the inner PerfEventConfig nested message into `dsc.msg`. Like
+// FtraceConfig, hand-rolled — the C SDK doesn't expose a generated
+// builder for PerfEventConfig.
+//
+// What we emit:
+//   timebase.frequency = 1000        (1 kHz, matches samply default)
+//   callstack_sampling.kernel_frames = true
+//   callstack_sampling.user_frames   = UNWIND_DWARF (=2, default but explicit)
+//   callstack_sampling.scope.target_pid = target_pid  (only if target_pid > 0)
+//
+// Field numbers (PerfEventConfig):
+//   timebase = 15            (PerfEvents.Timebase submsg)
+//   callstack_sampling = 16  (CallstackSampling submsg)
+// Field numbers (PerfEvents.Timebase):
+//   frequency = 2            (uint64, varint)
+// Field numbers (CallstackSampling):
+//   scope = 1                (Scope submsg)
+//   kernel_frames = 2        (bool, varint)
+//   user_frames = 3          (UnwindMode enum, varint)
+// Field numbers (Scope):
+//   target_pid = 1           (repeated int32)
+static void AppendPerfEventConfigContent(struct PerfettoPbMsg* perf_msg,
+                                         int32_t target_pid) {
+    {
+        struct PerfettoPbMsg timebase;
+        PerfettoPbMsgBeginNested(perf_msg, &timebase, /*field_id=*/15);
+        PerfettoPbMsgAppendType0Field(&timebase, /*field_id=*/2,
+                                      /*frequency_hz=*/1000);
+        PerfettoPbMsgEndNested(perf_msg);
+    }
+    {
+        struct PerfettoPbMsg cs;
+        PerfettoPbMsgBeginNested(perf_msg, &cs, /*field_id=*/16);
+        if (target_pid > 0) {
+            struct PerfettoPbMsg scope;
+            PerfettoPbMsgBeginNested(&cs, &scope, /*field_id=*/1);
+            PerfettoPbMsgAppendType0Field(&scope, /*field_id=*/1,
+                                          (uint64_t)(uint32_t)target_pid);
+            PerfettoPbMsgEndNested(&cs);
+        }
+        PerfettoPbMsgAppendType0Field(&cs, /*field_id=*/2, /*kernel_frames=*/1);
+        PerfettoPbMsgAppendType0Field(&cs, /*field_id=*/3, /*UNWIND_DWARF=*/2);
+        PerfettoPbMsgEndNested(perf_msg);
+    }
+}
+
 int sismo_perfetto_build_config(
     SismoMode mode,
     const SismoDsConfigEntry* entries,
@@ -419,6 +503,23 @@ int sismo_perfetto_build_config(
                 perfetto_protos_DataSourceConfig_begin_track_event_config(&dsc, &tec);
                 perfetto_protos_TrackEventConfig_set_cstr_enabled_categories(&tec, "*");
                 perfetto_protos_DataSourceConfig_end_track_event_config(&dsc, &tec);
+            } else if (strcmp(e->name, "linux.ftrace") == 0) {
+                // Hand-rolled FtraceConfig: the C SDK has no generated
+                // builder for it. Field 100 of DataSourceConfig.
+                struct PerfettoPbMsg ftrace;
+                PerfettoPbMsgBeginNested(&dsc.msg, &ftrace,
+                                         DSC_FTRACE_CONFIG_FIELD);
+                AppendFtraceConfigContent(&ftrace);
+                PerfettoPbMsgEndNested(&dsc.msg);
+            } else if (strcmp(e->name, "linux.perf") == 0) {
+                // Hand-rolled PerfEventConfig at field 111 of
+                // DataSourceConfig. target_pid scopes the producer to a
+                // single tgid via callstack_sampling.scope.target_pid.
+                struct PerfettoPbMsg perf;
+                PerfettoPbMsgBeginNested(&dsc.msg, &perf,
+                                         DSC_PERF_EVENT_CONFIG_FIELD);
+                AppendPerfEventConfigContent(&perf, e->target_pid);
+                PerfettoPbMsgEndNested(&dsc.msg);
             }
             if (e->extra_bytes && e->extra_bytes_size > 0) {
                 // Append (tag, length-varint, bytes) at field 2000 of
