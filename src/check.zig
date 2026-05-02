@@ -1,0 +1,70 @@
+//! Cross-platform compile sentinel. `zig build check -Dtarget=…` builds
+//! this file as an object (no link, no install) for the current target,
+//! exercising every module that's expected to compile on the OSes we
+//! claim to support. Catches cross-platform regressions in
+//! OS-portable code (heap_wire, proto_writer, sismo_config, …) and in
+//! the per-OS dispatcher modules (heap_protocol, heap_ring) without
+//! needing Perfetto or rust-bridge.
+//!
+//! The body calls each public function so Zig's semantic analyzer
+//! visits the bodies. Runtime correctness isn't the point — the calls
+//! are wrapped in `catch {}` and may be entered with garbage args; this
+//! file is never executed.
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+const heap_wire = @import("heap_wire.zig");
+const proto_writer = @import("proto_writer.zig");
+const sismo_config = @import("sismo_config.zig");
+const heap_emit = @import("heap_emit.zig");
+const heap_protocol = @import("heap_protocol.zig");
+const heap_ring = @import("heap_ring.zig");
+
+comptime {
+    _ = heap_wire;
+    _ = proto_writer;
+    _ = sismo_config;
+    _ = heap_emit;
+}
+
+pub export fn sismo_check_cmds() void {
+    // Force semantic analysis of every subcommand body. The `init` value
+    // is undefined (this function is never executed); the goal is just
+    // for the analyzer to walk the function bodies and surface any
+    // cross-platform regression at `zig build check` time.
+    //
+    // Windows is excluded because the cmd_* subcommands use POSIX
+    // primitives (sismo_paths' flock-based session lock, posix_spawnp,
+    // POSIX Args.iterate) that don't have direct equivalents. The
+    // Windows port lives in sibling _windows files once we're ready;
+    // until then the Windows build is sample-target only.
+    if (comptime builtin.os.tag == .windows) return;
+    const init: std.process.Init = undefined;
+    @import("sismo.zig").main(init) catch {};
+    @import("cmd_record.zig").runRecord(init) catch {};
+    @import("cmd_prepare.zig").runPrepare(init) catch {};
+    @import("cmd_snapshot.zig").runSnapshot(init) catch {};
+    @import("cmd_datasource.zig").runDatasource(init) catch {};
+}
+
+pub export fn sismo_check_dispatchers() void {
+    var path_buf: [128]u8 = undefined;
+    _ = heap_protocol.socketPath(1, &path_buf) catch {};
+    var listener = heap_protocol.listenForAttach(1) catch return;
+    defer listener.close();
+    _ = heap_protocol.acceptAndReceive(&listener) catch {};
+
+    _ = heap_ring.RingBuffer.create(4096) catch {};
+    _ = heap_ring.RingBuffer.attach(0, 4096) catch {};
+}
+
+pub export fn sismo_check_posix() void {
+    if (comptime builtin.os.tag == .windows) return;
+    const sismo_paths = @import("sismo_paths.zig");
+    const io: std.Io = undefined;
+    _ = sismo_paths.acquireSessionLock(1) catch {};
+    sismo_paths.releaseSessionLock(1);
+    _ = sismo_paths.readRecorderPid() catch {};
+    _ = sismo_paths.heapDylibPath(io, std.heap.page_allocator) catch {};
+}

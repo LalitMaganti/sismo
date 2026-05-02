@@ -1,0 +1,19 @@
+plans/
+
+# Zig
+.zig-cache/
+zig-out/
+
+# Rust
+target/
+Cargo.lock
+
+# Hermetic build deps installed by tools/install-build-deps
+third_party/
+
+# Python
+__pycache__/
+*.pyc
+
+# Perfetto
+*.pftrace

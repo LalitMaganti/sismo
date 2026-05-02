@@ -1,0 +1,61 @@
+// Sismo data source configs.
+//
+// One message per data source — keeps each producer's config narrow,
+// lets us evolve them independently, and avoids the cross-DS field
+// number juggling a unified message would force.
+//
+// This file documents the wire format. The encoder + decoder are
+// hand-written in `src/sismo_config.zig` (sismo doesn't compile
+// protos, so this file is documentation-only — the wire is what's
+// authoritative).
+//
+// **Embedding into Perfetto's DataSourceConfig.** Perfetto's
+// `DataSourceConfig` reserves field numbers 1..1001 for built-in
+// configs. We use field **2000** as a vendor extension by convention
+// (no formal proto2 `extend`, just a reserved-by-us number high
+// enough to never collide with upstream):
+//
+//   message DataSourceConfig {
+//     ...
+//     // Each ds carries its own message type — the producer knows
+//     // which to decode based on the `name` field.
+//     optional bytes sismo_config = 2000;
+//   }
+//
+// The producer's `on_setup` callback receives the full serialized
+// `DataSourceConfig`. It scans for tag (2000 << 3 | 2), extracts the
+// length-delimited bytes, and decodes them with the message type
+// matching its own `name` (e.g. `sismo.heap` decodes
+// `SismoHeapConfig`).
+
+syntax = "proto2";
+
+package sismo;
+
+// ---- sismo.macos_cpu_samples -------------------------------------------------
+message SismoMacosCpuSamplesConfig {
+  // PID to sample. Required.
+  optional uint32 target_pid = 1;
+
+  // Sampling period, in microseconds. 0 / unset = use producer
+  // default (1 ms = 1 kHz).
+  optional uint32 interval_us = 2;
+}
+
+// ---- sismo.heap --------------------------------------------------------
+message SismoHeapConfig {
+  // PID whose heap_preload to attach to. Required.
+  optional uint32 target_pid = 1;
+
+  // Per-target shm ring size. 0 / unset = 16 MiB.
+  optional uint64 ring_size_bytes = 2;
+
+  // Poisson sampling interval. 0 / unset = 4 KiB (heapprofd default).
+  optional uint64 sample_interval_bytes = 3;
+}
+
+// ---- sismo.macos_sched -----------------------------------------------
+message SismoMacosSchedConfig {
+  // Kernel kdebug ring sizing, in events. 0 / unset = 256k.
+  optional int32 kernel_buffer_events = 1;
+}
