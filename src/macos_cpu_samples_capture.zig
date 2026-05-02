@@ -18,10 +18,13 @@ const sampler = @import("macos/mach_sampler.zig");
 const dyld_images = @import("macos/dyld_images.zig");
 const unwinder = @import("unwinder.zig");
 const sismo_config = @import("sismo_config.zig");
+const perfetto_proto = @import("perfetto_proto.zig");
 
 const perfetto = @cImport({
     @cInclude("perfetto_shim.h");
 });
+
+const DS_NAME = "sismo.macos_cpu_samples";
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("cpu_sampler is macOS-only");
@@ -64,7 +67,8 @@ fn readStackCb(addr: u64, out: *u64, user_data: ?*anyopaque) callconv(.c) c_int 
 pub const Capture = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    ds: *perfetto.struct_PerfettoDs,
+    /// Slot handle returned by `sismo_ds_register`.
+    ds_slot: u32,
     config: Config,
 
     wakeup: std.Io.Event,
@@ -90,15 +94,14 @@ pub const Capture = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
-        ds_opaque: *anyopaque,
         config: Config,
     ) !*Capture {
-        const ds: *perfetto.struct_PerfettoDs = @ptrCast(ds_opaque);
         const self = try allocator.create(Capture);
+        errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .ds = ds,
+            .ds_slot = std.math.maxInt(u32), // set after register
             .config = config,
             .wakeup = .unset,
             .running = std.atomic.Value(bool).init(false),
@@ -112,6 +115,26 @@ pub const Capture = struct {
             .samples = std.atomic.Value(u64).init(0),
             .active_samples = std.atomic.Value(u64).init(0),
         };
+
+        // New shim path: descriptor built in Zig, registered via the
+        // public C++ SDK. The returned slot is what `sismo_ds_emit`
+        // identifies us by.
+        const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
+            allocator,
+            .{ .name = DS_NAME, .will_notify_on_stop = true },
+        );
+        defer allocator.free(desc_bytes);
+        const slot = perfetto.sismo_ds_register(
+            desc_bytes.ptr, desc_bytes.len,
+            onSetupTrampoline,
+            onStartTrampoline,
+            onStopTrampoline,
+            onFlushTrampoline,
+            self,
+        );
+        if (slot == std.math.maxInt(u32)) return error.PerfettoDsRegisterFailed;
+        self.ds_slot = slot;
+
         self.thread = try std.Thread.spawn(.{}, workerEntry, .{self});
         return self;
     }
@@ -153,7 +176,7 @@ pub const Capture = struct {
     /// buffered. Ack on the IO thread.
     pub fn onFlushTrampoline(user_arg: ?*anyopaque, flusher: ?*anyopaque) callconv(.c) void {
         _ = user_arg;
-        if (flusher) |f| perfetto.sismo_perfetto_flush_done(f);
+        if (flusher) |f| perfetto.sismo_flush_done(f);
     }
 
     pub fn shutdown(self: *Capture) Stats {
@@ -286,7 +309,7 @@ fn workerEntry(self: *Capture) void {
 
         const stopper_addr = self.pending_stopper.swap(0, .acq_rel);
         if (stopper_addr != 0) {
-            perfetto.sismo_perfetto_stop_done(@ptrFromInt(stopper_addr));
+            perfetto.sismo_stop_done(@ptrFromInt(stopper_addr));
             self.running.store(false, .release);
         }
 
@@ -311,7 +334,7 @@ fn parkUntilExit(self: *Capture) void {
         if (self.exit_requested.load(.acquire)) return;
         const stopper_addr = self.pending_stopper.swap(0, .acq_rel);
         if (stopper_addr != 0) {
-            perfetto.sismo_perfetto_stop_done(@ptrFromInt(stopper_addr));
+            perfetto.sismo_stop_done(@ptrFromInt(stopper_addr));
             self.running.store(false, .release);
         }
         if (self.exit_requested.load(.acquire)) return;
@@ -361,12 +384,21 @@ fn sampleOnce(self: *Capture, state: *ThreadState, u: *unwinder.Unwinder, ctx: *
     sampler.threadResume(state.thread) catch {};
     _ = n; // callstack interning is a follow-up; emit leaf-only sample for now
 
-    _ = perfetto.sismo_perfetto_ds_emit_perf_sample(
-        self.ds,
+    // Build PerfSample → wrap in TracePacket body → emit. All bytes
+    // built in Zig; C++ shim just wraps them in NewTracePacket().
+    const sample_bytes = perfetto_proto.encodePerfSample(self.allocator, .{
+        .cpu = 0, // we don't track which core
+        .pid = @intCast(self.target_pid),
+        .tid = @intCast(state.tid),
+        .callstack_iid = 0,
+    }) catch return;
+    defer self.allocator.free(sample_bytes);
+    const body = perfetto_proto.encodeTracePacketBody(
+        self.allocator,
         nowMonotonicNs(),
-        0, // cpu (we don't track which core)
-        @intCast(self.target_pid),
-        @intCast(state.tid),
-        0,
-    );
+        perfetto_proto.TP_FIELD_PERF_SAMPLE,
+        sample_bytes,
+    ) catch return;
+    defer self.allocator.free(body);
+    perfetto.sismo_ds_emit(self.ds_slot, body.ptr, body.len);
 }

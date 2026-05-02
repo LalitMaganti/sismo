@@ -512,57 +512,117 @@ fn maybeSpawnInner(
     return .{ .name = path, .pid = pid };
 }
 
-/// Entry point for the `record` subcommand. Dispatched from `sismo.zig`.
-/// Re-iterates `init.minimal.args` and skips two slots — the exe path
-/// and the literal "record" subcommand token — before parsing the
-/// record-specific arguments.
-pub fn runRecord(init: std.process.Init) !void {
-    if (comptime builtin.os.tag == .macos) {
-        return runRecordMacos(init);
+/// Per-platform capability table. Keep this small — flags should map
+/// to a single capability bit. The parser uses these as comptime gates;
+/// flags that don't make sense on the current OS are rejected at parse
+/// time with a clear message.
+///
+/// Heap on Linux: not yet wired (master plan §heap). Sched/cpu on
+/// Linux ride upstream traced_probes / traced_perf in-process.
+/// `--pid` attach: macOS-only today (Linux would need pidfd-based exit
+/// watching, not yet implemented).
+const PlatformCaps = struct {
+    const supports_pid_attach = builtin.os.tag == .macos;
+    const supports_sched = builtin.os.tag == .macos or builtin.os.tag == .linux;
+    const supports_cpu = builtin.os.tag == .macos or builtin.os.tag == .linux;
+    const supports_heap = builtin.os.tag == .macos;
+};
+
+/// Fully-parsed command-line arguments for `sismo record`. Platform-
+/// independent shape — fields a given OS doesn't honor stay at their
+/// default (e.g. `attach_pid` is always null on Linux because the
+/// parser rejects `--pid` there).
+pub const RecordArgs = struct {
+    output_path: []const u8 = "./sismo.pftrace",
+    attach_pid: ?c_int = null,
+    duration_secs: ?c_uint = null,
+    flight_recorder: bool = false,
+    buffer_kb: u32 = 128 * 1024,
+    buffer_set: bool = false,
+    sched_mode: SourceMode = .in_process,
+    cpu_mode: SourceMode = .in_process,
+    heap_mode: SourceMode = .in_process,
+    no_instrumentation: bool = false,
+    workload_argv: std.ArrayList([]const u8) = .empty,
+
+    pub fn deinit(self: *RecordArgs, gpa: std.mem.Allocator) void {
+        self.workload_argv.deinit(gpa);
     }
-    if (comptime builtin.os.tag == .linux) {
-        return runRecordLinux(init);
-    }
-    std.debug.print(
-        "sismo record: not yet implemented on {s}\n",
-        .{@tagName(builtin.os.tag)},
+};
+
+/// Print the platform-appropriate help text. Only flags valid on this
+/// OS appear, and the synopsis line reflects which positional forms
+/// are accepted (e.g. `--pid` only listed on macOS).
+fn printRecordHelp() void {
+    const pid_synopsis = if (comptime PlatformCaps.supports_pid_attach)
+        "(--pid <pid> | <command> [args...])"
+    else
+        "<command> [args...]";
+
+    var buf: [2048]u8 = undefined;
+    var w: usize = 0;
+    const writeStr = struct {
+        fn f(b: []u8, idx: *usize, s: []const u8) void {
+            const n = @min(s.len, b.len - idx.*);
+            @memcpy(b[idx.* .. idx.* + n], s[0..n]);
+            idx.* += n;
+        }
+    }.f;
+
+    writeStr(&buf, &w,
+        "usage: sismo record [--output <path>] [--duration <dur>]\n" ++
+        "                    [--flight-recorder [--buffer <size>]]\n" ++
+        "                    [--no-instrumentation]\n",
     );
+    if (comptime PlatformCaps.supports_sched) {
+        writeStr(&buf, &w, "                    [--no-sched | --external-sched]\n");
+    }
+    if (comptime PlatformCaps.supports_cpu) {
+        writeStr(&buf, &w, "                    [--no-cpu | --external-cpu]\n");
+    }
+    if (comptime PlatformCaps.supports_heap) {
+        writeStr(&buf, &w, "                    [--no-heap | --external-heap]\n");
+    }
+    if (comptime PlatformCaps.supports_sched or PlatformCaps.supports_cpu or PlatformCaps.supports_heap) {
+        writeStr(&buf, &w, "                    [--all-external]\n");
+    }
+    writeStr(&buf, &w, "                    ");
+    writeStr(&buf, &w, pid_synopsis);
+    writeStr(&buf, &w,
+        "\n\n" ++
+        "  --no-X         disable data source X entirely.\n" ++
+        "  --external-X   data source X comes from a sidecar\n" ++
+        "                 `sudo sismo datasource X` (no sudo on this process).\n" ++
+        "  --all-external shorthand for --external for every privileged source.\n",
+    );
+    if (comptime builtin.os.tag == .linux) {
+        writeStr(&buf, &w,
+            "\nLinux requires CAP_PERFMON for perf_event_open and read access\n" ++
+            "to /sys/kernel/tracing for ftrace; running with sudo is the\n" ++
+            "easiest path.\n",
+        );
+    }
+    std.debug.print("{s}", .{buf[0..w]});
 }
 
-fn runRecordMacos(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
+/// Parse `sismo record`'s arguments into a platform-independent
+/// RecordArgs struct. Rejects flags whose underlying capability isn't
+/// available on the running OS (per `PlatformCaps`). Returns null on
+/// any user-visible error (already printed to stderr) or on `--help`;
+/// caller treats null as "stop, don't run". On success the caller
+/// owns the workload_argv and must call `args.deinit(gpa)`.
+fn parseRecordArgs(
+    gpa: std.mem.Allocator,
+    iter: *std.process.Args.Iterator,
+) ?RecordArgs {
+    var args: RecordArgs = .{};
+    // Cleanup-on-failure: errdefer doesn't fire for `?T` returning
+    // null, only for `!T` errors. We have many `return null` paths
+    // (each user-input error), so a flag-flipped defer is the
+    // cleanest way to free workload_argv if any of them takes us out.
+    var ok = false;
+    defer if (!ok) args.deinit(gpa);
 
-    // Args: [--output <path>] (--pid <pid> | <command> [args...])
-    // Exactly one of --pid (attach to a running process) or <command>
-    // (spawn a new one) must be supplied. Everything after the first
-    // non-flag positional is the workload's argv when spawning.
-    var iter = init.minimal.args.iterate();
-    _ = iter.next(); // exe path
-    _ = iter.next(); // "record" subcommand token
-    var output_path: []const u8 = "./sismo.pftrace";
-    var attach_pid: ?c_int = null;
-    var duration_secs: ?c_uint = null;
-    var flight_recorder = false;
-    // 128 MB default for FILE mode (matches the original hardcoded
-    // buffer that kdebug needs to avoid SEQ_INCREMENTAL_STATE_CLEARED
-    // eviction). 256 MB default for flight-recorder mode (the master
-    // plan number — comfortable for typical desktop workloads).
-    var buffer_kb: u32 = 128 * 1024;
-    var buffer_set = false;
-    // Privileged data sources have three states: in_process (default —
-    // sismo runs the producer in this process; needs sudo), external
-    // (--external-X — sismo expects a sidecar `sudo sismo datasource X`
-    // to provide it), or off (--no-X — disabled).
-    var sched_mode: SourceMode = .in_process;
-    var cpu_mode: SourceMode = .in_process;
-    var heap_mode: SourceMode = .in_process;
-    var no_instrumentation = false;
-    var workload_argv: std.ArrayList([]const u8) = .empty;
-    defer workload_argv.deinit(gpa);
-
-    // setSourceMode: error if the user passed conflicting flags for the
-    // same data source (e.g. --no-sched and --external-sched).
     const setSourceMode = struct {
         fn f(slot: *SourceMode, slot_name: []const u8, flag_name: []const u8, want: SourceMode) bool {
             if (slot.* != .in_process and slot.* != want) {
@@ -578,109 +638,174 @@ fn runRecordMacos(init: std.process.Init) !void {
     }.f;
 
     while (iter.next()) |arg| {
-        if (workload_argv.items.len == 0 and std.mem.startsWith(u8, arg, "--")) {
-            if (std.mem.eql(u8, arg, "--output")) {
-                output_path = iter.next() orelse {
-                    std.debug.print("sismo record: --output needs a value\n", .{});
-                    return;
-                };
-            } else if (std.mem.eql(u8, arg, "--flight-recorder")) {
-                flight_recorder = true;
-            } else if (std.mem.eql(u8, arg, "--buffer")) {
-                const v = iter.next() orelse {
-                    std.debug.print("sismo record: --buffer needs a value (e.g. 256MB)\n", .{});
-                    return;
-                };
-                buffer_kb = parseBufferKb(v) orelse {
-                    std.debug.print(
-                        "sismo record: invalid --buffer '{s}' (use 256MB / 1GB / 512KB)\n",
-                        .{v},
-                    );
-                    return;
-                };
-                buffer_set = true;
-            } else if (std.mem.eql(u8, arg, "--pid")) {
-                const v = iter.next() orelse {
-                    std.debug.print("sismo record: --pid needs a value\n", .{});
-                    return;
-                };
-                attach_pid = std.fmt.parseInt(c_int, v, 10) catch {
-                    std.debug.print("sismo record: --pid '{s}' is not a number\n", .{v});
-                    return;
-                };
-            } else if (std.mem.eql(u8, arg, "--duration")) {
-                const v = iter.next() orelse {
-                    std.debug.print("sismo record: --duration needs a value (e.g. 30s, 5m, 1h)\n", .{});
-                    return;
-                };
-                duration_secs = parseDurationSeconds(v) orelse {
-                    std.debug.print(
-                        "sismo record: invalid --duration '{s}' (use 30s, 5m, 1h or a positive integer of seconds)\n",
-                        .{v},
-                    );
-                    return;
-                };
-            } else if (std.mem.eql(u8, arg, "--no-sched")) {
-                if (!setSourceMode(&sched_mode, "sched", "--no-sched", .off)) return;
-            } else if (std.mem.eql(u8, arg, "--no-cpu")) {
-                if (!setSourceMode(&cpu_mode, "cpu", "--no-cpu", .off)) return;
-            } else if (std.mem.eql(u8, arg, "--no-heap")) {
-                if (!setSourceMode(&heap_mode, "heap", "--no-heap", .off)) return;
-            } else if (std.mem.eql(u8, arg, "--external-sched")) {
-                if (!setSourceMode(&sched_mode, "sched", "--external-sched", .external)) return;
-            } else if (std.mem.eql(u8, arg, "--external-cpu")) {
-                if (!setSourceMode(&cpu_mode, "cpu", "--external-cpu", .external)) return;
-            } else if (std.mem.eql(u8, arg, "--external-heap")) {
-                if (!setSourceMode(&heap_mode, "heap", "--external-heap", .external)) return;
-            } else if (std.mem.eql(u8, arg, "--all-external")) {
-                // Convenience: every privileged data source not already
-                // explicitly configured becomes external.
-                if (sched_mode == .in_process) sched_mode = .external;
-                if (cpu_mode == .in_process) cpu_mode = .external;
-                if (heap_mode == .in_process) heap_mode = .external;
-            } else if (std.mem.eql(u8, arg, "--no-instrumentation")) {
-                no_instrumentation = true;
-            } else if (std.mem.eql(u8, arg, "--help")) {
+        // Once we see the first positional, every subsequent token is
+        // workload argv (so a workload can have its own --flags).
+        if (args.workload_argv.items.len > 0 or !std.mem.startsWith(u8, arg, "--")) {
+            args.workload_argv.append(gpa, arg) catch return null;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--output")) {
+            args.output_path = iter.next() orelse {
+                std.debug.print("sismo record: --output needs a value\n", .{});
+                return null;
+            };
+        } else if (std.mem.eql(u8, arg, "--flight-recorder")) {
+            args.flight_recorder = true;
+        } else if (std.mem.eql(u8, arg, "--buffer")) {
+            const v = iter.next() orelse {
+                std.debug.print("sismo record: --buffer needs a value (e.g. 256MB)\n", .{});
+                return null;
+            };
+            args.buffer_kb = parseBufferKb(v) orelse {
                 std.debug.print(
-                    "usage: sismo record [--output <path>] [--duration <dur>]\n" ++
-                    "                    [--flight-recorder [--buffer <size>]]\n" ++
-                    "                    [--no-{{sched,cpu,heap,instrumentation}}]\n" ++
-                    "                    [--external-{{sched,cpu,heap}} | --all-external]\n" ++
-                    "                    (--pid <pid> | <command> [args...])\n" ++
-                    "\n" ++
-                    "  --no-X         disable data source X entirely.\n" ++
-                    "  --external-X   data source X comes from a sidecar\n" ++
-                    "                 `sudo sismo datasource X` (no sudo on this process).\n" ++
-                    "  --all-external shorthand for --external-{{sched,cpu,heap}}.\n",
-                    .{},
+                    "sismo record: invalid --buffer '{s}' (use 256MB / 1GB / 512KB)\n",
+                    .{v},
                 );
-                return;
-            } else {
-                std.debug.print("sismo record: unknown flag '{s}'\n", .{arg});
-                return;
+                return null;
+            };
+            args.buffer_set = true;
+        } else if (std.mem.eql(u8, arg, "--pid")) {
+            if (comptime !PlatformCaps.supports_pid_attach) {
+                std.debug.print(
+                    "sismo record: --pid attach is not supported on {s}\n",
+                    .{@tagName(builtin.os.tag)},
+                );
+                return null;
             }
+            const v = iter.next() orelse {
+                std.debug.print("sismo record: --pid needs a value\n", .{});
+                return null;
+            };
+            args.attach_pid = std.fmt.parseInt(c_int, v, 10) catch {
+                std.debug.print("sismo record: --pid '{s}' is not a number\n", .{v});
+                return null;
+            };
+        } else if (std.mem.eql(u8, arg, "--duration")) {
+            const v = iter.next() orelse {
+                std.debug.print("sismo record: --duration needs a value (e.g. 30s, 5m, 1h)\n", .{});
+                return null;
+            };
+            args.duration_secs = parseDurationSeconds(v) orelse {
+                std.debug.print(
+                    "sismo record: invalid --duration '{s}' (use 30s, 5m, 1h or a positive integer of seconds)\n",
+                    .{v},
+                );
+                return null;
+            };
+        } else if (std.mem.eql(u8, arg, "--no-sched")) {
+            if (comptime !PlatformCaps.supports_sched) return rejectUnsupported("--no-sched", "sched");
+            if (!setSourceMode(&args.sched_mode, "sched", "--no-sched", .off)) return null;
+        } else if (std.mem.eql(u8, arg, "--no-cpu")) {
+            if (comptime !PlatformCaps.supports_cpu) return rejectUnsupported("--no-cpu", "cpu");
+            if (!setSourceMode(&args.cpu_mode, "cpu", "--no-cpu", .off)) return null;
+        } else if (std.mem.eql(u8, arg, "--no-heap")) {
+            if (comptime !PlatformCaps.supports_heap) return rejectUnsupported("--no-heap", "heap");
+            if (!setSourceMode(&args.heap_mode, "heap", "--no-heap", .off)) return null;
+        } else if (std.mem.eql(u8, arg, "--external-sched")) {
+            if (comptime !PlatformCaps.supports_sched) return rejectUnsupported("--external-sched", "sched");
+            if (!setSourceMode(&args.sched_mode, "sched", "--external-sched", .external)) return null;
+        } else if (std.mem.eql(u8, arg, "--external-cpu")) {
+            if (comptime !PlatformCaps.supports_cpu) return rejectUnsupported("--external-cpu", "cpu");
+            if (!setSourceMode(&args.cpu_mode, "cpu", "--external-cpu", .external)) return null;
+        } else if (std.mem.eql(u8, arg, "--external-heap")) {
+            if (comptime !PlatformCaps.supports_heap) return rejectUnsupported("--external-heap", "heap");
+            if (!setSourceMode(&args.heap_mode, "heap", "--external-heap", .external)) return null;
+        } else if (std.mem.eql(u8, arg, "--all-external")) {
+            // Only flips sources whose capability is supported AND
+            // which are still in the default in_process state.
+            if (comptime PlatformCaps.supports_sched) {
+                if (args.sched_mode == .in_process) args.sched_mode = .external;
+            }
+            if (comptime PlatformCaps.supports_cpu) {
+                if (args.cpu_mode == .in_process) args.cpu_mode = .external;
+            }
+            if (comptime PlatformCaps.supports_heap) {
+                if (args.heap_mode == .in_process) args.heap_mode = .external;
+            }
+        } else if (std.mem.eql(u8, arg, "--no-instrumentation")) {
+            args.no_instrumentation = true;
+        } else if (std.mem.eql(u8, arg, "--help")) {
+            printRecordHelp();
+            return null; // defer handles cleanup
         } else {
-            try workload_argv.append(gpa, arg);
+            std.debug.print("sismo record: unknown flag '{s}'\n", .{arg});
+            return null;
         }
     }
 
-    const have_pid = attach_pid != null;
-    const have_cmd = workload_argv.items.len > 0;
+    // Cross-cutting validation: exactly one workload-acquisition mode.
+    const have_pid = args.attach_pid != null;
+    const have_cmd = args.workload_argv.items.len > 0;
     if (have_pid and have_cmd) {
-        std.debug.print(
-            "sismo record: --pid and <command> are mutually exclusive\n",
-            .{},
-        );
-        return;
+        std.debug.print("sismo record: --pid and <command> are mutually exclusive\n", .{});
+        return null;
     }
     if (!have_pid and !have_cmd) {
         std.debug.print(
-            "sismo record: need either --pid <pid> or a workload <command>\n" ++
-            "usage: sismo record [--output <path>] (--pid <pid> | <command> [args...])\n",
-            .{},
+            "sismo record: need {s}\n",
+            .{if (comptime PlatformCaps.supports_pid_attach) "either --pid <pid> or a workload <command>" else "a workload <command>"},
         );
-        return;
+        return null;
     }
+
+    // FILE mode default buffer (128 MB) was already on the struct.
+    // Flight-recorder bumps to 256 MB unless the user set --buffer
+    // explicitly. Apply here so platform runners don't repeat the rule.
+    if (args.flight_recorder and !args.buffer_set) args.buffer_kb = 256 * 1024;
+
+    ok = true;
+    return args;
+}
+
+/// Helper for the parser's "this flag refers to a data source not
+/// wired on this platform" error path. Returning null bubbles up from
+/// the parser correctly.
+fn rejectUnsupported(flag_name: []const u8, ds_name: []const u8) ?RecordArgs {
+    std.debug.print(
+        "sismo record: {s} is not supported on {s} (data source '{s}' is not wired on this platform yet)\n",
+        .{ flag_name, @tagName(builtin.os.tag), ds_name },
+    );
+    return null;
+}
+
+/// Entry point for the `record` subcommand. Dispatched from `sismo.zig`.
+/// Parses arguments once into a platform-independent RecordArgs and
+/// hands them to the per-platform runner.
+pub fn runRecord(init: std.process.Init) !void {
+    var iter = init.minimal.args.iterate();
+    _ = iter.next(); // exe path
+    _ = iter.next(); // "record" subcommand token
+
+    var args = parseRecordArgs(init.gpa, &iter) orelse return;
+    defer args.deinit(init.gpa);
+
+    if (comptime builtin.os.tag == .macos) return runRecordMacos(init, &args);
+    if (comptime builtin.os.tag == .linux) return runRecordLinux(init, &args);
+
+    std.debug.print(
+        "sismo record: not yet implemented on {s}\n",
+        .{@tagName(builtin.os.tag)},
+    );
+}
+
+fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+
+    // Read fields off `args` into shorter local names; the per-platform
+    // path uses these heavily and keeping the prefix everywhere is noisy.
+    const output_path = args.output_path;
+    const attach_pid = args.attach_pid;
+    const duration_secs = args.duration_secs;
+    const flight_recorder = args.flight_recorder;
+    const buffer_kb = args.buffer_kb;
+    const sched_mode = args.sched_mode;
+    const cpu_mode = args.cpu_mode;
+    const heap_mode = args.heap_mode;
+    const no_instrumentation = args.no_instrumentation;
+    const workload_argv = &args.workload_argv;
+
     if (attach_pid) |pid| {
         // Quick sanity check before tearing into setup. kill(pid, 0)
         // returns 0 if we have permission to signal pid (i.e. it
@@ -723,10 +848,6 @@ fn runRecordMacos(init: std.process.Init) !void {
         }
     }
 
-    // Default buffer for flight-recorder mode is 256 MB (vs. 128 MB
-    // for streaming FILE mode). User --buffer overrides either way.
-    if (flight_recorder and !buffer_set) buffer_kb = 256 * 1024;
-
     // Single-session lock. Two `sismo record` invocations would race on
     // unlink+bind of the well-known socket and corrupt each other's
     // sessions; flock detects that cleanly. The fd stays open for the
@@ -767,21 +888,13 @@ fn runRecordMacos(init: std.process.Init) !void {
     const svc = try traced.create(prod_sock, cons_sock);
     defer traced.destroy(svc);
 
-    // 2. Init our own producer connection. Same SYSTEM backend the
-    //    workload uses; we connect from inside this process to our own
-    //    hosted socket.
-    c.sismo_perfetto_init();
+    // 2. Init our own producer connection. New shim path: connects to
+    //    the in-process traced via PERFETTO_PRODUCER_SOCK_NAME, which
+    //    we set above to `prod_sock`.
+    c.sismo_init(prod_sock.ptr);
 
-    // 3. Allocate DS handles for the three sismo data sources. We don't
-    //    register them yet — registration happens after we spawn the
-    //    captures (we need the captures' state pointers as the
-    //    callbacks' user_arg).
-    const ds_sched = c.sismo_perfetto_ds_alloc() orelse return error.PerfettoDsAllocFailed;
-    defer c.sismo_perfetto_ds_free(ds_sched);
-    const ds_cpu = c.sismo_perfetto_ds_alloc() orelse return error.PerfettoDsAllocFailed;
-    defer c.sismo_perfetto_ds_free(ds_cpu);
-    const ds_heap = c.sismo_perfetto_ds_alloc() orelse return error.PerfettoDsAllocFailed;
-    defer c.sismo_perfetto_ds_free(ds_heap);
+    // 3. All three captures (sched, cpu, heap) self-register via the
+    //    new shim inside their Capture.init — no separate ds_alloc.
 
     // 4. Acquire the workload — either spawn it (carrying
     //    DYLD_INSERT_LIBRARIES so the target loads the heap preload's
@@ -824,14 +937,14 @@ fn runRecordMacos(init: std.process.Init) !void {
     //    DataSourceConfig.
     const sched = blk: {
         if (sched_mode != .in_process) break :blk null;
-        break :blk macos_sched_capture.Capture.init(gpa, io, ds_sched, .{}) catch |err| {
+        break :blk macos_sched_capture.Capture.init(gpa, io, .{}) catch |err| {
             std.debug.print("sismo record: macos_sched_capture.init failed: {s}\n", .{@errorName(err)});
             break :blk null;
         };
     };
     const cpu = blk: {
         if (cpu_mode != .in_process) break :blk null;
-        break :blk macos_cpu_samples_capture.Capture.init(gpa, io, ds_cpu, .{}) catch |err| {
+        break :blk macos_cpu_samples_capture.Capture.init(gpa, io, .{}) catch |err| {
             std.debug.print("sismo record: macos_cpu_samples_capture.init failed: {s}\n", .{@errorName(err)});
             break :blk null;
         };
@@ -855,47 +968,14 @@ fn runRecordMacos(init: std.process.Init) !void {
                 break :blk null;
             }
         }
-        break :blk heap_capture.Capture.init(gpa, io, ds_heap, .{}) catch |err| {
+        break :blk heap_capture.Capture.init(gpa, io, .{}) catch |err| {
             std.debug.print("sismo record: heap_capture.init failed: {s}\n", .{@errorName(err)});
             break :blk null;
         };
     };
 
-    // 6. Register each DS with its on_setup / on_start / on_stop /
-    //    on_flush callbacks.
-    if (sched) |s| {
-        if (!c.sismo_perfetto_ds_register_with_callbacks(
-            ds_sched,
-            "sismo.macos_sched",
-            macos_sched_capture.Capture.onSetupTrampoline,
-            macos_sched_capture.Capture.onStartTrampoline,
-            macos_sched_capture.Capture.onStopTrampoline,
-            macos_sched_capture.Capture.onFlushTrampoline,
-            s,
-        )) std.debug.print("sismo record: register sismo.macos_sched failed\n", .{});
-    }
-    if (cpu) |s| {
-        if (!c.sismo_perfetto_ds_register_with_callbacks(
-            ds_cpu,
-            "sismo.macos_cpu_samples",
-            macos_cpu_samples_capture.Capture.onSetupTrampoline,
-            macos_cpu_samples_capture.Capture.onStartTrampoline,
-            macos_cpu_samples_capture.Capture.onStopTrampoline,
-            macos_cpu_samples_capture.Capture.onFlushTrampoline,
-            s,
-        )) std.debug.print("sismo record: register sismo.macos_cpu_samples failed\n", .{});
-    }
-    if (heap) |s| {
-        if (!c.sismo_perfetto_ds_register_with_callbacks(
-            ds_heap,
-            "sismo.heap",
-            heap_capture.Capture.onSetupTrampoline,
-            heap_capture.Capture.onStartTrampoline,
-            heap_capture.Capture.onStopTrampoline,
-            heap_capture.Capture.onFlushTrampoline,
-            s,
-        )) std.debug.print("sismo record: register sismo.heap failed\n", .{});
-    }
+    // 6. All captures (sched + cpu + heap) registered themselves via
+    //    the new shim path inside their Capture.init.
 
     // 7. Build the per-DS sismo configs (field 2000 of each
     //    DataSourceConfig), then build the TraceConfig + create + start
@@ -922,12 +1002,13 @@ fn runRecordMacos(init: std.process.Init) !void {
     // names so we can poll for their producer registration before
     // calling StartBlocking (otherwise the session would start without
     // the external producer ever connecting).
-    var entries_buf: [4]c.SismoDsConfigEntry = undefined;
+    const perfetto_proto = @import("perfetto_proto.zig");
+    var entries_buf: [4]perfetto_proto.DataSourceEntry = undefined;
     var n_entries: usize = 0;
     var external_names_buf: [3][]const u8 = undefined;
     var n_external: usize = 0;
     if (!no_instrumentation) {
-        entries_buf[n_entries] = .{ .name = "track_event", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = 0 };
+        entries_buf[n_entries] = .{ .track_event = .{ .enabled_categories = &.{"*"} } };
         n_entries += 1;
     }
     // Heap: in-process when `heap` capture exists; external when caller
@@ -936,7 +1017,7 @@ fn runRecordMacos(init: std.process.Init) !void {
     // capture is null but mode is still in_process — don't promote
     // those to external silently).
     if (heap != null or heap_mode == .external) {
-        entries_buf[n_entries] = .{ .name = "sismo.heap", .extra_bytes = heap_cfg.ptr, .extra_bytes_size = heap_cfg.len, .target_pid = 0 };
+        entries_buf[n_entries] = .{ .sismo_vendor = .{ .name = "sismo.heap", .sismo_config = heap_cfg } };
         n_entries += 1;
         if (heap_mode == .external) {
             external_names_buf[n_external] = "sismo.heap";
@@ -944,7 +1025,7 @@ fn runRecordMacos(init: std.process.Init) !void {
         }
     }
     if (cpu != null or cpu_mode == .external) {
-        entries_buf[n_entries] = .{ .name = "sismo.macos_cpu_samples", .extra_bytes = cpu_cfg.ptr, .extra_bytes_size = cpu_cfg.len, .target_pid = 0 };
+        entries_buf[n_entries] = .{ .sismo_vendor = .{ .name = "sismo.macos_cpu_samples", .sismo_config = cpu_cfg } };
         n_entries += 1;
         if (cpu_mode == .external) {
             external_names_buf[n_external] = "sismo.macos_cpu_samples";
@@ -952,7 +1033,7 @@ fn runRecordMacos(init: std.process.Init) !void {
         }
     }
     if (sched != null or sched_mode == .external) {
-        entries_buf[n_entries] = .{ .name = "sismo.macos_sched", .extra_bytes = if (sched_cfg.len > 0) sched_cfg.ptr else null, .extra_bytes_size = sched_cfg.len, .target_pid = 0 };
+        entries_buf[n_entries] = .{ .sismo_vendor = .{ .name = "sismo.macos_sched", .sismo_config = sched_cfg } };
         n_entries += 1;
         if (sched_mode == .external) {
             external_names_buf[n_external] = "sismo.macos_sched";
@@ -974,37 +1055,25 @@ fn runRecordMacos(init: std.process.Init) !void {
     // (snapshots use `sismo snapshot --output ...`), so don't touch
     // any file the user named.
     if (!flight_recorder) _ = std.c.unlink(@ptrCast(output_path.ptr));
-    var cfg: ?*anyopaque = null;
-    var cfg_len: usize = 0;
-    const path_z = try gpa.dupeZ(u8, output_path);
-    defer gpa.free(path_z);
-    const mode: c.SismoMode = if (flight_recorder) c.SISMO_MODE_RING else c.SISMO_MODE_FILE;
-    // RING mode ignores output_path (no auto-write), but the shim still
-    // accepts it; pass null so a future shim assert can catch a misuse.
-    const out_for_shim: ?[*:0]const u8 = if (flight_recorder) null else path_z.ptr;
-    const cfg_rc = c.sismo_perfetto_build_config(
-        mode,
-        entries.ptr,
-        entries.len,
-        buffer_kb,
-        0,
-        1024 * 1024 * 1024,
-        out_for_shim,
-        &cfg,
-        &cfg_len,
-    );
-    if (cfg_rc != 0) {
-        std.debug.print("sismo record: build_config rc={d}\n", .{cfg_rc});
+    const trace_cfg: perfetto_proto.TraceConfig = .{
+        .mode = if (flight_recorder) .ring else .file,
+        .buffer_size_kb = buffer_kb,
+        .output_path = if (flight_recorder) "" else output_path,
+        .max_file_size_bytes = 1024 * 1024 * 1024,
+        .data_sources = entries,
+    };
+    const cfg_bytes = perfetto_proto.encodeTraceConfig(gpa, trace_cfg) catch |err| {
+        std.debug.print("sismo record: encodeTraceConfig failed: {s}\n", .{@errorName(err)});
         return;
-    }
-    defer c.sismo_perfetto_free_config(cfg);
+    };
+    defer gpa.free(cfg_bytes);
 
     const session = c.sismo_consumer_session_create() orelse {
         std.debug.print("sismo record: session_create failed\n", .{});
         return;
     };
     defer c.sismo_consumer_session_destroy(session);
-    const setup_rc = c.sismo_consumer_session_setup(session, cfg, cfg_len);
+    const setup_rc = c.sismo_consumer_session_setup(session, cfg_bytes.ptr, cfg_bytes.len);
     if (setup_rc != 0) {
         std.debug.print("sismo record: session_setup rc={d} (TraceConfig failed to parse)\n", .{setup_rc});
         return;
@@ -1176,102 +1245,25 @@ fn runRecordMacos(init: std.process.Init) !void {
 //   - heap profiling: Linux LD_PRELOAD heap interception is its own
 //     task (master plan §"Heap (libc malloc)"), not wired here.
 // -----------------------------------------------------------------------------
-fn runRecordLinux(init: std.process.Init) !void {
+fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     const gpa = init.gpa;
     _ = init.io;
 
-    var iter = init.minimal.args.iterate();
-    _ = iter.next(); // exe path
-    _ = iter.next(); // "record" subcommand token
-    var output_path: []const u8 = "./sismo.pftrace";
-    var duration_secs: ?c_uint = null;
-    var flight_recorder = false;
-    var buffer_kb: u32 = 128 * 1024;
-    var buffer_set = false;
-    var no_sched = false;
-    var no_cpu = false;
-    var no_instrumentation = false;
-    var workload_argv: std.ArrayList([]const u8) = .empty;
-    defer workload_argv.deinit(gpa);
-
-    while (iter.next()) |arg| {
-        if (workload_argv.items.len == 0 and std.mem.startsWith(u8, arg, "--")) {
-            if (std.mem.eql(u8, arg, "--output")) {
-                output_path = iter.next() orelse {
-                    std.debug.print("sismo record: --output needs a value\n", .{});
-                    return;
-                };
-            } else if (std.mem.eql(u8, arg, "--flight-recorder")) {
-                flight_recorder = true;
-            } else if (std.mem.eql(u8, arg, "--buffer")) {
-                const v = iter.next() orelse {
-                    std.debug.print("sismo record: --buffer needs a value (e.g. 256MB)\n", .{});
-                    return;
-                };
-                buffer_kb = parseBufferKb(v) orelse {
-                    std.debug.print(
-                        "sismo record: invalid --buffer '{s}' (use 256MB / 1GB / 512KB)\n",
-                        .{v},
-                    );
-                    return;
-                };
-                buffer_set = true;
-            } else if (std.mem.eql(u8, arg, "--duration")) {
-                const v = iter.next() orelse {
-                    std.debug.print("sismo record: --duration needs a value (e.g. 30s, 5m, 1h)\n", .{});
-                    return;
-                };
-                duration_secs = parseDurationSeconds(v) orelse {
-                    std.debug.print(
-                        "sismo record: invalid --duration '{s}' (use 30s, 5m, 1h or a positive integer of seconds)\n",
-                        .{v},
-                    );
-                    return;
-                };
-            } else if (std.mem.eql(u8, arg, "--no-sched")) {
-                no_sched = true;
-            } else if (std.mem.eql(u8, arg, "--no-cpu")) {
-                no_cpu = true;
-            } else if (std.mem.eql(u8, arg, "--no-instrumentation")) {
-                no_instrumentation = true;
-            } else if (std.mem.eql(u8, arg, "--no-heap")) {
-                // Heap profiling not wired on Linux yet; accept the
-                // flag silently so users can share invocations across
-                // platforms.
-            } else if (std.mem.eql(u8, arg, "--pid")) {
-                std.debug.print("sismo record: --pid attach not yet supported on Linux\n", .{});
-                return;
-            } else if (std.mem.eql(u8, arg, "--help")) {
-                std.debug.print(
-                    "usage: sismo record [--output <path>] [--duration <dur>]\n" ++
-                    "                    [--flight-recorder [--buffer <size>]]\n" ++
-                    "                    [--no-sched] [--no-cpu] [--no-instrumentation]\n" ++
-                    "                    <command> [args...]\n" ++
-                    "\n" ++
-                    "Linux requires CAP_PERFMON for perf_event_open and read access\n" ++
-                    "to /sys/kernel/tracing for ftrace; running with sudo is the\n" ++
-                    "easiest path.\n",
-                    .{},
-                );
-                return;
-            } else {
-                std.debug.print("sismo record: unknown flag '{s}'\n", .{arg});
-                return;
-            }
-        } else {
-            try workload_argv.append(gpa, arg);
-        }
-    }
-
-    if (workload_argv.items.len == 0) {
-        std.debug.print(
-            "sismo record: need a workload <command> on Linux (--pid attach not yet supported)\n",
-            .{},
-        );
-        return;
-    }
-
-    if (flight_recorder and !buffer_set) buffer_kb = 256 * 1024;
+    // Read fields off `args` into local names. The Linux runner doesn't
+    // currently honor sched_mode/cpu_mode/heap_mode beyond the
+    // shared-parser semantics (privileged-source toggles for the linux
+    // producers + sismo.heap aren't wired through this codepath yet —
+    // that's a follow-up to plan 10). What we *do* honor today is
+    // --no-sched, --no-cpu, --no-instrumentation and the buffer/output
+    // family.
+    const output_path = args.output_path;
+    const duration_secs = args.duration_secs;
+    const flight_recorder = args.flight_recorder;
+    const buffer_kb = args.buffer_kb;
+    const no_sched = args.sched_mode == .off;
+    const no_cpu = args.cpu_mode == .off;
+    const no_instrumentation = args.no_instrumentation;
+    const workload_argv = &args.workload_argv;
 
     const lock_fd = paths.acquireSessionLock(std.c.getpid()) catch |err| switch (err) {
         error.AlreadyHeld => {
@@ -1346,26 +1338,26 @@ fn runRecordLinux(init: std.process.Init) !void {
     };
     std.debug.print("sismo record: spawned '{s}' pid={d}\n", .{ workload_cmd, target.pid });
 
-    // 4. Build the TraceConfig. Linux producers don't need sismo's
-    //    vendor extension at field 2000 — their config lives in the
-    //    Perfetto-native FtraceConfig / PerfEventConfig nested
-    //    submessages, which sismo_perfetto_build_config hand-rolls
-    //    when it sees the entry names "linux.ftrace" / "linux.perf".
-    var entries_buf: [3]c.SismoDsConfigEntry = undefined;
+    // 4. Build the TraceConfig in Zig. Linux producers (traced_probes,
+    //    traced_perf) get the Perfetto-native FtraceConfig /
+    //    PerfEventConfig nested submessages embedded inside the
+    //    DataSourceConfig — see perfetto_proto.zig.
+    const perfetto_proto = @import("perfetto_proto.zig");
+    var entries_buf: [3]perfetto_proto.DataSourceEntry = undefined;
     var n_entries: usize = 0;
     if (!no_instrumentation) {
-        entries_buf[n_entries] = .{ .name = "track_event", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = 0 };
+        entries_buf[n_entries] = .{ .track_event = .{ .enabled_categories = &.{"*"} } };
         n_entries += 1;
     }
     if (probes != null) {
         // ftrace stays system-wide because traced_probes can't filter
         // by pid. trace_processor handles separating the workload's
         // events out post-hoc.
-        entries_buf[n_entries] = .{ .name = "linux.ftrace", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = 0 };
+        entries_buf[n_entries] = .{ .linux_ftrace = .{} };
         n_entries += 1;
     }
     if (perf != null) {
-        entries_buf[n_entries] = .{ .name = "linux.perf", .extra_bytes = null, .extra_bytes_size = 0, .target_pid = target.pid };
+        entries_buf[n_entries] = .{ .linux_perf = .{ .target_pid = target.pid } };
         n_entries += 1;
     }
     if (n_entries == 0) {
@@ -1378,35 +1370,25 @@ fn runRecordLinux(init: std.process.Init) !void {
     const entries = entries_buf[0..n_entries];
 
     if (!flight_recorder) _ = std.c.unlink(@ptrCast(output_path.ptr));
-    var cfg: ?*anyopaque = null;
-    var cfg_len: usize = 0;
-    const path_z = try gpa.dupeZ(u8, output_path);
-    defer gpa.free(path_z);
-    const mode: c.SismoMode = if (flight_recorder) c.SISMO_MODE_RING else c.SISMO_MODE_FILE;
-    const out_for_shim: ?[*:0]const u8 = if (flight_recorder) null else path_z.ptr;
-    const cfg_rc = c.sismo_perfetto_build_config(
-        mode,
-        entries.ptr,
-        entries.len,
-        buffer_kb,
-        0,
-        1024 * 1024 * 1024,
-        out_for_shim,
-        &cfg,
-        &cfg_len,
-    );
-    if (cfg_rc != 0) {
-        std.debug.print("sismo record: build_config rc={d}\n", .{cfg_rc});
+    const trace_cfg: perfetto_proto.TraceConfig = .{
+        .mode = if (flight_recorder) .ring else .file,
+        .buffer_size_kb = buffer_kb,
+        .output_path = if (flight_recorder) "" else output_path,
+        .max_file_size_bytes = 1024 * 1024 * 1024,
+        .data_sources = entries,
+    };
+    const cfg_bytes = perfetto_proto.encodeTraceConfig(gpa, trace_cfg) catch |err| {
+        std.debug.print("sismo record: encodeTraceConfig failed: {s}\n", .{@errorName(err)});
         return;
-    }
-    defer c.sismo_perfetto_free_config(cfg);
+    };
+    defer gpa.free(cfg_bytes);
 
     const session = c.sismo_consumer_session_create() orelse {
         std.debug.print("sismo record: session_create failed\n", .{});
         return;
     };
     defer c.sismo_consumer_session_destroy(session);
-    const setup_rc = c.sismo_consumer_session_setup(session, cfg, cfg_len);
+    const setup_rc = c.sismo_consumer_session_setup(session, cfg_bytes.ptr, cfg_bytes.len);
     if (setup_rc != 0) {
         std.debug.print("sismo record: session_setup rc={d} (TraceConfig failed to parse)\n", .{setup_rc});
         return;

@@ -289,24 +289,21 @@ fn encodeTracePacketWithProfile(gpa: std.mem.Allocator, td: TraceData) ![]u8 {
 
 // ---- Public emission via data source -----------------------------------
 //
-// Encode the InternedData payload and the ProfilePacket payload, then
-// emit them as two TracePackets through `sismo_perfetto_ds_emit_payload`.
-// The C SDK wraps each call in a TracePacket with sequence_id + timestamp.
+// Build the ClockSnapshot and ProfilePacket TracePacket bodies in Zig,
+// emit each via `sismo_ds_emit` (the new public-C++-SDK shim). C++
+// wraps each into a NewTracePacket() handle and writes the body via
+// AppendRawProtoBytes — bytes go through verbatim.
 
 const c = @cImport({
     @cInclude("perfetto_shim.h");
 });
+const perfetto_proto = @import("perfetto_proto.zig");
 
-// `ds_opaque` is a *PerfettoDs (opaque). Each @cImport call site
-// generates its own anonymous opaque type, so the parameter is typed as
-// `*anyopaque` and cast back inside this module's @cImport scope.
 pub fn emitToDataSource(
     gpa: std.mem.Allocator,
-    ds_opaque: *anyopaque,
+    ds_slot: u32,
     td: TraceData,
 ) !void {
-    const ds: *c.struct_PerfettoDs = @ptrCast(ds_opaque);
-
     // Packet 1: ClockSnapshot mapping BUILTIN_CLOCK_MONOTONIC_COARSE 1:1
     // to BUILTIN_CLOCK_BOOTTIME at td.timestamp_ns. The heap parser
     // (ProfileModule::ParseProfilePacket) interprets ProcessHeapSamples'
@@ -320,14 +317,11 @@ pub fn emitToDataSource(
     // the two clocks share the same nanosecond timeline.
     const cs_payload = try encodeClockSnapshot(gpa, td.timestamp_ns);
     defer gpa.free(cs_payload);
-    _ = c.sismo_perfetto_ds_emit_payload(
-        ds,
-        td.timestamp_ns,
-        0,
-        TP_CLOCK_SNAPSHOT,
-        cs_payload.ptr,
-        cs_payload.len,
+    const cs_body = try perfetto_proto.encodeTracePacketBody(
+        gpa, td.timestamp_ns, TP_CLOCK_SNAPSHOT, cs_payload,
     );
+    defer gpa.free(cs_body);
+    c.sismo_ds_emit(ds_slot, cs_body.ptr, cs_body.len);
 
     // Packet 2: ProfilePacket. Interned tables are embedded INSIDE
     // profile_packet (legacy Android-Q fields strings/mappings/frames/
@@ -335,14 +329,12 @@ pub fn emitToDataSource(
     // reads from there, not from TracePacket.interned_data.
     const profile_payload = try encodeProfilePacket(gpa, td);
     defer gpa.free(profile_payload);
-    _ = c.sismo_perfetto_ds_emit_payload(
-        ds,
-        td.timestamp_ns,
-        SEQ_INCREMENTAL_STATE_CLEARED,
-        TP_PROFILE_PACKET,
-        profile_payload.ptr,
-        profile_payload.len,
+    const pp_body = try perfetto_proto.encodeTracePacketBodyWithFlags(
+        gpa, td.timestamp_ns, SEQ_INCREMENTAL_STATE_CLEARED,
+        TP_PROFILE_PACKET, profile_payload,
     );
+    defer gpa.free(pp_body);
+    c.sismo_ds_emit(ds_slot, pp_body.ptr, pp_body.len);
 }
 
 fn encodeClockSnapshot(gpa: std.mem.Allocator, ts_ns: u64) ![]u8 {

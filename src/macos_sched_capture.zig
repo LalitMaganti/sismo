@@ -31,10 +31,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const kdebug = @import("macos/kdebug.zig");
 const sismo_config = @import("sismo_config.zig");
+const perfetto_proto = @import("perfetto_proto.zig");
 
 const perfetto = @cImport({
     @cInclude("perfetto_shim.h");
 });
+
+const DS_NAME = "sismo.macos_sched";
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("macos_sched_capture is macOS-only");
@@ -97,7 +100,9 @@ pub const MAX_CPUS: usize = 256;
 pub const Capture = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    ds: *perfetto.struct_PerfettoDs,
+    /// Slot handle returned by `sismo_ds_register`. Used as the first
+    /// arg of every `sismo_ds_emit` call in the worker.
+    ds_slot: u32,
     config: Config,
 
     // Wakeup primitive — the worker waits on it with a timeout
@@ -136,11 +141,8 @@ pub const Capture = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
-        ds_opaque: *anyopaque,
         config: Config,
     ) !*Capture {
-        const ds: *perfetto.struct_PerfettoDs = @ptrCast(ds_opaque);
-
         const event_buf = try allocator.alloc(kdebug.KdBuf, config.drain_capacity_events);
         errdefer allocator.free(event_buf);
         const thread_map_buf = try allocator.alloc(kdebug.KdThreadMap, config.thread_map_capacity);
@@ -148,10 +150,11 @@ pub const Capture = struct {
         @memset(thread_map_buf, std.mem.zeroes(kdebug.KdThreadMap));
 
         const self = try allocator.create(Capture);
+        errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .ds = ds,
+            .ds_slot = std.math.maxInt(u32), // set after register
             .config = config,
             .wakeup = .unset,
             .running = std.atomic.Value(bool).init(false),
@@ -170,6 +173,27 @@ pub const Capture = struct {
             .drain_calls = std.atomic.Value(u64).init(0),
             .pending_switches = [_]PendingSwitch{.{}} ** MAX_CPUS,
         };
+
+        // Register the data source via the new C++-SDK-backed shim.
+        // Zig builds the descriptor; C++ parses + Register's it. The
+        // returned slot index is what every later `sismo_ds_emit` call
+        // identifies us by.
+        const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
+            allocator,
+            .{ .name = DS_NAME, .will_notify_on_stop = true },
+        );
+        defer allocator.free(desc_bytes);
+        const slot = perfetto.sismo_ds_register(
+            desc_bytes.ptr, desc_bytes.len,
+            onSetupTrampoline,
+            onStartTrampoline,
+            onStopTrampoline,
+            onFlushTrampoline,
+            self,
+        );
+        if (slot == std.math.maxInt(u32)) return error.PerfettoDsRegisterFailed;
+        self.ds_slot = slot;
+
         self.thread = try std.Thread.spawn(.{}, workerEntry, .{self});
         return self;
     }
@@ -213,7 +237,7 @@ pub const Capture = struct {
     /// dump. Ack on the IO thread.
     pub fn onFlushTrampoline(user_arg: ?*anyopaque, flusher: ?*anyopaque) callconv(.c) void {
         _ = user_arg;
-        if (flusher) |f| perfetto.sismo_perfetto_flush_done(f);
+        if (flusher) |f| perfetto.sismo_flush_done(f);
     }
 
     pub fn shutdown(self: *Capture) Stats {
@@ -286,7 +310,7 @@ fn workerEntry(self: *Capture) void {
         const stopper_addr = self.pending_stopper.swap(0, .acq_rel);
         if (stopper_addr != 0) {
             if (!self.setup_failed.load(.acquire)) drainOnce(self);
-            perfetto.sismo_perfetto_stop_done(@ptrFromInt(stopper_addr));
+            perfetto.sismo_stop_done(@ptrFromInt(stopper_addr));
             self.running.store(false, .release);
         }
 
@@ -311,9 +335,10 @@ fn drainOnce(self: *Capture) void {
     const n_evt = kdebug.Capture.drain(self.event_buf) catch 0;
     const n_thr = kdebug.Capture.readThreadMap(self.thread_map_buf) catch 0;
     const emitted = emitBatch(
+        self.allocator,
         self.event_buf[0..n_evt],
         self.thread_map_buf[0..n_thr],
-        self.ds,
+        self.ds_slot,
         self.tb_n,
         self.tb_d,
         &self.pending_switches,
@@ -343,21 +368,50 @@ fn lookupComm(threads: []const kdebug.KdThreadMap, tid: u64) []const u8 {
 /// state_bits == 0 (TH_RUN cleared, no other bits) is "preempted, still
 /// on the runqueue" → RUNNABLE. TH_RUN alone (0x04) is the same case
 /// before `thread_dispatch` clears it for waiters; treat as RUNNABLE.
-fn outgoingTaskState(state_bits: u32) perfetto.SismoTaskState {
-    if (state_bits & 0x02 != 0) return perfetto.SISMO_TASK_STATE_STOPPED;
+fn outgoingTaskState(state_bits: u32) perfetto_proto.TaskState {
+    if (state_bits & 0x02 != 0) return .stopped;
     if (state_bits & 0x01 != 0) {
-        return if (state_bits & 0x08 != 0)
-            perfetto.SISMO_TASK_STATE_UNINTERRUPTIBLE_SLEEP
-        else
-            perfetto.SISMO_TASK_STATE_INTERRUPTIBLE_SLEEP;
+        return if (state_bits & 0x08 != 0) .uninterruptible_sleep else .interruptible_sleep;
     }
-    return perfetto.SISMO_TASK_STATE_RUNNABLE;
+    return .runnable;
+}
+
+/// Build the GenericKernelTaskStateEvent payload + wrap in a TracePacket
+/// body, then emit via the public C++ SDK shim. Caller must pass the
+/// allocator that backs the temp encoders (allocations are bounded
+/// per-event and freed before return).
+fn emitTaskState(
+    gpa: std.mem.Allocator,
+    slot: u32,
+    timestamp_ns: u64,
+    cpu: i32,
+    comm: []const u8,
+    tid: i64,
+    state: perfetto_proto.TaskState,
+    prio: i32,
+) void {
+    const event_bytes = perfetto_proto.encodeKernelTaskStateEvent(gpa, .{
+        .cpu = cpu,
+        .comm = comm,
+        .tid = tid,
+        .state = state,
+        .prio = prio,
+    }) catch return;
+    defer gpa.free(event_bytes);
+    const body = perfetto_proto.encodeTracePacketBody(
+        gpa, timestamp_ns,
+        perfetto_proto.TP_FIELD_GENERIC_KERNEL_TASK_STATE,
+        event_bytes,
+    ) catch return;
+    defer gpa.free(body);
+    perfetto.sismo_ds_emit(slot, body.ptr, body.len);
 }
 
 fn emitBatch(
+    gpa: std.mem.Allocator,
     events: []const kdebug.KdBuf,
     thread_map: []const kdebug.KdThreadMap,
-    ds: *perfetto.struct_PerfettoDs,
+    ds_slot: u32,
     tb_n: u64,
     tb_d: u64,
     pending: *[MAX_CPUS]PendingSwitch,
@@ -411,25 +465,21 @@ fn emitBatch(
                 const ts_ns = slot.timestamp *% tb_n / tb_d;
                 const off_comm = lookupComm(thread_map, slot.outgoing_tid);
                 const off_state = outgoingTaskState(args.outgoing_state);
-                _ = perfetto.sismo_perfetto_ds_emit_kernel_task_state(
-                    ds,
-                    ts_ns,
+                emitTaskState(
+                    gpa, ds_slot, ts_ns,
                     @intCast(e.cpuid),
-                    off_comm.ptr,
-                    off_comm.len,
-                    @intCast(@as(i64, @intCast(slot.outgoing_tid))),
+                    off_comm,
+                    @intCast(slot.outgoing_tid),
                     off_state,
                     @intCast(slot.outgoing_pri),
                 );
                 const on_comm = lookupComm(thread_map, slot.incoming_tid);
-                _ = perfetto.sismo_perfetto_ds_emit_kernel_task_state(
-                    ds,
-                    ts_ns,
+                emitTaskState(
+                    gpa, ds_slot, ts_ns,
                     @intCast(e.cpuid),
-                    on_comm.ptr,
-                    on_comm.len,
-                    @intCast(@as(i64, @intCast(slot.incoming_tid))),
-                    perfetto.SISMO_TASK_STATE_RUNNING,
+                    on_comm,
+                    @intCast(slot.incoming_tid),
+                    .running,
                     @intCast(slot.incoming_pri),
                 );
                 slot.valid = false;

@@ -154,14 +154,17 @@ pub fn runDatasource(init: std.process.Init) !void {
 /// applies + the C-side DS handle so we can free both at shutdown.
 const Slot = struct {
     kind: Kind,
-    ds: *c.struct_PerfettoDs,
     sched: ?*macos_sched_capture.Capture = null,
     cpu: ?*macos_cpu_samples_capture.Capture = null,
     heap: ?*heap_capture.Capture = null,
 };
 
 fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
-    c.sismo_perfetto_init();
+    // New shim path: connect to the producer socket via the public
+    // C++ SDK. Captures' Capture.init internally builds + registers
+    // the DataSourceDescriptor.
+    const paths = @import("sismo_paths.zig");
+    c.sismo_init(paths.producer_sock.ptr);
 
     var slots_buf: [8]Slot = undefined;
     var n_slots: usize = 0;
@@ -180,46 +183,20 @@ fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
     }
 
     for (kinds) |kind| {
-        const ds = c.sismo_perfetto_ds_alloc() orelse return error.PerfettoDsAllocFailed;
-        var slot: Slot = .{ .kind = kind, .ds = ds };
+        var slot: Slot = .{ .kind = kind };
         switch (kind) {
             .sched => {
-                slot.sched = try macos_sched_capture.Capture.init(init.gpa, init.io, ds, .{});
-                if (!c.sismo_perfetto_ds_register_with_callbacks(
-                    ds,
-                    "sismo.macos_sched",
-                    macos_sched_capture.Capture.onSetupTrampoline,
-                    macos_sched_capture.Capture.onStartTrampoline,
-                    macos_sched_capture.Capture.onStopTrampoline,
-                    macos_sched_capture.Capture.onFlushTrampoline,
-                    slot.sched.?,
-                )) return error.PerfettoDsRegisterFailed;
+                // New API: Capture.init builds the descriptor + calls
+                // sismo_ds_register internally; no separate ds_alloc.
+                slot.sched = try macos_sched_capture.Capture.init(init.gpa, init.io, .{});
                 std.debug.print("sismo datasource: sismo.macos_sched registered\n", .{});
             },
             .cpu => {
-                slot.cpu = try macos_cpu_samples_capture.Capture.init(init.gpa, init.io, ds, .{});
-                if (!c.sismo_perfetto_ds_register_with_callbacks(
-                    ds,
-                    "sismo.macos_cpu_samples",
-                    macos_cpu_samples_capture.Capture.onSetupTrampoline,
-                    macos_cpu_samples_capture.Capture.onStartTrampoline,
-                    macos_cpu_samples_capture.Capture.onStopTrampoline,
-                    macos_cpu_samples_capture.Capture.onFlushTrampoline,
-                    slot.cpu.?,
-                )) return error.PerfettoDsRegisterFailed;
+                slot.cpu = try macos_cpu_samples_capture.Capture.init(init.gpa, init.io, .{});
                 std.debug.print("sismo datasource: sismo.macos_cpu_samples registered\n", .{});
             },
             .heap => {
-                slot.heap = try heap_capture.Capture.init(init.gpa, init.io, ds, .{});
-                if (!c.sismo_perfetto_ds_register_with_callbacks(
-                    ds,
-                    "sismo.heap",
-                    heap_capture.Capture.onSetupTrampoline,
-                    heap_capture.Capture.onStartTrampoline,
-                    heap_capture.Capture.onStopTrampoline,
-                    heap_capture.Capture.onFlushTrampoline,
-                    slot.heap.?,
-                )) return error.PerfettoDsRegisterFailed;
+                slot.heap = try heap_capture.Capture.init(init.gpa, init.io, .{});
                 std.debug.print("sismo datasource: sismo.heap registered\n", .{});
             },
         }
@@ -266,7 +243,6 @@ fn shutdownSlot(slot: Slot) void {
             );
         },
     }
-    c.sismo_perfetto_ds_free(slot.ds);
 }
 
 fn blockUntilStopped() void {

@@ -116,18 +116,18 @@ fn addUnixPipeline(
     };
 
     // -------------------------------------------------------------------------
-    // libperfetto.a + sismo's C shim (perfetto_shim.c). The shim wraps
-    // the Perfetto C SDK with sismo-flavoured helpers (hand-rolled
-    // proto encoding for messages the C SDK doesn't expose builders
-    // for; mode-aware TraceConfig builder; etc.).
+    // libperfetto.a — the comprehensive Perfetto C++ SDK static archive.
+    // The C SDK is gone (deleted with perfetto_shim.c); sismo's
+    // producer-side glue is `src/c/perfetto_ds.cc` (templated DataSource
+    // slots over the public C++ SDK) and consumer-side is
+    // `src/c/sismo_consumer.cc`. Both compile directly into the sismo
+    // binary, not as a separate static library.
     //
     // Build pipeline:
     //   1. tools/build_perfetto.sh runs ninja to produce libperfetto.a
     //      in third_party/src/perfetto/out/<perfetto_out_name>/.
     //      Cross-compile uses zig cc as a clang drop-in.
-    //   2. perfetto_shim_lib compiles src/c/perfetto_shim.c against the
-    //      vendored public headers (no amalgamation).
-    //   3. Each consumer linkLibrary(perfetto_shim_lib) +
+    //   2. Each consumer addCSourceFile()s the relevant .cc shims +
     //      addObjectFile(libperfetto.a) + OS-specific frameworks/libs.
     // -------------------------------------------------------------------------
     const perfetto_build = b.addSystemCommand(&.{ "bash", b.pathFromRoot("tools/build_perfetto.sh") });
@@ -135,34 +135,14 @@ fn addUnixPipeline(
     const perfetto_root = b.path("third_party/src/perfetto");
     const perfetto_out = b.path(b.fmt("third_party/src/perfetto/out/{s}", .{perfetto_out_name}));
 
-    const perfetto_shim_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    perfetto_shim_mod.addIncludePath(b.path("src/c"));
-    perfetto_shim_mod.addIncludePath(perfetto_root.path(b, "include"));
     // Perfetto's public headers (thread_utils.h on Linux) reach for
     // `syscall(__NR_gettid)`, which is gated behind `_GNU_SOURCE` in
-    // glibc's <unistd.h>. The header is included transitively from
-    // both perfetto_shim.c and sample_target_sdk.c so the define has
-    // to be set on every C source file that pulls in Perfetto.
+    // glibc's <unistd.h>. Set it on every C source file that pulls in
+    // Perfetto headers transitively (sample_target_sdk.c on Linux).
     const c_flags: []const []const u8 = if (is_macos)
         &.{"-std=c11"}
     else
         &.{ "-std=c11", "-D_GNU_SOURCE" };
-
-    perfetto_shim_mod.addCSourceFile(.{
-        .file = b.path("src/c/perfetto_shim.c"),
-        .flags = c_flags,
-        .language = .c,
-    });
-    const perfetto_shim_lib = b.addLibrary(.{
-        .name = "perfetto_shim",
-        .root_module = perfetto_shim_mod,
-        .linkage = .static,
-    });
-    perfetto_shim_lib.step.dependOn(&perfetto_build.step);
 
     const shim_include = b.path("src/c");
     const lib_a = perfetto_out.path(b, "libperfetto.a");
@@ -189,7 +169,7 @@ fn addUnixPipeline(
             .name = "sample-target",
             .root_module = target_mod,
         });
-        linkPerfetto(target_mod, &target_exe.step, perfetto_shim_lib, shim_include, lib_a, &perfetto_build.step, os_tag);
+        linkPerfetto(target_mod, &target_exe.step, shim_include, lib_a, &perfetto_build.step, os_tag);
         b.installArtifact(target_exe);
 
         const target_step = b.step("sample-target", "Build the sample-target workload binary");
@@ -251,6 +231,15 @@ fn addUnixPipeline(
             .flags = cpp_flags,
             .language = .cpp,
         });
+        // Public-C++-SDK based data source shim (replaces the C SDK
+        // shim's data source path; the C SDK's `PerfettoDsRegister`
+        // doesn't expose `protovm_program` on the descriptor).
+        // Coexists with the old shim during migration.
+        sismo_mod.addCSourceFile(.{
+            .file = b.path("src/c/perfetto_ds.cc"),
+            .flags = cpp_flags,
+            .language = .cpp,
+        });
         // Linux-only: embedded Perfetto producers run in-process as
         // worker threads (mirroring sismo_traced.cc). traced_probes
         // covers ftrace + procfs; traced_perf covers perf_event_open
@@ -292,7 +281,7 @@ fn addUnixPipeline(
             .name = "sismo",
             .root_module = sismo_mod,
         });
-        linkPerfetto(sismo_mod, &sismo_exe.step, perfetto_shim_lib, shim_include, lib_a, &perfetto_build.step, os_tag);
+        linkPerfetto(sismo_mod, &sismo_exe.step, shim_include, lib_a, &perfetto_build.step, os_tag);
         sismo_exe.step.dependOn(&cargo.step);
         b.installArtifact(sismo_exe);
         const sismo_step = b.step("sismo", "Build the sismo CLI (subcommand dispatcher)");
@@ -325,14 +314,12 @@ fn perfettoTargetTriple(target: std.Build.ResolvedTarget) ?[]const u8 {
 fn linkPerfetto(
     mod: *std.Build.Module,
     step: *std.Build.Step,
-    shim_lib: *std.Build.Step.Compile,
     inc: std.Build.LazyPath,
     lib_a: std.Build.LazyPath,
     build_step: *std.Build.Step,
     os_tag: std.Target.Os.Tag,
 ) void {
     mod.addIncludePath(inc);
-    mod.linkLibrary(shim_lib);
     // libperfetto.a is comprehensive: service code (traced) +
     // client API (shared_lib + tracing/client_api + backends).
     // Single archive — see sismo-local additions in
@@ -372,25 +359,6 @@ fn addWindowsPipeline(
     const perfetto_root = b.path("third_party/src/perfetto");
     const perfetto_out = b.path("third_party/src/perfetto/out/sismo");
 
-    const perfetto_shim_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    perfetto_shim_mod.addIncludePath(b.path("src/c"));
-    perfetto_shim_mod.addIncludePath(perfetto_root.path(b, "include"));
-    perfetto_shim_mod.addCSourceFile(.{
-        .file = b.path("src/c/perfetto_shim.c"),
-        .flags = &.{"-std=c11"},
-        .language = .c,
-    });
-    const perfetto_shim_lib = b.addLibrary(.{
-        .name = "perfetto_shim",
-        .root_module = perfetto_shim_mod,
-        .linkage = .static,
-    });
-    perfetto_shim_lib.step.dependOn(&perfetto_build.step);
-
     const target_mod = b.createModule(.{
         .root_source_file = b.path("src/sample_target.zig"),
         .target = target,
@@ -405,7 +373,6 @@ fn addWindowsPipeline(
     });
     target_mod.addIncludePath(perfetto_root.path(b, "include"));
     target_mod.addIncludePath(b.path("src/c"));
-    target_mod.linkLibrary(perfetto_shim_lib);
     target_mod.addObjectFile(perfetto_out.path(b, "libperfetto.a"));
 
     const target_exe = b.addExecutable(.{

@@ -27,10 +27,13 @@ const unwinder = @import("unwinder.zig");
 const symbolizer = @import("symbolizer.zig");
 const heap_emit = @import("heap_emit.zig");
 const sismo_config = @import("sismo_config.zig");
+const perfetto_proto = @import("perfetto_proto.zig");
 
 const perfetto = @cImport({
     @cInclude("perfetto_shim.h");
 });
+
+const DS_NAME = "sismo.heap";
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("heap_capture is macOS-only");
@@ -87,7 +90,8 @@ pub const Stats = struct {
 pub const Capture = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    ds: *perfetto.struct_PerfettoDs,
+    /// Slot handle returned by `sismo_ds_register`.
+    ds_slot: u32,
     config: Config,
 
     wakeup: std.Io.Event,
@@ -114,15 +118,14 @@ pub const Capture = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
-        ds_opaque: *anyopaque,
         config: Config,
     ) !*Capture {
-        const ds: *perfetto.struct_PerfettoDs = @ptrCast(ds_opaque);
         const self = try allocator.create(Capture);
+        errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .ds = ds,
+            .ds_slot = std.math.maxInt(u32), // set after register
             .config = config,
             .wakeup = .unset,
             .running = std.atomic.Value(bool).init(false),
@@ -138,6 +141,23 @@ pub const Capture = struct {
             .bytes_alloc = std.atomic.Value(u64).init(0),
             .sites_observed = std.atomic.Value(u32).init(0),
         };
+
+        const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
+            allocator,
+            .{ .name = DS_NAME, .will_notify_on_stop = true },
+        );
+        defer allocator.free(desc_bytes);
+        const slot = perfetto.sismo_ds_register(
+            desc_bytes.ptr, desc_bytes.len,
+            onSetupTrampoline,
+            onStartTrampoline,
+            onStopTrampoline,
+            onFlushTrampoline,
+            self,
+        );
+        if (slot == std.math.maxInt(u32)) return error.PerfettoDsRegisterFailed;
+        self.ds_slot = slot;
+
         self.thread = try std.Thread.spawn(.{}, workerEntry, .{self});
         return self;
     }
@@ -342,7 +362,7 @@ fn workerEntry(self: *Capture) void {
             emitProfile(self, &sizes_by_top_pc, target_images, sym, snapshot_ts) catch |err| {
                 std.debug.print("heap_capture: flush emit failed: {s}\n", .{@errorName(err)});
             };
-            perfetto.sismo_perfetto_flush_done(@ptrFromInt(flusher_addr));
+            perfetto.sismo_flush_done(@ptrFromInt(flusher_addr));
         }
 
         // Stop: detach from the target so it stops producing, do a
@@ -361,7 +381,7 @@ fn workerEntry(self: *Capture) void {
                 } }) catch {};
             }
             drainShmInto(self, &rb, u, &sizes_by_top_pc);
-            perfetto.sismo_perfetto_stop_done(@ptrFromInt(stopper_addr));
+            perfetto.sismo_stop_done(@ptrFromInt(stopper_addr));
             self.running.store(false, .release);
         }
 
@@ -385,10 +405,10 @@ fn parkUntilExit(self: *Capture) void {
         self.wakeup.reset();
         if (self.exit_requested.load(.acquire)) return;
         const flusher_addr = self.pending_flusher.swap(0, .acq_rel);
-        if (flusher_addr != 0) perfetto.sismo_perfetto_flush_done(@ptrFromInt(flusher_addr));
+        if (flusher_addr != 0) perfetto.sismo_flush_done(@ptrFromInt(flusher_addr));
         const stopper_addr = self.pending_stopper.swap(0, .acq_rel);
         if (stopper_addr != 0) {
-            perfetto.sismo_perfetto_stop_done(@ptrFromInt(stopper_addr));
+            perfetto.sismo_stop_done(@ptrFromInt(stopper_addr));
             self.running.store(false, .release);
         }
         if (self.exit_requested.load(.acquire)) return;
@@ -469,7 +489,7 @@ fn emitProfile(
     );
     defer owned.deinit(self.allocator);
     owned.fillTd();
-    try heap_emit.emitToDataSource(self.allocator, self.ds, owned.td);
+    try heap_emit.emitToDataSource(self.allocator, self.ds_slot, owned.td);
 }
 
 // ---- TraceData construction ------------------------------------------------
