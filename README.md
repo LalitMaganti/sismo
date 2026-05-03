@@ -52,13 +52,14 @@ Concretely, sismo can collect:
 
 In my full time job at Google, I work on [Perfetto](https://github.com/google/perfetto),
 a performance profiling and tracing tool. So on the surface, it might seem weird that I'm
-developing *another* performance debugging tool in my personal time.
+developing *another* performance debugging tool in my spare time.
 
 But in my head, Perfetto and sismo are two *very* distinct project:
 * Perfetto is a *platform*: a set of components which can be assembled together
   in many different ways depending on the problem you are tackling. Its power comes from
-  flexibility, but it's also *very* intimidating if you're not an expert.
-* sismo is a *product*: my view on what an average developer needs when they
+  flexibility, but it's also has a *steep* learning curve. It makes sense to invest if
+  you look at performance all the time but otherwise, it can just be too much
+* sismo is a *product*: my opinion on what an average developer needs when they
   start looking at performance. That makes it far less flexible than Perfetto,
   but also far simpler: any engineer should be able to pick up sismo and start
   being productive within minutes.
@@ -90,3 +91,8 @@ recording escape hatch.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Disclaimer
+
+This project is built in my personal capacity and is not affiliated with, endorsed
+by, or a product of my employer, Google.
