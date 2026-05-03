@@ -8,8 +8,9 @@ zig-out/
 target/
 Cargo.lock
 
-# Hermetic build deps installed by tools/install-build-deps
-third_party/
+# Hermetic build deps installed by tools/install-build-deps.
+# (Source deps live as git submodules under third_party/src/ and are tracked.)
+third_party/bin/
 
 # Python
 __pycache__/

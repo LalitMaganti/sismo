@@ -1,16 +1,18 @@
 # Copyright 2026 The Sismo Authors. All rights reserved.
 # Licensed under the MIT License.
 
-"""Installs build dependencies to third_party/bin/ and third_party/src/.
+"""Installs build dependencies to third_party/bin/.
 
 Mirrors syntaqlite's install-build-deps pattern: pinned, checksummed binary
-tarballs into third_party/bin/{platform_dir}/ and source tarballs into
-third_party/src/. Idempotent via per-dep .stamp files.
+tarballs into third_party/bin/{platform_dir}/. Idempotent via per-dep .stamp
+files.
 
 Sismo deps:
   - Zig 0.16.0 (binary tarball from ziglang.org)
   - Rust 1.94.0 (binary tarball from static.rust-lang.org)
-  - Perfetto C SDK source v54.0 (perfetto-c-sdk-src.zip from GitHub releases)
+
+Source deps (e.g. the Perfetto fork) are tracked as git submodules under
+third_party/src/ — fetch them with `git submodule update --init --recursive`.
 """
 
 from __future__ import annotations
@@ -38,11 +40,9 @@ def vprint(level: int, *args: object, **kwargs: object) -> None:
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 THIRD_PARTY_DIR: str = os.path.join(ROOT_DIR, "third_party")
 THIRD_PARTY_BIN_DIR: str = os.path.join(THIRD_PARTY_DIR, "bin")
-THIRD_PARTY_SRC_DIR: str = os.path.join(THIRD_PARTY_DIR, "src")
 
 ZIG_VERSION: str = "0.16.0"
 RUST_VERSION: str = "1.94.0"
-PERFETTO_SDK_VERSION: str = "v54.0"
 
 
 @dataclass
@@ -56,17 +56,6 @@ class BinaryDep:
     target_arch: str  # x64, arm64, or all
     format: str = "zip"
     strip_prefix: str = ""  # Directory prefix to strip from archive
-
-
-@dataclass
-class SourceDep:
-    """Source dependency (platform-independent)."""
-    name: str
-    version: str
-    url: str
-    sha256: str
-    strip_prefix: str = ""  # Directory prefix to strip from archive
-    format: str = "zip"
 
 
 # fmt: off
@@ -126,17 +115,6 @@ BINARY_DEPS: list[BinaryDep] = [
               "b349a6eace4063e4a89d9be1de2e77b20bd0193016a43036522f453be709c0f8",
               "windows", "x64", "tar.gz",
               f"rust-{RUST_VERSION}-x86_64-pc-windows-msvc"),
-]
-
-SOURCE_DEPS: list[SourceDep] = [
-    # Perfetto C SDK amalgamation. The zip contains 4 files at the root:
-    # perfetto_c.h, perfetto_c.cc, perfetto.h, perfetto.cc. We extract them
-    # into third_party/src/perfetto-c-sdk/.
-    SourceDep("perfetto-c-sdk", PERFETTO_SDK_VERSION,
-              f"https://github.com/google/perfetto/releases/download/{PERFETTO_SDK_VERSION}/perfetto-c-sdk-src.zip",
-              "8df276fedf291a55c871e08a8a7888ac2a48c7c54a550565bc63dc3c8636dc67",
-              strip_prefix="",
-              format="zip"),
 ]
 # fmt: on
 
@@ -333,51 +311,6 @@ def install_binary_dep(dep: BinaryDep, target_dir: str) -> bool:
     sys.exit(f"No installer for binary dep: {dep.name}")
 
 
-def install_source_dep(dep: SourceDep, target_dir: str) -> bool:
-    """Install a source dependency. Returns True on success."""
-    dest_dir = os.path.join(target_dir, dep.name)
-    stamp_path = os.path.join(target_dir, f".{dep.name}.stamp")
-
-    if os.path.exists(stamp_path) and os.path.isdir(dest_dir):
-        with open(stamp_path) as f:
-            if f.read().strip() == dep.version:
-                return True
-
-    vprint(1, f"Downloading {dep.name} source...")
-    os.makedirs(target_dir, exist_ok=True)
-
-    suffix = ".tar.gz" if dep.format == "tar.gz" else ".zip"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        if not download(dep.url, tmp_path):
-            print("Download failed", file=sys.stderr)
-            return False
-
-        actual = sha256_file(tmp_path)
-        if actual != dep.sha256:
-            print(f"SHA256 mismatch for {dep.name}: expected {dep.sha256}, got {actual}", file=sys.stderr)
-            return False
-
-        with tempfile.TemporaryDirectory() as extract_dir:
-            extract(tmp_path, extract_dir, dep.format)
-
-            src_path = os.path.join(extract_dir, dep.strip_prefix) if dep.strip_prefix else extract_dir
-            if os.path.exists(dest_dir):
-                shutil.rmtree(dest_dir)
-            shutil.move(src_path, dest_dir)
-
-        with open(stamp_path, "w") as f:
-            f.write(dep.version)
-
-        vprint(1, f"Installed {dep.name} to {dest_dir}")
-        return True
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-
 def main() -> int:
     global VERBOSITY
 
@@ -416,10 +349,6 @@ def main() -> int:
         if os_match and arch_match:
             if not install_binary_dep(dep, bin_target_dir):
                 success = False
-
-    for dep in SOURCE_DEPS:
-        if not install_source_dep(dep, THIRD_PARTY_SRC_DIR):
-            success = False
 
     return 0 if success else 1
 
