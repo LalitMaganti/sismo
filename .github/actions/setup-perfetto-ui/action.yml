@@ -1,0 +1,76 @@
+name: Setup Perfetto UI build environment
+description: |
+  Restores all caches relevant to building the Perfetto UI (toolchain
+  downloads, pnpm node_modules, ccache for the WASM C++ compile, and
+  the out/ui incremental build state), configures ccache, and runs
+  install-build-deps --ui.
+
+  Modeled on perfetto's upstream ui-tests workflow but adapted to
+  GitHub-hosted runners + actions/cache instead of self-hosted runners
+  + GCS-backed cache.
+
+runs:
+  using: composite
+  steps:
+    # Toolchain downloads from install-build-deps. Stable across commits;
+    # invalidated only when install-build-deps itself changes.
+    - name: Cache buildtools + third_party
+      uses: actions/cache@v5
+      with:
+        path: |
+          third_party/src/perfetto/buildtools
+          third_party/src/perfetto/third_party/pnpm
+        key: perfetto-buildtools-${{ runner.os }}-${{ hashFiles('third_party/src/perfetto/tools/install-build-deps') }}
+
+    # pnpm node_modules. Invalidated when the lockfile changes;
+    # install-build-deps detects an unchanged lockfile via .last_install
+    # and skips the pnpm install entirely on a cache hit.
+    - name: Cache ui/node_modules
+      uses: actions/cache@v5
+      with:
+        path: third_party/src/perfetto/ui/node_modules
+        key: perfetto-node-modules-${{ runner.os }}-${{ hashFiles('third_party/src/perfetto/ui/pnpm-lock.yaml') }}
+
+    # ccache for the WASM C++ compile (trace_processor, traceconv, etc).
+    # Per-SHA key with a fuzzy restore-keys fallback so every run starts
+    # from the most recent cache and writes a fresh layer at the end.
+    - name: Cache ccache
+      uses: actions/cache@v5
+      with:
+        path: ~/.ccache
+        key: perfetto-ccache-${{ runner.os }}-${{ github.sha }}
+        restore-keys: |
+          perfetto-ccache-${{ runner.os }}-
+
+    # Incremental build state. tsc, rollup, and ninja all use mtime-based
+    # dep tracking; restoring out/ui means small source changes only
+    # rebuild the touched files.
+    - name: Cache out/ui
+      uses: actions/cache@v5
+      with:
+        path: third_party/src/perfetto/out/ui
+        key: perfetto-out-ui-${{ runner.os }}-${{ github.sha }}
+        restore-keys: |
+          perfetto-out-ui-${{ runner.os }}-
+
+    # build.js auto-detects ccache on PATH (sets GN cc_wrapper="ccache").
+    # ubuntu-latest images come with ccache preinstalled, so just
+    # configure the cache dir + size limits.
+    - name: Configure ccache
+      shell: bash
+      run: |
+        mkdir -p ~/.ccache
+        cat > ~/.ccache/ccache.conf <<'EOF'
+        max_size = 2.0G
+        compression = true
+        compression_level = 6
+        sloppiness = include_file_ctime,include_file_mtime
+        compiler_check = string:${{ hashFiles('third_party/src/perfetto/tools/install-build-deps') }}
+        EOF
+        ccache --zero-stats || true
+        ccache --show-config
+
+    - name: Install Perfetto UI build deps
+      shell: bash
+      working-directory: third_party/src/perfetto
+      run: python3 tools/install-build-deps --ui
