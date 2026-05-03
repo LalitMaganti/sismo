@@ -284,11 +284,27 @@ def upload_loose_files(s3, bucket, channel, version, dist_dir):
       )
 
 
+def check_env():
+  """Fail fast with a clear message if any required secret is missing
+  or empty. Avoids burning a 15-minute build before the upload step
+  discovers a missing credential."""
+  required = (
+      'R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET')
+  missing = [k for k in required if not os.environ.get(k)]
+  if missing:
+    raise SystemExit(
+        'Missing or empty environment variables: ' + ', '.join(missing) +
+        '. Set them as GitHub Actions secrets with these exact names.')
+
+
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument('--channel', required=True, choices=CHANNELS)
   parser.add_argument('--upload', action='store_true')
   args = parser.parse_args()
+
+  if args.upload:
+    check_env()
 
   version, dist_dir = build(args.channel)
 
