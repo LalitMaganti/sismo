@@ -1,31 +1,17 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
-// Licensed under the Apache License, Version 2.0.
-//
+// Licensed under the MIT License.
+
 // Sismo's consumer-side surface, expressed via the Perfetto C++ SDK
-// (perfetto/tracing/tracing.h). Replaces the previous split where
-// session lifecycle went through the C SDK (perfetto_shim.c) but
-// CloneTrace went through the C++ SDK (perfetto_clone.cc) — the
-// recorder's "consumer" role now has one consistent backing.
-//
-// Producer-side (data source registration via the captures' C
-// trampolines) still lives in perfetto_shim.c and uses the C SDK's
-// PerfettoDsRegister machinery — that's where our trampoline-based
-// callback design fits naturally.
+// (perfetto/tracing/tracing.h).
 //
 // The C surface here is what cmd_record.zig and cmd_snapshot.zig
 // call into:
 //   - session_create / setup / start_blocking / stop_blocking / destroy
 //     drive the recorder's tracing session.
-//   - clone_to_file is used by `sismo snapshot` (and in principle the
-//     recorder, though we no longer auto-flush at session end —
-//     snapshotting is exclusively user-driven via `sismo snapshot`).
+//   - clone_to_file is used by `sismo snapshot` — snapshotting is
+//     exclusively user-driven via `sismo snapshot`.
 
-#include "perfetto_shim.h"
-
-// tracing.h only forward-declares TraceConfig; the .gen.h has the
-// full proto-generated class needed for ParseFromArray + Setup().
-#include "perfetto/tracing/core/trace_config.h"
-#include "perfetto/tracing/tracing.h"
+#include "src/c/perfetto_shim.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -35,6 +21,11 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+// tracing.h only forward-declares TraceConfig; the .gen.h has the
+// full proto-generated class needed for ParseFromArray + Setup().
+#include "perfetto/tracing/core/trace_config.h"
+#include "perfetto/tracing/tracing.h"
 
 namespace {
 

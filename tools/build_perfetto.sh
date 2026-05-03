@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
 # tools/build_perfetto.sh — incremental build of the Perfetto targets
 # sismo links against. Driven by zig build, but standalone-runnable
 # for debugging the GN side.

@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! In-process heap capture → `sismo.heap` producer.
 //!
 //! Single worker thread driven by the muxer pattern. Worker does
@@ -30,7 +33,7 @@ const sismo_config = @import("sismo_config.zig");
 const perfetto_proto = @import("perfetto_proto.zig");
 
 const perfetto = @cImport({
-    @cInclude("perfetto_shim.h");
+    @cInclude("src/c/perfetto_shim.h");
 });
 
 const DS_NAME = "sismo.heap";

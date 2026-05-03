@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! `sismo snapshot` — flight-recorder snapshot client.
 //!
 //! Doesn't talk to the recorder process. Connects independently to
@@ -22,7 +25,7 @@ const std = @import("std");
 const paths = @import("sismo_paths.zig");
 
 const c = @cImport({
-    @cInclude("perfetto_shim.h");
+    @cInclude("src/c/perfetto_shim.h");
 });
 
 // setenv has no idiomatic Zig wrapper — env mutation is intentionally

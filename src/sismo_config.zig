@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Hand-written encoders + decoders for sismo data source configs.
 //! See `protos/sismo_config.proto` for the schema.
 //!

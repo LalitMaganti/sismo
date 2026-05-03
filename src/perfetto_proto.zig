@@ -1,8 +1,9 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Hand-rolled byte builders for the Perfetto proto messages sismo
-//! emits. Replaces the old C-side encoders in `perfetto_shim.c`. Per
-//! the architectural call (see auto-memory `project_perfetto_integration`),
-//! the C++ side is glue only — every byte that goes on the wire is
-//! built here in Zig.
+//! emits. The C++ side is glue only — every byte that goes on the wire
+//! is built here in Zig.
 //!
 //! Field numbers are sourced from the vendored proto schemas at
 //! `third_party/src/perfetto/protos/...`. Wire format primitives live
@@ -125,11 +126,9 @@ fn encodeTrackEventConfig(gpa: std.mem.Allocator, te: TrackEventEntry) ![]u8 {
     return w.buf.toOwnedSlice(gpa);
 }
 
-/// FtraceConfig: hand-rolled (the C SDK had no generated builder).
-/// Today emits sched_switch / sched_waking / sched_wakeup /
-/// sched_process_exit + compact_sched.enabled — matches what the C
-/// shim produced. Field numbers per `protos/perfetto/config/ftrace/
-/// ftrace_config.proto`:
+/// FtraceConfig: emits sched_switch / sched_waking / sched_wakeup /
+/// sched_process_exit + compact_sched.enabled. Field numbers per
+/// `protos/perfetto/config/ftrace/ftrace_config.proto`:
 ///   ftrace_events = 1 (repeated string)
 ///   compact_sched = 12 (CompactSchedConfig submsg; .enabled = field 1)
 fn encodeFtraceConfig(gpa: std.mem.Allocator, _: LinuxFtraceEntry) ![]u8 {

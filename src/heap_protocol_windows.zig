@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Windows stub for the sismo heap-profiler control channel. Per
 //! `plans/05-heap-research.md` the Windows analog of the POSIX
 //! Unix-socket + SCM_RIGHTS design is a per-PID named pipe plus

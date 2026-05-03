@@ -1,7 +1,9 @@
-//! Module enumeration via dyld's `all_image_infos` (sequencing item #6,
-//! journal 02 phase 3 step 3a). Walks the target's loaded mach-o image
-//! list to produce `(base_avma, path)` tuples — the inputs framehop
-//! needs in `add_module` (3b/3c).
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
+//! Module enumeration via dyld's `all_image_infos`. Walks the target's
+//! loaded mach-o image list to produce `(base_avma, path)` tuples — the
+//! inputs framehop needs in `add_module`.
 //!
 //! Same data path samply uses (`proc_maps.rs::DyldInfoManager`):
 //!   1. `task_info(target, TASK_DYLD_INFO)` returns the address of the

@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! `sismo prepare` — launch a workload with the sismo dormant heap
 //! client (and the well-known producer socket env) wired in, then
 //! `execvp` into the user's command. The workload runs as a normal

@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! OS dispatcher for the heap-profiler shared-memory ring. Re-exports
 //! the per-OS implementation so consumers (heap_capture, heap_preload_*)
 //! only ever say `@import("heap_ring.zig")`.

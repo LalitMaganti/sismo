@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
 # tools/e2e_all_sources.sh — full end-to-end test of `sismo record`.
 # Builds everything, runs the recorder under sudo (so the in-process
 # heap and CPU producers can task_for_pid the spawned target), and

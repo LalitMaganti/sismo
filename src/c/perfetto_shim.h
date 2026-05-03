@@ -1,6 +1,6 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
-// Licensed under the Apache License, Version 2.0.
-//
+// Licensed under the MIT License.
+
 // C ABI exposed by sismo's C++ glue (perfetto_ds.cc, sismo_consumer.cc,
 // sismo_traced.cc) to Zig. The C++ side is *minimal glue over the
 // public Perfetto C++ SDK*; all proto encoding (DataSourceDescriptor,
@@ -9,11 +9,6 @@
 // capture module. The C++ shim does not interpret any proto bytes
 // other than parsing the descriptor blob immediately before passing
 // it to `DataSource::Register`.
-//
-// The original Perfetto C SDK was dropped on 2026-05-02 (see
-// `plans/09-cxx-sdk-direct-and-protovm.md` and the auto-memory
-// `project_perfetto_integration`). This header reflects post-migration
-// state — only the new generic ABI lives here.
 
 #ifndef SISMO_SRC_C_PERFETTO_SHIM_H_
 #define SISMO_SRC_C_PERFETTO_SHIM_H_

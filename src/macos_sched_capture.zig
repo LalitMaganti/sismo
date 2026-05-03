@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! In-process kdebug → `sismo.macos_sched` producer.
 //!
 //! Lifecycle (the "muxer" pattern shared by all sismo producers):
@@ -36,7 +39,7 @@ const perfetto_proto = @import("perfetto_proto.zig");
 const ProtoWriter = @import("proto_writer.zig").ProtoWriter;
 
 const perfetto = @cImport({
-    @cInclude("perfetto_shim.h");
+    @cInclude("src/c/perfetto_shim.h");
 });
 
 const DS_NAME = "sismo.macos_sched";

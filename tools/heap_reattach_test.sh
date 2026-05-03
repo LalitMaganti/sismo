@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
 # tools/heap_reattach_test.sh — runs sismo-record twice against the
 # same long-lived target to verify the heap producer's
 # dormant→active→dormant→active cycle. Each run is its own attached

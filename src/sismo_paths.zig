@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Well-known filesystem paths and binary-relative path resolution for
 //! sismo. Centralized here so `cmd_record`, `cmd_prepare`, and any
 //! future subcommand agree on the same constants — the whole point of

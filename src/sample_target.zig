@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! `sample-target` — workload binary `sismo record` spawns and
 //! profiles. Three deliberately distinct threads so the trace is
 //! easy to read by eye:
@@ -16,7 +19,7 @@
 const std = @import("std");
 
 const c = @cImport({
-    @cInclude("sample_target_sdk.h");
+    @cInclude("src/c/sample_target_sdk.h");
 });
 
 fn sleepUs(us: u64) void {

@@ -1,8 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
-// Licensed under the Apache License, Version 2.0.
-//
-// Public C++ SDK based data source shim. Replaces the C SDK based
-// `perfetto_shim.c` for sismo's in-process producer side.
+// Licensed under the MIT License.
+
+// Public C++ SDK based data source shim for sismo's in-process producer
+// side.
 //
 // **Why public C++ SDK**: the C SDK's inline `PerfettoDsRegister`
 // (`include/perfetto/public/data_source.h`) discards `protovm_program`
@@ -20,12 +20,7 @@
 // source-specific logic in C++.** All proto encoding (descriptor,
 // per-DS config, payloads, VmProgram) lives in Zig.
 
-#include "perfetto_shim.h"
-
-#include "perfetto/tracing/data_source.h"
-#include "perfetto/tracing/tracing.h"
-
-#include "protos/perfetto/common/data_source_descriptor.gen.h"
+#include "src/c/perfetto_shim.h"
 
 #include <array>
 #include <atomic>
@@ -34,9 +29,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <string>
+
+#include "perfetto/tracing/data_source.h"
+#include "perfetto/tracing/tracing.h"
+#include "protos/perfetto/common/data_source_descriptor.gen.h"
 
 namespace {
 
@@ -76,10 +74,9 @@ class SismoSlot : public perfetto::DataSource<SismoSlot<Slot>> {
     void OnSetup(const typename Base::SetupArgs& args) override {
         auto& cb = g_bundles[Slot];
         if (!cb.on_setup) return;
-        // Round-trip the parsed config back to bytes — the C SDK era
-        // contract is "Zig gets the serialized DataSourceConfig and
-        // scans it for field 2000". One serialize per session start
-        // is negligible.
+        // Round-trip the parsed config back to bytes — Zig gets the
+        // serialized DataSourceConfig and scans it for field 2000.
+        // One serialize per session start is negligible.
         std::string s = args.config->SerializeAsString();
         cb.on_setup(cb.user_arg, s.data(), s.size());
     }

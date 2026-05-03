@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Thin Zig bindings over `<libproc.h>` proc_pidinfo flavors used by
 //! the macOS sched producer to attach friendly process / thread names
 //! to scheduler events.

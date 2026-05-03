@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! macOS DYLD_INSERT_LIBRARIES preload — full dormant heap client.
 //!
 //! Loaded into a target via:
@@ -15,9 +18,6 @@
 //!      mallocs are captured.
 //!   4. On sismo detach (EOF on the control connection): flips
 //!      `enabled = false`, tears down the ring, returns to step 2.
-//!
-//! Phase A: capture is `(alloc_size, alloc_address, sequence)` only.
-//! Stack snapshot + register capture lands in Phase B.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -187,8 +187,7 @@ fn listenerThreadEntry(_: ?*anyopaque) callconv(.c) ?*anyopaque {
         g_dropped.store(0, .monotonic);
         // Stash the sampling interval and bump the generation so each
         // thread re-inits its threadlocal Sampler on its next malloc.
-        // sample_interval==0 is treated as "always sample" (legacy
-        // spike default before sampling existed).
+        // sample_interval==0 is treated as "always sample".
         g_sampling_interval = if (attach.config.sample_interval == 0) 1 else attach.config.sample_interval;
         _ = g_session_generation.fetchAdd(1, .release);
         g_rb = rb_ptr; // published via release of g_enabled below
@@ -346,8 +345,7 @@ fn sismoMallocShim(size: usize) callconv(.c) ?*anyopaque {
             // grows down; we copy upward (toward higher addresses).
             // The pages between sp and sp+8KB are part of the user's
             // stack region (assumed mapped — main thread always is;
-            // pthread defaults are 512KB). For deeper safety we'd
-            // probe-and-truncate; out of scope for the spike.
+            // pthread defaults are 512KB).
             const snapshot_dst: [*]u8 = s.ptr + @sizeOf(wire.AllocMetadata);
             const snapshot_src: [*]const u8 = @ptrFromInt(user_sp);
             @memcpy(snapshot_dst[0..STACK_SNAPSHOT_BYTES], snapshot_src[0..STACK_SNAPSHOT_BYTES]);

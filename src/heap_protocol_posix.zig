@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! POSIX implementation of the sismo heap-profiler control channel.
 //! Per `plans/05-heap-research.md`:
 //!
@@ -46,15 +49,15 @@ pub const ProtocolError = error{
 };
 
 /// Shape of the first message sismo sends to the dormant client.
-/// Fixed-size; no length-prefixing needed for the spike. Future
-/// expansion: reserve some bytes or version-tag.
+/// Fixed-size; no length-prefixing. Future expansion: reserve some
+/// bytes or version-tag.
 pub const AttachConfig = extern struct {
     /// Wire-format version. Bump if the layout changes.
     version: u32 align(8),
     /// Size of the shm ring's data region in bytes. Power of two.
     ring_size: u32,
-    /// Sampling interval (bytes between samples). Currently informational
-    /// for the spike; the client doesn't sample yet.
+    /// Sampling interval (bytes between samples). Currently informational;
+    /// the client doesn't sample yet.
     sample_interval: u64,
     /// Reserved.
     _reserved: [16]u8,
@@ -75,8 +78,8 @@ const SUN_PATH_MAX: usize = @typeInfo(@FieldType(SockaddrUn, "path")).array.len;
 /// Hardcoded `/tmp` (not `$TMPDIR`) so the orchestrator can find the
 /// socket even when run with sudo — sudo gets root's TMPDIR (something
 /// like `/var/folders/zz/...`) which differs from the launching user's
-/// TMPDIR. /tmp is shared. For production we'd put per-user sockets
-/// under the user's runtime dir, but the spike doesn't need that.
+/// TMPDIR. /tmp is shared. A future hardening pass could put per-user
+/// sockets under the user's runtime dir.
 pub fn socketPath(pid: i32, buf: []u8) ![:0]u8 {
     const path = std.fmt.bufPrintZ(buf, "/tmp/sismo-heap-{d}.sock", .{pid}) catch
         return error.PathTooLong;

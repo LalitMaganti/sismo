@@ -1,6 +1,6 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
-// Licensed under the Apache License, Version 2.0.
-//
+// Licensed under the MIT License.
+
 // Tiny C shim around Perfetto's C TrackEvent SDK
 // (`perfetto/public/track_event.h`) for the sample-target workload.
 //

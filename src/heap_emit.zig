@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Encodes sismo-heap's aggregated allocations into a Perfetto
 //! ProfilePacket-bearing .pftrace file. trace_processor populates the
 //! `heap_profile_allocation` table from this.
@@ -295,7 +298,7 @@ fn encodeTracePacketWithProfile(gpa: std.mem.Allocator, td: TraceData) ![]u8 {
 // AppendRawProtoBytes — bytes go through verbatim.
 
 const c = @cImport({
-    @cInclude("perfetto_shim.h");
+    @cInclude("src/c/perfetto_shim.h");
 });
 const perfetto_proto = @import("perfetto_proto.zig");
 

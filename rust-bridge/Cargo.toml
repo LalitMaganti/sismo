@@ -1,3 +1,6 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
 [package]
 name = "rust-bridge"
 version = "0.0.0"

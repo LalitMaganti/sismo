@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Zig wrapper for the in-process Perfetto traced_probes producer.
 //! Backed by `src/c/sismo_traced_probes.cc`, which links against
 //! libperfetto.a and drives ProbesProducer on a worker thread inside
@@ -15,7 +18,7 @@ comptime {
 }
 
 pub const c = @cImport({
-    @cInclude("sismo_traced_probes.h");
+    @cInclude("src/c/sismo_traced_probes.h");
 });
 
 pub const ProbesSvc = opaque {};

@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 // src/c/sismo_traced_probes.cc — embed Perfetto's ProbesProducer in-process.
 //
 // Mirrors sismo_traced.cc's worker-thread skeleton: MaybeLockFreeTaskRunner
@@ -6,16 +9,16 @@
 // been issued, and let the runner block on Run() until Quit() is called
 // from the orchestrator.
 
-#include "sismo_traced_probes.h"
-
-#include "perfetto/ext/base/lock_free_task_runner.h"
-#include "src/traced/probes/probes_producer.h"
+#include "src/c/sismo_traced_probes.h"
 
 #include <atomic>
 #include <memory>
 #include <stdio.h>
 #include <string>
 #include <thread>
+
+#include "perfetto/ext/base/lock_free_task_runner.h"
+#include "src/traced/probes/probes_producer.h"
 
 namespace {
 

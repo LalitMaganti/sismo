@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
 # tools/setup_perfetto.sh — bootstrap the vendored Perfetto subtree at
 # third_party/src/perfetto/ and gen a per-target build output dir.
 #

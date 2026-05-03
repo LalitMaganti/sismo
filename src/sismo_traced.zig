@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Zig wrapper for the in-process Perfetto tracing service. Backed by
 //! `src/c/sismo_traced.cc`, which links against `libperfetto.a` and
 //! drives `ServiceIPCHost`.
@@ -5,7 +8,7 @@
 const std = @import("std");
 
 pub const c = @cImport({
-    @cInclude("sismo_traced.h");
+    @cInclude("src/c/sismo_traced.h");
 });
 
 pub const TracedSvc = opaque {};

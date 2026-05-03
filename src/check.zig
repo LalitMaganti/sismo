@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Cross-platform compile sentinel. `zig build check -Dtarget=…` builds
 //! this file as an object (no link, no install) for the current target,
 //! exercising every module that's expected to compile on the OSes we

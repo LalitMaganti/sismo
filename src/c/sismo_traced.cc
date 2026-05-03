@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 // src/c/sismo_traced.cc — C++ implementation of the sismo_traced.h ABI.
 //
 // LockFreeTaskRunner pins itself to the constructing thread (see
@@ -6,10 +9,7 @@
 // thread spawned by create(), wait for "ready", then return control to
 // the caller. stop() sets Quit() (safe cross-thread); destroy() joins.
 
-#include "sismo_traced.h"
-
-#include "perfetto/ext/base/lock_free_task_runner.h"
-#include "perfetto/ext/tracing/ipc/service_ipc_host.h"
+#include "src/c/sismo_traced.h"
 
 #include <atomic>
 #include <list>
@@ -18,6 +18,9 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+
+#include "perfetto/ext/base/lock_free_task_runner.h"
+#include "perfetto/ext/tracing/ipc/service_ipc_host.h"
 
 namespace {
 

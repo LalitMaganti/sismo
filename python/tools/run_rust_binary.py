@@ -1,5 +1,5 @@
 # Copyright 2026 The Sismo Authors. All rights reserved.
-# Licensed under the Apache License, Version 2.0.
+# Licensed under the MIT License.
 
 """Wrapper to run cargo, rustc and other Rust binaries from third_party/."""
 

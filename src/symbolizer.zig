@@ -1,5 +1,8 @@
-//! Zig-side wrapper for the wholesym FFI in `rust-bridge` (journal 03).
-//! Mirrors `src/unwinder.zig`'s shape: opaque handle, error-union API,
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
+//! Zig-side wrapper for the wholesym FFI in `rust-bridge`. Mirrors
+//! `src/unwinder.zig`'s shape: opaque handle, error-union API,
 //! slice-based string parameters.
 //!
 //! Lifecycle:

@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! `sismo datasource <id> [<id>...]` — daemonized producer hosting one
 //! or more sismo data sources in this single process.
 //!
@@ -30,7 +33,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @cImport({
-    @cInclude("perfetto_shim.h");
+    @cInclude("src/c/perfetto_shim.h");
 });
 
 // macOS-only data sources: perf_event-based Linux equivalents (and ETW

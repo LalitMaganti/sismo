@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Zig wrapper for the in-process Perfetto traced_perf producer.
 //! Backed by `src/c/sismo_traced_perf.cc`, which links against
 //! libperfetto.a and drives PerfProducer on a worker thread inside
@@ -15,7 +18,7 @@ comptime {
 }
 
 pub const c = @cImport({
-    @cInclude("sismo_traced_perf.h");
+    @cInclude("src/c/sismo_traced_perf.h");
 });
 
 pub const PerfSvc = opaque {};

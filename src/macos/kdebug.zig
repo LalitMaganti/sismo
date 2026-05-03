@@ -1,4 +1,7 @@
-//! macOS kdebug reader (sequencing item #3 in the master plan).
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
+//! macOS kdebug reader.
 //!
 //! Captures `DBG_MACH_SCHED` events via the `KERN_KDEBUG` sysctl path,
 //! the same channel Apple's `trace(1)` and Instruments use under the hood.
@@ -357,7 +360,7 @@ pub fn extractFunc(debugid: u32) Func {
     return @enumFromInt(@as(u2, @intCast(debugid & c.KDBG_FUNC_MASK)));
 }
 
-/// Sleep helper; lets the standalone spike pull in this module without
+/// Sleep helper; lets standalone callers pull in this module without
 /// dragging std.time.
 pub fn sleepMs(ms: c_uint) void {
     const ts: std.c.timespec = .{

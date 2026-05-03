@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
 # tools/validate_heap_trace.sh — assert /tmp/sismo-heap.pftrace
 # (or $1) loads in trace_processor and contains heap_profile_allocation
 # rows. Used as the validation step in plans/07-unified-e2e.md Phase 4.

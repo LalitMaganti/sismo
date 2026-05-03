@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Wire-format record types for the sismo heap profiler IPC. Layouts
 //! mirror heapprofd's `wire_protocol.h` closely (same fields, same
 //! ordering, same atomicity rules) — see plans/05-heap-research.md

@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 // src/c/sismo_traced_perf.cc — embed Perfetto's PerfProducer in-process.
 //
 // Mirrors sismo_traced_probes.cc. The extra wrinkle is that PerfProducer
@@ -6,17 +9,17 @@
 // default-constructed in the non-Android branch, which is exactly what
 // sismo wants.
 
-#include "sismo_traced_perf.h"
-
-#include "perfetto/ext/base/lock_free_task_runner.h"
-#include "src/profiling/perf/perf_producer.h"
-#include "src/profiling/perf/proc_descriptors.h"
+#include "src/c/sismo_traced_perf.h"
 
 #include <atomic>
 #include <memory>
 #include <stdio.h>
 #include <string>
 #include <thread>
+
+#include "perfetto/ext/base/lock_free_task_runner.h"
+#include "src/profiling/perf/perf_producer.h"
+#include "src/profiling/perf/proc_descriptors.h"
 
 namespace {
 

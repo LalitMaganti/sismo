@@ -1,11 +1,13 @@
-//! Zig-side wrapper for the framehop FFI in `rust-bridge` (sequencing
-//! item #6, journal 02 phase 2 step 2d). Exposes a friendlier API on
-//! top of the four `sismo_unwinder_*` extern entries declared in
-//! `rust-bridge/include/bridge.h`.
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
+//! Zig-side wrapper for the framehop FFI in `rust-bridge`. Exposes a
+//! friendlier API on top of the `sismo_unwinder_*` extern entries
+//! declared in `rust-bridge/include/bridge.h`.
 //!
-//! Pattern matches `src/main.zig`'s inline `extern "c"` decls — Zig
-//! does not `@cImport` the bridge header today; the C header is the
-//! canonical reference, this module is the canonical Zig API.
+//! Zig does not `@cImport` the bridge header today; the C header
+//! (`rust-bridge/include/bridge.h`) is the canonical reference, this
+//! module is the canonical Zig API.
 //!
 //! Lifecycle:
 //!     const u = try unwinder.create();

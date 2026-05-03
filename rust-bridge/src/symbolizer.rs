@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! wholesym FFI surface — resolves AVMA → demangled function name +
 //! offset (and inline frame info where debug info is available).
 //!

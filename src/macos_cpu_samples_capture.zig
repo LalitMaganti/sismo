@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! In-process Mach CPU sampler → `sismo.macos_cpu_samples` producer.
 //!
 //! Periodic stack sampler driven by the muxer pattern (see
@@ -21,7 +24,7 @@ const sismo_config = @import("sismo_config.zig");
 const perfetto_proto = @import("perfetto_proto.zig");
 
 const perfetto = @cImport({
-    @cInclude("perfetto_shim.h");
+    @cInclude("src/c/perfetto_shim.h");
 });
 
 const DS_NAME = "sismo.macos_cpu_samples";

@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Framehop FFI surface — the Rust unwinder samply uses, exposed for Zig.
 //!
 //! Lifecycle: `sismo_unwinder_create_arm64()` returns an opaque handle;

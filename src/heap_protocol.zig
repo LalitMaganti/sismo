@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! OS dispatcher for the heap-profiler control channel. Re-exports
 //! the per-OS implementation so consumers (heap_capture, heap_preload_*,
 //! cmd_record) only ever say `@import("heap_protocol.zig")`.

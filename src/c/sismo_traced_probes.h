@@ -1,6 +1,6 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
-// Licensed under the Apache License, Version 2.0.
-//
+// Licensed under the MIT License.
+
 // C ABI for the embedded Perfetto traced_probes producer (Linux only).
 //
 // `sismo record` hosts ProbesProducer in-process on a worker thread so

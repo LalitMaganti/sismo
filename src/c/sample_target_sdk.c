@@ -1,11 +1,11 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
-// Licensed under the Apache License, Version 2.0.
-//
+// Licensed under the MIT License.
+
 // Implementation of the sample-target TrackEvent shim. See header for
 // the why; the macros below are the standard Perfetto C SDK setup
 // distilled to a single category named `app`.
 
-#include "sample_target_sdk.h"
+#include "src/c/sample_target_sdk.h"
 
 #include <stdatomic.h>
 

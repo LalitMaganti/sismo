@@ -1,4 +1,7 @@
-//! macOS Mach-based sampler (sequencing item #6 in the master plan).
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
+//! macOS Mach-based sampler.
 //!
 //! Wraps `task_threads` + `thread_get_state` to enumerate threads and read
 //! their register state. For self-profiling (target = own process) no
@@ -215,9 +218,9 @@ pub fn threadId(thread: thread_t) SamplerError!u64 {
 ///   - Trips on functions compiled without `-fno-omit-frame-pointer` (rare
 ///     on macOS — Apple ABI requires FP).
 ///
-/// Sufficient for the spike and for "good enough" prod sampling on macOS,
-/// where the system ABI keeps frame pointers. Will swap for framehop once
-/// rust-bridge has it.
+/// Sufficient for "good enough" sampling on macOS, where the system ABI
+/// keeps frame pointers. framehop (via rust-bridge) is the higher-fidelity
+/// option once we wire it in here.
 ///
 /// Returns the number of frames written to `out_pcs`. The current PC is
 /// always the first entry; saved LRs follow.

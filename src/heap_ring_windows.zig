@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Windows stub for the heap-profiler shared-memory ring. The Windows
 //! analog of POSIX `shm_open` + double-`mmap` mirror trick is
 //! `CreateFileMappingW` + two `MapViewOfFileEx` calls into a region

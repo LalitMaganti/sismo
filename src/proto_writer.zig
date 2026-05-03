@@ -1,8 +1,9 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Minimal protobuf wire-format encoder. Used by heap_emit.zig to
 //! emit ProfilePacket / InternedData / Mapping / Frame / Callstack
-//! messages directly into a .pftrace file (avoids touching the C SDK
-//! shim, which doesn't expose builders for the profiling proto family
-//! anyway — see plans/perfetto-upstream-bugs.md §1).
+//! messages directly into a .pftrace file.
 //!
 //! Wire format reference:
 //!   https://protobuf.dev/programming-guides/encoding/

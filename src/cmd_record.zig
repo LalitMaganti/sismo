@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! `sismo record` — the unified recorder subcommand.
 //!
 //! Hosts an in-process Perfetto tracing service (`ServiceIPCHost`) so
@@ -48,7 +51,7 @@ const heap_protocol = @import("heap_protocol.zig");
 const sismo_config = @import("sismo_config.zig");
 const paths = @import("sismo_paths.zig");
 const c = @cImport({
-    @cInclude("perfetto_shim.h");
+    @cInclude("src/c/perfetto_shim.h");
 });
 
 // macOS-only data sources. Linux needs perf_event-based equivalents,

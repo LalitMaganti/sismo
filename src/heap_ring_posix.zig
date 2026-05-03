@@ -1,3 +1,6 @@
+// Copyright 2026 The Sismo Authors. All rights reserved.
+// Licensed under the MIT License.
+
 //! Shared-memory ring buffer for sismo heap profiler IPC. Layout and
 //! algorithm follow heapprofd's `shared_ring_buffer.{h,cc}` closely:
 //!
@@ -218,8 +221,8 @@ pub const RingBuffer = struct {
     // ---- Spinlock --------------------------------------------------------
 
     fn lock(self: *RingBuffer) void {
-        // Test-test-and-set with exponential-ish backoff. Spike-quality;
-        // production would use a futex on Linux.
+        // Test-test-and-set with exponential-ish backoff. A futex
+        // (Linux) would be lower-overhead under contention.
         var spins: u32 = 0;
         while (true) {
             if (@atomicLoad(u32, &self.meta.spinlock, .monotonic) == 0) {
