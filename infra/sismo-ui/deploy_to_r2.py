@@ -200,10 +200,17 @@ def make_other_channel_updater(channel, new_version):
 
 
 def build(channel):
+  # Compute the sismo-side SHA *before* chdir to PERFETTO_ROOT so it's the
+  # sismo repo's HEAD, not perfetto's. Pass it through as a build-time env
+  # var so write_version_header.py bakes it into perfetto_version{.gen.h,.ts}
+  # — the version footer in the deployed UI then identifies the sismo
+  # commit that was deployed. See google/perfetto#5717.
+  sismo_sha = check_output_str(['git', 'rev-parse', 'HEAD'], cwd=SISMO_ROOT)
+  os.environ['PERFETTO_VERSION_HEADER_OVERRIDE_SCM_REVISION'] = sismo_sha
+
   os.chdir(PERFETTO_ROOT)
-  git_sha = check_output_str(['git', 'rev-parse', 'HEAD'])
   print('=' * 70)
-  print(f'Building UI for channel {channel} @ {git_sha}')
+  print(f'Building UI for channel {channel} @ sismo {sismo_sha}')
   print('=' * 70)
   version = check_output_str(['tools/write_version_header.py', '--stdout'])
   check_call_and_log(['tools/install-build-deps', '--ui'])

@@ -3,6 +3,7 @@
 
 import {Embedder} from './embedder';
 import {defaultPlugins} from './default_plugins';
+import {SismoHomePage} from './sismo_home_page';
 
 /**
  * Embedder used when the UI is served from a sismo deployment
@@ -17,6 +18,6 @@ export class SismoEmbedder implements Embedder {
     color: '#e07020',
   };
   readonly defaultPlugins = defaultPlugins;
-  readonly homePage = undefined;
+  readonly homePage = SismoHomePage;
   readonly brandLogo = undefined;
 }
