@@ -14,10 +14,12 @@ patch becomes a no-op and we delete the file from this directory.
 
 ## What does NOT belong here
 
-Sismo-permanent modifications (sismo plugins, the `SismoEmbedder`, sismo
-build-rule tweaks, the `.github/` deletion, README replacement, etc.) live as
-real commits on the `sismo-perfetto` fork's `main` branch. They are not
-patches — they are sismo's product, browsable in the fork tree.
+Sismo-permanent additions (the `SismoEmbedder`, the `external_embedder.ts`
+override that wires it in, future sismo plugins) live as overlay files
+under `third_party/overlays/perfetto/<mirror-of-perfetto-path>` and are
+copied into the perfetto checkout by `tools/install-build-deps` after
+patches are applied. They are not patches — they are sismo's own
+content, browsable as normal source files in this tree.
 
 ## File naming
 

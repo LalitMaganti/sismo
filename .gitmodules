@@ -1,3 +1,3 @@
 [submodule "third_party/src/perfetto"]
 	path = third_party/src/perfetto
-	url = git@github.com:LalitMaganti/sismo-perfetto.git
+	url = git@github.com:google/perfetto.git

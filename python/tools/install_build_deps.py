@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 """Installs build dependencies to third_party/bin/ and applies bridge
-patches to the Perfetto submodule.
+patches and overlays to the Perfetto submodule.
 
 Mirrors syntaqlite's install-build-deps pattern: pinned, checksummed binary
 tarballs into third_party/bin/{platform_dir}/. Idempotent via per-dep .stamp
@@ -12,14 +12,25 @@ Sismo deps:
   - Zig 0.16.0 (binary tarball from ziglang.org)
   - Rust 1.94.0 (binary tarball from static.rust-lang.org)
 
-Source deps (e.g. the Perfetto fork) are tracked as git submodules under
-third_party/src/ — fetch them with `git submodule update --init --recursive`.
+Source deps (the upstream Perfetto checkout) are tracked as git submodules
+under third_party/src/ — fetch them with
+`git submodule update --init --recursive`. The submodule pin points
+directly at google/perfetto; sismo no longer maintains a fork.
 
 Patches in third_party/patches/perfetto/*.patch are applied to the Perfetto
 submodule via `git apply`. These are bridge patches for in-flight upstream
-PRs only; sismo-permanent modifications live as commits on the
-sismo-perfetto fork. Each patch is idempotent — running install-build-deps
-twice is a no-op. See third_party/patches/perfetto/README.md.
+PRs only; each patch is idempotent and gets deleted when the corresponding
+upstream PR merges.
+
+Overlays in third_party/overlays/perfetto/<perfetto-relative-path> are
+copied into the Perfetto checkout after patches apply. Overlays are
+sismo-permanent additions (e.g. ui/src/core/embedder/sismo_embedder.ts)
+that don't correspond to any upstream PR — they live as normal
+TypeScript/Python/whatever files in this repo and only land in the
+Perfetto checkout at install time.
+
+See third_party/patches/perfetto/README.md for the patches/overlays
+convention.
 """
 
 from __future__ import annotations
@@ -320,6 +331,8 @@ def install_binary_dep(dep: BinaryDep, target_dir: str) -> bool:
 
 PERFETTO_DIR: str = os.path.join(THIRD_PARTY_DIR, "src", "perfetto")
 PERFETTO_PATCHES_DIR: str = os.path.join(THIRD_PARTY_DIR, "patches", "perfetto")
+PERFETTO_OVERLAYS_DIR: str = os.path.join(
+    THIRD_PARTY_DIR, "overlays", "perfetto")
 
 
 def apply_perfetto_patches() -> bool:
@@ -392,6 +405,48 @@ def apply_perfetto_patches() -> bool:
     return True
 
 
+def install_perfetto_overlays() -> bool:
+    """Copies sismo-permanent overlay files from third_party/overlays/perfetto/
+    into the Perfetto submodule. Overlay files are sismo additions that don't
+    correspond to any in-flight upstream PR — typically new files like
+    ui/src/core/embedder/{external_embedder,sismo_embedder}.ts that override
+    perfetto's defaults. Each overlay's path inside the overlays dir mirrors
+    its destination inside the perfetto checkout.
+    """
+    if not os.path.isdir(PERFETTO_OVERLAYS_DIR):
+        return True
+
+    if not os.path.isdir(os.path.join(PERFETTO_DIR, ".git")):
+        vprint(1, "Perfetto submodule not initialized; skipping overlay copy.")
+        return True
+
+    copied = 0
+    for src_dir, _, files in os.walk(PERFETTO_OVERLAYS_DIR):
+        for name in files:
+            src = os.path.join(src_dir, name)
+            rel = os.path.relpath(src, PERFETTO_OVERLAYS_DIR)
+            dst = os.path.join(PERFETTO_DIR, rel)
+
+            # Skip if already up to date (same content). Idempotent so a
+            # subsequent run doesn't churn mtimes and trigger needless
+            # rebuilds in build systems that mtime-track inputs.
+            if (os.path.exists(dst)
+                    and os.path.getsize(dst) == os.path.getsize(src)):
+                with open(src, "rb") as fa, open(dst, "rb") as fb:
+                    if fa.read() == fb.read():
+                        vprint(2, f"  {rel}: up to date")
+                        continue
+
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            vprint(1, f"installed perfetto overlay: {rel}")
+            copied += 1
+
+    if copied == 0:
+        vprint(2, "all perfetto overlays already up to date")
+    return True
+
+
 def main() -> int:
     global VERBOSITY
 
@@ -415,13 +470,14 @@ def main() -> int:
     parser.add_argument(
         "--no-patches",
         action="store_true",
-        help="Skip applying Perfetto bridge patches"
+        help="Skip applying Perfetto bridge patches and overlays"
     )
     parser.add_argument(
         "--patches-only",
         action="store_true",
-        help="Only apply Perfetto patches; skip toolchain installs. Useful "
-             "in CI where Perfetto's own install-build-deps handles tooling"
+        help="Only apply Perfetto patches and overlays; skip toolchain "
+             "installs. Useful in CI where Perfetto's own install-build-deps "
+             "handles tooling"
     )
     args = parser.parse_args()
     VERBOSITY = args.verbose
@@ -447,6 +503,8 @@ def main() -> int:
 
     if not args.no_patches:
         if not apply_perfetto_patches():
+            success = False
+        if not install_perfetto_overlays():
             success = False
 
     return 0 if success else 1
