@@ -10,7 +10,10 @@ runs:
   using: composite
   steps:
     # Toolchain downloads from install-build-deps. Stable across commits;
-    # invalidated only when install-build-deps itself changes.
+    # full match keys off install_build_deps.py (which contains the pin),
+    # restore-keys lets us fuzzy-restore a slightly stale cache when that
+    # file changes for unrelated reasons (e.g. zig version bumps). The
+    # downstream install-build-deps run reconciles whatever's missing.
     - name: Cache buildtools + third_party
       uses: actions/cache@v5
       with:
@@ -18,17 +21,21 @@ runs:
           third_party/src/perfetto/buildtools
           third_party/src/perfetto/third_party/pnpm
         key: perfetto-buildtools-${{ runner.os }}-${{ hashFiles('python/tools/install_build_deps.py') }}
+        restore-keys: |
+          perfetto-buildtools-${{ runner.os }}-
         save-always: true
 
     # pnpm node_modules. The lockfile lives inside the perfetto checkout,
     # which isn't on disk yet at cache-restore time — key off the pin in
-    # python/tools/install_build_deps.py instead. The pin determines which
-    # lockfile we'll end up with, so this invalidates correctly.
+    # install_build_deps.py instead. restore-keys lets a stale node_modules
+    # cache seed `pnpm install`, which then reconciles against the lockfile.
     - name: Cache ui/node_modules
       uses: actions/cache@v5
       with:
         path: third_party/src/perfetto/ui/node_modules
         key: perfetto-node-modules-${{ runner.os }}-${{ hashFiles('python/tools/install_build_deps.py') }}
+        restore-keys: |
+          perfetto-node-modules-${{ runner.os }}-
         save-always: true
 
     # ccache for the WASM C++ compile (trace_processor, traceconv, etc).
