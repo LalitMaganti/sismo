@@ -23,7 +23,6 @@ runs:
         key: perfetto-buildtools-${{ runner.os }}-${{ hashFiles('python/tools/install_build_deps.py') }}
         restore-keys: |
           perfetto-buildtools-${{ runner.os }}-
-        save-always: true
 
     # pnpm node_modules. The lockfile lives inside the perfetto checkout,
     # which isn't on disk yet at cache-restore time — key off the pin in
@@ -36,7 +35,6 @@ runs:
         key: perfetto-node-modules-${{ runner.os }}-${{ hashFiles('python/tools/install_build_deps.py') }}
         restore-keys: |
           perfetto-node-modules-${{ runner.os }}-
-        save-always: true
 
     # ccache for the WASM C++ compile (trace_processor, traceconv, etc).
     # Per-SHA key with a fuzzy restore-keys fallback so every run starts
@@ -48,7 +46,6 @@ runs:
         key: perfetto-ccache-${{ runner.os }}-${{ github.sha }}
         restore-keys: |
           perfetto-ccache-${{ runner.os }}-
-        save-always: true
 
     # Incremental build state. tsc, rollup, and ninja all use mtime-based
     # dep tracking; restoring out/ui means small source changes only
@@ -60,7 +57,6 @@ runs:
         key: perfetto-out-ui-${{ runner.os }}-${{ github.sha }}
         restore-keys: |
           perfetto-out-ui-${{ runner.os }}-
-        save-always: true
 
     # build.js auto-detects ccache on PATH (sets GN cc_wrapper="ccache").
     # ubuntu-latest does not preinstall ccache, so apt-install it first.
