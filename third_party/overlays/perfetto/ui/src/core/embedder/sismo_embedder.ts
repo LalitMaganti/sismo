@@ -3,6 +3,7 @@
 
 import {Embedder} from './embedder';
 import {defaultPlugins} from './default_plugins';
+import {SismoHomePage} from './sismo_home_page';
 
 // Transparent inline SVG placeholder used as the sidebar wordmark until a
 // proper sismo logo asset is designed. Keeps perfetto's brand aspect ratio
@@ -17,13 +18,10 @@ const SISMO_BRAND_PLACEHOLDER =
  * (ui.sismo.dev, the Cloudflare pages.dev preview URLs, and localhost
  * dev-server instances of this fork).
  *
- * `homePage` is undefined here on purpose: the sismo home page is an
- * overlay of perfetto's frontend/home_page.ts (same exported class name
- * `HomePage`). Wiring it through the embedder field would create a
- * circular import (embedder -> home page -> AppImpl -> createEmbedder
- * -> external_embedder -> embedder), which rollup 4 can't print
- * cleanly because perfetto's onwarn handler still uses the rollup-2
- * `warning.cycle` field.
+ * `homePage` references SismoHomePage; the App is delivered to it via
+ * Mithril attrs (see PR #5712) so the import graph from this module to
+ * SismoHomePage doesn't reach AppImpl, avoiding the cycle that would
+ * otherwise form via createEmbedder.
  */
 export class SismoEmbedder implements Embedder {
   readonly analyticsId = undefined;
@@ -33,6 +31,6 @@ export class SismoEmbedder implements Embedder {
     color: '#e07020',
   };
   readonly defaultPlugins = defaultPlugins;
-  readonly homePage = undefined;
+  readonly homePage = SismoHomePage;
   readonly brandLogo = {src: SISMO_BRAND_PLACEHOLDER, alt: 'sismo'};
 }

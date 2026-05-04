@@ -1,5 +1,5 @@
 diff --git a/tools/gen_ui_imports b/tools/gen_ui_imports
-index 3114fcd1a77..9d052de939a 100755
+index 3114fcd1a7..9d052de939 100755
 --- a/tools/gen_ui_imports
 +++ b/tools/gen_ui_imports
 @@ -59,9 +59,23 @@ def plugin_has_css(dir):
@@ -71,7 +71,7 @@ index 3114fcd1a77..9d052de939a 100755
  
  
 diff --git a/ui/build.js b/ui/build.js
-index 03974cfa25b..21823b419f7 100644
+index 03974cfa25..21823b419f 100644
 --- a/ui/build.js
 +++ b/ui/build.js
 @@ -77,6 +77,13 @@ const pjoin = path.join;
@@ -231,7 +231,7 @@ index 03974cfa25b..21823b419f7 100644
  
 diff --git a/ui/config/default.json b/ui/config/default.json
 new file mode 100644
-index 00000000000..ccf7c9a51f2
+index 0000000000..ccf7c9a51f
 --- /dev/null
 +++ b/ui/config/default.json
 @@ -0,0 +1,6 @@
@@ -242,7 +242,7 @@ index 00000000000..ccf7c9a51f2
 +  "includePlugins": null
 +}
 diff --git a/ui/src/assets/index.html b/ui/src/assets/index.html
-index c3ce2b14df3..cbcffcbee74 100644
+index c3ce2b14df..cbcffcbee7 100644
 --- a/ui/src/assets/index.html
 +++ b/ui/src/assets/index.html
 @@ -2,9 +2,9 @@
@@ -267,7 +267,7 @@ index c3ce2b14df3..cbcffcbee74 100644
  If you are seeing this message, something went wrong while loading the UI.
  In most cases this is due to very slow or flaky network and it goes away by
 diff --git a/ui/src/core/embedder/default_embedder.ts b/ui/src/core/embedder/default_embedder.ts
-index 8fe2231942a..eeceefaf8ee 100644
+index 8fe2231942..eeceefaf8e 100644
 --- a/ui/src/core/embedder/default_embedder.ts
 +++ b/ui/src/core/embedder/default_embedder.ts
 @@ -21,4 +21,6 @@ export class DefaultEmbedder implements Embedder {
@@ -278,33 +278,46 @@ index 8fe2231942a..eeceefaf8ee 100644
 +  readonly brandLogo = undefined;
  }
 diff --git a/ui/src/core/embedder/embedder.ts b/ui/src/core/embedder/embedder.ts
-index bdde74c3138..a7ce75369df 100644
+index bdde74c313..ac6e78654e 100644
 --- a/ui/src/core/embedder/embedder.ts
 +++ b/ui/src/core/embedder/embedder.ts
-@@ -12,6 +12,8 @@
+@@ -12,6 +12,19 @@
  // See the License for the specific language governing permissions and
  // limitations under the License.
  
 +import m from 'mithril';
++import {App} from '../../public/app';
++
++/**
++ * Attrs passed to an embedder-supplied home-page component. Carrying the
++ * `App` instance via Mithril attrs lets embedders use commands/settings
++ * without importing `AppImpl`, which would form a circular import (the
++ * embedder is referenced from `AppImpl` via `createEmbedder`).
++ */
++export interface HomePageAttrs {
++  readonly app: App;
++}
 +
  /**
   * Configuration for an embedder-provided default extension server.
   */
-@@ -62,4 +64,12 @@ export interface Embedder {
+@@ -62,4 +75,14 @@ export interface Embedder {
  
    // Returns the list of plugin IDs that should be enabled by default.
    readonly defaultPlugins: ReadonlyArray<string>;
 +
-+  // Mithril component rendered at route '/'. Undefined falls back to the
++  // Mithril component rendered at route '/'. Receives the running App via
++  // attrs so embedder-supplied components can reach commands/settings/the
++  // router without importing AppImpl. Undefined falls back to the
 +  // built-in HomePage.
-+  readonly homePage: m.ComponentTypes | undefined;
++  readonly homePage: m.ComponentTypes<HomePageAttrs> | undefined;
 +
 +  // Sidebar wordmark image. Undefined falls back to the bundled Perfetto
 +  // wordmark; embedders override to swap it out.
 +  readonly brandLogo: {readonly src: string; readonly alt?: string} | undefined;
  }
 diff --git a/ui/src/core/embedder/perfetto_ui_embedder.ts b/ui/src/core/embedder/perfetto_ui_embedder.ts
-index 1a89244f4c0..e349b95ff5d 100644
+index 1a89244f4c..e349b95ff5 100644
 --- a/ui/src/core/embedder/perfetto_ui_embedder.ts
 +++ b/ui/src/core/embedder/perfetto_ui_embedder.ts
 @@ -24,4 +24,6 @@ export class PerfettoUiEmbedder implements Embedder {
@@ -315,21 +328,24 @@ index 1a89244f4c0..e349b95ff5d 100644
 +  readonly brandLogo = undefined;
  }
 diff --git a/ui/src/frontend/index.ts b/ui/src/frontend/index.ts
-index a5845a59907..8f96a925f30 100644
+index a5845a5990..abba891f32 100644
 --- a/ui/src/frontend/index.ts
 +++ b/ui/src/frontend/index.ts
-@@ -358,7 +358,8 @@ function onCssLoaded(app: AppImpl) {
+@@ -358,7 +358,11 @@ function onCssLoaded(app: AppImpl) {
    document.body.innerHTML = '';
  
    const pages = app.pages;
 -  pages.registerPage({route: '/', render: () => m(HomePage)});
-+  const homePage = app.embedder.homePage ?? HomePage;
-+  pages.registerPage({route: '/', render: () => m(homePage)});
++  const homePage = app.embedder.homePage;
++  pages.registerPage({
++    route: '/',
++    render: () => (homePage ? m(homePage, {app}) : m(HomePage)),
++  });
    const router = new Router();
    router.onRouteChanged = routeChange;
  
 diff --git a/ui/src/frontend/ui_main.ts b/ui/src/frontend/ui_main.ts
-index 8a7c53c031c..02187c6e826 100644
+index 8a7c53c031..02187c6e82 100644
 --- a/ui/src/frontend/ui_main.ts
 +++ b/ui/src/frontend/ui_main.ts
 @@ -67,7 +67,7 @@ export class UiMain implements m.ClassComponent {
@@ -342,7 +358,7 @@ index 8a7c53c031c..02187c6e826 100644
        showStatusBarFlag.get() && renderStatusBar(app),
        app.perfDebugging.renderPerfStats(),
 diff --git a/ui/src/frontend/views/sidebar.ts b/ui/src/frontend/views/sidebar.ts
-index eac55a4c290..2e00fd60dd8 100644
+index eac55a4c29..2e00fd60dd 100644
 --- a/ui/src/frontend/views/sidebar.ts
 +++ b/ui/src/frontend/views/sidebar.ts
 @@ -80,7 +80,7 @@ export class Sidebar implements m.ClassComponent<SidebarAttrs> {

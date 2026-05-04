@@ -439,43 +439,49 @@ def install_source_dep(dep: SourceDep) -> bool:
             return False
 
     current = _git_head(abs_dir)
-    if current == dep.pin:
-        vprint(2, f"{dep.target_dir}: at pin {dep.pin[:10]}")
-        return True
+    if current != dep.pin:
+        if current:
+            vprint(1, f"{dep.target_dir}: {current[:10]} -> {dep.pin[:10]}")
+        else:
+            vprint(1,
+                   f"Fetching {dep.git_url} -> {dep.target_dir} "
+                   f"@ {dep.pin[:10]}")
 
-    if current:
-        vprint(1, f"{dep.target_dir}: {current[:10]} -> {dep.pin[:10]}")
-    else:
-        vprint(1, f"Fetching {dep.git_url} -> {dep.target_dir} @ {dep.pin[:10]}")
+        # Fetch the SHA directly; most forges allow reachable SHAs in want.
+        fetch = subprocess.run(
+            ["git", "-C", abs_dir, "fetch", "--depth", str(dep.fetch_depth),
+             dep.git_url, dep.pin],
+            capture_output=True,
+        )
+        if fetch.returncode != 0:
+            # Servers that reject SHA-in-want — fall back to deeper fetch.
+            rc = subprocess.run(
+                ["git", "-C", abs_dir, "fetch", "--depth",
+                 str(dep.fetch_depth * 2), dep.git_url],
+            ).returncode
+            if rc != 0:
+                print(f"Fetch failed: {dep.git_url}", file=sys.stderr)
+                return False
 
-    # Fetch the SHA directly; most forges allow reachable SHAs in want.
-    fetch = subprocess.run(
-        ["git", "-C", abs_dir, "fetch", "--depth", str(dep.fetch_depth),
-         dep.git_url, dep.pin],
-        capture_output=True,
-    )
-    if fetch.returncode != 0:
-        # Servers that reject SHA-in-want — fall back to a deeper full fetch.
-        rc = subprocess.run(
-            ["git", "-C", abs_dir, "fetch", "--depth",
-             str(dep.fetch_depth * 2), dep.git_url],
-        ).returncode
-        if rc != 0:
-            print(f"Fetch failed: {dep.git_url}", file=sys.stderr)
-            return False
-    # --force so a CI cache restore of gitignored subpaths (e.g. buildtools/)
-    # doesn't block the checkout. Pre-existing patches/overlays would also
-    # get reset here, but they're idempotently re-applied in the patch step.
+    # Always reset to clean pin state, even when HEAD already matches: prior
+    # runs leave patched modifications + untracked patch/overlay outputs in
+    # the working tree, and rebased patches collide with that stale state on
+    # the next forward apply. `git reset --hard` reverts patched tracked
+    # files; `git clean -fd` (no `-x`) drops untracked-non-gitignored leftovers
+    # while preserving cached buildtools/, out/ui/, ui/node_modules. The
+    # patches+overlays step that follows re-applies everything cleanly.
     rc = subprocess.run(
-        ["git", "-C", abs_dir, "checkout", "--force", "--detach", dep.pin]
+        ["git", "-C", abs_dir, "reset", "--hard", dep.pin, "-q"]
     ).returncode
     if rc != 0:
         print(
-            f"{dep.target_dir}: checkout of {dep.pin[:10]} failed",
+            f"{dep.target_dir}: reset to {dep.pin[:10]} failed",
             file=sys.stderr,
         )
         return False
+    subprocess.run(["git", "-C", abs_dir, "clean", "-fd", "-q"], check=False)
     _restore_mtimes_from_git(abs_dir)
+    vprint(2, f"{dep.target_dir}: at pin {dep.pin[:10]}")
     return True
 
 

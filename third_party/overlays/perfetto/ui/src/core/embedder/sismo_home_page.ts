@@ -1,18 +1,12 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-// Sismo's home page. Drop-in overlay for perfetto's
-// ui/src/frontend/home_page.ts — same exported class name (`HomePage`)
-// and same shape (Quick start, Shortcuts, Channel select), rebranded
-// title to 'Sismo', and the Google docs/privacy links replaced with a
-// sismo-on-GitHub link.
-//
-// Why this lives as an overlay (vs SismoEmbedder.homePage = SismoHomePage):
-// importing the class from sismo_embedder pulls in AppImpl, which pulls
-// in createEmbedder, which pulls in external_embedder, which pulls in
-// sismo_embedder — a cycle. Replacing home_page.ts directly side-steps
-// the cycle: frontend/index.ts already imports HomePage as the default,
-// no embedder reference required.
+// Sismo home page wired in via SismoEmbedder.homePage. PR #5712 passes
+// the running App through Mithril attrs so this file can stay clear of
+// AppImpl — importing AppImpl here would form a cycle (sismo_embedder
+// -> sismo_home_page -> AppImpl -> createEmbedder -> external_embedder
+// -> sismo_embedder). The App interface is in core/public/app.ts and
+// has no path back to createEmbedder.
 
 import m from 'mithril';
 import {
@@ -20,34 +14,35 @@ import {
   getCurrentChannel,
   getNextChannel,
   setChannel,
-} from '../core/channels';
-import {AppImpl} from '../core/app_impl';
-import {Anchor} from '../widgets/anchor';
-import {Button, ButtonVariant} from '../widgets/button';
-import {Intent} from '../widgets/common';
-import {HotkeyGlyphs, Keycap} from '../widgets/hotkey_glyphs';
-import {Switch} from '../widgets/switch';
-import {Stack} from '../widgets/stack';
-import {Icons} from '../base/semantic_icons';
-import {Icon} from '../widgets/icon';
-import {classNames} from '../base/classnames';
-import {Router} from '../core/router';
+} from '../channels';
+import {App} from '../../public/app';
+import {HomePageAttrs} from './embedder';
+import {Anchor} from '../../widgets/anchor';
+import {Button, ButtonVariant} from '../../widgets/button';
+import {Intent} from '../../widgets/common';
+import {HotkeyGlyphs, Keycap} from '../../widgets/hotkey_glyphs';
+import {Switch} from '../../widgets/switch';
+import {Stack} from '../../widgets/stack';
+import {Icons} from '../../base/semantic_icons';
+import {Icon} from '../../widgets/icon';
+import {classNames} from '../../base/classnames';
+import {Router} from '../router';
 import {
   KeyboardLayoutMap,
   nativeKeyboardLayoutMap,
   NotSupportedError,
-} from '../base/keyboard_layout_map';
-import {Spinner} from '../widgets/spinner';
-import {KeyMapping} from '../base/wasd_key_mapping';
+} from '../../base/keyboard_layout_map';
+import {Spinner} from '../../widgets/spinner';
+import {KeyMapping} from '../../base/wasd_key_mapping';
 
-export class HomePage implements m.ClassComponent {
-  view() {
+export class SismoHomePage implements m.ClassComponent<HomePageAttrs> {
+  view({attrs}: m.Vnode<HomePageAttrs>) {
     return m(
       '.pf-home-page',
       m(
         '.pf-home-page__center',
         m('.pf-home-page__title', 'Sismo'),
-        m(Hints),
+        m(Hints, {app: attrs.app}),
         m(ChannelSelect),
       ),
     );
@@ -110,15 +105,17 @@ class ChannelSelect implements m.ClassComponent {
   }
 }
 
-// Fallback keyboard map for environments where nativeKeyboardLayoutMap is
-// unavailable; converts 'KeyX' codes to their QWERTY glyphs.
 class EnglishQwertyKeyboardLayoutMap implements KeyboardLayoutMap {
   get(code: string): string {
     return code.replace(/^Key([A-Z])$/, '$1').toLowerCase();
   }
 }
 
-class Hints implements m.ClassComponent {
+interface HintsAttrs {
+  readonly app: App;
+}
+
+class Hints implements m.ClassComponent<HintsAttrs> {
   private keyMap?: KeyboardLayoutMap;
 
   oninit() {
@@ -148,8 +145,9 @@ class Hints implements m.ClassComponent {
     }
   }
 
-  view() {
-    const themeSetting = AppImpl.instance.settings.get<string>('theme');
+  view({attrs}: m.Vnode<HintsAttrs>) {
+    const {app} = attrs;
+    const themeSetting = app.settings.get<string>('theme');
     const isDarkMode = themeSetting?.get() === 'dark';
 
     return m(
@@ -165,9 +163,7 @@ class Hints implements m.ClassComponent {
               '.pf-home-page__button',
               {
                 onclick: () => {
-                  AppImpl.instance.commands.runCommand(
-                    'dev.perfetto.OpenTrace',
-                  );
+                  app.commands.runCommand('dev.perfetto.OpenTrace');
                 },
               },
               m(Icon, {icon: 'folder_open', className: 'pf-left-icon'}),
