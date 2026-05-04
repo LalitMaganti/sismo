@@ -21,7 +21,7 @@ jobs:
       - uses: ./.github/actions/setup-perfetto-ui
 
       - name: Install boto3
-        run: pip install --user boto3
+        run: pip install --user --upgrade 'boto3>=1.35.10'
 
       - name: Build & deploy stable
         env:
