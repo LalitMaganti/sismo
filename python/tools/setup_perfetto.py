@@ -107,6 +107,7 @@ ar = "zig ar"
 # extra_host_*flags empty so zig cc picks up the native target.
 extra_target_cflags = "-target {sismo_target}"
 extra_target_cxxflags = "-target {sismo_target}"
+extra_target_asmflags = "-target {sismo_target}"
 extra_target_ldflags = "-target {sismo_target} -fuse-ld=lld"
 
 enable_perfetto_traced_perf = true
