@@ -40,7 +40,7 @@ def main() -> int:
     if not os.access(RUN_DEV_SERVER, os.X_OK):
         print(
             f"perfetto run-dev-server not found at {RUN_DEV_SERVER} — "
-            f"did you `git submodule update --init --recursive`?",
+            f"did you run `tools/install-build-deps`?",
             file=sys.stderr,
         )
         return 1

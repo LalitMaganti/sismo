@@ -1,11 +1,12 @@
 # Copyright 2026 The Sismo Authors. All rights reserved.
 # Licensed under the MIT License.
 
-"""Bootstrap the vendored Perfetto subtree at third_party/src/perfetto/
-and gen a per-target build output dir.
+"""Bootstrap the Perfetto checkout at third_party/src/perfetto/ and gen a
+per-target build output dir.
 
 Steps:
-  1. Clone google/perfetto if not already present.
+  1. Ensure the perfetto source clone + sismo patches/overlays are in place
+     (delegates to tools/install-build-deps).
   2. Run Perfetto's install-build-deps to fetch gn, ninja, clang, protoc.
   3. gn gen the sismo build output dir with our args.
 
@@ -37,7 +38,6 @@ import sys
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PERFETTO_DIR: str = os.path.join(ROOT_DIR, "third_party", "src", "perfetto")
-PERFETTO_REMOTE: str = "https://github.com/google/perfetto.git"
 
 # Map of SISMO_TARGET → (out_name, target_os, target_cpu).
 TARGET_RESOLUTION: dict[str, tuple[str, str, str]] = {
@@ -120,39 +120,23 @@ enable_perfetto_unittests = false
 """
 
 
-def clone_or_pin(perfetto_pin: str) -> None:
-    print(f"==> Perfetto subtree at {PERFETTO_DIR}")
-    if not os.path.isdir(os.path.join(PERFETTO_DIR, ".git")):
-        print(f"==> cloning {PERFETTO_REMOTE}")
-        subprocess.check_call(
-            ["git", "clone", "--depth", "200", PERFETTO_REMOTE, PERFETTO_DIR]
-        )
-
-    if perfetto_pin:
-        print(f"==> pinning to {perfetto_pin}")
-        subprocess.check_call(
-            ["git", "-C", PERFETTO_DIR, "fetch", "--depth", "200",
-             "origin", "tag", perfetto_pin]
-        )
-        subprocess.check_call(
-            ["git", "-C", PERFETTO_DIR, "checkout", perfetto_pin]
-        )
-
-    head = subprocess.check_output(
-        ["git", "-C", PERFETTO_DIR, "describe", "--always"],
-        text=True,
-    ).strip()
-    print(f"    at {head}")
-
-
-def apply_sismo_patches() -> None:
-    print("==> applying sismo bridge patches (third_party/patches/perfetto/*.patch)")
-    # Reuse install-build-deps's idempotent patch+overlay logic directly
-    # rather than shelling out — same Python interpreter, same ROOT_DIR.
+def ensure_perfetto_source_and_patches() -> None:
+    """Idempotently clones perfetto at the pinned SHA + applies patches and
+    overlays. Delegates to install_build_deps so the source-of-truth for
+    SOURCE_DEPS, the patches list, and overlay copy logic stays there."""
     from python.tools.install_build_deps import (
+        SOURCE_DEPS,
         apply_perfetto_patches,
         install_perfetto_overlays,
+        install_source_dep,
     )
+    print(f"==> Perfetto checkout at {PERFETTO_DIR}")
+    for dep in SOURCE_DEPS:
+        if dep.name != "perfetto":
+            continue
+        if not install_source_dep(dep):
+            sys.exit("perfetto source install failed")
+    print("==> applying sismo bridge patches (third_party/patches/perfetto/*.patch)")
     if not apply_perfetto_patches():
         sys.exit("perfetto patch apply failed")
     if not install_perfetto_overlays():
@@ -220,11 +204,6 @@ def main() -> int:
         default=os.environ.get("SISMO_TARGET", ""),
         help="Target triple for cross-compile (also honored via SISMO_TARGET env)",
     )
-    parser.add_argument(
-        "--pin",
-        default=os.environ.get("PERFETTO_PIN", ""),
-        help="Pin the Perfetto checkout to a tag (e.g. v54.0). Default: HEAD.",
-    )
     args = parser.parse_args()
 
     sismo_target = args.target
@@ -238,8 +217,7 @@ def main() -> int:
     else:
         out_name = "sismo"
 
-    clone_or_pin(args.pin)
-    apply_sismo_patches()
+    ensure_perfetto_source_and_patches()
     link_sismo_gn_target()
     run_perfetto_install_build_deps()
 

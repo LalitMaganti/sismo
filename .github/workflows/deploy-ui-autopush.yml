@@ -15,8 +15,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-        with:
-          submodules: recursive
 
       - uses: ./.github/actions/setup-perfetto-ui
 

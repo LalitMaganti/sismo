@@ -1,26 +1,29 @@
 # Copyright 2026 The Sismo Authors. All rights reserved.
 # Licensed under the MIT License.
 
-"""Installs build dependencies to third_party/bin/ and applies bridge
-patches and overlays to the Perfetto submodule.
+"""Installs build dependencies under third_party/, clones the upstream
+Perfetto repo at a pinned SHA, and applies sismo's bridge patches and
+overlays to it.
 
-Mirrors syntaqlite's install-build-deps pattern: pinned, checksummed binary
-tarballs into third_party/bin/{platform_dir}/. Idempotent via per-dep .stamp
-files.
+Binary deps land as pinned, checksummed tarballs under
+third_party/bin/{platform_dir}/, idempotent via per-dep .stamp files.
+Source deps land as pinned git checkouts under third_party/src/, idempotent
+by checking HEAD against the pin.
 
 Sismo deps:
   - Zig 0.16.0 (binary tarball from ziglang.org)
   - Rust 1.94.0 (binary tarball from static.rust-lang.org)
+  - Perfetto (git clone of google/perfetto, pinned to PERFETTO_PIN below)
 
-Source deps (the upstream Perfetto checkout) are tracked as git submodules
-under third_party/src/ — fetch them with
-`git submodule update --init --recursive`. The submodule pin points
-directly at google/perfetto; sismo no longer maintains a fork.
+Perfetto is checked out at third_party/src/perfetto/. The clone is shallow
+(--depth 200) and detached at PERFETTO_PIN. Bumping the pin to a newer
+upstream SHA only requires editing the constant; on the next run the
+function fetches and checks out the new SHA.
 
-Patches in third_party/patches/perfetto/*.patch are applied to the Perfetto
-submodule via `git apply`. These are bridge patches for in-flight upstream
-PRs only; each patch is idempotent and gets deleted when the corresponding
-upstream PR merges.
+Patches in third_party/patches/perfetto/*.patch are applied on top via
+`git apply`. These are bridge patches for in-flight upstream PRs only;
+each patch is idempotent and gets deleted when the corresponding upstream
+PR merges.
 
 Overlays in third_party/overlays/perfetto/<perfetto-relative-path> are
 copied into the Perfetto checkout after patches apply. Overlays are
@@ -76,6 +79,30 @@ class BinaryDep:
     strip_prefix: str = ""  # Directory prefix to strip from archive
 
 
+@dataclass
+class SourceDep:
+    """Source dependency: a git checkout pinned to a specific commit."""
+    name: str
+    target_dir: str  # Relative to ROOT_DIR.
+    git_url: str
+    pin: str  # Full SHA1 commit hash.
+    fetch_depth: int = 200
+
+
+SOURCE_DEPS: list[SourceDep] = [
+    # Perfetto. Bump `pin` to roll forward; the next install-build-deps run
+    # fetches and detaches at the new SHA. Sismo's bridge patches in
+    # third_party/patches/perfetto/ must apply cleanly against this SHA —
+    # see third_party/patches/perfetto/README.md.
+    SourceDep(
+        name="perfetto",
+        target_dir="third_party/src/perfetto",
+        git_url="https://github.com/google/perfetto.git",
+        pin="0eb65d89f0b0eb1dc512d519ff15457bcfc86ed8",
+    ),
+]
+
+
 # fmt: off
 BINARY_DEPS: list[BinaryDep] = [
     # Zig 0.16.0 from ziglang.org. SHA256s from
@@ -107,7 +134,6 @@ BINARY_DEPS: list[BinaryDep] = [
               f"zig-x86_64-windows-{ZIG_VERSION}"),
 
     # Rust toolchain. SHA256s from https://static.rust-lang.org/dist/channel-rust-1.94.0.toml.
-    # Same set syntaqlite uses; reuse verbatim since version is identical.
     BinaryDep("rust", RUST_VERSION,
               f"https://static.rust-lang.org/dist/2026-03-05/rust-{RUST_VERSION}-aarch64-apple-darwin.tar.gz",
               "94903e93a4334d42bb6d92377a39903349c07f3709c792864bcdf7959f3c8c7d",
@@ -335,19 +361,82 @@ PERFETTO_OVERLAYS_DIR: str = os.path.join(
     THIRD_PARTY_DIR, "overlays", "perfetto")
 
 
+def _is_git_repo(path: str) -> bool:
+    """Returns True if `path` is a git working tree (a regular clone with a
+    .git directory, or a checkout with a .git pointer file)."""
+    return os.path.exists(os.path.join(path, ".git"))
+
+
+def _git_head(repo: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", repo, "rev-parse", "HEAD"], text=True
+    ).strip()
+
+
+def install_source_dep(dep: SourceDep) -> bool:
+    """Idempotent git checkout: clone the repo on first run, fetch+detach at
+    `dep.pin` if HEAD diverges, otherwise no-op. Patches/overlays applied on
+    top of the working tree are preserved as long as HEAD already matches.
+    """
+    abs_dir = os.path.join(ROOT_DIR, dep.target_dir)
+
+    if not _is_git_repo(abs_dir):
+        vprint(1, f"Cloning {dep.git_url} -> {dep.target_dir}")
+        os.makedirs(os.path.dirname(abs_dir), exist_ok=True)
+        rc = subprocess.run(
+            ["git", "clone", "--depth", str(dep.fetch_depth), dep.git_url,
+             abs_dir]
+        ).returncode
+        if rc != 0:
+            print(f"Clone failed: {dep.git_url}", file=sys.stderr)
+            return False
+
+    current = _git_head(abs_dir)
+    if current == dep.pin:
+        vprint(2, f"{dep.target_dir}: at pin {dep.pin[:10]}")
+        return True
+
+    vprint(1, f"{dep.target_dir}: {current[:10]} -> {dep.pin[:10]}")
+    # The pinned SHA may not be in the existing shallow clone. Fetch it
+    # specifically; most forges allow fetching reachable SHAs in want.
+    fetch = subprocess.run(
+        ["git", "-C", abs_dir, "fetch", "--depth", str(dep.fetch_depth),
+         "origin", dep.pin],
+        capture_output=True,
+    )
+    if fetch.returncode != 0:
+        # Servers that reject SHA-in-want — fall back to a deeper full fetch.
+        rc = subprocess.run(
+            ["git", "-C", abs_dir, "fetch", "--depth",
+             str(dep.fetch_depth * 2), "origin"],
+        ).returncode
+        if rc != 0:
+            print(f"Fetch failed: {dep.git_url}", file=sys.stderr)
+            return False
+    rc = subprocess.run(
+        ["git", "-C", abs_dir, "checkout", "--detach", dep.pin]
+    ).returncode
+    if rc != 0:
+        print(
+            f"{dep.target_dir}: checkout of {dep.pin[:10]} failed — working "
+            f"tree may have local changes (patches/overlays). Stash or reset "
+            f"and re-run.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def apply_perfetto_patches() -> bool:
     """Applies *.patch files from third_party/patches/perfetto/ to the
-    Perfetto submodule. Idempotent: skips patches that are already applied.
+    Perfetto checkout. Idempotent: skips patches that are already applied.
     """
     if not os.path.isdir(PERFETTO_PATCHES_DIR):
         return True
 
-    if not os.path.isdir(os.path.join(PERFETTO_DIR, ".git")):
-        # The submodule directory has no .git (file or dir); the user hasn't
-        # initialized submodules yet. Don't try to apply — the build steps
-        # that need a populated submodule will fail loudly later.
-        vprint(1, "Perfetto submodule not initialized; skipping patch apply.")
-        vprint(1, "Run `git submodule update --init --recursive` first.")
+    if not _is_git_repo(PERFETTO_DIR):
+        vprint(1, "Perfetto checkout missing; skipping patch apply.")
+        vprint(1, "Run `tools/install-build-deps` first to clone it.")
         return True
 
     patches = sorted(
@@ -382,9 +471,9 @@ def apply_perfetto_patches() -> bool:
             print(f"Patch {name} does not apply cleanly:", file=sys.stderr)
             print(check.stderr.decode(), file=sys.stderr)
             print(
-                f"\nThe submodule HEAD may have moved underneath this patch. "
-                f"Either re-base the patch against the current submodule HEAD, "
-                f"or delete it if the upstream PR has merged.",
+                f"\nPERFETTO_PIN may have moved underneath this patch. "
+                f"Either re-base the patch against the current pin, or "
+                f"delete it if the upstream PR has merged.",
                 file=sys.stderr,
             )
             return False
@@ -407,7 +496,7 @@ def apply_perfetto_patches() -> bool:
 
 def install_perfetto_overlays() -> bool:
     """Copies sismo-permanent overlay files from third_party/overlays/perfetto/
-    into the Perfetto submodule. Overlay files are sismo additions that don't
+    into the Perfetto checkout. Overlay files are sismo additions that don't
     correspond to any in-flight upstream PR — typically new files like
     ui/src/core/embedder/{external_embedder,sismo_embedder}.ts that override
     perfetto's defaults. Each overlay's path inside the overlays dir mirrors
@@ -416,8 +505,8 @@ def install_perfetto_overlays() -> bool:
     if not os.path.isdir(PERFETTO_OVERLAYS_DIR):
         return True
 
-    if not os.path.isdir(os.path.join(PERFETTO_DIR, ".git")):
-        vprint(1, "Perfetto submodule not initialized; skipping overlay copy.")
+    if not _is_git_repo(PERFETTO_DIR):
+        vprint(1, "Perfetto checkout missing; skipping overlay copy.")
         return True
 
     copied = 0
@@ -468,6 +557,14 @@ def main() -> int:
         help="Skip Zig installation"
     )
     parser.add_argument(
+        "--no-source",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Skip a source dep by name (repeatable). Use 'all' to skip all "
+             f"({', '.join(d.name for d in SOURCE_DEPS)})."
+    )
+    parser.add_argument(
         "--no-patches",
         action="store_true",
         help="Skip applying Perfetto bridge patches and overlays"
@@ -500,6 +597,14 @@ def main() -> int:
             if os_match and arch_match:
                 if not install_binary_dep(dep, bin_target_dir):
                     success = False
+
+    if not args.patches_only:
+        skip_all_sources = "all" in args.no_source
+        for dep in SOURCE_DEPS:
+            if skip_all_sources or dep.name in args.no_source:
+                continue
+            if not install_source_dep(dep):
+                success = False
 
     if not args.no_patches:
         if not apply_perfetto_patches():

@@ -1,8 +1,10 @@
 # Perfetto patches
 
-Bridge patches applied to the `third_party/src/perfetto` submodule at
-`tools/install-build-deps` time. Each `*.patch` file in this directory is a
-unified diff applied with `git apply` (in `LANG=C.UTF-8 -p1` form) by
+Bridge patches applied to the `third_party/src/perfetto` checkout at
+`tools/install-build-deps` time. The checkout is a shallow git clone of
+`google/perfetto` pinned to `PERFETTO_PIN` in
+`python/tools/install_build_deps.py`. Each `*.patch` file in this directory
+is a unified diff applied with `git apply` (in `LANG=C.UTF-8 -p1` form) by
 `python/tools/install_build_deps.py`.
 
 ## What belongs here
@@ -41,6 +43,6 @@ delete it if it's been subsumed.
   `gh pr diff <num> --repo google/perfetto > NNNN-pr<num>-<desc>.patch`,
   then commit in sismo.
 - Upstream PR merges:
-  `git -C third_party/src/perfetto merge upstream/main` in the fork, push,
-  bump submodule SHA in sismo, then `rm` the patch file. The next
-  `install-build-deps` run is a no-op against the (now-merged) patch.
+  bump `PERFETTO_PIN` in `python/tools/install_build_deps.py` to a SHA past
+  the merge, then `rm` the patch file. The next `install-build-deps` run
+  fetches and detaches at the new SHA; the deleted patch leaves no trace.

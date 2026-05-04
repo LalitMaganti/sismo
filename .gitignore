@@ -8,9 +8,9 @@ zig-out/
 target/
 Cargo.lock
 
-# Hermetic build deps installed by tools/install-build-deps.
-# (Source deps live as git submodules under third_party/src/ and are tracked.)
+# Hermetic build deps + source clones installed by tools/install-build-deps.
 third_party/bin/
+third_party/src/
 
 # Tool-specific Python virtualenvs (e.g. tools/e2e-all-sources bootstraps
 # one with the `perfetto` package).

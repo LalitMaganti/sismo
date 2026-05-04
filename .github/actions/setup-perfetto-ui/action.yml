@@ -2,12 +2,9 @@ name: Setup Perfetto UI build environment
 description: |
   Restores all caches relevant to building the Perfetto UI (toolchain
   downloads, pnpm node_modules, ccache for the WASM C++ compile, and
-  the out/ui incremental build state), configures ccache, and runs
+  the out/ui incremental build state), configures ccache, clones the
+  Perfetto checkout via sismo's install-build-deps, and runs Perfetto's
   install-build-deps --ui.
-
-  Modeled on perfetto's upstream ui-tests workflow but adapted to
-  GitHub-hosted runners + actions/cache instead of self-hosted runners
-  + GCS-backed cache.
 
 runs:
   using: composite
@@ -20,17 +17,18 @@ runs:
         path: |
           third_party/src/perfetto/buildtools
           third_party/src/perfetto/third_party/pnpm
-        key: perfetto-buildtools-${{ runner.os }}-${{ hashFiles('third_party/src/perfetto/tools/install-build-deps') }}
+        key: perfetto-buildtools-${{ runner.os }}-${{ hashFiles('python/tools/install_build_deps.py') }}
         save-always: true
 
-    # pnpm node_modules. Invalidated when the lockfile changes;
-    # install-build-deps detects an unchanged lockfile via .last_install
-    # and skips the pnpm install entirely on a cache hit.
+    # pnpm node_modules. The lockfile lives inside the perfetto checkout,
+    # which isn't on disk yet at cache-restore time — key off the pin in
+    # python/tools/install_build_deps.py instead. The pin determines which
+    # lockfile we'll end up with, so this invalidates correctly.
     - name: Cache ui/node_modules
       uses: actions/cache@v5
       with:
         path: third_party/src/perfetto/ui/node_modules
-        key: perfetto-node-modules-${{ runner.os }}-${{ hashFiles('third_party/src/perfetto/ui/pnpm-lock.yaml') }}
+        key: perfetto-node-modules-${{ runner.os }}-${{ hashFiles('python/tools/install_build_deps.py') }}
         save-always: true
 
     # ccache for the WASM C++ compile (trace_processor, traceconv, etc).
@@ -72,17 +70,17 @@ runs:
         compression = true
         compression_level = 6
         sloppiness = include_file_ctime,include_file_mtime
-        compiler_check = string:${{ hashFiles('third_party/src/perfetto/tools/install-build-deps') }}
+        compiler_check = string:${{ hashFiles('python/tools/install_build_deps.py') }}
         EOF
         ccache --zero-stats || true
         ccache --show-config
 
-    # Apply sismo bridge patches (third_party/patches/perfetto/*.patch) to
-    # the submodule before any build step touches it. Idempotent across
-    # re-runs and cache restores.
-    - name: Apply sismo bridge patches
+    # Clone the Perfetto checkout (third_party/src/perfetto) at the pinned
+    # SHA and apply sismo's bridge patches/overlays. Idempotent across re-runs
+    # and cache restores. Skips zig/rust since the UI build doesn't need them.
+    - name: Set up Perfetto checkout
       shell: bash
-      run: python3 tools/install-build-deps --patches-only
+      run: python3 tools/install-build-deps --no-zig --no-rust
 
     - name: Install Perfetto UI build deps
       shell: bash
