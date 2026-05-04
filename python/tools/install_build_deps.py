@@ -379,6 +379,45 @@ def _git_head(repo: str) -> str | None:
     return result.stdout.strip()
 
 
+def _restore_mtimes_from_git(repo_dir: str) -> None:
+    """Set every tracked file's mtime to the timestamp of the last commit that
+    touched it.
+
+    `git checkout` resets the mtime of every checked-out file to "now". On a
+    fresh CI runner that turns ninja's incremental build state in the
+    cached out/ui directory into garbage — every input is newer than every
+    output, so everything rebuilds from scratch. Restoring mtimes from git
+    makes successive checkouts at the same SHA produce bit-identical
+    mtimes, so the cached build state stays valid.
+
+    Walks `git log --name-only` newest-to-oldest; the first time we see a
+    path is the last commit that touched it.
+    """
+    log = subprocess.check_output(
+        ["git", "-C", repo_dir, "log", "--name-only", "--pretty=format:%ct"],
+        text=True,
+    )
+    last_seen: dict[str, int] = {}
+    current_ts: int | None = None
+    for line in log.splitlines():
+        if not line:
+            continue
+        if line.isdigit():
+            current_ts = int(line)
+        elif line not in last_seen and current_ts is not None:
+            last_seen[line] = current_ts
+
+    for rel, ts in last_seen.items():
+        full = os.path.join(repo_dir, rel)
+        try:
+            os.utime(full, (ts, ts), follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            # Path was deleted or renamed in a more recent commit than the
+            # one that's checked out — git log within the shallow clone may
+            # mention it; the working tree won't have it. Ignore.
+            pass
+
+
 def install_source_dep(dep: SourceDep) -> bool:
     """Idempotent git checkout: ensures `dep.target_dir` is a git repo at
     `dep.pin`. Init-fetch-checkout flow (rather than `git clone`) so we
@@ -436,6 +475,7 @@ def install_source_dep(dep: SourceDep) -> bool:
             file=sys.stderr,
         )
         return False
+    _restore_mtimes_from_git(abs_dir)
     return True
 
 

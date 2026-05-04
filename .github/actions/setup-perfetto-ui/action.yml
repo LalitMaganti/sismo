@@ -9,21 +9,19 @@ description: |
 runs:
   using: composite
   steps:
-    # Toolchain downloads from install-build-deps + the perfetto checkout's
-    # .git directory. Including .git is critical: with it, install_source_dep
-    # finds HEAD already at the pin and skips `git checkout --force`, which
-    # would otherwise reset every source file's mtime and force ninja to
-    # rebuild out/ui from scratch on every run. Full-match keys off
-    # install_build_deps.py (the pin lives there); restore-keys fuzzy-fall
-    # back to a slightly stale cache when that file changes for unrelated
-    # reasons (e.g. zig version bumps), and install-build-deps reconciles.
+    # Toolchain downloads from install-build-deps. Stable across commits;
+    # full match keys off install_build_deps.py (which contains the pin),
+    # restore-keys lets us fuzzy-restore a slightly stale cache when that
+    # file changes for unrelated reasons (e.g. zig version bumps). The
+    # downstream install-build-deps run reconciles whatever's missing and
+    # restores tracked-file mtimes from git so ninja's incremental tracking
+    # against the cached out/ui still works after `git checkout --force`.
     - name: Cache buildtools + third_party
       uses: actions/cache@v5
       with:
         path: |
           third_party/src/perfetto/buildtools
           third_party/src/perfetto/third_party/pnpm
-          third_party/src/perfetto/.git
         key: perfetto-buildtools-${{ runner.os }}-${{ hashFiles('python/tools/install_build_deps.py') }}
         restore-keys: |
           perfetto-buildtools-${{ runner.os }}-
