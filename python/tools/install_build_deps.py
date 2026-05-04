@@ -367,28 +367,36 @@ def _is_git_repo(path: str) -> bool:
     return os.path.exists(os.path.join(path, ".git"))
 
 
-def _git_head(repo: str) -> str:
-    return subprocess.check_output(
-        ["git", "-C", repo, "rev-parse", "HEAD"], text=True
-    ).strip()
+def _git_head(repo: str) -> str | None:
+    """Returns the current HEAD SHA, or None if the repo has no HEAD yet
+    (e.g. just-initialized, no fetch yet)."""
+    result = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def install_source_dep(dep: SourceDep) -> bool:
-    """Idempotent git checkout: clone the repo on first run, fetch+detach at
-    `dep.pin` if HEAD diverges, otherwise no-op. Patches/overlays applied on
-    top of the working tree are preserved as long as HEAD already matches.
+    """Idempotent git checkout: ensures `dep.target_dir` is a git repo at
+    `dep.pin`. Init-fetch-checkout flow (rather than `git clone`) so we
+    cope with target dirs pre-populated by other steps — e.g. CI cache
+    restores that drop gitignored subpaths in before this runs. No-ops when
+    HEAD already matches `dep.pin`, preserving any patches/overlays applied
+    on top of the working tree.
     """
     abs_dir = os.path.join(ROOT_DIR, dep.target_dir)
 
     if not _is_git_repo(abs_dir):
-        vprint(1, f"Cloning {dep.git_url} -> {dep.target_dir}")
-        os.makedirs(os.path.dirname(abs_dir), exist_ok=True)
+        vprint(1, f"Initializing git repo at {dep.target_dir}")
+        os.makedirs(abs_dir, exist_ok=True)
         rc = subprocess.run(
-            ["git", "clone", "--depth", str(dep.fetch_depth), dep.git_url,
-             abs_dir]
+            ["git", "init", "-q", abs_dir]
         ).returncode
         if rc != 0:
-            print(f"Clone failed: {dep.git_url}", file=sys.stderr)
+            print(f"git init failed: {abs_dir}", file=sys.stderr)
             return False
 
     current = _git_head(abs_dir)
@@ -396,31 +404,35 @@ def install_source_dep(dep: SourceDep) -> bool:
         vprint(2, f"{dep.target_dir}: at pin {dep.pin[:10]}")
         return True
 
-    vprint(1, f"{dep.target_dir}: {current[:10]} -> {dep.pin[:10]}")
-    # The pinned SHA may not be in the existing shallow clone. Fetch it
-    # specifically; most forges allow fetching reachable SHAs in want.
+    if current:
+        vprint(1, f"{dep.target_dir}: {current[:10]} -> {dep.pin[:10]}")
+    else:
+        vprint(1, f"Fetching {dep.git_url} -> {dep.target_dir} @ {dep.pin[:10]}")
+
+    # Fetch the SHA directly; most forges allow reachable SHAs in want.
     fetch = subprocess.run(
         ["git", "-C", abs_dir, "fetch", "--depth", str(dep.fetch_depth),
-         "origin", dep.pin],
+         dep.git_url, dep.pin],
         capture_output=True,
     )
     if fetch.returncode != 0:
         # Servers that reject SHA-in-want — fall back to a deeper full fetch.
         rc = subprocess.run(
             ["git", "-C", abs_dir, "fetch", "--depth",
-             str(dep.fetch_depth * 2), "origin"],
+             str(dep.fetch_depth * 2), dep.git_url],
         ).returncode
         if rc != 0:
             print(f"Fetch failed: {dep.git_url}", file=sys.stderr)
             return False
+    # --force so a CI cache restore of gitignored subpaths (e.g. buildtools/)
+    # doesn't block the checkout. Pre-existing patches/overlays would also
+    # get reset here, but they're idempotently re-applied in the patch step.
     rc = subprocess.run(
-        ["git", "-C", abs_dir, "checkout", "--detach", dep.pin]
+        ["git", "-C", abs_dir, "checkout", "--force", "--detach", dep.pin]
     ).returncode
     if rc != 0:
         print(
-            f"{dep.target_dir}: checkout of {dep.pin[:10]} failed — working "
-            f"tree may have local changes (patches/overlays). Stash or reset "
-            f"and re-run.",
+            f"{dep.target_dir}: checkout of {dep.pin[:10]} failed",
             file=sys.stderr,
         )
         return False
