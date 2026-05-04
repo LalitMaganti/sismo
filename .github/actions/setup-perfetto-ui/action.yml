@@ -36,6 +36,34 @@ runs:
         restore-keys: |
           perfetto-node-modules-${{ runner.os }}-
 
+    # perfetto's test/data: fixture traces / protos pulled from GCS by
+    # `tools/test_data` (each is fetched against a tracked .sha256 sidecar).
+    # Cache only the downloaded blobs; the .sha256 sidecars come from the
+    # perfetto checkout itself. Same fuzzy restore-keys pattern as above —
+    # tools/test_data redownloads only the entries whose sidecars don't
+    # match what's on disk.
+    - name: Cache perfetto test/data
+      uses: actions/cache@v5
+      with:
+        path: |
+          third_party/src/perfetto/test/data
+          !third_party/src/perfetto/test/data/**/*.sha256
+        key: perfetto-test-data-${{ runner.os }}-${{ hashFiles('python/tools/install_build_deps.py') }}
+        restore-keys: |
+          perfetto-test-data-${{ runner.os }}-
+
+    # Tool-specific Python venvs (currently just e2e-all-sources, which
+    # pip-installs the `perfetto` package). Key off the file that pins
+    # the package version; restore-keys lets a stale venv seed pip,
+    # which then reconciles against the new pin.
+    - name: Cache python venvs
+      uses: actions/cache@v5
+      with:
+        path: third_party/venv
+        key: python-venvs-${{ runner.os }}-${{ hashFiles('python/tools/e2e_all_sources.py') }}
+        restore-keys: |
+          python-venvs-${{ runner.os }}-
+
     # ccache for the WASM C++ compile (trace_processor, traceconv, etc).
     # Per-SHA key with a fuzzy restore-keys fallback so every run starts
     # from the most recent cache and writes a fresh layer at the end.
