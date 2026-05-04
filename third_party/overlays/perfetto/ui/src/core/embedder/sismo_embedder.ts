@@ -5,13 +5,17 @@ import {Embedder} from './embedder';
 import {defaultPlugins} from './default_plugins';
 import {SismoHomePage} from './sismo_home_page';
 
-// Transparent inline SVG placeholder used as the sidebar wordmark until a
-// proper sismo logo asset is designed. Keeps perfetto's brand aspect ratio
-// so the absolutely-positioned `SISMO` badge and channel-name label still
-// land in their existing slots; the wordmark itself just renders nothing.
-const SISMO_BRAND_PLACEHOLDER =
+// Inline SVG wordmark used as the sidebar brand. The sidebar background is
+// always dark (light-theme blue #262f3c, dark-theme gray #343434), so a
+// fixed light fill renders correctly under both themes. Embedded as a data
+// URL because the brand slot is rendered via <img>, which would not pick up
+// `currentColor` from parent CSS.
+const SISMO_BRAND =
   "data:image/svg+xml;utf8," +
-  "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 252 60'/>";
+  "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 130 60'>" +
+  "<text x='4' y='46' font-family='Roboto,sans-serif' font-size='44'" +
+  " font-weight='300' fill='%23e07020'>Sismo</text>" +
+  '</svg>';
 
 /**
  * Embedder used when the UI is served from a sismo deployment
@@ -26,11 +30,8 @@ const SISMO_BRAND_PLACEHOLDER =
 export class SismoEmbedder implements Embedder {
   readonly analyticsId = undefined;
   readonly extensionServer = undefined;
-  readonly brandingBadge = {
-    text: 'SISMO',
-    color: '#e07020',
-  };
+  readonly brandingBadge = undefined;
   readonly defaultPlugins = defaultPlugins;
   readonly homePage = SismoHomePage;
-  readonly brandLogo = {src: SISMO_BRAND_PLACEHOLDER, alt: 'sismo'};
+  readonly brandLogo = {src: SISMO_BRAND, alt: 'Sismo'};
 }
