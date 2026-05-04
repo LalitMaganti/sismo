@@ -46,20 +46,19 @@ fi
 
 # Targets we need (GN labels confirmed from the vendored tree):
 #
-#   traced                          — bundles libperfetto.a as a side
-#                                     effect (sismo-local patch in
-#                                     third_party/src/perfetto/BUILD.gn
-#                                     makes the archive comprehensive:
-#                                     service code + client API +
-#                                     tracing backends + C SDK).
+#   //sismo:sismo_libperfetto       — sismo-defined static_library that
+#                                     bundles service + client API +
+#                                     tracing backends + C SDK into one
+#                                     archive (libsismo_libperfetto.a).
+#                                     The target lives in the sismo repo
+#                                     at infra/perfetto-build/sismo/BUILD.gn
+#                                     and is symlinked into //sismo by
+#                                     tools/setup_perfetto.sh — no
+#                                     modifications to Perfetto's BUILD.gn.
+#   traced                          — service binary; linked separately by
+#                                     sismo's process model.
 #   trace_processor_shell           — standalone for E2E validation.
-#   //src/profiling/perf:producer   — Linux-only traced_perf source set,
-#                                     linked in-process on Linux.
-#   //src/traced/probes:probes_src  — Linux-only traced_probes source set
-#                                     (ftrace + procfs); the :probes_src
-#                                     target excludes probes.cc's main()
-#                                     which is what we want for embedding.
-TARGETS=("traced")
+TARGETS=("sismo:sismo_libperfetto" "traced")
 
 # Native builds also pull in trace_processor_shell (E2E validation).
 # Cross-compiles skip it because SQLite trips zig cc's stricter
@@ -68,20 +67,13 @@ if [[ -z "$SISMO_TARGET" ]]; then
     TARGETS+=("trace_processor_shell")
 fi
 
-# traced_perf and traced_probes are Linux-only producers we link in
-# process. traced_perf pulls in buildtools/android-unwinding for stack
-# unwinding; traced_probes pulls in the ftrace + procfs machinery. Both
-# need to be built on every Linux build (native and cross).
-case "${SISMO_TARGET:-$(uname -s)}" in
-    *linux*|Linux)
-        TARGETS+=("src/profiling/perf:producer")
-        TARGETS+=("src/traced/probes:probes_src")
-        ;;
-esac
+# traced_perf / traced_probes producer source sets are pulled in
+# transitively by //sismo:sismo_libperfetto on Linux (see deps in
+# infra/perfetto-build/sismo/BUILD.gn) — no need to list them here.
 
 echo "==> building Perfetto targets in $OUT_NAME: ${TARGETS[*]}"
 "$NINJA" -C "$OUT_DIR" "${TARGETS[@]}"
 
 echo
 echo "==> built artifacts in $OUT_DIR/"
-ls -la "$OUT_DIR/" | grep -E "(traced|libperfetto|trace_processor)" | head -20
+ls -la "$OUT_DIR/" | grep -E "(traced|libperfetto|libsismo_libperfetto|trace_processor)" | head -20

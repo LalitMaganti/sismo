@@ -176,18 +176,23 @@ fn addUnixPipeline(
     };
 
     // -------------------------------------------------------------------------
-    // libperfetto.a — the comprehensive Perfetto C++ SDK static archive.
+    // libsismo_libperfetto.a — comprehensive Perfetto C++ SDK static
+    // archive built from sismo's own GN target //sismo:sismo_libperfetto
+    // (defined in infra/perfetto-build/sismo/BUILD.gn, symlinked into
+    // the Perfetto checkout at //sismo by tools/setup_perfetto.sh).
     // sismo's producer-side glue is `src/c/perfetto_ds.cc` (templated
     // DataSource slots over the public C++ SDK) and consumer-side is
     // `src/c/sismo_consumer.cc`. Both compile directly into the sismo
     // binary, not as a separate static library.
     //
     // Build pipeline:
-    //   1. tools/build_perfetto.sh runs ninja to produce libperfetto.a
-    //      in third_party/src/perfetto/out/<perfetto_out_name>/.
+    //   1. tools/build_perfetto.sh runs ninja to produce
+    //      libsismo_libperfetto.a in
+    //      third_party/src/perfetto/out/<perfetto_out_name>/.
     //      Cross-compile uses zig cc as a clang drop-in.
     //   2. Each consumer addCSourceFile()s the relevant .cc shims +
-    //      addObjectFile(libperfetto.a) + OS-specific frameworks/libs.
+    //      addObjectFile(libsismo_libperfetto.a) + OS-specific
+    //      frameworks/libs.
     // -------------------------------------------------------------------------
     const perfetto_build = b.addSystemCommand(&.{ "bash", b.pathFromRoot("tools/build_perfetto.sh") });
     if (sismo_target) |trip| perfetto_build.setEnvironmentVariable("SISMO_TARGET", trip);
@@ -198,7 +203,7 @@ fn addUnixPipeline(
     // `#include "src/c/perfetto_shim.h"`), so the include root is the
     // repo root.
     const repo_root_include = b.path(".");
-    const lib_a = perfetto_out.path(b, "libperfetto.a");
+    const lib_a = perfetto_out.path(b, "libsismo_libperfetto.a");
 
     // Workload binary — uses the Perfetto C SDK directly via
     // src/c/sample_target_sdk.c. Cross-platform; the SDK headers are

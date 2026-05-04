@@ -1,0 +1,67 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+#
+# Sismo's GN target file. Lives in the sismo repo at
+# infra/perfetto-build/sismo/BUILD.gn and is symlinked into the Perfetto
+# checkout at //sismo/BUILD.gn by tools/setup_perfetto.sh. Treated as part
+# of Perfetto's GN graph at build time but never modifies any upstream
+# Perfetto file — replaces a previously-needed fork patch to Perfetto's
+# top-level BUILD.gn.
+
+import("//gn/perfetto.gni")
+
+# sismo_libperfetto: comprehensive Perfetto static archive for sismo's
+# in-process producer host. Variant of //:libperfetto that bundles the
+# C SDK (//src/shared_lib), the C++ client API (//src/tracing:client_api),
+# and the traced_probes / traced_perf producer source sets so sismo links
+# one archive instead of many.
+#
+# Built by tools/build_perfetto.sh; consumed by build.zig as
+# libsismo_libperfetto.a.
+if (enable_perfetto_platform_services) {
+  static_library("sismo_libperfetto") {
+    complete_static_lib = true
+    deps = [
+      "//gn:default_deps",
+      "//src/shared_lib",
+      "//src/traced/service",
+      "//src/tracing:client_api",
+    ]
+
+    # Aggregate traced_probes' producer source set (NOT the //src/traced/probes
+    # executable target which adds probes.cc's main()) so sismo can embed
+    # ProbesProducer on a worker thread inside the orchestrator process.
+    if (enable_perfetto_traced_probes) {
+      deps += [ "//src/traced/probes:probes_src" ]
+    }
+
+    # Bundle traced_perf's producer source set on Linux so sismo's
+    # in-process orchestrator can host it alongside traced. Gated on
+    # enable_perfetto_traced_perf (set by tools/setup_perfetto.sh in
+    # args.gn) and is_linux because the producer source set is Linux-only
+    # (uses perf_event_open).
+    if (enable_perfetto_traced_perf && is_linux) {
+      deps += [ "//src/profiling/perf:producer" ]
+    }
+  }
+}
+
+# Top-level group used when sismo's build invokes
+#   gn gen --root-target=//sismo …
+# The flag tells GN to load this BUILD.gn (instead of //BUILD.gn) as the
+# entry point, so perfetto's full default-target (the //:default group
+# that builds every standalone perfetto binary) is bypassed in favor of
+# the strict subset sismo actually consumes.
+group("default") {
+  deps = []
+  if (enable_perfetto_platform_services) {
+    deps += [
+      ":sismo_libperfetto",
+      "//src/traced/service:traced",
+    ]
+  }
+  if (enable_perfetto_trace_processor &&
+      enable_perfetto_trace_processor_sqlite) {
+    deps += [ "//src/trace_processor:trace_processor_shell" ]
+  }
+}

@@ -51,6 +51,25 @@ echo "    at $(git -C "$PERFETTO_DIR" describe --always)"
 echo "==> applying sismo bridge patches (third_party/patches/perfetto/*.patch)"
 "$REPO/tools/install-build-deps" --patches-only
 
+# Symlink sismo's GN target file into the Perfetto checkout so GN sees
+# it as //sismo:sismo_libperfetto without any modification to Perfetto's
+# own BUILD.gn files. The directory is gitignored from Perfetto's
+# perspective (it lives under the gitignored Perfetto checkout, but the
+# real file is checked in to the sismo repo at infra/perfetto-build/sismo).
+SISMO_GN_LINK="$PERFETTO_DIR/sismo"
+SISMO_GN_TARGET="$REPO/infra/perfetto-build/sismo"
+if [[ -L "$SISMO_GN_LINK" ]]; then
+    # Already a symlink — refresh it idempotently so a re-pin can update
+    # the target if needed.
+    rm "$SISMO_GN_LINK"
+fi
+if [[ -e "$SISMO_GN_LINK" && ! -L "$SISMO_GN_LINK" ]]; then
+    echo "==> $SISMO_GN_LINK exists and is not a symlink; refusing to overwrite" >&2
+    exit 1
+fi
+ln -s "$SISMO_GN_TARGET" "$SISMO_GN_LINK"
+echo "==> linked //sismo -> $SISMO_GN_TARGET"
+
 echo "==> running install-build-deps (fetches gn/ninja/clang/protoc into the subtree)"
 # Default scope (no flags) installs the toolchain + dev tools needed for
 # native builds. We don't pass --android / --ui / --bazel — they're opt-in.
@@ -154,7 +173,11 @@ EOF
 fi
 
 # gn gen needs to be invoked with Perfetto's repo as the source root.
-( cd "$PERFETTO_DIR" && tools/gn gen "out/$OUT_NAME" )
+# --root-target=//sismo points GN at the symlinked sismo BUILD.gn as the
+# entry point so the build graph is rooted at sismo's :default group
+# (sismo_libperfetto + traced + trace_processor_shell) instead of
+# Perfetto's full standalone build (UI, perfetto_cmd, traceconv, etc.).
+( cd "$PERFETTO_DIR" && tools/gn gen "out/$OUT_NAME" --root-target=//sismo )
 
 echo
 echo "==> setup complete"
