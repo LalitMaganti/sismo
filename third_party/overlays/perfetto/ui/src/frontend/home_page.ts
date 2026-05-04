@@ -1,10 +1,18 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-// Sismo's home page (route '/'). Mirrors perfetto's ui/src/frontend/home_page.ts
-// closely — same Quick start / Shortcuts / Channel select layout — but rebrands
-// the title to 'Sismo' and points the docs/privacy links at the sismo repo.
-// Wired in via SismoEmbedder.homePage.
+// Sismo's home page. Drop-in overlay for perfetto's
+// ui/src/frontend/home_page.ts — same exported class name (`HomePage`)
+// and same shape (Quick start, Shortcuts, Channel select), rebranded
+// title to 'Sismo', and the Google docs/privacy links replaced with a
+// sismo-on-GitHub link.
+//
+// Why this lives as an overlay (vs SismoEmbedder.homePage = SismoHomePage):
+// importing the class from sismo_embedder pulls in AppImpl, which pulls
+// in createEmbedder, which pulls in external_embedder, which pulls in
+// sismo_embedder — a cycle. Replacing home_page.ts directly side-steps
+// the cycle: frontend/index.ts already imports HomePage as the default,
+// no embedder reference required.
 
 import m from 'mithril';
 import {
@@ -12,27 +20,27 @@ import {
   getCurrentChannel,
   getNextChannel,
   setChannel,
-} from '../channels';
-import {AppImpl} from '../app_impl';
-import {Anchor} from '../../widgets/anchor';
-import {Button, ButtonVariant} from '../../widgets/button';
-import {Intent} from '../../widgets/common';
-import {HotkeyGlyphs, Keycap} from '../../widgets/hotkey_glyphs';
-import {Switch} from '../../widgets/switch';
-import {Stack} from '../../widgets/stack';
-import {Icons} from '../../base/semantic_icons';
-import {Icon} from '../../widgets/icon';
-import {classNames} from '../../base/classnames';
-import {Router} from '../router';
+} from '../core/channels';
+import {AppImpl} from '../core/app_impl';
+import {Anchor} from '../widgets/anchor';
+import {Button, ButtonVariant} from '../widgets/button';
+import {Intent} from '../widgets/common';
+import {HotkeyGlyphs, Keycap} from '../widgets/hotkey_glyphs';
+import {Switch} from '../widgets/switch';
+import {Stack} from '../widgets/stack';
+import {Icons} from '../base/semantic_icons';
+import {Icon} from '../widgets/icon';
+import {classNames} from '../base/classnames';
+import {Router} from '../core/router';
 import {
   KeyboardLayoutMap,
   nativeKeyboardLayoutMap,
   NotSupportedError,
-} from '../../base/keyboard_layout_map';
-import {Spinner} from '../../widgets/spinner';
-import {KeyMapping} from '../../base/wasd_key_mapping';
+} from '../base/keyboard_layout_map';
+import {Spinner} from '../widgets/spinner';
+import {KeyMapping} from '../base/wasd_key_mapping';
 
-export class SismoHomePage implements m.ClassComponent {
+export class HomePage implements m.ClassComponent {
   view() {
     return m(
       '.pf-home-page',
