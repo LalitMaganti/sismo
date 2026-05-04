@@ -1,7 +1,8 @@
 # Copyright 2026 The Sismo Authors. All rights reserved.
 # Licensed under the MIT License.
 
-"""Installs build dependencies to third_party/bin/.
+"""Installs build dependencies to third_party/bin/ and applies bridge
+patches to the Perfetto submodule.
 
 Mirrors syntaqlite's install-build-deps pattern: pinned, checksummed binary
 tarballs into third_party/bin/{platform_dir}/. Idempotent via per-dep .stamp
@@ -13,6 +14,12 @@ Sismo deps:
 
 Source deps (e.g. the Perfetto fork) are tracked as git submodules under
 third_party/src/ — fetch them with `git submodule update --init --recursive`.
+
+Patches in third_party/patches/perfetto/*.patch are applied to the Perfetto
+submodule via `git apply`. These are bridge patches for in-flight upstream
+PRs only; sismo-permanent modifications live as commits on the
+sismo-perfetto fork. Each patch is idempotent — running install-build-deps
+twice is a no-op. See third_party/patches/perfetto/README.md.
 """
 
 from __future__ import annotations
@@ -311,6 +318,80 @@ def install_binary_dep(dep: BinaryDep, target_dir: str) -> bool:
     sys.exit(f"No installer for binary dep: {dep.name}")
 
 
+PERFETTO_DIR: str = os.path.join(THIRD_PARTY_DIR, "src", "perfetto")
+PERFETTO_PATCHES_DIR: str = os.path.join(THIRD_PARTY_DIR, "patches", "perfetto")
+
+
+def apply_perfetto_patches() -> bool:
+    """Applies *.patch files from third_party/patches/perfetto/ to the
+    Perfetto submodule. Idempotent: skips patches that are already applied.
+    """
+    if not os.path.isdir(PERFETTO_PATCHES_DIR):
+        return True
+
+    if not os.path.isdir(os.path.join(PERFETTO_DIR, ".git")):
+        # The submodule directory has no .git (file or dir); the user hasn't
+        # initialized submodules yet. Don't try to apply — the build steps
+        # that need a populated submodule will fail loudly later.
+        vprint(1, "Perfetto submodule not initialized; skipping patch apply.")
+        vprint(1, "Run `git submodule update --init --recursive` first.")
+        return True
+
+    patches = sorted(
+        p for p in os.listdir(PERFETTO_PATCHES_DIR) if p.endswith(".patch")
+    )
+    if not patches:
+        return True
+
+    applied_count = 0
+    for name in patches:
+        patch_path = os.path.join(PERFETTO_PATCHES_DIR, name)
+
+        # Already applied? `git apply --reverse --check` succeeds iff the
+        # patch's post-state matches the working tree, i.e. it would apply
+        # cleanly if reversed.
+        already = subprocess.run(
+            ["git", "-C", PERFETTO_DIR, "apply", "--reverse", "--check",
+             patch_path],
+            capture_output=True,
+        )
+        if already.returncode == 0:
+            vprint(2, f"  {name}: already applied")
+            continue
+
+        # Not applied — but make sure it *would* apply before doing it, so
+        # we get a clean error rather than a half-applied state.
+        check = subprocess.run(
+            ["git", "-C", PERFETTO_DIR, "apply", "--check", patch_path],
+            capture_output=True,
+        )
+        if check.returncode != 0:
+            print(f"Patch {name} does not apply cleanly:", file=sys.stderr)
+            print(check.stderr.decode(), file=sys.stderr)
+            print(
+                f"\nThe submodule HEAD may have moved underneath this patch. "
+                f"Either re-base the patch against the current submodule HEAD, "
+                f"or delete it if the upstream PR has merged.",
+                file=sys.stderr,
+            )
+            return False
+
+        result = subprocess.run(
+            ["git", "-C", PERFETTO_DIR, "apply", patch_path],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            print(f"Failed to apply {name}:", file=sys.stderr)
+            print(result.stderr.decode(), file=sys.stderr)
+            return False
+        vprint(1, f"applied perfetto patch: {name}")
+        applied_count += 1
+
+    if applied_count == 0:
+        vprint(2, f"all {len(patches)} perfetto patch(es) already applied")
+    return True
+
+
 def main() -> int:
     global VERBOSITY
 
@@ -331,24 +412,42 @@ def main() -> int:
         action="store_true",
         help="Skip Zig installation"
     )
+    parser.add_argument(
+        "--no-patches",
+        action="store_true",
+        help="Skip applying Perfetto bridge patches"
+    )
+    parser.add_argument(
+        "--patches-only",
+        action="store_true",
+        help="Only apply Perfetto patches; skip toolchain installs. Useful "
+             "in CI where Perfetto's own install-build-deps handles tooling"
+    )
     args = parser.parse_args()
     VERBOSITY = args.verbose
 
-    host_os, host_arch, platform_dir = get_platform()
-    bin_target_dir = os.path.join(THIRD_PARTY_BIN_DIR, platform_dir)
-
     success = True
 
-    for dep in BINARY_DEPS:
-        if dep.name == "rust" and args.no_rust:
-            continue
-        if dep.name == "zig" and args.no_zig:
-            continue
-        os_match = dep.target_os == "all" or dep.target_os == host_os
-        arch_match = dep.target_arch == "all" or dep.target_arch == host_arch
-        if os_match and arch_match:
-            if not install_binary_dep(dep, bin_target_dir):
-                success = False
+    if not args.patches_only:
+        host_os, host_arch, platform_dir = get_platform()
+        bin_target_dir = os.path.join(THIRD_PARTY_BIN_DIR, platform_dir)
+
+        for dep in BINARY_DEPS:
+            if dep.name == "rust" and args.no_rust:
+                continue
+            if dep.name == "zig" and args.no_zig:
+                continue
+            os_match = dep.target_os == "all" or dep.target_os == host_os
+            arch_match = (
+                dep.target_arch == "all" or dep.target_arch == host_arch
+            )
+            if os_match and arch_match:
+                if not install_binary_dep(dep, bin_target_dir):
+                    success = False
+
+    if not args.no_patches:
+        if not apply_perfetto_patches():
+            success = False
 
     return 0 if success else 1
 

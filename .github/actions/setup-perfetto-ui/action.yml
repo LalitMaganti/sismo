@@ -77,6 +77,13 @@ runs:
         ccache --zero-stats || true
         ccache --show-config
 
+    # Apply sismo bridge patches (third_party/patches/perfetto/*.patch) to
+    # the submodule before any build step touches it. Idempotent across
+    # re-runs and cache restores.
+    - name: Apply sismo bridge patches
+      shell: bash
+      run: python3 tools/install-build-deps --patches-only
+
     - name: Install Perfetto UI build deps
       shell: bash
       working-directory: third_party/src/perfetto

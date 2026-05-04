@@ -48,6 +48,9 @@ if [[ -n "$PERFETTO_PIN" ]]; then
 fi
 echo "    at $(git -C "$PERFETTO_DIR" describe --always)"
 
+echo "==> applying sismo bridge patches (third_party/patches/perfetto/*.patch)"
+"$REPO/tools/install-build-deps" --patches-only
+
 echo "==> running install-build-deps (fetches gn/ninja/clang/protoc into the subtree)"
 # Default scope (no flags) installs the toolchain + dev tools needed for
 # native builds. We don't pass --android / --ui / --bazel — they're opt-in.
