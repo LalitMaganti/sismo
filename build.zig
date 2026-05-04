@@ -156,7 +156,7 @@ fn addUnixPipeline(
     // Perfetto out dir per target. Cross-compiled targets live in
     // sibling dirs so a macOS host can keep both `out/sismo` (native)
     // and `out/sismo_linux_x64` (cross via zig cc) populated. The
-    // names match what tools/setup_perfetto.sh derives from
+    // names match what tools/setup-perfetto derives from
     // SISMO_TARGET; build.zig and the script have to agree.
     const sismo_target = perfettoTargetTriple(target);
     const perfetto_out_name = if (sismo_target == null)
@@ -179,14 +179,14 @@ fn addUnixPipeline(
     // libsismo_libperfetto.a — comprehensive Perfetto C++ SDK static
     // archive built from sismo's own GN target //sismo:sismo_libperfetto
     // (defined in infra/perfetto-build/sismo/BUILD.gn, symlinked into
-    // the Perfetto checkout at //sismo by tools/setup_perfetto.sh).
+    // the Perfetto checkout at //sismo by tools/setup-perfetto).
     // sismo's producer-side glue is `src/c/perfetto_ds.cc` (templated
     // DataSource slots over the public C++ SDK) and consumer-side is
     // `src/c/sismo_consumer.cc`. Both compile directly into the sismo
     // binary, not as a separate static library.
     //
     // Build pipeline:
-    //   1. tools/build_perfetto.sh runs ninja to produce
+    //   1. tools/build-perfetto runs ninja to produce
     //      libsismo_libperfetto.a in
     //      third_party/src/perfetto/out/<perfetto_out_name>/.
     //      Cross-compile uses zig cc as a clang drop-in.
@@ -194,7 +194,7 @@ fn addUnixPipeline(
     //      addObjectFile(libsismo_libperfetto.a) + OS-specific
     //      frameworks/libs.
     // -------------------------------------------------------------------------
-    const perfetto_build = b.addSystemCommand(&.{ "bash", b.pathFromRoot("tools/build_perfetto.sh") });
+    const perfetto_build = b.addSystemCommand(&.{b.pathFromRoot("tools/build-perfetto")});
     if (sismo_target) |trip| perfetto_build.setEnvironmentVariable("SISMO_TARGET", trip);
     const perfetto_root = b.path("third_party/src/perfetto");
     const perfetto_out = b.path(b.fmt("third_party/src/perfetto/out/{s}", .{perfetto_out_name}));
@@ -326,7 +326,7 @@ fn addComponentSources(
     }
 }
 
-/// SISMO_TARGET value to pass to tools/setup_perfetto.sh + build_perfetto.sh
+/// SISMO_TARGET value to pass to tools/setup-perfetto + build-perfetto
 /// when cross-compiling. Returns null when targeting the build host
 /// (use the default out/sismo dir + Perfetto's hermetic clang).
 fn perfettoTargetTriple(target: std.Build.ResolvedTarget) ?[]const u8 {
@@ -387,12 +387,12 @@ fn addWindowsPipeline(
     // is the link surface (no CoreFoundation, no libdl — Winsock2 +
     // ntdll come from the Perfetto archive itself).
     //
-    // Requires `tools/setup_perfetto.sh` to have produced a Windows
+    // Requires `tools/setup-perfetto` to have produced a Windows
     // libperfetto.a. The setup script doesn't gen for Windows yet
     // (`uname -s` only knows Darwin/Linux), so this branch is wired up
     // for the day that's fixed — running it before then will fail at
     // the perfetto build step.
-    const perfetto_build = b.addSystemCommand(&.{ "bash", b.pathFromRoot("tools/build_perfetto.sh") });
+    const perfetto_build = b.addSystemCommand(&.{b.pathFromRoot("tools/build-perfetto")});
     const perfetto_root = b.path("third_party/src/perfetto");
     const perfetto_out = b.path("third_party/src/perfetto/out/sismo");
 
@@ -433,7 +433,7 @@ fn addWindowsPipeline(
 // being built — the include paths reference the host out dir
 // (`third_party/src/perfetto/out/sismo`); paths that don't exist yet are
 // fine, clangd just shows missing-header diagnostics until you run
-// `tools/setup_perfetto.sh`.
+// `tools/setup-perfetto`.
 
 const CompileDbStep = struct {
     step: std.Build.Step,

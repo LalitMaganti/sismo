@@ -3,7 +3,7 @@
 #
 # Sismo's GN target file. Lives in the sismo repo at
 # infra/perfetto-build/sismo/BUILD.gn and is symlinked into the Perfetto
-# checkout at //sismo/BUILD.gn by tools/setup_perfetto.sh. Treated as part
+# checkout at //sismo/BUILD.gn by tools/setup-perfetto. Treated as part
 # of Perfetto's GN graph at build time but never modifies any upstream
 # Perfetto file — replaces a previously-needed fork patch to Perfetto's
 # top-level BUILD.gn.
@@ -16,7 +16,7 @@ import("//gn/perfetto.gni")
 # and the traced_probes / traced_perf producer source sets so sismo links
 # one archive instead of many.
 #
-# Built by tools/build_perfetto.sh; consumed by build.zig as
+# Built by tools/build-perfetto; consumed by build.zig as
 # libsismo_libperfetto.a.
 if (enable_perfetto_platform_services) {
   static_library("sismo_libperfetto") {
@@ -37,7 +37,7 @@ if (enable_perfetto_platform_services) {
 
     # Bundle traced_perf's producer source set on Linux so sismo's
     # in-process orchestrator can host it alongside traced. Gated on
-    # enable_perfetto_traced_perf (set by tools/setup_perfetto.sh in
+    # enable_perfetto_traced_perf (set by tools/setup-perfetto in
     # args.gn) and is_linux because the producer source set is Linux-only
     # (uses perf_event_open).
     if (enable_perfetto_traced_perf && is_linux) {

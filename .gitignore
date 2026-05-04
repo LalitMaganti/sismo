@@ -12,6 +12,10 @@ Cargo.lock
 # (Source deps live as git submodules under third_party/src/ and are tracked.)
 third_party/bin/
 
+# Tool-specific Python virtualenvs (e.g. tools/e2e-all-sources bootstraps
+# one with the `perfetto` package).
+third_party/venv/
+
 # Python
 __pycache__/
 *.pyc
