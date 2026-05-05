@@ -553,44 +553,50 @@ def apply_perfetto_patches() -> bool:
 
 
 def install_perfetto_overlays() -> bool:
-    """Copies sismo-permanent overlay files from third_party/overlays/perfetto/
+    """Symlinks sismo-permanent overlay files from third_party/overlays/perfetto/
     into the Perfetto checkout. Overlay files are sismo additions that don't
     correspond to any in-flight upstream PR — typically new files like
     ui/src/core/embedder/{external_embedder,sismo_embedder}.ts that override
     perfetto's defaults. Each overlay's path inside the overlays dir mirrors
     its destination inside the perfetto checkout.
+
+    Symlinks (rather than copies) so edits to overlay files in this repo
+    show up live in the perfetto checkout — no second copy step, and the
+    dev server's file watcher picks up the change immediately. Targets are
+    relative paths so the link survives moving the repo.
     """
     if not os.path.isdir(PERFETTO_OVERLAYS_DIR):
         return True
 
     if not _is_git_repo(PERFETTO_DIR):
-        vprint(1, "Perfetto checkout missing; skipping overlay copy.")
+        vprint(1, "Perfetto checkout missing; skipping overlay link.")
         return True
 
-    copied = 0
+    linked = 0
     for src_dir, _, files in os.walk(PERFETTO_OVERLAYS_DIR):
         for name in files:
-            src = os.path.join(src_dir, name)
+            src = os.path.abspath(os.path.join(src_dir, name))
             rel = os.path.relpath(src, PERFETTO_OVERLAYS_DIR)
             dst = os.path.join(PERFETTO_DIR, rel)
+            target = os.path.relpath(src, os.path.dirname(os.path.abspath(dst)))
 
-            # Skip if already up to date (same content). Idempotent so a
-            # subsequent run doesn't churn mtimes and trigger needless
-            # rebuilds in build systems that mtime-track inputs.
-            if (os.path.exists(dst)
-                    and os.path.getsize(dst) == os.path.getsize(src)):
-                with open(src, "rb") as fa, open(dst, "rb") as fb:
-                    if fa.read() == fb.read():
-                        vprint(2, f"  {rel}: up to date")
-                        continue
+            # Already a symlink pointing at the right overlay? Done.
+            if os.path.islink(dst) and os.readlink(dst) == target:
+                vprint(2, f"  {rel}: symlink up to date")
+                continue
+
+            # Stale symlink or pre-existing real file (e.g. from a prior
+            # copy-based install). Replace it.
+            if os.path.islink(dst) or os.path.exists(dst):
+                os.unlink(dst)
 
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
-            vprint(1, f"installed perfetto overlay: {rel}")
-            copied += 1
+            os.symlink(target, dst)
+            vprint(1, f"linked perfetto overlay: {rel}")
+            linked += 1
 
-    if copied == 0:
-        vprint(2, "all perfetto overlays already up to date")
+    if linked == 0:
+        vprint(2, "all perfetto overlays already linked")
     return True
 
 
