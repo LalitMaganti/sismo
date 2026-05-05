@@ -37,10 +37,13 @@ export class SismoEmbedder implements Embedder {
   readonly analyticsId = undefined;
   readonly extensionServer = undefined;
   readonly brandingBadge = undefined;
-  // Sismo ships with no plugins enabled by default; users can opt in via
-  // the Plugins page. Avoids inheriting perfetto's full Android/Chromium
-  // bundle which isn't relevant to the sismo profiling flows.
-  readonly defaultPlugins: ReadonlyArray<string> = [];
+  // Minimal plugin set: only enough for a blank trace to load and the
+  // timeline shell to render. Iteratively grown empirically — adding a
+  // plugin here should be justified by something the user can't do
+  // without it.
+  readonly defaultPlugins: ReadonlyArray<string> = [
+    'dev.perfetto.Timeline',
+  ];
   readonly homePage = SismoHomePage;
   readonly brandLogo = {src: SISMO_BRAND, alt: 'Sismo'};
 }
