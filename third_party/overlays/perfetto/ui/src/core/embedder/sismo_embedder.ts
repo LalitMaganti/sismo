@@ -10,15 +10,14 @@ import {SismoHomePage} from './sismo_home_page';
 // URL because the brand slot is rendered via <img>, which would not pick up
 // `currentColor` from parent CSS.
 //
-// Right-aligned within a 130-wide canvas: the channel-name badge
-// (`CANARY` / `AUTOPUSH`, position: absolute at right: 48px) sits to the
-// right of the wordmark, so pushing "Sismo" toward that edge keeps the two
-// visually grouped instead of separated by a wide gap.
+// Small right-shift inside the brand canvas so the wordmark isn't flush
+// against the sidebar edge but also doesn't drift far enough right to leave
+// a gap on the left.
 const SISMO_BRAND =
   "data:image/svg+xml;utf8," +
-  "<svg xmlns='http://www.w3.org/2000/svg' width='130' height='36'" +
-  " viewBox='0 0 130 36'>" +
-  "<text x='130' y='27' text-anchor='end' font-family='Roboto,sans-serif'" +
+  "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='36'" +
+  " viewBox='0 0 100 36'>" +
+  "<text x='100' y='27' text-anchor='end' font-family='Roboto,sans-serif'" +
   " font-size='28' font-weight='300' fill='white'>Sismo</text>" +
   '</svg>';
 
