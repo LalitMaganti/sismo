@@ -15,9 +15,9 @@ import {SismoHomePage} from './sismo_home_page';
 // a gap on the left.
 const SISMO_BRAND =
   "data:image/svg+xml;utf8," +
-  "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='36'" +
-  " viewBox='0 0 100 36'>" +
-  "<text x='100' y='27' text-anchor='end' font-family='Roboto,sans-serif'" +
+  "<svg xmlns='http://www.w3.org/2000/svg' width='122' height='36'" +
+  " viewBox='0 0 122 36'>" +
+  "<text x='122' y='27' text-anchor='end' font-family='Roboto,sans-serif'" +
   " font-size='28' font-weight='300' fill='white'>Sismo</text>" +
   '</svg>';
 
@@ -42,6 +42,7 @@ export class SismoEmbedder implements Embedder {
   readonly defaultPlugins: ReadonlyArray<string> = [
     'dev.perfetto.Timeline',
     'dev.perfetto.SettingsPage',
+    'dev.perfetto.CoreCommands',
   ];
   readonly homePage = SismoHomePage;
   readonly brandLogo = {src: SISMO_BRAND, alt: 'Sismo'};
