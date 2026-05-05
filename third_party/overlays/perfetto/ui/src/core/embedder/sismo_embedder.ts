@@ -2,19 +2,25 @@
 // Licensed under the MIT License.
 
 import {Embedder} from './embedder';
-import {defaultPlugins} from './default_plugins';
 import {SismoHomePage} from './sismo_home_page';
 
 // Inline SVG wordmark used as the sidebar brand. The sidebar background is
 // always dark (light-theme blue #262f3c, dark-theme gray #343434), so a
-// fixed light fill renders correctly under both themes. Embedded as a data
+// fixed white fill renders correctly under both themes. Embedded as a data
 // URL because the brand slot is rendered via <img>, which would not pick up
 // `currentColor` from parent CSS.
+//
+// Explicit width/height (matched to the CSS `height: 36px` rule on
+// .pf-sidebar__brand) and a tight viewBox keep the SVG from rendering at a
+// browser default size, so the "S" lands at the header's 12px left padding —
+// horizontally aligned with the menu-item icons (4px content padding + 8px
+// button padding = 12px) below.
 const SISMO_BRAND =
   "data:image/svg+xml;utf8," +
-  "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 130 60'>" +
-  "<text x='4' y='46' font-family='Roboto,sans-serif' font-size='44'" +
-  " font-weight='300' fill='%23e07020'>Sismo</text>" +
+  "<svg xmlns='http://www.w3.org/2000/svg' width='95' height='36'" +
+  " viewBox='0 0 95 36'>" +
+  "<text x='0' y='27' font-family='Roboto,sans-serif' font-size='28'" +
+  " font-weight='300' fill='white'>Sismo</text>" +
   '</svg>';
 
 /**
@@ -31,7 +37,10 @@ export class SismoEmbedder implements Embedder {
   readonly analyticsId = undefined;
   readonly extensionServer = undefined;
   readonly brandingBadge = undefined;
-  readonly defaultPlugins = defaultPlugins;
+  // Sismo ships with no plugins enabled by default; users can opt in via
+  // the Plugins page. Avoids inheriting perfetto's full Android/Chromium
+  // bundle which isn't relevant to the sismo profiling flows.
+  readonly defaultPlugins: ReadonlyArray<string> = [];
   readonly homePage = SismoHomePage;
   readonly brandLogo = {src: SISMO_BRAND, alt: 'Sismo'};
 }
