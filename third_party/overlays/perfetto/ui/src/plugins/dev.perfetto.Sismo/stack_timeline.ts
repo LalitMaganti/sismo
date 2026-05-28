@@ -54,7 +54,23 @@ const STACK_SLICE_SCHEMA = {
   utid: NUM,
   depth: NUM,
   name: STR_NULL,
+  mapping_name: STR_NULL,
+  rel_pc: LONG,
 } as const;
+
+// Display label for a stack frame. Symbolised frames use their name; for
+// unsymbolised frames (no debug info — common for stripped binaries) fall back
+// to `binary+0xoffset` rather than rendering an unreadable blank slice.
+function frameLabel(row: {
+  name: string | null;
+  mapping_name: string | null;
+  rel_pc: bigint;
+}): string {
+  if (row.name) return row.name;
+  const off = `0x${row.rel_pc.toString(16)}`;
+  const base = row.mapping_name?.split('/').pop();
+  return base ? `${base}+${off}` : off;
+}
 
 async function userTableExists(trace: Trace, name: string): Promise<boolean> {
   // CREATE PERFETTO TABLE registers in sqlite_master, not perfetto_tables —
@@ -127,10 +143,13 @@ async function createStackTable(trace: Trace, upidList: string): Promise<void> {
           f.callsite_at_depth AS callsite_at_depth,
           f.frame_id AS frame_id,
           spf.name AS frame_name,
-          spf.mapping AS mapping_id
+          spf.mapping AS mapping_id,
+          spf.rel_pc AS rel_pc,
+          spm.name AS mapping_name
         FROM priv_samples s
         JOIN frames f ON f.leaf = s.callsite_id
         JOIN stack_profile_frame spf ON spf.id = f.frame_id
+        LEFT JOIN stack_profile_mapping spm ON spm.id = spf.mapping
       ),
       with_neighbors AS (
         SELECT *,
@@ -170,7 +189,9 @@ async function createStackTable(trace: Trace, upidList: string): Promise<void> {
       depth,
       min(frame_name) AS name,
       min(frame_id) AS frame_id,
-      min(mapping_id) AS mapping_id
+      min(mapping_id) AS mapping_id,
+      coalesce(min(rel_pc), 0) AS rel_pc,
+      min(mapping_name) AS mapping_name
     FROM grouped
     GROUP BY utid, depth, run_id
     ORDER BY utid, ts, depth;
@@ -327,8 +348,8 @@ export async function registerStackTimelineForThread(
         schema: STACK_SLICE_SCHEMA,
         filter: {col: 'utid', eq: utid},
       }),
-    sliceName: (row) => row.name ?? '[unknown]',
-    colorizer: (row) => materialColorScheme(row.name ?? ''),
+    sliceName: (row) => frameLabel(row),
+    colorizer: (row) => materialColorScheme(frameLabel(row)),
   });
   trace.tracks.registerTrack({
     uri,

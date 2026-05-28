@@ -27,6 +27,7 @@ import {Tooltip} from '../../widgets/tooltip';
 import {loadCpuSummary, type CpuSummary} from './cpu_data';
 import {fmtCount, fmtDuration, fmtMegacycles, fmtPercent} from './format';
 import {CpuDetailPage} from './cpu_detail_page';
+import {LatencyDetailPage} from './latency_detail_page';
 import {
   EMPTY_PRIVILEGED_SET,
   loadPrivilegedSet,
@@ -58,6 +59,12 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
     if (key === 'cpu') {
       return m(CpuDetailPage, {trace: attrs.trace, privileged: this.privileged});
     }
+    if (key === 'latency') {
+      return m(LatencyDetailPage, {
+        trace: attrs.trace,
+        privileged: this.privileged,
+      });
+    }
     return this.renderOverview(attrs.trace);
   }
 
@@ -87,15 +94,11 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
         m(
           '.pf-sismo-page__body',
           this.renderCpuSection(trace),
+          this.renderLatencySection(),
           this.renderComingSoonSection(
             'Memory',
             'memory',
             'Per-process RSS, swap, GPU mem, ION/dma-buf, OOM signals.',
-          ),
-          this.renderComingSoonSection(
-            'Latency',
-            'speed',
-            'Scheduling latency, IO waits, critical paths, long blocking calls.',
           ),
         ),
       ),
@@ -276,6 +279,51 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
             '.pf-sismo-page__hero-titlewrap',
             m('.pf-sismo-page__hero-title', `${title} (coming soon)`),
             m('.pf-sismo-page__hero-tagline', blurb),
+          ),
+        ),
+      ),
+    );
+  }
+
+  private renderLatencySection(): m.Children {
+    return m(
+      Section,
+      {
+        title: 'Latency',
+        subtitle: 'Scheduling delay, blocking waits, critical paths.',
+      },
+      m(
+        Card,
+        {
+          className: 'pf-sismo-page__hero pf-sismo-page__hero--clickable',
+          interactive: true,
+          onclick: () => {
+            window.location.hash = '#!/sismo/latency';
+          },
+        },
+        m(
+          '.pf-sismo-page__hero-head',
+          m(Icon, {
+            icon: 'speed',
+            className: 'pf-sismo-page__hero-icon',
+            filled: true,
+          }),
+          m(
+            '.pf-sismo-page__hero-titlewrap',
+            m('.pf-sismo-page__hero-title', 'Scheduling latency'),
+            m(
+              '.pf-sismo-page__hero-tagline',
+              'What held the CPU while your threads were waiting to run.',
+            ),
+          ),
+          m(
+            Anchor,
+            {
+              href: '#!/sismo/latency',
+              icon: 'arrow_forward',
+              className: 'pf-sismo-page__hero-cta',
+            },
+            'Drill in',
           ),
         ),
       ),

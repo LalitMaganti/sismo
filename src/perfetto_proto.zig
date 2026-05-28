@@ -77,6 +77,14 @@ pub const LinuxFtraceEntry = struct {
     // Today: hardcoded sched events. Future: configurable.
 };
 
+/// A PMU counter to attach as a perf follower event. `id` is the
+/// PerfEvents.Counter enum value (protos/perfetto/common/perf_events.proto);
+/// `name` is the trace-side display name.
+pub const PerfCounter = struct {
+    id: u32,
+    name: []const u8,
+};
+
 pub const LinuxPerfEntry = struct {
     /// Scopes the producer to a single tgid via
     /// `callstack_sampling.scope.target_pid`. 0 = system-wide.
@@ -86,6 +94,13 @@ pub const LinuxPerfEntry = struct {
     /// overflows at 1 kHz sampling with stack snapshots — bump callers
     /// pass through cmd_record.zig.
     ring_buffer_pages: u32 = 0,
+    /// PMU counters to read on every sample as follower events (leader
+    /// sampling), giving each sample a counter vector for IPC / stall
+    /// analysis. The caller passes only counters it has already confirmed the
+    /// hardware can open (see perf_counter_probe.zig) — perfetto opens the
+    /// sample group all-or-nothing, so an unsupported follower here would sink
+    /// CPU sampling entirely. Empty = timebase-only sampling.
+    counters: []const PerfCounter = &.{},
 };
 
 /// One entry per `data_sources { config { ... } }` block in the
@@ -193,6 +208,17 @@ fn encodePerfEventConfig(gpa: std.mem.Allocator, p: LinuxPerfEntry) ![]u8 {
     // already keeps them.
     try cs.writeUint32(3, 3); // user_frames = UNWIND_FRAME_POINTER
     try w.writeMessage(16, cs.bytes());
+
+    // followers = 19 (repeated FollowerEvent). Each FollowerEvent: counter = 1
+    // (PerfEvents.Counter enum, varint), name = 4 (string). Read alongside the
+    // timebase on every sample via the kernel's leader-sampling group.
+    for (p.counters) |fc| {
+        var follower = ProtoWriter.init(gpa);
+        defer follower.deinit();
+        try follower.writeUint32(1, fc.id); // counter (enum)
+        try follower.writeString(4, fc.name); // name
+        try w.writeMessage(19, follower.bytes());
+    }
 
     return w.buf.toOwnedSlice(gpa);
 }

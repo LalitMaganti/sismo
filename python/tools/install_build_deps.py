@@ -98,7 +98,7 @@ SOURCE_DEPS: list[SourceDep] = [
         name="perfetto",
         target_dir="third_party/src/perfetto",
         git_url="https://github.com/google/perfetto.git",
-        pin="f43717c58540c0d83387451a82249dc7b1bb1dcd",
+        pin="a85b5352e4b0df6649e05ff13dfc7a406b8982fb",
     ),
 ]
 

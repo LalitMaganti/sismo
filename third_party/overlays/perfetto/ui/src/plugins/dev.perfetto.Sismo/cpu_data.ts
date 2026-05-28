@@ -59,6 +59,9 @@ export interface CpuSummary {
 export interface CpuCoreRow {
   cpu: number;
   clusterId: number | null;
+  // Relative core capacity (ARM DynamIQ / Apple AMP: bigger = performance
+  // core). Null on uniform x86. Used to label clusters P/E.
+  capacity: number | null;
   processor: string | null;
   runtimeNs: bigint | null;
   privilegedRuntimeNs: bigint | null;
@@ -178,9 +181,6 @@ export interface CpuDetail {
   topContextProcesses: CpuProcessRow[];
   privilegedThreads: CpuThreadRow[];
   topContextThreads: CpuThreadRow[];
-  blame: CpuBlameRow[];
-  threadBlame: CpuThreadBlameRow[];
-  idleStates: CpuIdleStateRow[];
   microarch: MicroarchData;
 }
 
@@ -406,9 +406,6 @@ export async function loadCpuDetail(
       topContextProcesses: [],
       privilegedThreads: [],
       topContextThreads: [],
-      blame: [],
-      threadBlame: [],
-      idleStates: [],
       microarch: EMPTY_MICROARCH,
     };
   }
@@ -421,9 +418,6 @@ export async function loadCpuDetail(
   const topContextProcesses = await loadProcessRows(engine, priv, 'context', 20);
   const privilegedThreads = await loadThreadRows(engine, priv, 'privileged');
   const topContextThreads = await loadThreadRows(engine, priv, 'context', 20);
-  const blame = await loadBlame(engine, priv, 20);
-  const threadBlame = await loadThreadBlame(engine, priv, 20);
-  const idleStates = await loadIdleStates(engine);
   const microarch = await loadMicroarch(engine, priv);
   return {
     summary,
@@ -432,11 +426,38 @@ export async function loadCpuDetail(
     topContextProcesses,
     privilegedThreads,
     topContextThreads,
-    blame,
-    threadBlame,
-    idleStates,
     microarch,
   };
+}
+
+export interface LatencyDetail {
+  hasSched: boolean;
+  hasPriv: boolean;
+  // Per-CPU cpuidle residency. Lives on the latency page because deep C-states
+  // have higher exit latency — a wakeup-latency signal, not a CPU-usage one.
+  idleStates: CpuIdleStateRow[];
+  // Other processes/threads that held the CPU while one of your threads was
+  // runnable-but-not-running — i.e. what your scheduling latency is owed to.
+  blame: CpuBlameRow[];
+  threadBlame: CpuThreadBlameRow[];
+}
+
+export async function loadLatencyDetail(
+  engine: Engine,
+  priv: PrivilegedSet,
+): Promise<LatencyDetail> {
+  const hasSchedRes = await engine.query(
+    `SELECT (SELECT count() FROM sched LIMIT 1) > 0 AS has_sched`,
+  );
+  const hasSched = hasSchedRes.firstRow({has_sched: NUM}).has_sched === 1;
+  const hasPriv = priv.upids.length > 0;
+  if (!hasSched) {
+    return {hasSched: false, hasPriv, blame: [], threadBlame: [], idleStates: []};
+  }
+  const blame = await loadBlame(engine, priv, 20);
+  const threadBlame = await loadThreadBlame(engine, priv, 20);
+  const idleStates = await loadIdleStates(engine);
+  return {hasSched: true, hasPriv, blame, threadBlame, idleStates};
 }
 
 // Empty microarch result used as a fallback when perf_sample is missing.
@@ -608,6 +629,7 @@ async function loadPerCore(
     SELECT
       cpu.cpu AS cpu,
       cpu.cluster_id AS cluster_id,
+      cpu.capacity AS capacity,
       cpu.processor AS processor,
       sched_per_cpu.runtime AS runtime_ns,
       priv_per_cpu.runtime AS priv_runtime_ns,
@@ -626,6 +648,7 @@ async function loadPerCore(
     const it = res.iter({
       cpu: NUM_NULL,
       cluster_id: NUM_NULL,
+      capacity: NUM_NULL,
       processor: STR_NULL,
       runtime_ns: LONG_NULL,
       priv_runtime_ns: LONG_NULL,
@@ -641,6 +664,7 @@ async function loadPerCore(
     rows.push({
       cpu: it.cpu,
       clusterId: it.cluster_id,
+      capacity: it.capacity,
       processor: it.processor,
       runtimeNs: it.runtime_ns ?? null,
       privilegedRuntimeNs:

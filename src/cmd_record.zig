@@ -51,6 +51,7 @@ const heap_protocol = @import("heap_protocol.zig");
 const sismo_config = @import("sismo_config.zig");
 const paths = @import("sismo_paths.zig");
 const privileged_marker = @import("sismo_privileged_marker.zig");
+const perf_counter_probe = @import("perf_counter_probe.zig");
 const c = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
@@ -547,6 +548,10 @@ pub const RecordArgs = struct {
     cpu_mode: SourceMode = .in_process,
     heap_mode: SourceMode = .in_process,
     no_instrumentation: bool = false,
+    // PMU hardware counters (IPC + stall breakdown) on the perf sampler.
+    // On by default like the other sources; --no-counters opts out. Recording
+    // degrades to timebase-only sampling when the hardware lacks the counters.
+    counters: bool = true,
     workload_argv: std.ArrayList([]const u8) = .empty,
 
     pub fn deinit(self: *RecordArgs, gpa: std.mem.Allocator) void {
@@ -583,6 +588,7 @@ fn printRecordHelp() void {
     }
     if (comptime PlatformCaps.supports_cpu) {
         writeStr(&buf, &w, "                    [--no-cpu | --external-cpu]\n");
+        writeStr(&buf, &w, "                    [--no-counters]\n");
     }
     if (comptime PlatformCaps.supports_heap) {
         writeStr(&buf, &w, "                    [--no-heap | --external-heap]\n");
@@ -597,7 +603,11 @@ fn printRecordHelp() void {
         "  --no-X         disable data source X entirely.\n" ++
         "  --external-X   data source X comes from a sidecar\n" ++
         "                 `sudo sismo datasource X` (no sudo on this process).\n" ++
-        "  --all-external shorthand for --external for every privileged source.\n",
+        "  --all-external shorthand for --external for every privileged source.\n" ++
+        "  --no-counters  don't attach PMU hardware counters (IPC, frontend/\n" ++
+        "                 backend stalls, cache/branch misses) to CPU samples.\n" ++
+        "                 Counters are on by default and degrade to plain\n" ++
+        "                 sampling when the hardware can't provide them.\n",
     );
     if (comptime builtin.os.tag == .linux) {
         writeStr(&buf, &w,
@@ -729,6 +739,9 @@ fn parseRecordArgs(
             }
         } else if (std.mem.eql(u8, arg, "--no-instrumentation")) {
             args.no_instrumentation = true;
+        } else if (std.mem.eql(u8, arg, "--no-counters")) {
+            if (comptime !PlatformCaps.supports_cpu) return rejectUnsupported("--no-counters", "cpu");
+            args.counters = false;
         } else if (std.mem.eql(u8, arg, "--help")) {
             printRecordHelp();
             return null; // defer handles cleanup
@@ -1378,6 +1391,14 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         entries_buf[n_entries] = .{ .linux_ftrace = .{} };
         n_entries += 1;
     }
+    // PMU counters are opt-out (--no-counters). Probe which the hardware can
+    // actually open so we only ask perfetto for those — it opens the sample
+    // group all-or-nothing, so an unsupported follower would sink CPU sampling.
+    var perf_counters: []const perfetto_proto.PerfCounter = &.{};
+    if (perf != null and args.counters) {
+        perf_counters = perf_counter_probe.probeSupported(gpa) catch &.{};
+    }
+    defer gpa.free(perf_counters);
     if (perf != null) {
         // 2048 pages = 8 MB per CPU. perfetto's 256-page default overflows at
         // 1 kHz sampling with full DWARF stack snapshots; trace stats show
@@ -1386,6 +1407,7 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         entries_buf[n_entries] = .{ .linux_perf = .{
             .target_pid = target.pid,
             .ring_buffer_pages = 2048,
+            .counters = perf_counters,
         } };
         n_entries += 1;
     }

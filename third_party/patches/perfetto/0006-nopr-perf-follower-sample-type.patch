@@ -1,0 +1,23 @@
+diff --git a/src/profiling/perf/event_config.cc b/src/profiling/perf/event_config.cc
+index 490ac4a9..0f087299 100644
+--- a/src/profiling/perf/event_config.cc
++++ b/src/profiling/perf/event_config.cc
+@@ -694,8 +694,16 @@ std::optional<EventConfig> EventConfig::CreateSampling(
+     pe_follower.exclude_user = e.attr_exclude_user;
+     pe_follower.exclude_kernel = e.attr_exclude_kernel;
+     pe_follower.exclude_hv = e.attr_exclude_hv;
+-    // Some arguments must match the timebase:
+-    pe_follower.sample_type = pe.sample_type;
++    // Some arguments must match the timebase. But a follower is a group-read
++    // counter with no sampling period of its own, so the leader's per-record
++    // payload bits (user stack, user regs, callchain) describe samples the
++    // follower never produces. Leaving them set makes perf_event_open reject
++    // the follower with EINVAL on stricter kernels, which discards the whole
++    // sampling data source. Strip those bits; keep the rest (TID/TIME/READ).
++    constexpr uint64_t kLeaderOnlySampleTypes = PERF_SAMPLE_STACK_USER |
++                                                PERF_SAMPLE_REGS_USER |
++                                                PERF_SAMPLE_CALLCHAIN;
++    pe_follower.sample_type = pe.sample_type & ~kLeaderOnlySampleTypes;
+     pe_follower.clockid = pe.clockid;
+     pe_follower.use_clockid = pe.use_clockid;
+ 

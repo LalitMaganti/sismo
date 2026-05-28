@@ -1,5 +1,5 @@
 diff --git a/ui/build.mjs b/ui/build.mjs
-index 53da90ca..42165c91 100644
+index 7d14885b..09f1729d 100644
 --- a/ui/build.mjs
 +++ b/ui/build.mjs
 @@ -77,6 +77,13 @@ const __dirname = path.dirname(__filename);
@@ -16,7 +16,7 @@ index 53da90ca..42165c91 100644
  const DEFAULT_PORT = 10000;
  
  const cfg = {
-@@ -117,6 +124,8 @@ const cfg = {
+@@ -118,6 +125,8 @@ const cfg = {
    outBigtraceDistDir: '',
    outOpenPerfettoTraceDistDir: '',
    lockFile: '',
@@ -25,7 +25,7 @@ index 53da90ca..42165c91 100644
  };
  
  const RULES = [
-@@ -166,6 +175,74 @@ function loadDevServerEnvFile() {
+@@ -169,6 +178,74 @@ function loadDevServerEnvFile() {
    }
  }
  
@@ -100,7 +100,7 @@ index 53da90ca..42165c91 100644
  async function main() {
    const parser = new argparse.ArgumentParser({
      formatter_class: argparse.RawDescriptionHelpFormatter,
-@@ -228,6 +305,9 @@ Env-var overrides:
+@@ -236,6 +313,9 @@ Env-var overrides:
    parser.add_argument('--title', {
      help: 'Override the page title (useful for distinguishing multiple instances)',
    });
@@ -110,7 +110,7 @@ index 53da90ca..42165c91 100644
  
    // Load ~/.config/perfetto/ui-dev-server.env defaults, then map any
    // PERFETTO_UI_* env vars to synthetic argv entries prepended before the
-@@ -310,6 +390,8 @@ Env-var overrides:
+@@ -319,6 +399,8 @@ Env-var overrides:
    cfg.check = !!args.typecheck;
    cfg.onlyWasmMemory64 = !!args.only_wasm_memory64;
    cfg.titleOverride = args.title || '';
@@ -119,7 +119,7 @@ index 53da90ca..42165c91 100644
    cfg.wasmModules = ['traceconv', 'proto_utils', 'trace_processor_memory64'];
    if (!cfg.onlyWasmMemory64) {
      cfg.wasmModules.push('trace_processor');
-@@ -474,8 +556,17 @@ function runTests(cfgFile) {
+@@ -487,8 +569,17 @@ function runTests() {
    }
  }
  
@@ -138,7 +138,7 @@ index 53da90ca..42165c91 100644
    // First copy the html as-is into the dist/v1.2.3/ directory. This is
    // only used for archival purporses, so one can open
    // ui.perfetto.dev/v1.2.3/ to skip the auto-update and channel logic.
-@@ -501,7 +592,15 @@ function cpHtml(src, filename) {
+@@ -514,7 +605,15 @@ function cpHtml(src, filename) {
  }
  
  function copyIndexHtml(src) {
@@ -155,7 +155,7 @@ index 53da90ca..42165c91 100644
  }
  
  function copyBigtraceHtml(src) {
-@@ -750,6 +849,10 @@ function runVite() {
+@@ -788,6 +887,10 @@ function runVite() {
      NO_TREESHAKE: cfg.noTreeshake ? 'true' : '',
      MINIFY_JS: cfg.minifyJs || '',
      IS_MEMORY64_ONLY: cfg.onlyWasmMemory64 ? 'true' : '',
@@ -164,8 +164,18 @@ index 53da90ca..42165c91 100644
 +    // emits all discovered plugins, matching pre-include-list behavior.
 +    PERFETTO_INCLUDE_PLUGINS_PATH: cfg.config.includePluginsPath || '',
    };
-   const bundles = [
-     'frontend',
+   const useDevServer = cfg.watch && cfg.startHttpServer;
+   const bundles = ['engine', 'traceconv', 'service_worker', 'chrome_extension'];
+@@ -894,6 +997,9 @@ async function startViteDevServer() {
+       /data-perfetto_version='[^']*'/,
+       `data-perfetto_version='${versionMap}'`,
+     );
++    // Match prod's cpHtml: fill the app-title placeholder from the deployment
++    // config. Without this the literal __APP_TITLE__ leaks through in dev.
++    html = html.replaceAll('__APP_TITLE__', cfg.config.appTitle);
+     if (cfg.titleOverride) {
+       html = html.replace(
+         /<title>[^<]*<\/title>/,
 diff --git a/ui/src/assets/index.html b/ui/src/assets/index.html
 index 0392e494..58e9c55d 100644
 --- a/ui/src/assets/index.html
@@ -239,33 +249,6 @@ index e18b802e..a92af2ec 100644
            width: 120,
            overflow: 'truncate',
            ellipsis: '\u2026',
-diff --git a/ui/src/core/embedder/create_embedder.ts b/ui/src/core/embedder/create_embedder.ts
-index a30050be..640965d8 100644
---- a/ui/src/core/embedder/create_embedder.ts
-+++ b/ui/src/core/embedder/create_embedder.ts
-@@ -15,13 +15,19 @@
- import type {Embedder} from './embedder';
- import {DefaultEmbedder} from './default_embedder';
- import {PerfettoUiEmbedder} from './perfetto_ui_embedder';
-+import {EXTERNAL_EMBEDDER} from './external_embedder';
- 
- /**
-- * Returns the appropriate Embedder based on the current origin.
-- * Uses PerfettoUiEmbedder when running on ui.perfetto.dev or localhost,
-- * and DefaultEmbedder otherwise.
-+ * Returns the appropriate Embedder. A deployment-supplied external
-+ * embedder (provided by overriding the contents of external_embedder.ts)
-+ * is used unconditionally when present. Otherwise selects between
-+ * PerfettoUiEmbedder for ui.perfetto.dev / localhost and
-+ * DefaultEmbedder for everything else.
-  */
- export function createEmbedder(): Embedder {
-+  if (EXTERNAL_EMBEDDER !== undefined) {
-+    return EXTERNAL_EMBEDDER;
-+  }
-   const origin = self.location?.origin ?? '';
-   if (
-     origin.endsWith('.perfetto.dev') ||
 diff --git a/ui/src/core/embedder/default_embedder.ts b/ui/src/core/embedder/default_embedder.ts
 index e1f81829..2d7b6ed6 100644
 --- a/ui/src/core/embedder/default_embedder.ts
@@ -328,10 +311,10 @@ index 46bc9bcf..2c800823 100644
 +  readonly brandLogo = undefined;
  }
 diff --git a/ui/src/frontend/index.ts b/ui/src/frontend/index.ts
-index 3a404a43..bba4329a 100644
+index b30592c3..d3ba8818 100644
 --- a/ui/src/frontend/index.ts
 +++ b/ui/src/frontend/index.ts
-@@ -359,7 +359,11 @@ function onCssLoaded(app: AppImpl) {
+@@ -360,7 +360,11 @@ function onCssLoaded(app: AppImpl) {
    document.body.innerHTML = '';
  
    const pages = app.pages;
@@ -345,23 +328,23 @@ index 3a404a43..bba4329a 100644
    router.onRouteChanged = routeChange;
  
 diff --git a/ui/src/frontend/ui_main.ts b/ui/src/frontend/ui_main.ts
-index 8a7c53c0..02187c6e 100644
+index 7ad231f4..591a2496 100644
 --- a/ui/src/frontend/ui_main.ts
 +++ b/ui/src/frontend/ui_main.ts
-@@ -67,7 +67,7 @@ export class UiMain implements m.ClassComponent {
-         state: isSomethingLoading ? 'indeterminate' : 'none',
-       }),
-       m('.pf-ui-main__page-container', app.pages.renderPageForCurrentRoute()),
+@@ -75,7 +75,7 @@ export class UiMain implements m.ClassComponent {
+           pageContent: app.pages.renderPageForCurrentRoute(),
+         }),
+       ),
 -      m(CookieConsent),
 +      app.embedder.analyticsId !== undefined && m(CookieConsent),
        maybeRenderFullscreenModalDialog(),
        showStatusBarFlag.get() && renderStatusBar(app),
        app.perfDebugging.renderPerfStats(),
 diff --git a/ui/src/frontend/views/sidebar.ts b/ui/src/frontend/views/sidebar.ts
-index 806ce863..59e84385 100644
+index 64b01ff6..303cbba8 100644
 --- a/ui/src/frontend/views/sidebar.ts
 +++ b/ui/src/frontend/views/sidebar.ts
-@@ -80,7 +80,7 @@ export class Sidebar implements m.ClassComponent<SidebarAttrs> {
+@@ -81,7 +81,7 @@ export class Sidebar implements m.ClassComponent<SidebarAttrs> {
        {
          className: `pf-sidebar__header--${getCurrentChannel()}`,
        },
@@ -370,7 +353,7 @@ index 806ce863..59e84385 100644
        app.embedder.brandingBadge &&
          m(
            'span.pf-sidebar__branding-badge',
-@@ -107,6 +107,14 @@ export class Sidebar implements m.ClassComponent<SidebarAttrs> {
+@@ -108,6 +108,14 @@ export class Sidebar implements m.ClassComponent<SidebarAttrs> {
      );
    }
  
@@ -386,11 +369,11 @@ index 806ce863..59e84385 100644
      return m(
        '.pf-sidebar__content',
 diff --git a/ui/vite.config.mjs b/ui/vite.config.mjs
-index cdb19c9d..56b7c6d0 100644
+index 28b57d90..46a1eae4 100644
 --- a/ui/vite.config.mjs
 +++ b/ui/vite.config.mjs
-@@ -118,6 +118,20 @@ function pluginAllPluginsBarrel() {
-     'virtual:perfetto/all_plugins':      path.join(SRC, 'plugins'),
+@@ -119,6 +119,20 @@ function pluginAllPluginsBarrel() {
+     'virtual:perfetto/all_plugins': path.join(SRC, 'plugins'),
      'virtual:perfetto/all_core_plugins': path.join(SRC, 'core_plugins'),
    };
 +  // Optional plugin allowlist supplied by an embedder via build.mjs's
@@ -409,16 +392,16 @@ index cdb19c9d..56b7c6d0 100644
 +  }
    const toCamelCase = (s) => {
      const [first, ...rest] = s.split(/[._]/);
-     return first +
-@@ -132,6 +146,7 @@ function pluginAllPluginsBarrel() {
-                  fs.existsSync(path.join(full, 'index.ts'));
-         } catch (_) { return false; }
+     return (
+@@ -139,6 +153,7 @@ function pluginAllPluginsBarrel() {
+           return false;
+         }
        })
 +      .filter(({name}) => includeSet === null || includeSet.has(name))
        .sort((a, b) => a.name.localeCompare(b.name));
      const imports = entries
        .map(({name, full}) => `import ${toCamelCase(name)} from '${full}';`)
-@@ -180,6 +195,62 @@ function pluginAllPluginsBarrel() {
+@@ -187,6 +202,62 @@ function pluginAllPluginsBarrel() {
    };
  }
  
@@ -481,11 +464,11 @@ index cdb19c9d..56b7c6d0 100644
  function pluginGenRelativeImports() {
    return {
      name: 'perfetto:gen-relative-imports',
-@@ -232,6 +303,7 @@ export default defineConfig({
-     // Compiles *.grammar files (lezer parser definitions) on import. Replaces
-     // the old "manually run lezer-generator and commit gen/*.js" workflow.
-     lezer(),
-+    pluginOverlayDepResolution(),
-     pluginGenRelativeImports(),
-     ...(NO_SOURCE_MAPS ? [] : [pluginEmbedMinimalSourceMap()]),
-   ],
+@@ -288,6 +359,7 @@ export default defineConfig(({command}) => {
+       // Compiles *.grammar files (lezer parser definitions) on import. Replaces
+       // the old "manually run lezer-generator and commit gen/*.js" workflow.
+       lezer(),
++      pluginOverlayDepResolution(),
+       pluginGenRelativeImports(),
+       ...(isBuild ? [] : [pluginGenWasmGlueEsm()]),
+       ...(NO_SOURCE_MAPS ? [] : [pluginEmbedMinimalSourceMap()]),

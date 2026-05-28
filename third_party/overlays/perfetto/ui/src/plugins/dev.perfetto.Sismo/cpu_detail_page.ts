@@ -25,17 +25,18 @@ import {Button, ButtonVariant} from '../../widgets/button';
 import {Icon} from '../../widgets/icon';
 import {Tooltip} from '../../widgets/tooltip';
 import {Tabs} from '../../widgets/tabs';
-import {BarChart} from '../../components/widgets/charts/bar_chart';
-import {getThreadOrProcUri} from '../../public/utils';
+import {
+  goToTimeline,
+  renderPrivilegedBanner,
+  renderProcessLink,
+  renderThreadLink,
+} from './page_common';
 import {
   loadCpuDetail,
-  type CpuBlameRow,
   type CpuCoreRow,
   type CpuDetail,
-  type CpuIdleStateRow,
   type CpuProcessRow,
   type CpuSummary,
-  type CpuThreadBlameRow,
   type CpuThreadRow,
   type HotMappingRow,
   type HotSymbolRow,
@@ -44,31 +45,12 @@ import {
 import {
   fmtCount,
   fmtDuration,
-  fmtDurationNs,
   fmtFreqKhz,
   fmtMegacycles,
   fmtMegacyclesNum,
   fmtPercent,
 } from './format';
 import type {PrivilegedSet} from './privileged_set';
-
-const IDLE_PALETTE = ['#cfe2ff', '#9ec5fe', '#6ea8fe', '#3d8bfd', '#0d6efd'];
-
-function goToTimeline(
-  trace: Trace,
-  target?: {upid?: number; utid?: number},
-): void {
-  trace.navigate('#!/viewer');
-  if (target === undefined) return;
-  const uri =
-    target.upid !== undefined
-      ? getThreadOrProcUri(target.upid, null)
-      : target.utid !== undefined
-        ? getThreadOrProcUri(null, target.utid)
-        : undefined;
-  if (uri === undefined) return;
-  trace.scrollTo({track: {uri, expandGroup: true}});
-}
 
 export interface CpuDetailPageAttrs {
   readonly trace: Trace;
@@ -79,7 +61,6 @@ export class CpuDetailPage implements m.ClassComponent<CpuDetailPageAttrs> {
   private data?: CpuDetail;
   private error?: string;
   private consumersTab: 'processes' | 'threads' = 'processes';
-  private blameTab: 'processes' | 'threads' = 'processes';
 
   oninit({attrs}: m.CVnode<CpuDetailPageAttrs>) {
     this.load(attrs.trace, attrs.privileged);
@@ -144,8 +125,6 @@ export class CpuDetailPage implements m.ClassComponent<CpuDetailPageAttrs> {
       this.renderHeadline(trace, d.summary),
       this.renderPerCore(trace, d.summary, d.perCore),
       this.renderConsumers(trace, d),
-      this.renderBlameTabs(trace, d),
-      this.renderIdleStates(d.idleStates),
       this.renderMicroarch(d.microarch),
     ];
   }
@@ -209,78 +188,39 @@ export class CpuDetailPage implements m.ClassComponent<CpuDetailPageAttrs> {
     );
   }
 
-  private renderPerCore(_trace: Trace, _summary: CpuSummary, rows: CpuCoreRow[]): m.Children {
+  private renderPerCore(
+    trace: Trace,
+    summary: CpuSummary,
+    rows: CpuCoreRow[],
+  ): m.Children {
     if (rows.length === 0) {
       return m(
         Section,
-        {title: 'Per-core breakdown', subtitle: 'Runtime per CPU, your processes vs the rest of the system'},
+        {
+          title: 'Per-core breakdown',
+          subtitle: 'How busy each core was and at what frequency.',
+        },
         m(EmptyState, {icon: 'memory', title: 'No per-core data'}),
       );
     }
-    // Busy-time only (no idle): idle dominates most traces so a walltime-
-    // normalised stack would render the yours-vs-others split as a sliver.
+    const walltime = summary.walltimeNs !== null ? Number(summary.walltimeNs) : 0;
     const hasPriv = rows.some((r) => r.privilegedRuntimeNs !== null);
-
-    const labels = rows.map((r) => `CPU ${r.cpu}`);
-    const privItems = rows.map((r) => ({
-      label: `CPU ${r.cpu}`,
-      value: Number(r.privilegedRuntimeNs ?? 0n),
-    }));
-    const contextItems = rows.map((r) => {
-      const runtime = Number(r.runtimeNs ?? 0n);
-      const priv = Number(r.privilegedRuntimeNs ?? 0n);
-      return {label: `CPU ${r.cpu}`, value: Math.max(0, runtime - priv)};
-    });
-    const series = hasPriv
-      ? [
-          {name: 'Your processes', items: privItems},
-          {name: 'Other processes', items: contextItems},
-        ]
-      : [{name: 'Busy', items: contextItems}];
-
-    const freqRows = rows.filter(
-      (r) =>
-        r.avgFreqKhz !== null || r.minFreqKhz !== null || r.maxFreqKhz !== null,
-    );
-
+    const clusters = groupCoresByCluster(rows);
+    const subtitle =
+      clusters.length > 1
+        ? 'Cores grouped by cluster. Per core: how busy it was (your work vs the rest) and the frequency it ran at.'
+        : 'Per core: how busy it was (your work vs the rest) and the frequency it ran at.';
     return m(
       Section,
-      {title: 'Per-core breakdown', subtitle: 'Runtime per CPU, your processes vs the rest of the system'},
-      m(
-        Card,
-        {className: 'pf-sismo-page__chart-card'},
-        m(BarChart, {
-          data: {items: [], series},
-          orientation: 'horizontal',
-          height: Math.max(160, labels.length * 28),
-          measureLabel: 'Time',
-          formatMeasure: fmtDurationNs,
-          legendPosition: 'top',
-          gridLines: 'vertical',
-        }),
-      ),
-      freqRows.length > 0 &&
+      {title: 'Per-core breakdown', subtitle},
+      clusters.map((cl) =>
         m(
-          'details.pf-sismo-page__details',
-          m('summary', `Frequency stats per CPU (${freqRows.length} cores)`),
-          m(
-            '.pf-sismo-page__freq-grid',
-            freqRows.map((r) =>
-              m(
-                '.pf-sismo-page__freq-cell',
-                m('.pf-sismo-page__freq-cell-label', `CPU ${r.cpu}`),
-                m(
-                  '.pf-sismo-page__freq-cell-value',
-                  fmtFreqKhz(r.avgFreqKhz),
-                ),
-                m(
-                  '.pf-sismo-page__freq-cell-range',
-                  `${fmtFreqKhz(r.minFreqKhz)} – ${fmtFreqKhz(r.maxFreqKhz)}`,
-                ),
-              ),
-            ),
-          ),
+          '.pf-sismo-page__tab-pane',
+          clusters.length > 1 &&
+            m('.pf-sismo-page__tab-pane-label', cl.label),
+          renderCoreTable(trace, cl.cores, walltime, hasPriv),
         ),
+      ),
     );
   }
 
@@ -380,35 +320,6 @@ export class CpuDetailPage implements m.ClassComponent<CpuDetailPageAttrs> {
     );
   }
 
-  private renderBlameTabs(trace: Trace, d: CpuDetail): m.Children {
-    return m(
-      Section,
-      {
-        title: 'What was running while you were runnable',
-        subtitle:
-          'For each other process/thread on the system: how long it was on the CPU while one of your threads was waiting to run. Higher = more of your scheduling latency this attributes to.',
-      },
-      m(Tabs, {
-        activeTabKey: this.blameTab,
-        onTabChange: (key) => {
-          this.blameTab = key as 'processes' | 'threads';
-        },
-        tabs: [
-          {
-            key: 'processes',
-            title: 'Processes',
-            content: renderBlameProcessTable(trace, d.blame),
-          },
-          {
-            key: 'threads',
-            title: 'Threads',
-            content: renderBlameThreadTable(trace, d.threadBlame),
-          },
-        ],
-      }),
-    );
-  }
-
   private renderMicroarch(m_: MicroarchData): m.Children {
     if (!m_.hasSamples) {
       return m(
@@ -475,70 +386,6 @@ export class CpuDetailPage implements m.ClassComponent<CpuDetailPageAttrs> {
     );
   }
 
-  private renderIdleStates(rows: CpuIdleStateRow[]): m.Children {
-    if (rows.length === 0) {
-      return m(
-        Section,
-        {
-          title: 'Idle states',
-          subtitle: 'Time each CPU spent in each cpuidle state',
-        },
-        m(EmptyState, {
-          icon: 'bedtime',
-          title: 'No idle-state data',
-        }),
-      );
-    }
-    // Preserve first-seen state order across CPUs so stacks line up by depth
-    // (typically shallow → deep, C1, C2, …).
-    const states: string[] = [];
-    const stateSet = new Set<string>();
-    for (const r of rows) {
-      if (!stateSet.has(r.state)) {
-        stateSet.add(r.state);
-        states.push(r.state);
-      }
-    }
-    const cpus = Array.from(new Set(rows.map((r) => r.cpu))).sort(
-      (a, b) => a - b,
-    );
-    // BarChartSeries has no per-series color knob; ECharts cycles its default
-    // palette positionally. IDLE_PALETTE is kept around as the target shape
-    // for when we move to a chart widget that takes explicit colors.
-    void IDLE_PALETTE;
-    const series = states.map((state) => ({
-      name: state,
-      items: cpus.map((cpu) => {
-        const row = rows.find((r) => r.cpu === cpu && r.state === state);
-        return {
-          label: `CPU ${cpu}`,
-          value: row ? row.percentage : 0,
-        };
-      }),
-    }));
-    return m(
-      Section,
-      {
-        title: 'Idle states',
-        subtitle:
-          'Time each CPU spent in each cpuidle state, shallow → deep. Requires cpuidle counters.',
-      },
-      m(
-        Card,
-        {className: 'pf-sismo-page__chart-card'},
-        m(BarChart, {
-          data: {items: [], series},
-          orientation: 'horizontal',
-          height: Math.max(160, cpus.length * 28),
-          measureLabel: '% of time',
-          formatMeasure: (v) => `${v.toFixed(0)}%`,
-          legendPosition: 'top',
-          gridLines: 'vertical',
-        }),
-      ),
-    );
-  }
-
   private async load(trace: Trace, priv: PrivilegedSet): Promise<void> {
     try {
       this.data = await loadCpuDetail(trace.engine, priv);
@@ -553,67 +400,6 @@ interface HeadlineCard {
   readonly label: string;
   readonly value: string;
   readonly help?: string;
-}
-
-function renderPrivilegedBanner(priv: PrivilegedSet): m.Children {
-  if (priv.pids.length === 0) {
-    return m(
-      '.pf-sismo-page__priv-banner.pf-sismo-page__priv-banner--empty',
-      m(Icon, {icon: 'info'}),
-      " No profiled processes detected — sections below show the system undifferentiated. Record with `sismo record` to tag the processes you're profiling.",
-    );
-  }
-  const pidList = priv.pids.map((p) => `pid ${p}`).join(', ');
-  return m(
-    '.pf-sismo-page__priv-banner',
-    m(Icon, {icon: 'star', filled: true}),
-    ` Profiling ${pidList}`,
-    priv.upids.length < priv.pids.length &&
-      m(
-        'span.pf-sismo-page__muted',
-        ` (${priv.pids.length - priv.upids.length} not found in this trace)`,
-      ),
-  );
-}
-
-function renderProcessLink(
-  trace: Trace,
-  name: string,
-  pid: number | null,
-  upid: number,
-): m.Children {
-  return m(
-    Anchor,
-    {
-      href: '#!/viewer',
-      onclick: (e: Event) => {
-        e.preventDefault();
-        goToTimeline(trace, {upid});
-      },
-    },
-    name,
-    pid !== null && m('span.pf-sismo-page__muted', ` (pid ${pid})`),
-  );
-}
-
-function renderThreadLink(
-  trace: Trace,
-  threadName: string,
-  tid: number | null,
-  utid: number,
-): m.Children {
-  return m(
-    Anchor,
-    {
-      href: '#!/viewer',
-      onclick: (e: Event) => {
-        e.preventDefault();
-        goToTimeline(trace, {utid});
-      },
-    },
-    threadName,
-    tid !== null && m('span.pf-sismo-page__muted', ` (tid ${tid})`),
-  );
 }
 
 function renderProcessTable(
@@ -688,74 +474,103 @@ function renderThreadTable(
   );
 }
 
-function renderBlameProcessTable(
-  trace: Trace,
-  rows: ReadonlyArray<CpuBlameRow>,
-): m.Children {
-  if (rows.length === 0) {
-    return m(EmptyState, {
-      icon: 'block',
-      title:
-        'Nothing was blocking you — your threads got the CPU as soon as they became runnable.',
-    });
+interface CoreCluster {
+  readonly label: string;
+  readonly cores: CpuCoreRow[];
+}
+
+// Groups cores by cluster_id and labels clusters performance/efficiency when
+// they're distinguishable (distinct capacities, or failing that distinct peak
+// frequencies). Falls back to a single "All cores" group on uniform SoCs.
+function groupCoresByCluster(rows: CpuCoreRow[]): CoreCluster[] {
+  const byId = new Map<number, CpuCoreRow[]>();
+  for (const r of rows) {
+    const id = r.clusterId ?? 0;
+    const bucket = byId.get(id);
+    if (bucket === undefined) byId.set(id, [r]);
+    else bucket.push(r);
   }
-  const data = rows.map((r) => [
-    m(
-      GridCell,
-      {wrap: true},
-      renderProcessLink(trace, r.name, r.pid, r.upid),
+  if (byId.size <= 1) {
+    return [{label: `All cores (${rows.length})`, cores: rows}];
+  }
+  const groups = [...byId.values()].map((cores) => ({
+    cores,
+    cap: Math.max(...cores.map((c) => c.capacity ?? 0)),
+    freq: Math.max(
+      ...cores.map((c) => (c.maxFreqKhz !== null ? Number(c.maxFreqKhz) : 0)),
     ),
-    m(GridCell, {align: 'right'}, fmtDuration(trace, r.blockedNs)),
-  ]);
+  }));
+  const caps = new Set(groups.map((g) => g.cap));
+  const freqs = new Set(groups.map((g) => g.freq));
+  const byCap = caps.size > 1 && !caps.has(0);
+  const byFreq = !byCap && freqs.size > 1 && !freqs.has(0);
+  const rankable = byCap || byFreq;
+  groups.sort((a, b) => (byCap ? b.cap - a.cap : b.freq - a.freq));
+  return groups.map((g, i) => {
+    const n = g.cores.length;
+    let label: string;
+    if (!rankable) label = `Cluster ${g.cores[0].clusterId ?? i} (${n} cores)`;
+    else if (i === 0) label = `Performance cores (${n})`;
+    else if (i === groups.length - 1) label = `Efficiency cores (${n})`;
+    else label = `Cluster ${g.cores[0].clusterId ?? i} (${n} cores)`;
+    return {label, cores: g.cores};
+  });
+}
+
+function renderCoreTable(
+  trace: Trace,
+  cores: ReadonlyArray<CpuCoreRow>,
+  walltime: number,
+  hasPriv: boolean,
+): m.Children {
+  const data = cores.map((r) => {
+    const runtime = Number(r.runtimeNs ?? 0n);
+    const priv = Number(r.privilegedRuntimeNs ?? 0n);
+    const busyFrac = walltime > 0 ? runtime / walltime : 0;
+    const privFrac = runtime > 0 ? Math.max(0, Math.min(1, priv / runtime)) : 0;
+    return [
+      m(GridCell, `CPU ${r.cpu}`),
+      m(GridCell, {align: 'right'}, fmtDuration(trace, r.runtimeNs ?? 0n)),
+      m(GridCell, {align: 'right'}, fmtPercent(busyFrac)),
+      m(GridCell, renderCoreBar(busyFrac, privFrac, hasPriv)),
+      m(GridCell, {align: 'right'}, fmtFreqKhz(r.avgFreqKhz)),
+      m(GridCell, {align: 'right'}, fmtFreqKhz(r.maxFreqKhz)),
+      m(GridCell, {align: 'right'}, fmtMegacycles(r.megacycles)),
+    ];
+  });
   return m(
     Card,
     {className: 'pf-sismo-page__table-card'},
     m(Grid, {
       columns: [
-        {key: 'name', header: m(GridHeaderCell, 'Process')},
-        {
-          key: 'blocked',
-          header: m(GridHeaderCell, 'Time on CPU while you wanted it'),
-        },
+        {key: 'core', header: m(GridHeaderCell, 'Core')},
+        {key: 'busy', header: m(GridHeaderCell, 'Busy')},
+        {key: 'pct', header: m(GridHeaderCell, '% busy')},
+        {key: 'bar', header: m(GridHeaderCell, '')},
+        {key: 'avg', header: m(GridHeaderCell, 'Avg freq')},
+        {key: 'peak', header: m(GridHeaderCell, 'Peak freq')},
+        {key: 'cyc', header: m(GridHeaderCell, 'Cycles')},
       ],
       rowData: data,
     }),
   );
 }
 
-function renderBlameThreadTable(
-  trace: Trace,
-  rows: ReadonlyArray<CpuThreadBlameRow>,
+// Busy fraction of the core, split into your work (blue) vs the rest (grey).
+function renderCoreBar(
+  busyFrac: number,
+  privFrac: number,
+  hasPriv: boolean,
 ): m.Children {
-  if (rows.length === 0) {
-    return m(EmptyState, {
-      icon: 'block',
-      title:
-        'No blocking threads — your threads got the CPU as soon as they became runnable.',
-    });
-  }
-  const data = rows.map((r) => [
-    m(
-      GridCell,
-      {wrap: true},
-      renderThreadLink(trace, r.threadName, r.tid, r.utid),
-    ),
-    m(GridCell, {wrap: true}, r.processName ?? '—'),
-    m(GridCell, {align: 'right'}, fmtDuration(trace, r.blockedNs)),
-  ]);
+  const busyPct = Math.max(0, Math.min(1, busyFrac)) * 100;
   return m(
-    Card,
-    {className: 'pf-sismo-page__table-card'},
-    m(Grid, {
-      columns: [
-        {key: 'thread', header: m(GridHeaderCell, 'Thread')},
-        {key: 'process', header: m(GridHeaderCell, 'Process')},
-        {
-          key: 'blocked',
-          header: m(GridHeaderCell, 'Time on CPU while you wanted it'),
-        },
-      ],
-      rowData: data,
+    '.pf-sismo-page__meter-bar',
+    hasPriv &&
+      m('.pf-sismo-page__meter-fill.pf-sismo-page__meter-fill--priv', {
+        style: {width: `${busyPct * privFrac}%`},
+      }),
+    m('.pf-sismo-page__meter-fill.pf-sismo-page__meter-fill--ctx', {
+      style: {width: `${hasPriv ? busyPct * (1 - privFrac) : busyPct}%`},
     }),
   );
 }
