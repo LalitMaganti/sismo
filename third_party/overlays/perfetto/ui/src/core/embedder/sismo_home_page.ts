@@ -1,12 +1,9 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-// Sismo home page wired in via SismoEmbedder.homePage. PR #5712 passes
-// the running App through Mithril attrs so this file can stay clear of
-// AppImpl — importing AppImpl here would form a cycle (sismo_embedder
-// -> sismo_home_page -> AppImpl -> createEmbedder -> external_embedder
-// -> sismo_embedder). The App interface is in core/public/app.ts and
-// has no path back to createEmbedder.
+// Receives the running App via Mithril attrs (rather than importing AppImpl)
+// to avoid a circular import: sismo_embedder → sismo_home_page → AppImpl →
+// createEmbedder → external_embedder → sismo_embedder.
 
 import m from 'mithril';
 import {

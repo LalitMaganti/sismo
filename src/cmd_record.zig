@@ -50,6 +50,7 @@ const traced = @import("sismo_traced.zig");
 const heap_protocol = @import("heap_protocol.zig");
 const sismo_config = @import("sismo_config.zig");
 const paths = @import("sismo_paths.zig");
+const privileged_marker = @import("sismo_privileged_marker.zig");
 const c = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
@@ -1216,6 +1217,10 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         std.debug.print("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)\n", .{});
     } else {
         std.debug.print("sismo record: trace saved to {s}\n", .{output_path});
+        // TODO: replace with JSON-in-zip sidecar. See sismo_privileged_marker.zig.
+        privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}) catch |err| {
+            std.debug.print("sismo record: failed to write privileged marker: {s}\n", .{@errorName(err)});
+        };
     }
 
     // 11. Shut down captures (signals EXIT, joins worker, frees state).
@@ -1264,7 +1269,7 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
 // -----------------------------------------------------------------------------
 fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     const gpa = init.gpa;
-    _ = init.io;
+    const io = init.io;
 
     // Read fields off `args` into local names. The Linux runner doesn't
     // currently honor sched_mode/cpu_mode/heap_mode beyond the
@@ -1374,7 +1379,14 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         n_entries += 1;
     }
     if (perf != null) {
-        entries_buf[n_entries] = .{ .linux_perf = .{ .target_pid = target.pid } };
+        // 2048 pages = 8 MB per CPU. perfetto's 256-page default overflows at
+        // 1 kHz sampling with full DWARF stack snapshots; trace stats show
+        // hundreds of lost records per CPU under that default. 8 MB is what
+        // perfetto's docs recommend for "high frequency / large stacks".
+        entries_buf[n_entries] = .{ .linux_perf = .{
+            .target_pid = target.pid,
+            .ring_buffer_pages = 2048,
+        } };
         n_entries += 1;
     }
     if (n_entries == 0) {
@@ -1479,6 +1491,10 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         std.debug.print("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)\n", .{});
     } else {
         std.debug.print("sismo record: trace saved to {s}\n", .{output_path});
+        // TODO: replace with JSON-in-zip sidecar. See sismo_privileged_marker.zig.
+        privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}) catch |err| {
+            std.debug.print("sismo record: failed to write privileged marker: {s}\n", .{@errorName(err)});
+        };
     }
 
     // 7. Tear-down via Zig defer LIFO:

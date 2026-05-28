@@ -81,6 +81,11 @@ pub const LinuxPerfEntry = struct {
     /// Scopes the producer to a single tgid via
     /// `callstack_sampling.scope.target_pid`. 0 = system-wide.
     target_pid: i32 = 0,
+    /// Per-CPU kernel perf ring buffer size, in 4K pages. Must be a power
+    /// of two. 0 leaves it at perfetto's 256-page (1 MB) default, which
+    /// overflows at 1 kHz sampling with stack snapshots — bump callers
+    /// pass through cmd_record.zig.
+    ring_buffer_pages: u32 = 0,
 };
 
 /// One entry per `data_sources { config { ... } }` block in the
@@ -161,6 +166,10 @@ fn encodePerfEventConfig(gpa: std.mem.Allocator, p: LinuxPerfEntry) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
 
+    if (p.ring_buffer_pages > 0) {
+        try w.writeUint32(3, p.ring_buffer_pages); // ring_buffer_pages
+    }
+
     var timebase = ProtoWriter.init(gpa);
     defer timebase.deinit();
     try timebase.writeUint64(2, 1000); // frequency = 1 kHz
@@ -175,7 +184,14 @@ fn encodePerfEventConfig(gpa: std.mem.Allocator, p: LinuxPerfEntry) ![]u8 {
         try cs.writeMessage(1, scope.bytes());
     }
     try cs.writeBool(2, true); // kernel_frames
-    try cs.writeUint32(3, 2); // user_frames = UNWIND_DWARF
+    // UNWIND_FRAME_POINTER (3): kernel walks user frame pointers via
+    // PERF_SAMPLE_CALLCHAIN. No per-sample stack copy, no /proc/<pid>/mem
+    // reads, no DWARF parsing — far more robust than UNWIND_DWARF on
+    // workloads that spend time in libc/vdso. Requires every binary in the
+    // call chain (workload + libc) to keep frame pointers; sample-target
+    // adds -fno-omit-frame-pointer in build.zig, and modern Fedora glibc
+    // already keeps them.
+    try cs.writeUint32(3, 3); // user_frames = UNWIND_FRAME_POINTER
     try w.writeMessage(16, cs.bytes());
 
     return w.buf.toOwnedSlice(gpa);

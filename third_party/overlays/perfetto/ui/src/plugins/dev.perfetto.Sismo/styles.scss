@@ -1,0 +1,584 @@
+// Copyright (C) 2026 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+.pf-sismo-page {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 16px;
+  display: flex;
+  justify-content: center;
+
+  &__inner {
+    width: 95%;
+    max-width: 1400px;
+    background: var(--pf-color-background);
+    border-radius: 12px;
+    box-shadow: 0px 2px 6px var(--pf-color-box-shadow);
+    overflow: hidden;
+  }
+
+  &__header {
+    padding: 24px 28px 20px;
+    border-bottom: 1px solid var(--pf-color-border);
+  }
+
+  &__title {
+    font-size: 28px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    letter-spacing: -0.02em;
+  }
+
+  &__header-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  &__subtitle {
+    color: var(--pf-color-text-muted);
+    font-size: var(--pf-font-size-l);
+    line-height: 1.5;
+  }
+
+  &__breadcrumbs {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    margin-bottom: 8px;
+
+    a {
+      margin-right: 4px;
+    }
+  }
+
+  &__body {
+    padding: 16px 28px 24px;
+
+    .pf-section {
+      border: none;
+      border-radius: 0;
+      margin-bottom: 28px;
+
+      &:last-child {
+        margin-bottom: 0;
+      }
+
+      header {
+        border-bottom: none;
+        margin-bottom: 8px;
+        padding: 0;
+
+        h1 {
+          font-size: var(--pf-font-size-xxl);
+          font-weight: 600;
+          color: var(--pf-color-text);
+          letter-spacing: -0.01em;
+          margin-bottom: 4px;
+        }
+      }
+
+      .pf-section__subtitle {
+        font-size: var(--pf-font-size-m);
+        color: var(--pf-color-text-muted);
+        line-height: 1.4;
+        margin: 0;
+      }
+
+      article {
+        padding: 0;
+      }
+    }
+
+    .pf-grid-layout {
+      gap: 16px;
+      margin-bottom: 0;
+    }
+  }
+
+  // Hero card used on the overview to introduce each top-level area.
+  &__hero {
+    padding: 16px;
+    background: var(--pf-color-background-secondary);
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  &__hero--clickable {
+    cursor: pointer;
+    transition:
+      transform 0.1s ease-in-out,
+      box-shadow 0.1s ease-in-out;
+
+    &:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+    }
+
+    &:active {
+      transform: translateY(0);
+    }
+  }
+
+  &__hero--placeholder {
+    opacity: 0.7;
+  }
+
+  &__hero-head {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  &__hero-icon {
+    font-size: 32px;
+    color: var(--pf-color-text);
+  }
+
+  &__hero-titlewrap {
+    flex: 1;
+    min-width: 0;
+  }
+
+  &__hero-title {
+    font-size: var(--pf-font-size-xl);
+    font-weight: 600;
+    color: var(--pf-color-text);
+    line-height: 1.2;
+  }
+
+  &__hero-tagline {
+    font-size: var(--pf-font-size-m);
+    color: var(--pf-color-text-muted);
+    margin-top: 2px;
+    line-height: 1.4;
+  }
+
+  &__hero-cta {
+    white-space: nowrap;
+  }
+
+  // Stat cards used inside hero or in the detail page's Summary grid.
+  &__stat-card {
+    padding: 12px;
+    min-height: 90px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    background: var(--pf-color-background);
+  }
+
+  &__stat-label {
+    font-size: var(--pf-font-size-s);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--pf-color-text);
+    opacity: 0.7;
+    margin-bottom: 8px;
+  }
+
+  &__stat-value {
+    font-size: var(--pf-font-size-xl);
+    font-weight: 600;
+    line-height: 1.3;
+    word-break: break-word;
+  }
+
+  &__help-icon {
+    font-size: var(--pf-font-size-m);
+    margin-left: 6px;
+    color: var(--pf-color-text-muted);
+    opacity: 0.6;
+    cursor: default;
+
+    &:hover {
+      opacity: 1;
+    }
+  }
+
+  &__table-card {
+    padding: 0;
+    background: var(--pf-color-background-secondary);
+    overflow: hidden;
+  }
+
+  &__chart-card {
+    padding: 16px;
+    background: var(--pf-color-background);
+    overflow: hidden;
+  }
+
+  // Inside a tab pane, two tables may stack (privileged + context).
+  // Each gets a small heading so it's clear which is which.
+  &__tab-panes {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    margin-top: 8px;
+  }
+
+  &__tab-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  &__tab-pane-label {
+    font-size: var(--pf-font-size-m);
+    font-weight: 600;
+    color: var(--pf-color-text);
+    letter-spacing: -0.005em;
+  }
+
+  &__headline {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+
+    @media (min-width: 900px) {
+      grid-template-columns: minmax(320px, 0.7fr) minmax(0, 1fr);
+      align-items: stretch;
+    }
+  }
+
+  &__stat-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 12px;
+    align-content: start;
+  }
+
+  // Cycle-budget meters: three side-by-side cards in the headline, each a
+  // labelled progress bar plus a "X of Y" primary readout.
+  &__meters {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  &__meter {
+    padding: 16px;
+    background: var(--pf-color-background-secondary);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  &__meter-label {
+    font-size: var(--pf-font-size-s);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--pf-color-text);
+    opacity: 0.7;
+    display: flex;
+    align-items: center;
+  }
+
+  &__meter-primary {
+    font-size: 13px;
+    color: var(--pf-color-text-muted);
+    line-height: 1.2;
+  }
+
+  &__meter-big {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--pf-color-text);
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__meter-of {
+    font-size: 13px;
+    color: var(--pf-color-text-muted);
+  }
+
+  &__meter-bar {
+    height: 8px;
+    background: var(--pf-color-background);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 4px;
+    overflow: hidden;
+    display: flex;
+  }
+
+  &__meter-fill {
+    height: 100%;
+
+    &--priv {
+      background: #3478f6;
+    }
+    &--ctx {
+      background: #9aa0a6;
+    }
+  }
+
+  &__meter-sub {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    line-height: 1.3;
+  }
+
+  // Two-column layout used by the Microarchitecture section to put the
+  // hot-symbols table next to the hot-mappings table.
+  &__microarch {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+    margin-bottom: 16px;
+
+    @media (min-width: 900px) {
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    }
+  }
+
+  &__microarch-col {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  &__share-hero {
+    padding: 20px;
+    background: var(--pf-color-background-secondary);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+
+  &__share-hero-chart {
+    position: relative;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+  }
+
+  // Center label sits in the donut hole. Constrained to a max width that
+  // matches the inner-radius diameter so it never bleeds onto the ring.
+  &__share-hero-center {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    text-align: center;
+  }
+
+  &__share-hero-pct {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--pf-color-text);
+    letter-spacing: -0.02em;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__share-hero-pct-label {
+    font-size: 10px;
+    color: var(--pf-color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 2px;
+    max-width: 110px;
+  }
+
+  &__share-hero-legend {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+  }
+
+  &__share-hero-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--pf-font-size-m);
+  }
+
+  &__share-hero-name {
+    flex: 1;
+    color: var(--pf-color-text);
+  }
+
+  &__share-hero-value {
+    color: var(--pf-color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    display: inline-block;
+    flex: 0 0 auto;
+  }
+
+  &__details {
+    margin-top: 12px;
+
+    summary {
+      cursor: pointer;
+      color: var(--pf-color-text-muted);
+      font-size: var(--pf-font-size-s);
+      padding: 4px 0;
+
+      &:hover {
+        color: var(--pf-color-text);
+      }
+    }
+  }
+
+  &__freq-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  &__freq-cell {
+    padding: 8px;
+    background: var(--pf-color-background-secondary);
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  &__freq-cell-label {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  &__freq-cell-value {
+    font-size: var(--pf-font-size-m);
+    font-weight: 600;
+    color: var(--pf-color-text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__freq-cell-range {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__muted {
+    color: var(--pf-color-text-muted);
+    font-weight: 400;
+  }
+
+  // (detail tab styles live in their own top-level block below)
+  &__priv-banner {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 12px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    background: var(--pf-color-background-secondary);
+    color: var(--pf-color-text);
+    font-size: var(--pf-font-size-m);
+    line-height: 1.4;
+
+    &--empty {
+      color: var(--pf-color-text-muted);
+    }
+
+    .material-icons,
+    .material-icons-filled {
+      font-size: 18px;
+    }
+  }
+}
+
+// Whole-trace detail pane (detail_tab.ts). Lives in the bottom drawer, so it
+// scrolls within the drawer rather than the page.
+.pf-sismo-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+
+  &__toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--pf-color-border);
+    flex: 0 0 auto;
+  }
+
+  &__toolbar-label {
+    font-size: var(--pf-font-size-s);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--pf-color-text-muted);
+  }
+
+  &__view {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: 12px;
+  }
+
+  &__card {
+    padding: 0;
+    background: var(--pf-color-background-secondary);
+    overflow: hidden;
+  }
+
+  // Inline proportion / state bar shown in the last column of detail tables.
+  &__bar {
+    display: flex;
+    width: 100%;
+    min-width: 80px;
+    height: 10px;
+    background: var(--pf-color-background);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  &__bar-fill {
+    height: 100%;
+  }
+
+  &__legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin-bottom: 10px;
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+
+  &__legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+}

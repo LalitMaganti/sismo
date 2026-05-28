@@ -98,7 +98,7 @@ SOURCE_DEPS: list[SourceDep] = [
         name="perfetto",
         target_dir="third_party/src/perfetto",
         git_url="https://github.com/google/perfetto.git",
-        pin="0eb65d89f0b0eb1dc512d519ff15457bcfc86ed8",
+        pin="f43717c58540c0d83387451a82249dc7b1bb1dcd",
     ),
 ]
 
@@ -485,6 +485,43 @@ def install_source_dep(dep: SourceDep) -> bool:
     return True
 
 
+def _patch_modify_paths(patch_path: str) -> set[str]:
+    """Returns the set of repo-relative paths the patch modifies in place
+    (i.e. files present on both sides of the diff — neither created from
+    /dev/null nor deleted to /dev/null).
+
+    Used by `apply_perfetto_patches` to detect "already applied" robustly:
+    overlays may have replaced patch-CREATED files with different content,
+    which breaks `git apply --reverse --check`. But the MODIFY portion of
+    each patch is the part we can reliably round-trip — if those tracked
+    files are dirty in the workdir, the patch is already applied.
+    """
+    paths: set[str] = set()
+    pending: str | None = None
+    is_create = False
+    is_delete = False
+    with open(patch_path) as f:
+        for line in f:
+            if line.startswith("diff --git "):
+                if pending is not None and not is_create and not is_delete:
+                    paths.add(pending)
+                # Take the b/ side path. Format: "diff --git a/X b/Y".
+                tokens = line.rstrip("\n").split(" ")
+                if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                    pending = tokens[3][2:]
+                else:
+                    pending = None
+                is_create = False
+                is_delete = False
+            elif line.startswith("--- /dev/null"):
+                is_create = True
+            elif line.startswith("+++ /dev/null"):
+                is_delete = True
+    if pending is not None and not is_create and not is_delete:
+        paths.add(pending)
+    return paths
+
+
 def apply_perfetto_patches() -> bool:
     """Applies *.patch files from third_party/patches/perfetto/ to the
     Perfetto checkout. Idempotent: skips patches that are already applied.
@@ -503,13 +540,37 @@ def apply_perfetto_patches() -> bool:
     if not patches:
         return True
 
+    # One `git diff --name-only HEAD` call up front, shared across patches —
+    # used to detect "already applied" patches whose modify portions are
+    # present in the workdir even when overlay-managed paths block
+    # `git apply --reverse --check`.
+    dirty_proc = subprocess.run(
+        ["git", "-C", PERFETTO_DIR, "diff", "--name-only", "HEAD"],
+        capture_output=True,
+    )
+    dirty_set: set[str] = (
+        set(dirty_proc.stdout.decode().splitlines())
+        if dirty_proc.returncode == 0 else set()
+    )
+
     applied_count = 0
     for name in patches:
         patch_path = os.path.join(PERFETTO_PATCHES_DIR, name)
 
+        # Fast path: if every tracked file the patch modifies in place is
+        # already dirty in the workdir, treat the patch as applied. This
+        # holds up even after `install_perfetto_overlays` has replaced
+        # patch-created files with overlay symlinks (which is what breaks
+        # the `--reverse --check` test below).
+        modify_paths = _patch_modify_paths(patch_path)
+        if modify_paths and modify_paths.issubset(dirty_set):
+            vprint(2, f"  {name}: already applied (modifies present in workdir)")
+            continue
+
         # Already applied? `git apply --reverse --check` succeeds iff the
         # patch's post-state matches the working tree, i.e. it would apply
-        # cleanly if reversed.
+        # cleanly if reversed. This is the strict check — used when the
+        # fast path can't decide (e.g. pure-create patches).
         already = subprocess.run(
             ["git", "-C", PERFETTO_DIR, "apply", "--reverse", "--check",
              patch_path],

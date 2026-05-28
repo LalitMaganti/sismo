@@ -1,83 +1,11 @@
-diff --git a/tools/gen_ui_imports b/tools/gen_ui_imports
-index 3114fcd1a7..9d052de939 100755
---- a/tools/gen_ui_imports
-+++ b/tools/gen_ui_imports
-@@ -59,9 +59,23 @@ def plugin_has_css(dir):
-   return os.path.isdir(dir) and os.path.exists(os.path.join(dir, 'styles.scss'))
+diff --git a/ui/build.mjs b/ui/build.mjs
+index 53da90ca..42165c91 100644
+--- a/ui/build.mjs
++++ b/ui/build.mjs
+@@ -77,6 +77,13 @@ const __dirname = path.dirname(__filename);
  
- 
--def gen_imports(input_dir, output_path):
-+def parse_include_list(path):
-+  """Reads a plugin allowlist file. One basename per line; blank lines and
-+  lines starting with '#' are ignored. Returns the set of allowed names."""
-+  allowed = set()
-+  with open(path, 'r') as f:
-+    for line in f:
-+      stripped = line.split('#', 1)[0].strip()
-+      if stripped:
-+        allowed.add(stripped)
-+  return allowed
-+
-+
-+def gen_imports(input_dir, output_path, include_list=None):
-   paths = [os.path.join(input_dir, p) for p in os.listdir(input_dir)]
-   paths = [p for p in paths if is_plugin_dir(p)]
-+  if include_list is not None:
-+    paths = [p for p in paths if os.path.basename(p) in include_list]
-   paths.sort()
- 
-   output_dir = os.path.dirname(output_path)
-@@ -88,9 +102,11 @@ def gen_imports(input_dir, output_path):
-   return True
- 
- 
--def gen_css_import(input_dir, output_path):
-+def gen_css_import(input_dir, output_path, include_list=None):
-   paths = [os.path.join(input_dir, p) for p in os.listdir(input_dir)]
-   paths = [p for p in paths if plugin_has_css(p)]
-+  if include_list is not None:
-+    paths = [p for p in paths if os.path.basename(p) in include_list]
-   paths.sort()
- 
-   output_dir = os.path.dirname(output_path)
-@@ -112,9 +128,18 @@ def main():
-       description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-   parser.add_argument('INPUT')
-   parser.add_argument('--out', required=True)
-+  parser.add_argument(
-+      '--include-list',
-+      help='Path to a file listing plugin directory basenames to include '
-+      '(one per line; blank lines and # comments allowed). Plugins not '
-+      'in the list are silently dropped, so callers must validate the '
-+      'list contents themselves.')
-   args = parser.parse_args()
-   input_dir = args.INPUT
-   output_path = args.out
-+  include_list = (
-+      parse_include_list(args.include_list)
-+      if args.include_list is not None else None)
- 
-   if not os.path.isdir(input_dir):
-     print(f'INPUT argument {input_dir} must be a directory')
-@@ -128,8 +153,8 @@ def main():
-     print(f'--out ({output_path}) should not be a directory')
-     exit(1)
- 
--  success = gen_imports(input_dir, output_path)
--  success = success | gen_css_import(input_dir, output_path)
-+  success = gen_imports(input_dir, output_path, include_list)
-+  success = success | gen_css_import(input_dir, output_path, include_list)
-   return 0 if success else 1
- 
- 
-diff --git a/ui/build.js b/ui/build.js
-index 03974cfa25..21823b419f 100644
---- a/ui/build.js
-+++ b/ui/build.js
-@@ -77,6 +77,13 @@ const pjoin = path.join;
- const ROOT_DIR = path.dirname(__dirname);  // The repo root.
+ const ROOT_DIR = path.dirname(__dirname); // The repo root.
  const VERSION_SCRIPT = pjoin(ROOT_DIR, 'tools/write_version_header.py');
- const GEN_IMPORTS_SCRIPT = pjoin(ROOT_DIR, 'tools/gen_ui_imports');
 +const DEFAULT_CONFIG_PATH = pjoin(ROOT_DIR, 'ui/config/default.json');
 +const CONFIG_KEYS = new Set([
 +  'appTitle',
@@ -97,7 +25,7 @@ index 03974cfa25..21823b419f 100644
  };
  
  const RULES = [
-@@ -169,6 +178,70 @@ function loadDevServerEnvFile() {
+@@ -166,6 +175,74 @@ function loadDevServerEnvFile() {
    }
  }
  
@@ -126,7 +54,10 @@ index 03974cfa25..21823b419f 100644
 +  // Resolve includePlugins (if set) against the config-file directory so
 +  // embedder configs can reference allowlists with relative paths.
 +  if (merged.includePlugins !== null && merged.includePlugins !== undefined) {
-+    const resolved = path.resolve(path.dirname(configPath), merged.includePlugins);
++    const resolved = path.resolve(
++      path.dirname(configPath),
++      merged.includePlugins,
++    );
 +    if (!fs.existsSync(resolved)) {
 +      console.error(`--config: includePlugins file not found: ${resolved}`);
 +      process.exit(1);
@@ -159,8 +90,9 @@ index 03974cfa25..21823b419f 100644
 +  const missing = [...requested].filter((n) => !available.has(n)).sort();
 +  if (missing.length > 0) {
 +    console.error(
-+        `--config: includePlugins entries do not match any plugin in ` +
-+        `ui/src/plugins or ui/src/core_plugins: ${missing.join(', ')}`);
++      `--config: includePlugins entries do not match any plugin in ` +
++        `ui/src/plugins or ui/src/core_plugins: ${missing.join(', ')}`,
++    );
 +    process.exit(1);
 +  }
 +}
@@ -168,7 +100,7 @@ index 03974cfa25..21823b419f 100644
  async function main() {
    const parser = new argparse.ArgumentParser({
      formatter_class: argparse.RawDescriptionHelpFormatter,
-@@ -231,6 +304,9 @@ Env-var overrides:
+@@ -228,6 +305,9 @@ Env-var overrides:
    parser.add_argument('--title', {
      help: 'Override the page title (useful for distinguishing multiple instances)',
    });
@@ -178,7 +110,7 @@ index 03974cfa25..21823b419f 100644
  
    // Load ~/.config/perfetto/ui-dev-server.env defaults, then map any
    // PERFETTO_UI_* env vars to synthetic argv entries prepended before the
-@@ -309,6 +385,8 @@ Env-var overrides:
+@@ -310,6 +390,8 @@ Env-var overrides:
    cfg.check = !!args.typecheck;
    cfg.onlyWasmMemory64 = !!args.only_wasm_memory64;
    cfg.titleOverride = args.title || '';
@@ -187,7 +119,7 @@ index 03974cfa25..21823b419f 100644
    cfg.wasmModules = ['traceconv', 'proto_utils', 'trace_processor_memory64'];
    if (!cfg.onlyWasmMemory64) {
      cfg.wasmModules.push('trace_processor');
-@@ -485,8 +563,17 @@ function runTests(cfgFile) {
+@@ -474,8 +556,17 @@ function runTests(cfgFile) {
    }
  }
  
@@ -206,43 +138,36 @@ index 03974cfa25..21823b419f 100644
    // First copy the html as-is into the dist/v1.2.3/ directory. This is
    // only used for archival purporses, so one can open
    // ui.perfetto.dev/v1.2.3/ to skip the auto-update and channel logic.
-@@ -511,7 +598,11 @@ function cpHtml(src, filename) {
+@@ -501,7 +592,15 @@ function cpHtml(src, filename) {
  }
  
  function copyIndexHtml(src) {
 -  addTask(cpHtml, [src, 'index.html']);
-+  addTask(cpHtml, [src, 'index.html', {
-+    '__APP_TITLE__': cfg.config.appTitle,
-+    '__ERROR_MESSAGE__': cfg.config.errorMessage,
-+    '__FAVICON_PATH__': cfg.config.faviconPath,
-+  }]);
++  addTask(cpHtml, [
++    src,
++    'index.html',
++    {
++      __APP_TITLE__: cfg.config.appTitle,
++      __ERROR_MESSAGE__: cfg.config.errorMessage,
++      __FAVICON_PATH__: cfg.config.faviconPath,
++    },
++  ]);
  }
  
  function copyBigtraceHtml(src) {
-@@ -605,6 +696,9 @@ function generateImports(dir, name) {
-   const dstTs = pjoin(ROOT_DIR, 'ui/src/gen', name);
-   const inputDir = pjoin(ROOT_DIR, dir);
-   const args = [GEN_IMPORTS_SCRIPT, inputDir, '--out', dstTs];
-+  if (cfg.config.includePluginsPath) {
-+    args.push('--include-list', cfg.config.includePluginsPath);
-+  }
-   addTask(exec, ['python3', args]);
- }
- 
-diff --git a/ui/config/default.json b/ui/config/default.json
-new file mode 100644
-index 0000000000..ccf7c9a51f
---- /dev/null
-+++ b/ui/config/default.json
-@@ -0,0 +1,6 @@
-+{
-+  "appTitle": "Perfetto UI",
-+  "errorMessage": "Perfetto UI - An unrecoverable problem occurred",
-+  "faviconPath": "data:image/png;base64,iVBORw0KGgo=",
-+  "includePlugins": null
-+}
+@@ -750,6 +849,10 @@ function runVite() {
+     NO_TREESHAKE: cfg.noTreeshake ? 'true' : '',
+     MINIFY_JS: cfg.minifyJs || '',
+     IS_MEMORY64_ONLY: cfg.onlyWasmMemory64 ? 'true' : '',
++    // Propagate the deployment-config include-list to ui/vite.config.mjs.
++    // Empty when the config doesn't restrict plugins — vite reads no list and
++    // emits all discovered plugins, matching pre-include-list behavior.
++    PERFETTO_INCLUDE_PLUGINS_PATH: cfg.config.includePluginsPath || '',
+   };
+   const bundles = [
+     'frontend',
 diff --git a/ui/src/assets/index.html b/ui/src/assets/index.html
-index c3ce2b14df..cbcffcbee7 100644
+index 0392e494..58e9c55d 100644
 --- a/ui/src/assets/index.html
 +++ b/ui/src/assets/index.html
 @@ -2,9 +2,9 @@
@@ -266,8 +191,83 @@ index c3ce2b14df..cbcffcbee7 100644
  
  If you are seeing this message, something went wrong while loading the UI.
  In most cases this is due to very slow or flaky network and it goes away by
+diff --git a/ui/src/components/widgets/charts/chart_option_builder.ts b/ui/src/components/widgets/charts/chart_option_builder.ts
+index e18b802e..a92af2ec 100644
+--- a/ui/src/components/widgets/charts/chart_option_builder.ts
++++ b/ui/src/components/widgets/charts/chart_option_builder.ts
+@@ -25,7 +25,7 @@ import {assertUnreachable} from '../../../base/assert';
+ import type {LegendPosition} from './common';
+ 
+ /** Font size used for axis tick labels across all charts. */
+-export const AXIS_LABEL_FONT_SIZE = 10;
++export const AXIS_LABEL_FONT_SIZE = 13;
+ 
+ /**
+  * Configuration for an axis in a chart.
+@@ -76,7 +76,7 @@ export function buildAxisOption(
+     name: config.name,
+     nameLocation: 'middle' as const,
+     ...(nameGap !== undefined && {nameGap}),
+-    nameTextStyle: {fontSize: 11},
++    nameTextStyle: {fontSize: 13},
+     axisLabel: {
+       fontSize: AXIS_LABEL_FONT_SIZE,
+       ...(config.formatter !== undefined && {formatter: config.formatter}),
+@@ -176,14 +176,14 @@ export function buildLegendOption(
+         show: true,
+         type: 'scroll',
+         top: 0,
+-        textStyle: {fontSize: 10},
++        textStyle: {fontSize: 13},
+       };
+     case 'bottom':
+       return {
+         show: true,
+         type: 'scroll',
+         bottom: 0,
+-        textStyle: {fontSize: 10},
++        textStyle: {fontSize: 13},
+       };
+     case 'right':
+       return {
+@@ -194,7 +194,7 @@ export function buildLegendOption(
+         top: 20,
+         bottom: 20,
+         textStyle: {
+-          fontSize: 10,
++          fontSize: 13,
+           width: 120,
+           overflow: 'truncate',
+           ellipsis: '\u2026',
+diff --git a/ui/src/core/embedder/create_embedder.ts b/ui/src/core/embedder/create_embedder.ts
+index a30050be..640965d8 100644
+--- a/ui/src/core/embedder/create_embedder.ts
++++ b/ui/src/core/embedder/create_embedder.ts
+@@ -15,13 +15,19 @@
+ import type {Embedder} from './embedder';
+ import {DefaultEmbedder} from './default_embedder';
+ import {PerfettoUiEmbedder} from './perfetto_ui_embedder';
++import {EXTERNAL_EMBEDDER} from './external_embedder';
+ 
+ /**
+- * Returns the appropriate Embedder based on the current origin.
+- * Uses PerfettoUiEmbedder when running on ui.perfetto.dev or localhost,
+- * and DefaultEmbedder otherwise.
++ * Returns the appropriate Embedder. A deployment-supplied external
++ * embedder (provided by overriding the contents of external_embedder.ts)
++ * is used unconditionally when present. Otherwise selects between
++ * PerfettoUiEmbedder for ui.perfetto.dev / localhost and
++ * DefaultEmbedder for everything else.
+  */
+ export function createEmbedder(): Embedder {
++  if (EXTERNAL_EMBEDDER !== undefined) {
++    return EXTERNAL_EMBEDDER;
++  }
+   const origin = self.location?.origin ?? '';
+   if (
+     origin.endsWith('.perfetto.dev') ||
 diff --git a/ui/src/core/embedder/default_embedder.ts b/ui/src/core/embedder/default_embedder.ts
-index 8fe2231942..eeceefaf8e 100644
+index e1f81829..2d7b6ed6 100644
 --- a/ui/src/core/embedder/default_embedder.ts
 +++ b/ui/src/core/embedder/default_embedder.ts
 @@ -21,4 +21,6 @@ export class DefaultEmbedder implements Embedder {
@@ -278,7 +278,7 @@ index 8fe2231942..eeceefaf8e 100644
 +  readonly brandLogo = undefined;
  }
 diff --git a/ui/src/core/embedder/embedder.ts b/ui/src/core/embedder/embedder.ts
-index bdde74c313..ac6e78654e 100644
+index bdde74c3..ac6e7865 100644
 --- a/ui/src/core/embedder/embedder.ts
 +++ b/ui/src/core/embedder/embedder.ts
 @@ -12,6 +12,19 @@
@@ -317,7 +317,7 @@ index bdde74c313..ac6e78654e 100644
 +  readonly brandLogo: {readonly src: string; readonly alt?: string} | undefined;
  }
 diff --git a/ui/src/core/embedder/perfetto_ui_embedder.ts b/ui/src/core/embedder/perfetto_ui_embedder.ts
-index 1a89244f4c..e349b95ff5 100644
+index 46bc9bcf..2c800823 100644
 --- a/ui/src/core/embedder/perfetto_ui_embedder.ts
 +++ b/ui/src/core/embedder/perfetto_ui_embedder.ts
 @@ -24,4 +24,6 @@ export class PerfettoUiEmbedder implements Embedder {
@@ -328,10 +328,10 @@ index 1a89244f4c..e349b95ff5 100644
 +  readonly brandLogo = undefined;
  }
 diff --git a/ui/src/frontend/index.ts b/ui/src/frontend/index.ts
-index a5845a5990..abba891f32 100644
+index 3a404a43..bba4329a 100644
 --- a/ui/src/frontend/index.ts
 +++ b/ui/src/frontend/index.ts
-@@ -358,7 +358,11 @@ function onCssLoaded(app: AppImpl) {
+@@ -359,7 +359,11 @@ function onCssLoaded(app: AppImpl) {
    document.body.innerHTML = '';
  
    const pages = app.pages;
@@ -345,7 +345,7 @@ index a5845a5990..abba891f32 100644
    router.onRouteChanged = routeChange;
  
 diff --git a/ui/src/frontend/ui_main.ts b/ui/src/frontend/ui_main.ts
-index 8a7c53c031..02187c6e82 100644
+index 8a7c53c0..02187c6e 100644
 --- a/ui/src/frontend/ui_main.ts
 +++ b/ui/src/frontend/ui_main.ts
 @@ -67,7 +67,7 @@ export class UiMain implements m.ClassComponent {
@@ -358,7 +358,7 @@ index 8a7c53c031..02187c6e82 100644
        showStatusBarFlag.get() && renderStatusBar(app),
        app.perfDebugging.renderPerfStats(),
 diff --git a/ui/src/frontend/views/sidebar.ts b/ui/src/frontend/views/sidebar.ts
-index eac55a4c29..2e00fd60dd 100644
+index 806ce863..59e84385 100644
 --- a/ui/src/frontend/views/sidebar.ts
 +++ b/ui/src/frontend/views/sidebar.ts
 @@ -80,7 +80,7 @@ export class Sidebar implements m.ClassComponent<SidebarAttrs> {
@@ -385,3 +385,107 @@ index eac55a4c29..2e00fd60dd 100644
    private renderSidebarContent(app: AppImpl) {
      return m(
        '.pf-sidebar__content',
+diff --git a/ui/vite.config.mjs b/ui/vite.config.mjs
+index cdb19c9d..56b7c6d0 100644
+--- a/ui/vite.config.mjs
++++ b/ui/vite.config.mjs
+@@ -118,6 +118,20 @@ function pluginAllPluginsBarrel() {
+     'virtual:perfetto/all_plugins':      path.join(SRC, 'plugins'),
+     'virtual:perfetto/all_core_plugins': path.join(SRC, 'core_plugins'),
+   };
++  // Optional plugin allowlist supplied by an embedder via build.mjs's
++  // --config / ui/config/default.json#includePlugins. When set, only plugin
++  // directories whose basename appears in the file are bundled. Missing or
++  // empty path → no filter. Read once at plugin construction time; embedders
++  // don't dynamically swap the list mid-build.
++  const includePath = process.env.PERFETTO_INCLUDE_PLUGINS_PATH || '';
++  let includeSet = null;
++  if (includePath) {
++    includeSet = new Set();
++    for (const raw of fs.readFileSync(includePath, 'utf8').split('\n')) {
++      const stripped = raw.split('#', 1)[0].trim();
++      if (stripped) includeSet.add(stripped);
++    }
++  }
+   const toCamelCase = (s) => {
+     const [first, ...rest] = s.split(/[._]/);
+     return first +
+@@ -132,6 +146,7 @@ function pluginAllPluginsBarrel() {
+                  fs.existsSync(path.join(full, 'index.ts'));
+         } catch (_) { return false; }
+       })
++      .filter(({name}) => includeSet === null || includeSet.has(name))
+       .sort((a, b) => a.name.localeCompare(b.name));
+     const imports = entries
+       .map(({name, full}) => `import ${toCamelCase(name)} from '${full}';`)
+@@ -180,6 +195,62 @@ function pluginAllPluginsBarrel() {
+   };
+ }
+ 
++// Re-anchors imports issued from files that live outside the perfetto
++// checkout. Embedders may symlink individual sources from their own tree into
++// ui/src/<...>; Rollup canonicalises those symlinks before module resolution
++// runs, so subsequent imports (bare or relative) try to resolve relative to
++// the embedder repo where neither perfetto's node_modules nor the rest of
++// ui/src exist. This plugin walks ui/src/ to build a canonical→symlink map,
++// then re-runs resolution as if the importer were at its symlink site inside
++// perfetto. The map is cached; on a miss we re-walk once before giving up so
++// symlinks created after the dev server started (e.g. a fresh overlay file)
++// are picked up without a restart.
++function pluginOverlayDepResolution() {
++  let symlinkMap = null;
++  function refresh() {
++    const map = new Map();
++    function walk(dir) {
++      let entries;
++      try {
++        entries = fs.readdirSync(dir, {withFileTypes: true});
++      } catch (_) { return; }
++      for (const ent of entries) {
++        const full = path.join(dir, ent.name);
++        if (ent.isSymbolicLink()) {
++          try {
++            const real = fs.realpathSync(full);
++            if (!real.startsWith(ROOT_DIR + path.sep)) map.set(real, full);
++          } catch (_) {}
++        } else if (ent.isDirectory()) {
++          walk(full);
++        }
++      }
++    }
++    walk(SRC);
++    symlinkMap = map;
++    return symlinkMap;
++  }
++  return {
++    name: 'perfetto:overlay-dep-resolution',
++    enforce: 'pre',
++    async resolveId(source, importer) {
++      if (!importer || source.includes('\0')) return null;
++      if (importer.startsWith(ROOT_DIR + path.sep)) return null;
++      const importerFile = importer.split('?')[0];
++      let map = symlinkMap ?? refresh();
++      let symlinkImporter = map.get(importerFile);
++      if (!symlinkImporter) {
++        // Miss — could be a symlink that appeared after the cache was built.
++        // Re-walk once and retry; if it's still not there, give up.
++        map = refresh();
++        symlinkImporter = map.get(importerFile);
++        if (!symlinkImporter) return null;
++      }
++      return this.resolve(source, symlinkImporter, {skipSelf: true});
++    },
++  };
++}
++
+ function pluginGenRelativeImports() {
+   return {
+     name: 'perfetto:gen-relative-imports',
+@@ -232,6 +303,7 @@ export default defineConfig({
+     // Compiles *.grammar files (lezer parser definitions) on import. Replaces
+     // the old "manually run lezer-generator and commit gen/*.js" workflow.
+     lezer(),
++    pluginOverlayDepResolution(),
+     pluginGenRelativeImports(),
+     ...(NO_SOURCE_MAPS ? [] : [pluginEmbedMinimalSourceMap()]),
+   ],

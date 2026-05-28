@@ -34,10 +34,13 @@ const c_sources = [_]CSource{
 
 // Linux gets `-D_GNU_SOURCE` so Perfetto's public headers (which call
 // `syscall(__NR_gettid)`) compile against glibc.
-const c_flags_macos: []const []const u8 = &.{"-std=c11"};
-const c_flags_linux: []const []const u8 = &.{ "-std=c11", "-D_GNU_SOURCE" };
-const cpp_flags_macos: []const []const u8 = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DNDEBUG" };
-const cpp_flags_linux: []const []const u8 = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DNDEBUG", "-D_GNU_SOURCE" };
+// -fno-omit-frame-pointer is mandatory: sismo's perf data source uses kernel-
+// side frame-pointer unwinding (UNWIND_FRAME_POINTER), so any C/C++ frame in
+// the call chain must keep its FP.
+const c_flags_macos: []const []const u8 = &.{ "-std=c11", "-fno-omit-frame-pointer" };
+const c_flags_linux: []const []const u8 = &.{ "-std=c11", "-D_GNU_SOURCE", "-fno-omit-frame-pointer" };
+const cpp_flags_macos: []const []const u8 = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DNDEBUG", "-fno-omit-frame-pointer" };
+const cpp_flags_linux: []const []const u8 = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DNDEBUG", "-D_GNU_SOURCE", "-fno-omit-frame-pointer" };
 
 fn flagsFor(lang: Language, is_macos: bool) []const []const u8 {
     return switch (lang) {
@@ -215,6 +218,7 @@ fn addUnixPipeline(
             .optimize = optimize,
             .link_libc = true,
             .link_libcpp = true,
+            .omit_frame_pointer = false,
         });
         addComponentSources(b, target_mod, .sample_target, is_macos);
         target_mod.addIncludePath(perfetto_root.path(b, "include"));
@@ -282,8 +286,14 @@ fn addUnixPipeline(
         // Linux producer shims include "src/profiling/perf/perf_producer.h"
         // and "src/traced/probes/probes_producer.h" — both are
         // non-public headers that resolve from Perfetto's repo root.
+        // perf_producer.h transitively reaches <unwindstack/Unwinder.h>
+        // via src/profiling/common/callstack_trie.h, so the bundled
+        // libunwindstack headers (buildtools/android-unwinding) need to
+        // be on the include path too. Mirror buildtools/BUILD.gn's
+        // libunwindstack_config.
         if (!is_macos) {
             sismo_mod.addIncludePath(perfetto_root);
+            sismo_mod.addIncludePath(perfetto_root.path(b, "buildtools/android-unwinding/libunwindstack/include"));
         }
         sismo_mod.addIncludePath(perfetto_out.path(b, "gen"));
         sismo_mod.addIncludePath(perfetto_out.path(b, "gen/build_config"));
@@ -402,6 +412,7 @@ fn addWindowsPipeline(
         .optimize = optimize,
         .link_libc = true,
         .link_libcpp = true,
+        .omit_frame_pointer = false,
     });
     // Windows uses the same `c_flags_macos` (no -D_GNU_SOURCE) — the
     // value isn't macos-specific, just "non-Linux".
