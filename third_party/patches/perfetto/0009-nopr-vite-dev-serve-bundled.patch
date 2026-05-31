@@ -1,0 +1,111 @@
+diff --git a/ui/build.mjs b/ui/build.mjs
+index 09f1729..67e03e2 100644
+--- a/ui/build.mjs
++++ b/ui/build.mjs
+@@ -98,6 +98,7 @@ const cfg = {
+   startHttpServer: false,
+   httpServerListenHost: '127.0.0.1',
+   httpServerListenPort: undefined,
++  serveBundled: false,
+   onlyWasmMemory64: false,
+   wasmModules: [],
+   crossOriginIsolation: false,
+@@ -153,6 +154,13 @@ const httpWatches = [];
+ const tStart = performance.now();
+ const subprocesses = [];
+ const LIVE_SERVER_DEBOUNCE_MS = 250;
++
++// Injected into served HTML in --serve-bundled mode. The bundled frontend has
++// no Vite HMR, so subscribe to startServer's /live_reload SSE endpoint and
++// refresh when `vite build --watch` rewrites a bundle.
++const LIVE_RELOAD_SNIPPET =
++  "<script>(function(){try{const s=new EventSource('/live_reload');" +
++  's.onmessage=function(){location.reload();};}catch(e){}})();</script>';
+ let liveServerDebounceTimerId = 0;
+ const notifyLiveServerPendingFiles = new Set();
+ 
+@@ -285,6 +293,13 @@ Env-var overrides:
+   parser.add_argument('--serve', '-s', {action: 'store_true'});
+   parser.add_argument('--serve-host', {help: '--serve bind host'});
+   parser.add_argument('--serve-port', {help: '--serve bind port', type: 'int'});
++  parser.add_argument('--serve-bundled', {
++    action: 'store_true',
++    help: 'Bundle the frontend with `vite build --watch` and serve it as a ' +
++          'static file instead of on-demand native ESM. ~1k module requests ' +
++          'collapse to one bundle — the decisive win for a remote dev ' +
++          'server. Trades away HMR: edits trigger a full rebuild + reload.',
++  });
+   parser.add_argument('--verbose', '-v', {action: 'store_true'});
+   parser.add_argument('--no-build', '-n', {action: 'store_true'});
+   parser.add_argument('--no-wasm', '-W', {action: 'store_true'});
+@@ -387,6 +402,9 @@ Env-var overrides:
+   if (args.serve_port) {
+     cfg.httpServerListenPort = args.serve_port;
+   }
++  if (args.serve_bundled) {
++    cfg.serveBundled = true;
++  }
+   if (args.interactive) {
+     process.env.PERFETTO_UI_TESTS_INTERACTIVE = '1';
+   }
+@@ -536,7 +554,7 @@ Env-var overrides:
+   if (cfg.watch) console.log('\nFirst build completed!');
+ 
+   if (cfg.startHttpServer) {
+-    if (cfg.watch) {
++    if (useViteDevServer()) {
+       await startViteDevServer();
+     } else {
+       startServer();
+@@ -872,6 +890,15 @@ function transpileTsProject(project, options) {
+   }
+ }
+ 
++// True when the frontend is served as live native-ESM by Vite's dev server
++// (--serve --watch). False in bundled-dev mode (--serve-bundled), where the
++// frontend is built into frontend_bundle.js by `vite build --watch` and served
++// as one static file — ~1k module requests collapse to one, the decisive win
++// on a remote dev server, at the cost of HMR (edits trigger a full reload).
++function useViteDevServer() {
++  return cfg.watch && cfg.startHttpServer && !cfg.serveBundled;
++}
++
+ // Runs `vite build` (optionally in --watch mode) to transpile TS and produce
+ // the {frontend, engine, traceconv}_bundle.js files in cfg.outDistDir. All
+ // configuration lives in ui/vite.config.mjs; flags are passed via env vars to
+@@ -892,7 +919,7 @@ function runVite() {
+     // emits all discovered plugins, matching pre-include-list behavior.
+     PERFETTO_INCLUDE_PLUGINS_PATH: cfg.config.includePluginsPath || '',
+   };
+-  const useDevServer = cfg.watch && cfg.startHttpServer;
++  const useDevServer = useViteDevServer();
+   const bundles = ['engine', 'traceconv', 'service_worker', 'chrome_extension'];
+   if (!useDevServer) bundles.unshift('frontend');
+   if (cfg.bigtrace) bundles.push('bigtrace');
+@@ -1183,6 +1210,17 @@ function startServer() {
+       };
+       const ext = uri.split('.').pop();
+       const cType = mimeMap[ext] || 'octect/stream';
++      // In bundled-dev mode the page is a plain static bundle, so graft on the
++      // SSE live-reload client (no-op endpoint-wise unless we're watching).
++      if (cfg.serveBundled && ext === 'html') {
++        const html = data.toString('utf8');
++        data = Buffer.from(
++          html.includes('</body>')
++            ? html.replace('</body>', `${LIVE_RELOAD_SNIPPET}</body>`)
++            : html + LIVE_RELOAD_SNIPPET,
++          'utf8',
++        );
++      }
+       const acceptsGzip = (req.headers['accept-encoding'] || '').includes(
+         'gzip',
+       );
+@@ -1256,7 +1294,7 @@ function isDistComplete() {
+   // In watch+serve mode the frontend bundle and its CSS are served live by
+   // the Vite dev server, never materialised on disk. Only require the
+   // artifacts that genuinely have to exist before the user can load a trace.
+-  const useDevServer = cfg.watch && cfg.startHttpServer;
++  const useDevServer = useViteDevServer();
+   const requiredArtifacts = [
+     ...(useDevServer ? [] : ['frontend_bundle.js', 'frontend.css']),
+     'engine_bundle.js',

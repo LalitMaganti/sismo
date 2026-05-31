@@ -52,6 +52,7 @@ const sismo_config = @import("sismo_config.zig");
 const paths = @import("sismo_paths.zig");
 const privileged_marker = @import("sismo_privileged_marker.zig");
 const perf_counter_probe = @import("perf_counter_probe.zig");
+const perf_symbolize = @import("perf_symbolize.zig");
 const c = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
@@ -1517,6 +1518,9 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}) catch |err| {
             std.debug.print("sismo record: failed to write privileged marker: {s}\n", .{@errorName(err)});
         };
+        // Resolve perf sample frames to function names. traced_perf records
+        // them unsymbolized; this appends ModuleSymbols for the UI to join.
+        if (perf != null) perf_symbolize.symbolizeTrace(gpa, io, output_path);
     }
 
     // 7. Tear-down via Zig defer LIFO:

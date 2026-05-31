@@ -24,6 +24,7 @@ export class SismoEmbedder implements Embedder {
     'dev.perfetto.Timeline',
     'dev.perfetto.SettingsPage',
     'dev.perfetto.CoreCommands',
+    'dev.perfetto.SismoWidgets',
     'dev.perfetto.Sismo',
   ];
   readonly homePage = SismoHomePage;

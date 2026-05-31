@@ -30,7 +30,6 @@ export interface CpuSummary {
   numThreads: number;
   totalRuntimeNs: bigint | null;
   walltimeNs: bigint | null;
-  avgUtilization: number | null;
   megacycles: bigint | null;
   minFreqKhz: bigint | null;
   maxFreqKhz: bigint | null;
@@ -44,16 +43,16 @@ export interface CpuSummary {
   // Total cycles delivered / peak cycles available. 100% means every core
   // ran at peak freq for the entire trace.
   bandwidthUtilization: number | null;
-  // Avg cores in use over walltime (totalRuntimeNs / walltimeNs). 1.0 means
-  // a single-thread workload kept one core busy continuously; numCpus means
-  // every core was saturated.
-  effectiveConcurrency: number | null;
-  // Same, restricted to privileged processes. Null if no priv set.
-  privilegedConcurrency: number | null;
-  // Count of distinct utids belonging to privileged processes that ran at
-  // least once. The "threads you actually used" denominator for the
-  // parallelism question.
-  numPrivilegedThreads: number | null;
+  // Wall-clock time during which at least one non-idle thread was running
+  // anywhere (union of all running intervals). The denominator for whole-trace
+  // parallelism: runtime ÷ this = avg cores busy while anything ran.
+  activeWalltimeNs: bigint | null;
+  // Same, restricted to privileged threads: time ≥1 privileged thread ran.
+  // Null if no priv set. privilegedRuntimeNs ÷ this = avg cores your processes
+  // held while they were actually running (idle gaps excluded).
+  privilegedActiveWalltimeNs: bigint | null;
+  // Same for context (everything not privileged). Null if no priv set.
+  contextActiveWalltimeNs: bigint | null;
 }
 
 export interface CpuCoreRow {
@@ -216,7 +215,6 @@ export async function loadCpuSummary(
       numThreads: 0,
       totalRuntimeNs: null,
       walltimeNs: null,
-      avgUtilization: null,
       megacycles: null,
       minFreqKhz: null,
       maxFreqKhz: null,
@@ -225,9 +223,9 @@ export async function loadCpuSummary(
       privilegedMegacycles: null,
       peakMegacycles: null,
       bandwidthUtilization: null,
-      effectiveConcurrency: null,
-      privilegedConcurrency: null,
-      numPrivilegedThreads: null,
+      activeWalltimeNs: null,
+      privilegedActiveWalltimeNs: null,
+      contextActiveWalltimeNs: null,
     };
   }
 
@@ -323,10 +321,6 @@ export async function loadCpuSummary(
   const numCpus = topoRow.num_cpus;
   const totalRuntime = topoRow.total_runtime_ns ?? null;
   const walltime = topoRow.walltime_ns ?? null;
-  let avgUtilization: number | null = null;
-  if (totalRuntime !== null && walltime !== null && walltime > 0n && numCpus > 0) {
-    avgUtilization = Number(totalRuntime) / (Number(walltime) * numCpus);
-  }
 
   // 1 kHz × 1 ns = 1e-6 cycles, divided by 1e6 = megacycles. So
   // sum_peak_khz × walltime_ns × 1e-12 = peak megacycles available.
@@ -339,34 +333,23 @@ export async function loadCpuSummary(
     }
   }
 
-  // Avg cores in use over walltime. Same numerator as utilization, but
-  // divided by walltime instead of (walltime × numCpus) — so the unit is
-  // "cores", not a fraction. More legible at a glance than utilization for
-  // a multi-core SoC.
-  let effectiveConcurrency: number | null = null;
-  if (totalRuntime !== null && walltime !== null && walltime > 0n) {
-    effectiveConcurrency = Number(totalRuntime) / Number(walltime);
-  }
-
-  let privilegedConcurrency: number | null = null;
-  let numPrivilegedThreads: number | null = null;
+  // Active walltime = union of running intervals. Whole-trace always; per-set
+  // only when there's a privileged set to split by. These are the parallelism
+  // denominators: runtime ÷ active = avg cores busy *while anything ran*.
+  await engine.query('INCLUDE PERFETTO MODULE intervals.overlap;');
+  const activeWalltimeNs = await loadActiveWalltime(engine, '');
+  let privilegedActiveWalltimeNs: bigint | null = null;
+  let contextActiveWalltimeNs: bigint | null = null;
   if (priv.upids.length > 0) {
-    const privRuntime = topoRow.privileged_runtime_ns ?? 0n;
-    if (walltime !== null && walltime > 0n) {
-      privilegedConcurrency = Number(privRuntime) / Number(walltime);
-    }
-    // Only count threads that actually ran. A process can have hundreds of
-    // declared threads but only a handful that did any work; the
-    // parallelism question is about the latter.
-    const tcountRes = await engine.query(`
-      SELECT count(DISTINCT sched.utid) AS n
-      FROM sched
-      JOIN thread USING (utid)
-      WHERE thread.upid ${privIn}
-        AND sched.dur > 0
-        AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))
-    `);
-    numPrivilegedThreads = tcountRes.firstRow({n: NUM}).n;
+    privilegedActiveWalltimeNs = await loadActiveWalltime(
+      engine,
+      `AND thread.upid ${privIn}`,
+    );
+    // NULL upids (kernel threads) belong to context, so guard the NOT IN.
+    contextActiveWalltimeNs = await loadActiveWalltime(
+      engine,
+      `AND (thread.upid IS NULL OR thread.upid ${privNotInClause(priv)})`,
+    );
   }
 
   return {
@@ -377,7 +360,6 @@ export async function loadCpuSummary(
     numThreads: topoRow.num_threads,
     totalRuntimeNs: totalRuntime,
     walltimeNs: walltime,
-    avgUtilization,
     megacycles,
     minFreqKhz: minFreq,
     maxFreqKhz: maxFreq,
@@ -387,10 +369,41 @@ export async function loadCpuSummary(
     privilegedMegacycles,
     peakMegacycles,
     bandwidthUtilization,
-    effectiveConcurrency,
-    privilegedConcurrency,
-    numPrivilegedThreads,
+    activeWalltimeNs,
+    privilegedActiveWalltimeNs,
+    contextActiveWalltimeNs,
   };
+}
+
+// Wall-clock time during which at least one matching sched slice was running,
+// i.e. the union (not sum) of running intervals. `schedFilter` is appended to
+// the WHERE on `sched JOIN thread` to scope to a set (privileged / context);
+// empty for the whole trace. intervals_overlap_count gives a (ts, depth)
+// step function; we sum the spans where depth ≥ 1.
+async function loadActiveWalltime(
+  engine: Engine,
+  schedFilter: string,
+): Promise<bigint | null> {
+  const res = await engine.query(`
+    WITH running AS (
+      SELECT sched.ts AS ts, sched.dur AS dur
+      FROM sched
+      JOIN thread USING (utid)
+      WHERE sched.dur > 0
+        AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))
+        ${schedFilter}
+    ),
+    depth AS (
+      SELECT ts, value FROM intervals_overlap_count!(running, ts, dur)
+    ),
+    spans AS (
+      SELECT ts, value, lead(ts) OVER (ORDER BY ts) AS next_ts FROM depth
+    )
+    SELECT sum(next_ts - ts) AS active_ns
+    FROM spans
+    WHERE value >= 1 AND next_ts IS NOT NULL
+  `);
+  return res.firstRow({active_ns: LONG_NULL}).active_ns ?? null;
 }
 
 export async function loadCpuDetail(
@@ -1197,4 +1210,199 @@ export async function loadCoreActivity(
     });
   }
   return rows;
+}
+
+// ---- Microarchitecture: per-sample PMU follower counters ----------------
+//
+// Leader-sampling attaches a vector of hardware counter values (instructions,
+// cycles, stalls, misses) to each CPU sample. trace_processor exposes them via
+// the `linux.perf.counters` stdlib view `linux_perf_sample_with_counters`
+// (one row per sample × counter); we pivot by counter name and attribute to the
+// leaf frame to get IPC / stall / miss breakdowns per function.
+
+// HW follower counters sismo asks for (perf_counter_probe.zig). cpu-clock is the
+// software timebase, not a microarchitecture counter, so it's deliberately not
+// here — a sampling-only trace shows just cpu-clock and reads as 'no-counters'.
+const HW_FOLLOWER_COUNTERS = [
+  'instructions',
+  'cpu-cycles',
+  'cache-misses',
+  'branch-misses',
+  'stalled-cycles-frontend',
+  'stalled-cycles-backend',
+];
+
+// Usability of per-sample counters in this trace:
+//  - 'no-counters': none recorded (sampling-only timebase).
+//  - 'all-zero': recorded but reading zero — e.g. a VM whose vPMU isn't
+//    counting. Worth saying explicitly rather than showing empty tables.
+//  - 'ok': nonzero counters present.
+export type MicroarchState = 'no-counters' | 'all-zero' | 'ok';
+
+export interface MicroarchTotals {
+  instructions: number | null;
+  cycles: number | null;
+  ipc: number | null;
+  feStallCycles: number | null;
+  beStallCycles: number | null;
+  cacheMisses: number | null;
+  branchMisses: number | null;
+}
+
+export interface MicroarchFuncRow {
+  name: string;
+  mappingName: string | null;
+  samples: number;
+  instructions: number | null;
+  cycles: number | null;
+  ipc: number | null;
+  // Stalled cycles as a fraction of this function's cycles.
+  feStallPct: number | null;
+  beStallPct: number | null;
+}
+
+export interface MicroarchCounters {
+  state: MicroarchState;
+  // Distinct in-scope samples carrying counters.
+  totalSamples: number;
+  totals: MicroarchTotals;
+  perFunc: MicroarchFuncRow[];
+}
+
+const EMPTY_MICROARCH_TOTALS: MicroarchTotals = {
+  instructions: null,
+  cycles: null,
+  ipc: null,
+  feStallCycles: null,
+  beStallCycles: null,
+  cacheMisses: null,
+  branchMisses: null,
+};
+
+export async function loadMicroarchCounters(
+  engine: Engine,
+  priv: PrivilegedSet,
+  limit = 100,
+): Promise<MicroarchCounters> {
+  // Are any HW follower counters present at all? Cheap gate before touching the
+  // (potentially large) per-sample counter view.
+  const namesRes = await engine.query(
+    `SELECT DISTINCT name FROM perf_counter_track WHERE name IS NOT NULL`,
+  );
+  const present = new Set<string>();
+  for (const it = namesRes.iter({name: STR_NULL}); it.valid(); it.next()) {
+    if (it.name !== null) present.add(it.name);
+  }
+  if (!HW_FOLLOWER_COUNTERS.some((n) => present.has(n))) {
+    return {
+      state: 'no-counters',
+      totalSamples: 0,
+      totals: EMPTY_MICROARCH_TOTALS,
+      perFunc: [],
+    };
+  }
+
+  await engine.query('INCLUDE PERFETTO MODULE linux.perf.counters;');
+  const scope = sampleScopePredicate(priv);
+
+  const totRes = await engine.query(`
+    WITH v AS (
+      SELECT s.sample_id AS sample_id, t.name AS cname, s.counter_value AS val
+      FROM linux_perf_sample_with_counters s
+      JOIN perf_counter_track t ON t.id = s.track_id
+      WHERE s.callsite_id IS NOT NULL ${scope}
+    )
+    SELECT
+      count(DISTINCT sample_id) AS samples,
+      sum(CASE WHEN cname = 'instructions' THEN val END) AS instructions,
+      sum(CASE WHEN cname = 'cpu-cycles' THEN val END) AS cycles,
+      sum(CASE WHEN cname = 'stalled-cycles-frontend' THEN val END) AS fe,
+      sum(CASE WHEN cname = 'stalled-cycles-backend' THEN val END) AS be,
+      sum(CASE WHEN cname = 'cache-misses' THEN val END) AS cache_miss,
+      sum(CASE WHEN cname = 'branch-misses' THEN val END) AS branch_miss
+    FROM v
+  `);
+  const t = totRes.firstRow({
+    samples: NUM,
+    instructions: NUM_NULL,
+    cycles: NUM_NULL,
+    fe: NUM_NULL,
+    be: NUM_NULL,
+    cache_miss: NUM_NULL,
+    branch_miss: NUM_NULL,
+  });
+
+  // Counters wired up but reading zero — the PMU isn't actually counting
+  // (typical in a VM without a working vPMU). Nothing meaningful to break down.
+  if ((t.cycles ?? 0) === 0 && (t.instructions ?? 0) === 0) {
+    return {
+      state: 'all-zero',
+      totalSamples: t.samples,
+      totals: EMPTY_MICROARCH_TOTALS,
+      perFunc: [],
+    };
+  }
+
+  const totals: MicroarchTotals = {
+    instructions: t.instructions,
+    cycles: t.cycles,
+    ipc:
+      t.instructions !== null && t.cycles ? t.instructions / t.cycles : null,
+    feStallCycles: t.fe,
+    beStallCycles: t.be,
+    cacheMisses: t.cache_miss,
+    branchMisses: t.branch_miss,
+  };
+
+  const fnRes = await engine.query(`
+    WITH v AS (
+      SELECT s.callsite_id AS callsite_id, s.sample_id AS sample_id,
+             t.name AS cname, s.counter_value AS val
+      FROM linux_perf_sample_with_counters s
+      JOIN perf_counter_track t ON t.id = s.track_id
+      WHERE s.callsite_id IS NOT NULL ${scope}
+    )
+    SELECT
+      coalesce(NULLIF(spf.name, ''), '[unsymbolised]') AS name,
+      spm.name AS mapping_name,
+      count(DISTINCT v.sample_id) AS samples,
+      sum(CASE WHEN cname = 'instructions' THEN val END) AS instructions,
+      sum(CASE WHEN cname = 'cpu-cycles' THEN val END) AS cycles,
+      sum(CASE WHEN cname = 'stalled-cycles-frontend' THEN val END) AS fe,
+      sum(CASE WHEN cname = 'stalled-cycles-backend' THEN val END) AS be
+    FROM v
+    JOIN stack_profile_callsite c ON c.id = v.callsite_id
+    JOIN stack_profile_frame spf ON spf.id = c.frame_id
+    LEFT JOIN stack_profile_mapping spm ON spm.id = spf.mapping
+    GROUP BY 1, 2
+    ORDER BY cycles IS NULL, cycles DESC
+    LIMIT ${limit}
+  `);
+  const perFunc: MicroarchFuncRow[] = [];
+  for (
+    const it = fnRes.iter({
+      name: STR_NULL,
+      mapping_name: STR_NULL,
+      samples: NUM,
+      instructions: NUM_NULL,
+      cycles: NUM_NULL,
+      fe: NUM_NULL,
+      be: NUM_NULL,
+    });
+    it.valid();
+    it.next()
+  ) {
+    const cyc = it.cycles;
+    perFunc.push({
+      name: it.name ?? '[unsymbolised]',
+      mappingName: it.mapping_name,
+      samples: it.samples,
+      instructions: it.instructions,
+      cycles: cyc,
+      ipc: it.instructions !== null && cyc ? it.instructions / cyc : null,
+      feStallPct: it.fe !== null && cyc ? it.fe / cyc : null,
+      beStallPct: it.be !== null && cyc ? it.be / cyc : null,
+    });
+  }
+  return {state: 'ok', totalSamples: t.samples, totals, perFunc};
 }

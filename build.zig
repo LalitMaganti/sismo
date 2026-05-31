@@ -27,6 +27,7 @@ const c_sources = [_]CSource{
     .{ .path = "src/c/sample_target_sdk.c", .language = .c, .component = .sample_target },
     .{ .path = "src/c/sismo_traced.cc", .language = .cpp, .component = .sismo_unix },
     .{ .path = "src/c/sismo_consumer.cc", .language = .cpp, .component = .sismo_unix },
+    .{ .path = "src/c/sismo_trace_query.cc", .language = .cpp, .component = .sismo_unix },
     .{ .path = "src/c/perfetto_ds.cc", .language = .cpp, .component = .sismo_unix },
     .{ .path = "src/c/sismo_traced_probes.cc", .language = .cpp, .component = .sismo_linux },
     .{ .path = "src/c/sismo_traced_perf.cc", .language = .cpp, .component = .sismo_linux },

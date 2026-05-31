@@ -28,6 +28,18 @@ if (enable_perfetto_platform_services) {
       "//src/tracing:client_api",
     ]
 
+    # trace_processor: sismo's post-record symbolization
+    # (src/c/sismo_trace_query.cc) embeds it to extract unsymbolized
+    # stack frames from a recorded trace via SQL, rather than hand-parsing
+    # the interned stack_profile protos. We depend on the `:lib` source_set
+    # (what the `:trace_processor` static_library wraps) rather than the
+    # static_library itself: complete_static_lib only merges source_set
+    # objects into the archive — a nested static_library would be left as an
+    # order-only input and its symbols would go unresolved at link time.
+    if (enable_perfetto_trace_processor_sqlite) {
+      deps += [ "//src/trace_processor:lib" ]
+    }
+
     # Aggregate traced_probes' producer source set (NOT the //src/traced/probes
     # executable target which adds probes.cc's main()) so sismo can embed
     # ProbesProducer on a worker thread inside the orchestrator process.

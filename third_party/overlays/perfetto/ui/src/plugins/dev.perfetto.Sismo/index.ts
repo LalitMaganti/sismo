@@ -16,6 +16,9 @@ import './styles.scss';
 import m from 'mithril';
 import type {PerfettoPlugin} from '../../public/plugin';
 import type {Trace} from '../../public/trace';
+import SismoWidgets from '../dev.perfetto.SismoWidgets';
+import SchedPlugin from '../dev.perfetto.Sched';
+import ThreadPlugin from '../dev.perfetto.Thread';
 import {SismoPage} from './sismo_page';
 import {EMPTY_PRIVILEGED_SET, loadPrivilegedSet} from './privileged_set';
 import {
@@ -28,6 +31,10 @@ import {registerSismoDetailTab} from './detail_tab';
 
 export default class implements PerfettoPlugin {
   static readonly id = 'dev.perfetto.Sismo';
+  // Cross-plugin deps the UI import check requires us to declare: the shared
+  // Meter widget (SismoWidgets) and the Sched/Thread track classes the
+  // workspaces reuse.
+  static readonly dependencies = [SismoWidgets, SchedPlugin, ThreadPlugin];
 
   async onTraceLoad(trace: Trace): Promise<void> {
     trace.pages.registerPage({
@@ -36,11 +43,16 @@ export default class implements PerfettoPlugin {
     });
     trace.sidebar.addMenuItem({
       section: 'current_trace',
-      text: 'Sismo Overview',
+      text: 'Overview',
       href: '#!/sismo',
       icon: 'dashboard',
       sortOrder: 14,
     });
+
+    // Land on the Sismo overview rather than the raw timeline when a trace
+    // finishes loading — the overview is this build's purpose. High priority so
+    // it beats any generic landing-page suggestion.
+    trace.initialPage.suggest('/sismo', 100);
 
     trace.defaultWorkspace.title = 'Combined timeline (all data)';
 

@@ -147,10 +147,18 @@ fn encodeTrackEventConfig(gpa: std.mem.Allocator, te: TrackEventEntry) ![]u8 {
 }
 
 /// FtraceConfig: emits sched_switch / sched_waking / sched_wakeup /
-/// sched_process_exit + compact_sched.enabled. Field numbers per
+/// sched_process_exit + power/cpu_frequency + power/cpu_idle +
+/// compact_sched.enabled. Field numbers per
 /// `protos/perfetto/config/ftrace/ftrace_config.proto`:
 ///   ftrace_events = 1 (repeated string)
 ///   compact_sched = 12 (CompactSchedConfig submsg; .enabled = field 1)
+///
+/// power/cpu_frequency + power/cpu_idle drive trace_processor's `cpufreq`
+/// / `cpuidle` counter tracks, which the `linux.cpu.utilization.*` stdlib
+/// turns into the megacycle / frequency figures the CPU views read. DVFS
+/// tracepoints only fire on a transition, so a core pinned at one
+/// frequency for the whole trace yields no events — the views degrade to
+/// runtime-only and hide the frequency-derived numbers.
 fn encodeFtraceConfig(gpa: std.mem.Allocator, _: LinuxFtraceEntry) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
@@ -159,6 +167,8 @@ fn encodeFtraceConfig(gpa: std.mem.Allocator, _: LinuxFtraceEntry) ![]u8 {
         "sched/sched_waking",
         "sched/sched_wakeup",
         "sched/sched_process_exit",
+        "power/cpu_frequency",
+        "power/cpu_idle",
     };
     for (events) |e| try w.writeString(1, e);
 

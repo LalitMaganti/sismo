@@ -12,84 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Latency domain body. Parked while we focus on CPU, but kept wired up: it
+// renders the existing scheduling-latency analysis under the shared Sismo
+// shell (the shell owns the header / domain selector, so this is body-only).
+
 import m from 'mithril';
-import type {Trace} from '../../public/trace';
-import {Section} from '../../widgets/section';
-import {Card} from '../../widgets/card';
-import {Grid, GridCell, GridHeaderCell} from '../../widgets/grid';
-import {EmptyState} from '../../widgets/empty_state';
-import {Callout} from '../../widgets/callout';
-import {Intent} from '../../widgets/common';
-import {Anchor} from '../../widgets/anchor';
-import {Button, ButtonVariant} from '../../widgets/button';
-import {Tabs} from '../../widgets/tabs';
+import type {Trace} from '../../../public/trace';
+import {Section} from '../../../widgets/section';
+import {Card} from '../../../widgets/card';
+import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
+import {EmptyState} from '../../../widgets/empty_state';
+import {Callout} from '../../../widgets/callout';
+import {Intent} from '../../../widgets/common';
+import {Tabs} from '../../../widgets/tabs';
 import {
   loadLatencyDetail,
   type CpuBlameRow,
   type CpuIdleStateRow,
   type CpuThreadBlameRow,
   type LatencyDetail,
-} from './cpu_data';
-import {fmtDuration} from './format';
-import {
-  goToTimeline,
-  renderPrivilegedBanner,
-  renderProcessLink,
-  renderThreadLink,
-} from './page_common';
-import type {PrivilegedSet} from './privileged_set';
+} from '../cpu_data';
+import {fmtDuration} from '../format';
+import {renderProcessLink, renderThreadLink} from '../page_common';
+import type {PrivilegedSet} from '../privileged_set';
 
-export interface LatencyDetailPageAttrs {
+export interface LatencyViewAttrs {
   readonly trace: Trace;
   readonly privileged: PrivilegedSet;
 }
 
-export class LatencyDetailPage
-  implements m.ClassComponent<LatencyDetailPageAttrs>
-{
+export class LatencyView implements m.ClassComponent<LatencyViewAttrs> {
   private data?: LatencyDetail;
   private error?: string;
   private blameTab: 'processes' | 'threads' = 'processes';
 
-  oninit({attrs}: m.CVnode<LatencyDetailPageAttrs>) {
+  oninit({attrs}: m.CVnode<LatencyViewAttrs>) {
     this.load(attrs.trace, attrs.privileged);
   }
 
-  view({attrs}: m.CVnode<LatencyDetailPageAttrs>) {
-    return m(
-      '.pf-sismo-page',
-      m(
-        '.pf-sismo-page__inner',
-        m(
-          '.pf-sismo-page__header',
-          m(
-            '.pf-sismo-page__breadcrumbs',
-            m(Anchor, {href: '#!/sismo', startIcon: 'arrow_back'}, 'Overview'),
-            ' / Latency',
-          ),
-          m(
-            '.pf-sismo-page__header-row',
-            m('h1.pf-sismo-page__title', 'Latency'),
-            m(Button, {
-              label: 'Open timeline',
-              icon: 'timeline',
-              variant: ButtonVariant.Filled,
-              onclick: () => goToTimeline(attrs.trace),
-            }),
-          ),
-          m(
-            '.pf-sismo-page__subtitle',
-            'Why your work waited: scheduling delay, what held the CPU while ' +
-              'you were runnable, and (coming soon) blocking calls and IO waits.',
-          ),
-          renderPrivilegedBanner(attrs.privileged),
-        ),
-        m('.pf-sismo-page__body', this.renderBody(attrs.trace)),
-      ),
-    );
-  }
-
-  private renderBody(trace: Trace): m.Children {
+  view({attrs}: m.CVnode<LatencyViewAttrs>): m.Children {
     if (this.error !== undefined) {
       return m(Callout, {icon: 'error', intent: Intent.Danger}, this.error);
     }
@@ -109,7 +70,7 @@ export class LatencyDetailPage
       );
     }
     return [
-      this.renderBlame(trace, d),
+      this.renderBlame(attrs.trace, d),
       this.renderIdleStates(d.idleStates),
       this.renderComingSoon(),
     ];
@@ -142,10 +103,7 @@ export class LatencyDetailPage
       const summary = states
         .map((s) => `${s.state} ${s.percentage.toFixed(0)}%`)
         .join(', ');
-      return [
-        m(GridCell, `CPU ${cpu}`),
-        m(GridCell, {wrap: true}, summary),
-      ];
+      return [m(GridCell, `CPU ${cpu}`), m(GridCell, {wrap: true}, summary)];
     });
     return m(
       Section,
@@ -259,7 +217,8 @@ function renderBlameProcessTable(
     return m(EmptyState, {
       icon: 'block',
       title:
-        'Nothing was blocking you — your threads got the CPU as soon as they became runnable.',
+        'Nothing was blocking you — your threads got the CPU as soon as they ' +
+        'became runnable.',
     });
   }
   const data = rows.map((r) => [
@@ -290,11 +249,16 @@ function renderBlameThreadTable(
     return m(EmptyState, {
       icon: 'block',
       title:
-        'No blocking threads — your threads got the CPU as soon as they became runnable.',
+        'No blocking threads — your threads got the CPU as soon as they became ' +
+        'runnable.',
     });
   }
   const data = rows.map((r) => [
-    m(GridCell, {wrap: true}, renderThreadLink(trace, r.threadName, r.tid, r.utid)),
+    m(
+      GridCell,
+      {wrap: true},
+      renderThreadLink(trace, r.threadName, r.tid, r.utid),
+    ),
     m(GridCell, {wrap: true}, r.processName ?? '—'),
     m(GridCell, {align: 'right'}, fmtDuration(trace, r.blockedNs)),
   ]);

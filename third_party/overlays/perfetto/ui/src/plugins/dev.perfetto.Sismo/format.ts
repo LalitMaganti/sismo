@@ -54,6 +54,24 @@ export function fmtMegacyclesNum(v: number | null): string {
   return `${v.toFixed(0)} Mcyc`;
 }
 
+// Compact engineering-suffix count (e.g. 1.23B, 45.6M) for raw counter totals
+// like instructions, cycles and misses, where full digit groups are noise.
+export function fmtMetric(n: number | null): string {
+  if (n === null || !isFinite(n)) return '—';
+  const abs = Math.abs(n);
+  if (abs >= 1e12) return `${(n / 1e12).toFixed(2)}T`;
+  if (abs >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return n.toFixed(0);
+}
+
+// Instructions-per-cycle, the headline microarchitecture efficiency number.
+export function fmtIpc(ipc: number | null): string {
+  if (ipc === null || !isFinite(ipc)) return '—';
+  return ipc.toFixed(2);
+}
+
 // Used for chart axis ticks, which can't handle bigints.
 export function fmtDurationNs(ns: number): string {
   if (!isFinite(ns)) return '—';
