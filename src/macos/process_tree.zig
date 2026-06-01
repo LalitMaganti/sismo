@@ -28,11 +28,10 @@ comptime {
 //   struct proc_bsdinfo (PROC_PIDTBSDINFO_SIZE = sizeof)
 //   struct proc_threadinfo (PROC_PIDTHREADID64INFO_SIZE = sizeof)
 //
-// We only read a handful of fields — but the buffer size handed to
-// `proc_pidinfo` MUST equal the declared SIZE of the flavor or the
-// kernel returns ENOMEM, so the structs need to mirror the kernel
-// layout byte-for-byte. Verified at comptime via @sizeOf assertions
-// below.
+// Only a handful of fields are read, but the buffer size handed to
+// `proc_pidinfo` MUST equal the flavor's declared SIZE or the kernel
+// returns ENOMEM — so the structs mirror the kernel layout byte-for-byte,
+// verified by the @sizeOf assertions below.
 
 const MAXCOMLEN: usize = 16;
 const MAXTHREADNAMESIZE: usize = 64;
@@ -80,9 +79,8 @@ comptime {
     // From `<sys/proc_info.h>` on Darwin 25.4 (verified via cc -E):
     //   PROC_PIDTBSDINFO_SIZE       = sizeof(struct proc_bsdinfo)    = 136
     //   PROC_PIDTHREADID64INFO_SIZE = sizeof(struct proc_threadinfo) = 112
-    // proc_pidinfo enforces the size match, so a layout drift would
-    // be caught at runtime — but failing fast at comptime saves an
-    // afternoon of "why is this returning ENOMEM" debugging.
+    // proc_pidinfo enforces this size match (mismatch → ENOMEM), so a
+    // layout drift fails fast here instead of at runtime.
     std.debug.assert(@sizeOf(ProcBsdinfo) == 136);
     std.debug.assert(@sizeOf(ProcThreadinfo) == 112);
 }
@@ -98,10 +96,9 @@ extern "c" fn proc_pidinfo(
     buffersize: c_int,
 ) c_int;
 
-/// Fetch BSDINFO for a pid. Returns null on ESRCH (pid gone) or any
-/// other proc_pidinfo failure — callers treat null as "not in our
-/// process universe right now" rather than distinguishing transient
-/// vs. permanent errors.
+/// Fetch BSDINFO for a pid. Returns null on ESRCH (pid gone) or any other
+/// proc_pidinfo failure — callers treat null as "not resolvable right now"
+/// rather than distinguishing transient vs. permanent errors.
 pub fn bsdinfo(pid: c_int) ?ProcBsdinfo {
     var info: ProcBsdinfo = std.mem.zeroes(ProcBsdinfo);
     const rc = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, @sizeOf(ProcBsdinfo));
@@ -113,7 +110,7 @@ pub fn bsdinfo(pid: c_int) ?ProcBsdinfo {
 /// value `KdThreadMap.thread` carries — Darwin's `thread_t.thread_id`,
 /// not the pthread `mach_port_t`). Returns null if the lookup fails or
 /// the thread has no name (kernel zero-fills `pth_name` for unnamed
-/// threads — we treat that as "no useful name" too).
+/// threads — also treated as "no useful name").
 pub fn threadName(pid: c_int, tid: u64, out_buf: *[MAXTHREADNAMESIZE]u8) ?[]const u8 {
     var info: ProcThreadinfo = std.mem.zeroes(ProcThreadinfo);
     const rc = proc_pidinfo(pid, PROC_PIDTHREADID64INFO, tid, &info, @sizeOf(ProcThreadinfo));

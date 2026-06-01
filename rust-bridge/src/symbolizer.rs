@@ -41,6 +41,34 @@ struct SymModule {
     map: Option<SymbolMap>,
 }
 
+/// Build the wholesym config. Debuginfod is opt-in (it does network I/O),
+/// so only enable it when the standard `DEBUGINFOD_URLS` env var is set —
+/// the same switch `debuginfod-find` and gdb honor. wholesym 0.8 still
+/// needs an explicit cache dir even when the system debuginfod client is
+/// installed, so point it at `$XDG_CACHE_HOME/sismo/debuginfod` (falling
+/// back to a temp dir). This is what lets sismo symbolize *stripped*
+/// system libraries whose debug info lives in a separate file/server.
+fn build_config() -> SymbolManagerConfig {
+    let mut cfg = SymbolManagerConfig::default();
+    if std::env::var_os("DEBUGINFOD_URLS").is_some() {
+        let cache = cache_dir().join("sismo").join("debuginfod");
+        cfg = cfg
+            .use_debuginfod(true)
+            .debuginfod_cache_dir_if_not_installed(cache);
+    }
+    cfg
+}
+
+fn cache_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(d);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache");
+    }
+    std::env::temp_dir()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn sismo_symbolizer_create() -> *mut Symbolizer {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -50,12 +78,27 @@ pub extern "C" fn sismo_symbolizer_create() -> *mut Symbolizer {
         Ok(r) => r,
         Err(_) => return std::ptr::null_mut(),
     };
-    let manager = SymbolManager::with_config(SymbolManagerConfig::default());
+    let manager = SymbolManager::with_config(build_config());
     Box::into_raw(Box::new(Symbolizer {
         rt,
         manager,
         modules: Vec::new(),
     }))
+}
+
+/// Write `msg` into `out[..cap]` as a NUL-terminated, UTF-8-safe string,
+/// truncating on a char boundary. No-op if `out` is null or `cap == 0`.
+unsafe fn write_cstr(out: *mut u8, cap: usize, msg: &str) {
+    if out.is_null() || cap == 0 {
+        return;
+    }
+    let mut n = msg.len().min(cap - 1);
+    while n > 0 && !msg.is_char_boundary(n) {
+        n -= 1;
+    }
+    let dst = unsafe { slice::from_raw_parts_mut(out, cap) };
+    dst[..n].copy_from_slice(&msg.as_bytes()[..n]);
+    dst[n] = 0;
 }
 
 #[unsafe(no_mangle)]
@@ -75,6 +118,12 @@ pub unsafe extern "C" fn sismo_symbolizer_destroy(s: *mut Symbolizer) {
 ///   -1  bad arguments.
 /// `uuid_bytes` (optional, 16 bytes) is the preferred disambiguator.
 /// `arch_utf8` / `arch_len` is a fallback when UUID isn't available.
+///
+/// Diagnostics (all optional — pass null to skip):
+///   `symbol_count_out`  on success, the number of symbols in the map.
+///   `err_out`/`err_cap` on failure (rc 1), the wholesym error rendered
+///                       as a NUL-terminated string. This is the reason a
+///                       module didn't symbolize — surface it to the user.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_symbolizer_add_module(
     s: *mut Symbolizer,
@@ -85,6 +134,9 @@ pub unsafe extern "C" fn sismo_symbolizer_add_module(
     uuid_bytes: *const u8,
     arch_utf8: *const u8,
     arch_len: usize,
+    symbol_count_out: *mut u64,
+    err_out: *mut u8,
+    err_cap: usize,
 ) -> c_int {
     if s.is_null() || path_utf8.is_null() || path_len == 0 || end_avma <= base_avma {
         return -1;
@@ -130,12 +182,21 @@ pub unsafe extern "C" fn sismo_symbolizer_add_module(
             .load_symbol_map_for_binary_at_path(&path, disambiguator),
     );
     let (map, rc) = match load_result {
-        Ok(m) => (Some(m), 0),
-        // Failure is common on macOS for dyld_shared_cache-only system
-        // dylibs (libsystem_c, libdispatch, …) and isn't actionable —
-        // samply hits the same wall. Don't log; just register the avma
-        // range and let resolve() return 0 for AVMAs in this module.
-        Err(_) => (None, 1),
+        Ok(m) => {
+            if !symbol_count_out.is_null() {
+                unsafe { *symbol_count_out = m.symbol_count() as u64 };
+            }
+            (Some(m), 0)
+        }
+        // A load failure is sometimes expected (dyld_shared_cache-only
+        // macOS system dylibs) and sometimes actionable (a stripped Linux
+        // binary with no debug info installed). The bridge can't tell the
+        // two apart, so it hands the rendered error back to the caller and
+        // still registers the avma range so resolve() returns 0 here.
+        Err(e) => {
+            unsafe { write_cstr(err_out, err_cap, &format!("{e}")) };
+            (None, 1)
+        }
     };
     symbolizer.modules.push(SymModule {
         base_avma,
@@ -200,4 +261,60 @@ pub unsafe extern "C" fn sismo_symbolizer_resolve(
     let out = unsafe { slice::from_raw_parts_mut(out_utf8, n) };
     out.copy_from_slice(&bytes[..n]);
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add(s: *mut Symbolizer, path: &str) -> (c_int, u64, String) {
+        let mut count: u64 = 0;
+        let mut err = [0u8; 256];
+        let rc = unsafe {
+            sismo_symbolizer_add_module(
+                s,
+                0,
+                0x300000,
+                path.as_ptr(),
+                path.len(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                &mut count,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        let end = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+        (rc, count, String::from_utf8_lossy(&err[..end]).into_owned())
+    }
+
+    // A missing path must report rc=1 with a non-empty reason; the bridge
+    // used to swallow this, leaving the user with no clue why a module
+    // didn't symbolize.
+    #[test]
+    fn missing_path_yields_reason() {
+        let s = sismo_symbolizer_create();
+        assert!(!s.is_null());
+        let (rc, count, err) = add(s, "/no/such/binary.so");
+        assert_eq!(rc, 1);
+        assert_eq!(count, 0);
+        assert!(!err.is_empty(), "expected a load-failure reason");
+        unsafe { sismo_symbolizer_destroy(s) };
+    }
+
+    // The host libc should load with a positive symbol count (skipped if
+    // the well-known path isn't present, e.g. non-glibc hosts).
+    #[test]
+    fn host_libc_reports_symbol_count() {
+        let path = "/usr/lib64/libc.so.6";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let s = sismo_symbolizer_create();
+        let (rc, count, _) = add(s, path);
+        assert_eq!(rc, 0);
+        assert!(count > 0, "expected a positive symbol count");
+        unsafe { sismo_symbolizer_destroy(s) };
+    }
 }

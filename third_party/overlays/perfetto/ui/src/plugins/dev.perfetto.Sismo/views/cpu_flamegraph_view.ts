@@ -24,7 +24,7 @@ import {Flamegraph, type FlamegraphState} from '../../../widgets/flamegraph';
 import {buildSampleFlamegraphMetrics} from '../stack_timeline';
 import type {PrivilegedSet} from '../privileged_set';
 
-export interface CpuFlamegraphViewAttrs {
+interface CpuFlamegraphViewAttrs {
   readonly trace: Trace;
   readonly priv: PrivilegedSet;
   readonly hasSamples: boolean;

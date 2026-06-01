@@ -100,6 +100,16 @@ SOURCE_DEPS: list[SourceDep] = [
         git_url="https://github.com/google/perfetto.git",
         pin="a85b5352e4b0df6649e05ff13dfc7a406b8982fb",
     ),
+    # Intel's PMU event/metric database (per-microarchitecture JSON + a CPUID
+    # mapfile). gen_pmu_events.py turns it into the collector's event-encoding
+    # table, so PMU configs come from Intel's source of truth per CPU model
+    # instead of hardcoded raw values. No patches; consumed read-only.
+    SourceDep(
+        name="perfmon",
+        target_dir="third_party/perfmon",
+        git_url="https://github.com/intel/perfmon.git",
+        pin="7ab0b6e2c09d3df26671c7875148d6ab6e853775",
+    ),
 ]
 
 

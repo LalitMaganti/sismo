@@ -175,7 +175,7 @@ pub fn acceptAndReceive(listener: *Listener) !AttachState {
 }
 
 pub const AttachState = struct {
-    /// Control connection — when sismo closes it, we detach.
+    /// Control connection — the client detaches when sismo closes it.
     conn_fd: c_int,
     /// shm fd received via SCM_RIGHTS. Caller owns; pass to
     /// `RingBuffer.attach`.

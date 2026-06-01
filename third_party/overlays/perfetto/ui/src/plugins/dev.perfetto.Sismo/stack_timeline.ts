@@ -22,6 +22,7 @@ import {materialColorScheme} from '../../components/colorizer';
 import {Time} from '../../base/time';
 import type {time} from '../../base/time';
 import type {TimeScale} from '../../base/time_scale';
+import {frameNameExpr} from './cpu_data/sql';
 import type {
   TrackRenderContext,
   TrackRenderer,
@@ -142,7 +143,7 @@ async function createStackTable(trace: Trace, upidList: string): Promise<void> {
           f.depth AS depth,
           f.callsite_at_depth AS callsite_at_depth,
           f.frame_id AS frame_id,
-          spf.name AS frame_name,
+          ${frameNameExpr('spf')} AS frame_name,
           spf.mapping AS mapping_id,
           spf.rel_pc AS rel_pc,
           spm.name AS mapping_name

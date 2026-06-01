@@ -16,25 +16,20 @@
 //! user pre-launches via `prepare`, then attaches whenever something
 //! interesting happens.
 //!
-//! What it does, mechanically:
-//!   1. Resolve $LIBEXEC/libsismo_heap.dylib (or dev-tree fallback).
-//!   2. Set DYLD_INSERT_LIBRARIES so dyld loads the dormant client
-//!      into the workload (its constructor binds
-//!      /tmp/sismo-heap-{pid}.sock and waits for sismo to attach).
-//!   3. Set PERFETTO_PRODUCER_SOCK_NAME=/tmp/sismo-producer.sock so
-//!      any Perfetto-SDK-linked workload finds the well-known socket.
-//!      (Once the sismo SDK lands and bakes the path in internally,
-//!      this env var becomes redundant; harmless to keep setting it.)
-//!   4. execvp into the user's command. The current process becomes
-//!      the workload; the env we set is inherited.
+//! DYLD_INSERT_LIBRARIES points dyld at libsismo_heap.dylib so the
+//! workload loads the dormant client (its constructor binds
+//! /tmp/sismo-heap-{pid}.sock and waits for sismo to attach).
+//! PERFETTO_PRODUCER_SOCK_NAME points any Perfetto-SDK-linked workload at
+//! the well-known producer socket — redundant once the sismo SDK bakes
+//! the path in, but harmless to keep setting. Then execvp inherits the
+//! env into the user's command.
 //!
-//! Hardened-runtime caveat: macOS strips DYLD_INSERT_LIBRARIES from
-//! the env on exec for hardened-runtime / library-validation /
-//! restricted-segment binaries. For unsigned dev binaries (the side-
-//! project audience), this is fine. For signed third-party apps,
-//! heap injection silently fails — we don't currently detect this
-//! at prepare time; the user notices when sismo record reports the
-//! heap socket missing.
+//! Hardened-runtime caveat: macOS strips DYLD_INSERT_LIBRARIES from the
+//! env on exec for hardened-runtime / library-validation / restricted-
+//! segment binaries. Unsigned dev binaries (the audience here) are fine;
+//! for signed third-party apps heap injection silently fails. sismo does
+//! not detect this at prepare time — the user notices when sismo record
+//! reports the heap socket missing.
 
 const std = @import("std");
 const paths = @import("sismo_paths.zig");
@@ -49,9 +44,8 @@ pub fn runPrepare(init: std.process.Init) !void {
     _ = iter.next(); // exe path
     _ = iter.next(); // "prepare" subcommand token
 
-    // Collect remaining args. First positional past any flags is the
-    // workload's argv[0]; rest become its argv[1..]. We accept --help
-    // but no other flags right now — prepare is intentionally thin.
+    // First positional is the workload's argv[0]; the rest are its
+    // argv[1..]. --help is the only flag prepare understands.
     var workload_argv: std.ArrayList([]const u8) = .empty;
     defer workload_argv.deinit(gpa);
 
@@ -59,10 +53,10 @@ pub fn runPrepare(init: std.process.Init) !void {
         if (workload_argv.items.len == 0 and std.mem.eql(u8, arg, "--help")) {
             std.debug.print(
                 "usage: sismo prepare <command> [args...]\n" ++
-                "\n" ++
-                "  Launch <command> with sismo's heap-profiler dormant client\n" ++
-                "  preloaded. The launched process can later be recorded via\n" ++
-                "  `sismo record --pid <pid>`.\n",
+                    "\n" ++
+                    "  Launch <command> with sismo's heap-profiler dormant client\n" ++
+                    "  preloaded. The launched process can later be recorded via\n" ++
+                    "  `sismo record --pid <pid>`.\n",
                 .{},
             );
             return;
@@ -73,7 +67,7 @@ pub fn runPrepare(init: std.process.Init) !void {
     if (workload_argv.items.len == 0) {
         std.debug.print(
             "sismo prepare: no command specified\n" ++
-            "usage: sismo prepare <command> [args...]\n",
+                "usage: sismo prepare <command> [args...]\n",
             .{},
         );
         return;
@@ -88,12 +82,9 @@ pub fn runPrepare(init: std.process.Init) !void {
     _ = setenv("DYLD_INSERT_LIBRARIES", heap_dylib.ptr, 1);
     _ = setenv("PERFETTO_PRODUCER_SOCK_NAME", paths.producer_sock.ptr, 1);
 
-    // Build NUL-terminated argv for execvp. argv must end with a null
-    // sentinel — that's what the [*:null] type encodes.
+    // Build NUL-terminated argv for execvp (the [*:null] type requires
+    // the trailing null sentinel).
     const cmd = workload_argv.items[0];
-    const cmd_z = try gpa.dupeZ(u8, cmd);
-    defer gpa.free(cmd_z);
-
     var argv_z = try gpa.alloc(?[*:0]const u8, workload_argv.items.len + 1);
     defer gpa.free(argv_z);
 
@@ -108,8 +99,7 @@ pub fn runPrepare(init: std.process.Init) !void {
     }
     argv_z[workload_argv.items.len] = null;
 
-    // execvp replaces this process. On success it does not return.
-    const rc = execvp(cmd_z.ptr, @ptrCast(argv_z.ptr));
-    // Only reachable on failure.
+    // execvp replaces this process; only returns on failure.
+    const rc = execvp(arg_dups[0].ptr, @ptrCast(argv_z.ptr));
     std.debug.print("sismo prepare: execvp({s}) failed rc={d}\n", .{ cmd, rc });
 }

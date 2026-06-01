@@ -27,9 +27,9 @@ const c = @cImport({
 
 // kd_buf event record. Layout copied from
 //   MacOSX26.4.sdk/.../Kernel.framework/Headers/sys/kdebug_private.h
-// (a private header we don't include from user space — pulls in
-// kext-side declarations). The struct is wire-stable across LP32/LP64
-// per Apple's own comment in that header.
+// (a private header not included from user space — it pulls in kext-side
+// declarations). The struct is wire-stable across LP32/LP64 per Apple's
+// own comment in that header.
 //
 // 64 bytes on arm64 macOS (LP64 + the trailing `unused` field that's only
 // present on LP64/arm64 to keep wire compatibility with LP32).
@@ -73,21 +73,6 @@ pub const KdThreadMap = extern struct {
     pid: c_int,
     command: [20]u8,
 };
-
-/// Extended CPU map entry — maps `kd_buf.cpuid` to a stable CPU name.
-/// Preceded in the buffer by `KdCpuMapHeader`.
-pub const KdCpuMapExt = extern struct {
-    cpu_id: u32,
-    flags: u32,
-    name: [32]u8,
-};
-
-pub const KdCpuMapHeader = extern struct {
-    version_no: u32,
-    cpu_count: u32,
-};
-
-pub const KDBG_CPUMAP_IS_IOP: u32 = 0x1;
 
 /// MACH_SCHED / MACH_STACK_HANDOFF event arguments.
 /// Source: xnu `osfmk/kern/sched_prim.c`, `thread_invoke` (the emit fires
@@ -151,11 +136,7 @@ pub const MachDispatchArgs = struct {
     }
 };
 
-// kd_regtype.type values (from xnu's bsd/sys/kdebug_private.h).
-pub const KDBG_TYPENONE: c_uint = 0x80000000;
-pub const KDBG_RANGETYPE: c_uint = 0x00000100;
-pub const KDBG_VALCHECK: c_uint = 0x00000200;
-pub const KDBG_CLASSTYPE: c_uint = 0x00010000;
+// kd_regtype.type value (from xnu's bsd/sys/kdebug_private.h).
 pub const KDBG_SUBCLSTYPE: c_uint = 0x00020000;
 
 fn errno() c_int {
@@ -238,20 +219,10 @@ pub const Capture = struct {
         }
     }
 
-    /// Disable tracing and drain the kernel buffer into `events`. Returns
-    /// the number of events read (capped at events.len). Caller can still
-    /// pull the thread/cpu maps after this; call `tearDown` when done.
-    pub fn stopAndDrain(events: []KdBuf) !usize {
-        _ = sysctlSetInt(c.KERN_KDENABLE, 0);
-        return try sysctlReadTr(events);
-    }
-
     /// Drain the kernel ring buffer WITHOUT stopping capture. Returns
-    /// the number of events read (capped at events.len). Intended for
-    /// the streaming model: a polling loop drains every ~100 ms and
-    /// emits to a Perfetto session, so the kernel ring never fills up
-    /// regardless of capture duration. Same primitive (`KERN_KDREADTR`)
-    /// as `stopAndDrain`; this one just doesn't disable first.
+    /// the number of events read (capped at events.len). The streaming
+    /// model polls this every ~100 ms and emits to a Perfetto session, so
+    /// the kernel ring never fills up regardless of capture duration.
     pub fn drain(events: []KdBuf) !usize {
         return try sysctlReadTr(events);
     }
@@ -307,65 +278,6 @@ pub const Capture = struct {
     }
 };
 
-pub fn isRoot() bool {
-    return std.c.geteuid() == 0;
-}
-
-/// Human-readable name for a `DBG_MACH_SCHED` event code. Driven by the
-/// constants in `<sys/kdebug.h>` so it stays in sync with the SDK; we only
-/// list the events most relevant to Perfetto-style sched analysis. `null`
-/// for unrecognized codes (rare boundary events like `MACH_AMP_DEBUG`).
-pub fn schedCodeName(code: u32) ?[]const u8 {
-    return switch (code) {
-        c.MACH_SCHED => "MACH_SCHED",                       // context switch
-        c.MACH_STACK_HANDOFF => "MACH_STACK_HANDOFF",       // direct handoff
-        c.MACH_MAKE_RUNNABLE => "MACH_MAKE_RUNNABLE",       // wakeup
-        c.MACH_IDLE => "MACH_IDLE",
-        c.MACH_BLOCK => "MACH_BLOCK",                       // off-CPU
-        c.MACH_WAIT => "MACH_WAIT",                         // wait assertion
-        c.MACH_DISPATCH => "MACH_DISPATCH",                 // ctx switch done
-        c.MACH_MOVED => "MACH_MOVED",
-        c.MACH_GET_URGENCY => "MACH_GET_URGENCY",
-        c.MACH_URGENCY => "MACH_URGENCY",
-        c.MACH_REDISPATCH => "MACH_REDISPATCH",
-        c.MACH_QUANTUM_HANDOFF => "MACH_QUANTUM_HANDOFF",
-        c.MACH_SCHED_THREAD_SWITCH => "MACH_SCHED_THREAD_SWITCH",
-        c.MACH_SCHED_CHANGE_PRIORITY => "MACH_SCHED_CHANGE_PRIORITY",
-        c.MACH_SCHED_QUANTUM_EXPIRED => "MACH_SCHED_QUANTUM_EXPIRED",
-        c.MACH_SCHED_THREAD_SELECT => "MACH_SCHED_THREAD_SELECT",
-        c.MACH_SCHED_LOAD => "MACH_SCHED_LOAD",
-        c.MACH_SCHED_LOAD_EFFECTIVE => "MACH_SCHED_LOAD_EFFECTIVE",
-        c.MACH_SCHED_AST_CHECK => "MACH_SCHED_AST_CHECK",
-        c.MACH_SCHED_MODE_CHANGE => "MACH_SCHED_MODE_CHANGE",
-        c.MACH_SCHED_PREEMPT_TIMER_ACTIVE => "MACH_SCHED_PREEMPT_TIMER_ACTIVE",
-        c.MACH_PSET_AVG_EXEC_TIME => "MACH_PSET_AVG_EXEC_TIME",
-        c.MACH_TURNSTILE_KERNEL_CHANGE => "MACH_TURNSTILE_KERNEL_CHANGE",
-        c.MACH_TURNSTILE_USER_CHANGE => "MACH_TURNSTILE_USER_CHANGE",
-        else => null,
-    };
-}
-
 pub fn extractCode(debugid: u32) u32 {
     return (debugid & c.KDBG_CODE_MASK) >> c.KDBG_CODE_OFFSET;
-}
-
-/// The low two bits of `debugid` carry the event semantic:
-///   0 = single instantaneous event
-///   1 = nested-region START
-///   2 = nested-region END
-///   3 = unused / reserved
-pub const Func = enum(u2) { instant = 0, start = 1, end = 2, none = 3 };
-
-pub fn extractFunc(debugid: u32) Func {
-    return @enumFromInt(@as(u2, @intCast(debugid & c.KDBG_FUNC_MASK)));
-}
-
-/// Sleep helper; lets standalone callers pull in this module without
-/// dragging std.time.
-pub fn sleepMs(ms: c_uint) void {
-    const ts: std.c.timespec = .{
-        .sec = @intCast(ms / std.time.ms_per_s),
-        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&ts, null);
 }

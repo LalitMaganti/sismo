@@ -15,8 +15,8 @@
 //! PIE libc): trace_processor's `rel_pc` is the module-relative virtual
 //! address that an emitted `AddressSymbols.address` must equal. wholesym's
 //! `LookupAddress::Relative` wants `rel_pc - load_bias`, which the bridge
-//! computes as `avma - base_avma` — so we register each module at
-//! `base_avma = load_bias` and resolve `rel_pc` directly.
+//! computes as `avma - base_avma` — so each module is registered at
+//! `base_avma = load_bias` and `rel_pc` resolves directly.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -73,9 +73,9 @@ const Collector = struct {
 };
 
 /// Per-row callback: rows arrive grouped by (name, build_id, load_bias), so
-/// we extend the trailing module while the key matches and start a new one
-/// when it changes. Duplicate rel_pcs (many samples hitting one address)
-/// are collapsed via `seen`.
+/// the trailing module is extended while the key matches and a new one
+/// starts when it changes. Duplicate rel_pcs (many samples hitting one
+/// address) are collapsed via `seen`.
 fn onRow(
     ctx: ?*anyopaque,
     name_ptr: [*]const u8,
@@ -152,13 +152,21 @@ fn symbolizeTraceImpl(gpa: std.mem.Allocator, io: std.Io, trace_path: []const u8
 
     var out = ProtoWriter.init(gpa);
     defer out.deinit();
+
+    var stats: std.ArrayList(ModuleStat) = .empty;
+    defer stats.deinit(gpa);
+
     var n_funcs: usize = 0;
     var n_addrs: usize = 0;
 
     for (collector.modules.items) |*m| {
         if (m.rel_pcs.items.len == 0) continue;
-        const ms = try buildModuleSymbols(gpa, sym, m, &n_funcs, &n_addrs);
+        var stat: ModuleStat = .{ .name = m.name, .build_id_hex = m.build_id_hex };
+        const ms = try buildModuleSymbols(gpa, sym, m, &stat);
         defer gpa.free(ms);
+        n_addrs += stat.n_addrs;
+        n_funcs += stat.n_resolved;
+        try stats.append(gpa, stat);
         if (ms.len == 0) continue;
         // Wrap the ModuleSymbols body in TracePacket.module_symbols (61),
         // then the packet in Trace.packet (1).
@@ -168,30 +176,169 @@ fn symbolizeTraceImpl(gpa: std.mem.Allocator, io: std.Io, trace_path: []const u8
         try out.writeMessage(TP_FIELD_TRACE_PACKET, tp.bytes());
     }
 
-    if (out.bytes().len == 0) {
-        std.debug.print("sismo record: symbolization found no resolvable frames\n", .{});
-        return;
+    if (out.bytes().len > 0) {
+        var file = try std.Io.Dir.cwd().openFile(io, trace_path, .{ .mode = .read_write });
+        defer file.close(io);
+        const end = try file.length(io);
+        try file.writePositionalAll(io, out.bytes(), end);
     }
 
-    var file = try std.Io.Dir.cwd().openFile(io, trace_path, .{ .mode = .read_write });
-    defer file.close(io);
-    const end = try file.length(io);
-    try file.writePositionalAll(io, out.bytes(), end);
+    report(io, stats.items, n_addrs, n_funcs);
+}
 
+/// What happened when we tried to symbolize one module. Carries enough to
+/// tell a missing-symbols problem (actionable: install debug info) apart
+/// from a loaded-but-nothing-matched problem (a capture/build mismatch),
+/// which need very different fixes.
+const ModuleStat = struct {
+    name: []const u8, // borrowed from the Module (outlives the report)
+    build_id_hex: []const u8,
+    /// false → wholesym couldn't load symbols for this path at all.
+    symbols_loaded: bool = false,
+    /// Symbol count when loaded; 0 otherwise.
+    symbol_count: u64 = 0,
+    n_addrs: usize = 0,
+    n_resolved: usize = 0,
+    /// wholesym's load-failure reason (empty unless `!symbols_loaded`).
+    err_buf: [256]u8 = undefined,
+    err_len: usize = 0,
+
+    const Status = enum { ok, partial, unresolved, no_symbols };
+
+    fn err(self: *const ModuleStat) []const u8 {
+        return self.err_buf[0..self.err_len];
+    }
+
+    fn status(self: *const ModuleStat) Status {
+        if (!self.symbols_loaded) return .no_symbols;
+        if (self.n_resolved == 0) return .unresolved;
+        if (self.n_resolved < self.n_addrs) return .partial;
+        return .ok;
+    }
+};
+
+/// Print the per-module symbolization result, then — when something didn't
+/// fully resolve — concrete next steps. The whole point is that a user (or
+/// an agent) staring at hex addresses in the UI can run `record` again, read
+/// this, and know whether to install debug symbols or look at the capture.
+fn report(io: std.Io, stats: []const ModuleStat, n_addrs: usize, n_funcs: usize) void {
+    if (stats.len == 0) {
+        std.debug.print("sismo record: no unsymbolized frames to resolve\n", .{});
+        return;
+    }
     std.debug.print(
-        "sismo record: symbolized {d} addresses ({d} resolved) across {d} modules\n",
-        .{ n_addrs, n_funcs, collector.modules.items.len },
+        "sismo record: symbolized {d}/{d} addresses across {d} modules\n",
+        .{ n_funcs, n_addrs, stats.len },
     );
+    // Only `no_symbols` / `unresolved` are actionable; `partial` (a few
+    // PLT/JIT stubs missing) is shown in the table but needs no advice.
+    var needs_help = false;
+    for (stats) |*s| {
+        const tag = switch (s.status()) {
+            .ok => "ok        ",
+            .partial => "partial   ",
+            .unresolved => "unresolved",
+            .no_symbols => "no symbols",
+        };
+        switch (s.status()) {
+            .no_symbols, .unresolved => needs_help = true,
+            .ok, .partial => {},
+        }
+        std.debug.print("  [{s}] {d:>5}/{d:<5} {s}\n", .{ tag, s.n_resolved, s.n_addrs, s.name });
+    }
+    if (needs_help) printGuidance(io, stats);
+}
+
+fn printGuidance(io: std.Io, stats: []const ModuleStat) void {
+    const hint = installHint(io);
+    std.debug.print("\nsismo record: some modules did not fully symbolize:\n", .{});
+    for (stats) |*s| {
+        switch (s.status()) {
+            .ok, .partial => continue, // partial is usually PLT stubs / JIT — not actionable
+            .no_symbols => {
+                std.debug.print("\n  {s}\n    no symbols could be loaded", .{s.name});
+                if (s.err().len > 0) std.debug.print(" — wholesym: {s}", .{s.err()});
+                std.debug.print("\n", .{});
+                if (!fileExists(io, s.name)) {
+                    std.debug.print(
+                        "    the file is no longer at this path (deleted/unmounted since recording?)\n",
+                        .{},
+                    );
+                } else {
+                    std.debug.print("    the binary on disk is stripped and has no separate debug info installed.\n", .{});
+                    std.debug.print("    fix it one of these ways:\n", .{});
+                    std.debug.print("      - install its debug package: {s}\n", .{hint});
+                    std.debug.print("      - or let sismo fetch it: export DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/\n", .{});
+                    std.debug.print("        then re-run `sismo record` (sismo honors DEBUGINFOD_URLS and caches downloads).\n", .{});
+                }
+            },
+            .unresolved => {
+                std.debug.print("\n  {s}\n    {d} symbols loaded, but 0/{d} sampled addresses fell inside any function.\n", .{ s.name, s.symbol_count, s.n_addrs });
+                std.debug.print("    this is NOT a missing-symbols problem. The sampled addresses don't match this build.\n", .{});
+                std.debug.print("    likely the binary changed since recording, or a build-id mismatch:\n", .{});
+                std.debug.print("      sampled build-id: {s}\n", .{s.build_id_hex});
+                std.debug.print("      on disk:          readelf -n {s} | grep -i 'build id'\n", .{s.name});
+            },
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+fn fileExists(io: std.Io, path: []const u8) bool {
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    file.close(io);
+    return true;
+}
+
+/// Read up to `buf.len` bytes of an absolute path. Returns null if it can't
+/// be opened/read — callers treat that as "info unavailable".
+fn readFileAbsolute(io: std.Io, path: []const u8, buf: []u8) ?[]u8 {
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+    const n = file.readPositional(io, &.{buf}, 0) catch return null;
+    return buf[0..n];
+}
+
+/// Best-effort debug-package install command for the running distro, read
+/// from /etc/os-release. Falls back to a generic note.
+fn installHint(io: std.Io) []const u8 {
+    var buf: [4096]u8 = undefined;
+    const text = readFileAbsolute(io, "/etc/os-release", &buf) orelse return generic_hint;
+    const id = osReleaseId(text) orelse return generic_hint;
+    if (eqlAny(id, &.{ "fedora", "rhel", "centos", "rocky", "almalinux" }))
+        return "sudo dnf debuginfo-install <package>";
+    if (eqlAny(id, &.{ "debian", "ubuntu", "pop", "linuxmint" }))
+        return "sudo apt install <package>-dbgsym  (enable the debug/-dbgsym repo first)";
+    if (eqlAny(id, &.{ "arch", "manjaro" }))
+        return "install the matching -debug package (or use a debuginfod server)";
+    return generic_hint;
+}
+
+const generic_hint = "install your distro's debug-symbols package for this library";
+
+fn osReleaseId(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "ID=")) continue;
+        var v = line["ID=".len..];
+        if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
+        return v;
+    }
+    return null;
+}
+
+fn eqlAny(id: []const u8, names: []const []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, id, n)) return true;
+    return false;
 }
 
 /// Build one ModuleSymbols message for `m`, or return an empty slice if no
-/// address in it resolved (so we don't emit a useless empty record).
+/// address in it resolved (avoids emitting a useless empty record).
 fn buildModuleSymbols(
     gpa: std.mem.Allocator,
     sym: *symbolizer.Symbolizer,
     m: *Module,
-    n_funcs: *usize,
-    n_addrs: *usize,
+    stat: *ModuleStat,
 ) ![]u8 {
     // base_avma = load_bias makes the bridge's `rel = avma - base_avma`
     // equal `rel_pc - load_bias`, the module-relative address wholesym wants.
@@ -200,10 +347,19 @@ fn buildModuleSymbols(
     for (m.rel_pcs.items) |pc| max_pc = @max(max_pc, pc);
     const end_avma = max_pc + 1;
 
-    // wholesym loads symbols from the file at `m.name`. A missing or
-    // symbol-less binary registers the range but resolves to nothing —
-    // we just emit no lines for it.
-    symbolizer.addModule(sym, m.load_bias, end_avma, m.name, null, null) catch {};
+    // wholesym loads symbols from the file at `m.name`. Capture why it did
+    // or didn't so `report` can guide the user; a failed load still
+    // registers the range and just resolves to nothing.
+    var diag: symbolizer.Diag = .{};
+    if (symbolizer.addModule(sym, m.load_bias, end_avma, m.name, null, null, &diag)) {
+        stat.symbols_loaded = true;
+    } else |_| {
+        stat.symbols_loaded = false;
+    }
+    stat.symbol_count = diag.symbol_count;
+    const reason = diag.err();
+    stat.err_len = @min(reason.len, stat.err_buf.len);
+    @memcpy(stat.err_buf[0..stat.err_len], reason[0..stat.err_len]);
 
     var address_symbols = ProtoWriter.init(gpa);
     defer address_symbols.deinit();
@@ -211,12 +367,12 @@ fn buildModuleSymbols(
     var name_buf: [1024]u8 = undefined;
     var any = false;
     for (m.rel_pcs.items) |rel_pc| {
-        n_addrs.* += 1;
+        stat.n_addrs += 1;
         const n = symbolizer.resolve(sym, rel_pc, &name_buf);
         if (n == 0) continue;
         const func = stripOffset(name_buf[0..n]);
         if (func.len == 0) continue;
-        n_funcs.* += 1;
+        stat.n_resolved += 1;
         any = true;
 
         var line = ProtoWriter.init(gpa);
@@ -280,6 +436,28 @@ test "stripOffset removes trailing offset" {
     try std.testing.expectEqualStrings("matmul", stripOffset("matmul +12"));
     try std.testing.expectEqualStrings("operator+", stripOffset("operator+ +0"));
     try std.testing.expectEqualStrings("nooffset", stripOffset("nooffset"));
+}
+
+test "osReleaseId extracts and unquotes the distro id" {
+    try std.testing.expectEqualStrings("fedora", osReleaseId("NAME=\"Fedora\"\nID=fedora\nVERSION=44\n").?);
+    try std.testing.expectEqualStrings("ubuntu", osReleaseId("ID=\"ubuntu\"\n").?);
+    try std.testing.expect(osReleaseId("NAME=nope\n") == null);
+}
+
+test "installHint maps known distro families" {
+    try std.testing.expect(eqlAny("fedora", &.{ "fedora", "rhel" }));
+    try std.testing.expect(!eqlAny("gentoo", &.{ "fedora", "rhel" }));
+}
+
+test "ModuleStat status classification" {
+    const loaded: ModuleStat = .{ .name = "x", .build_id_hex = "", .symbols_loaded = true, .n_addrs = 10, .n_resolved = 10 };
+    try std.testing.expectEqual(ModuleStat.Status.ok, loaded.status());
+    const partial: ModuleStat = .{ .name = "x", .build_id_hex = "", .symbols_loaded = true, .n_addrs = 10, .n_resolved = 3 };
+    try std.testing.expectEqual(ModuleStat.Status.partial, partial.status());
+    const unresolved: ModuleStat = .{ .name = "x", .build_id_hex = "", .symbols_loaded = true, .n_addrs = 10, .n_resolved = 0 };
+    try std.testing.expectEqual(ModuleStat.Status.unresolved, unresolved.status());
+    const none: ModuleStat = .{ .name = "x", .build_id_hex = "", .symbols_loaded = false, .n_addrs = 10 };
+    try std.testing.expectEqual(ModuleStat.Status.no_symbols, none.status());
 }
 
 test "hexToBytes roundtrips a build id" {

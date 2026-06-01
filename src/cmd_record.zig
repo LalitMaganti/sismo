@@ -10,21 +10,19 @@
 //! muxer worker threads inside this same process.
 //!
 //! Muxer pattern (see e.g. `src/macos_sched_capture.zig` for the
-//! per-DS state machine):
-//!   1. We register each `sismo.*` data source with on_setup /
-//!      on_start / on_stop / on_flush callbacks bound to a `*Capture`
-//!      state owned by this process.
-//!   2. We spawn each capture's worker thread BEFORE starting the
-//!      session; the worker waits for `on_setup`, then does its own
-//!      heavy setup (`task_for_pid`, image enumeration, framehop
-//!      registration, heap attach) on its own thread.
-//!   3. When the session starts, traced fires `on_start` on its IO
-//!      thread → the trampoline flips the worker into RUNNING via a
-//!      `std.Io.Event`. The IO thread returns immediately.
-//!   4. On flush (heap snapshot) and on_stop (async stopper handle),
-//!      the same pattern applies — trampoline updates an atomic +
-//!      sets the wakeup event; worker drains/emits/acks.
-//!   5. At process exit we signal EXIT and join.
+//! per-DS state machine): each `sismo.*` data source registers
+//! on_setup / on_start / on_stop / on_flush callbacks bound to a
+//! `*Capture` state owned by this process. Each capture's worker
+//! thread is spawned BEFORE the session starts; it waits for on_setup,
+//! then does its own heavy setup (task_for_pid, image enumeration,
+//! framehop registration, heap attach) on its own thread. When the
+//! session starts, traced fires on_start on its IO thread and the
+//! trampoline flips the worker into RUNNING via a std.Io.Event,
+//! returning immediately so the IO thread never blocks. Flush (heap
+//! snapshot) and on_stop (async stopper handle) follow the same
+//! pattern — the trampoline updates an atomic + sets the wakeup event;
+//! the worker drains/emits/acks. At process exit the worker is
+//! signalled EXIT and joined.
 //!
 //! Output: a single Perfetto trace file with all four data sources
 //! merged on one timeline (sample-target's `track_event` +
@@ -51,7 +49,6 @@ const heap_protocol = @import("heap_protocol.zig");
 const sismo_config = @import("sismo_config.zig");
 const paths = @import("sismo_paths.zig");
 const privileged_marker = @import("sismo_privileged_marker.zig");
-const perf_counter_probe = @import("perf_counter_probe.zig");
 const perf_symbolize = @import("perf_symbolize.zig");
 const c = @cImport({
     @cInclude("src/c/perfetto_shim.h");
@@ -74,17 +71,19 @@ const heap_capture = switch (builtin.os.tag) {
     else => struct {},
 };
 
-// Linux uses upstream Perfetto producers (traced_probes + traced_perf)
-// embedded as in-process worker threads — same pattern as
-// `sismo_traced` for the service. No Zig-side capture wrappers needed;
-// the producers self-register their data sources when the consumer's
-// TraceConfig requests them.
+// Linux uses upstream Perfetto's traced_probes (ftrace + procfs) embedded as
+// an in-process worker thread — same pattern as `sismo_traced` for the
+// service. It self-registers its data source when the consumer's TraceConfig
+// requests it.
 const linux_traced_probes = switch (builtin.os.tag) {
     .linux => @import("sismo_traced_probes.zig"),
     else => struct {},
 };
-const linux_traced_perf = switch (builtin.os.tag) {
-    .linux => @import("sismo_traced_perf.zig"),
+
+// In-process BPF CPU collector (per-thread counters + stack sampling) — the
+// Linux CPU profiler.
+const linux_bpf_capture = switch (builtin.os.tag) {
+    .linux => @import("linux_bpf_capture.zig"),
     else => struct {},
 };
 
@@ -94,10 +93,10 @@ const linux_traced_perf = switch (builtin.os.tag) {
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // `std.c.posix_spawnp` only exposes the Darwin variant in zig 0.16; on
-// Linux it's a libc symbol not surfaced through std.c. Declare locally
-// with `?*const anyopaque` for the file_actions / attrp pointers since
-// we only ever pass null for both — the actual struct types differ
-// per-OS but never get instantiated here.
+// Linux it's a libc symbol not surfaced through std.c. Declared locally
+// with `?*const anyopaque` for the file_actions / attrp pointers, both
+// always null here — the actual struct types differ per-OS but are never
+// instantiated.
 extern "c" fn posix_spawnp(
     pid: *c_int,
     path: [*:0]const u8,
@@ -288,7 +287,10 @@ fn waitForExternalDataSources(
             }.cb);
 
             var all = true;
-            for (seen) |s| if (!s) { all = false; break; };
+            for (seen) |s| if (!s) {
+                all = false;
+                break;
+            };
             if (all) return true;
         }
         // rc != 0 (RPC fail / buffer too small) → just retry; transient
@@ -330,7 +332,7 @@ const attach_watcher = if (builtin.os.tag == .macos) struct {
     }
 };
 
-// Spawn-mode exit watcher: blocks on waitpid for the child we own.
+// Spawn-mode exit watcher: blocks on waitpid for the owned child.
 fn waitpidExitWatch(ctx: *const WaitCtx) void {
     _ = std.c.waitpid(ctx.pid, null, 0);
     const buf = [_]u8{'X'};
@@ -357,15 +359,14 @@ fn durationTimerThread(ctx: *const DurationCtx) void {
     _ = std.c.write(ctx.write_fd, &buf, 1);
 }
 
-// Attach-mode exit watcher: register a kqueue NOTE_EXIT filter on the
-// pid (which is not our child, so waitpid would EINTR or return ECHILD).
-// EVFILT_PROC + NOTE_EXIT works for any pid we have permission to see.
-// On macOS this is the canonical way to watch a non-child for exit.
+// Attach-mode exit watcher: register a kqueue NOTE_EXIT filter on the pid
+// (not a child, so waitpid would EINTR or return ECHILD). EVFILT_PROC +
+// NOTE_EXIT works for any visible pid — the canonical macOS way to watch a
+// non-child for exit.
 fn kqueueExitWatch(ctx: *const WaitCtx) void {
     const kq = std.c.kqueue();
     if (kq < 0) {
-        // Without a kqueue we can't watch — main loop will only stop on
-        // SIGINT or --duration. Silent return; SIGINT still works.
+        // No kqueue — the main loop will only stop on SIGINT or --duration.
         return;
     }
     defer _ = std.c.close(kq);
@@ -402,30 +403,30 @@ const SpawnedChild = struct {
     pid: c_int,
 };
 
+/// Parse `num_part` as a base-10 integer, scale by `multiplier`, and fit
+/// into `T`. Rejects zero, overflow, and anything exceeding `T`.
+fn parseScaled(comptime T: type, num_part: []const u8, multiplier: u64) ?T {
+    const n = std.fmt.parseInt(u64, num_part, 10) catch return null;
+    const total = std.math.mul(u64, n, multiplier) catch return null;
+    if (total == 0 or total > std.math.maxInt(T)) return null;
+    return @intCast(total);
+}
+
 /// Parse a buffer-size argument like "256MB" / "1GB" / "512KB" into KB
 /// (build_config takes uint32_t buffer_size_kb). Suffix is required —
 /// bare integers are rejected to avoid ambiguity (bytes vs. KB?).
 fn parseBufferKb(s: []const u8) ?u32 {
     if (s.len < 3) return null;
     const last2 = s[s.len - 2 ..];
-    var num_part: []const u8 = undefined;
-    var multiplier_kb: u64 = 0;
-    if (std.ascii.eqlIgnoreCase(last2, "kb")) {
-        num_part = s[0 .. s.len - 2];
-        multiplier_kb = 1;
-    } else if (std.ascii.eqlIgnoreCase(last2, "mb")) {
-        num_part = s[0 .. s.len - 2];
-        multiplier_kb = 1024;
-    } else if (std.ascii.eqlIgnoreCase(last2, "gb")) {
-        num_part = s[0 .. s.len - 2];
-        multiplier_kb = 1024 * 1024;
-    } else {
+    const multiplier_kb: u64 = if (std.ascii.eqlIgnoreCase(last2, "kb"))
+        1
+    else if (std.ascii.eqlIgnoreCase(last2, "mb"))
+        1024
+    else if (std.ascii.eqlIgnoreCase(last2, "gb"))
+        1024 * 1024
+    else
         return null;
-    }
-    const n = std.fmt.parseInt(u64, num_part, 10) catch return null;
-    const total = n * multiplier_kb;
-    if (total == 0 or total > std.math.maxInt(u32)) return null;
-    return @intCast(total);
+    return parseScaled(u32, s[0 .. s.len - 2], multiplier_kb);
 }
 
 /// Parse a duration argument. Accepts a bare integer (interpreted as
@@ -435,12 +436,8 @@ fn parseDurationSeconds(s: []const u8) ?c_uint {
     if (s.len == 0) return null;
     var num_part = s;
     var multiplier: u64 = 1;
-    const last = s[s.len - 1];
-    switch (last) {
-        's' => {
-            num_part = s[0 .. s.len - 1];
-            multiplier = 1;
-        },
+    switch (s[s.len - 1]) {
+        's' => num_part = s[0 .. s.len - 1],
         'm' => {
             num_part = s[0 .. s.len - 1];
             multiplier = 60;
@@ -452,10 +449,7 @@ fn parseDurationSeconds(s: []const u8) ?c_uint {
         '0'...'9' => {},
         else => return null,
     }
-    const n = std.fmt.parseInt(u64, num_part, 10) catch return null;
-    const total = n * multiplier;
-    if (total == 0 or total > std.math.maxInt(c_uint)) return null;
-    return @intCast(total);
+    return parseScaled(c_uint, num_part, multiplier);
 }
 
 fn maybeSpawn(
@@ -549,10 +543,6 @@ pub const RecordArgs = struct {
     cpu_mode: SourceMode = .in_process,
     heap_mode: SourceMode = .in_process,
     no_instrumentation: bool = false,
-    // PMU hardware counters (IPC + stall breakdown) on the perf sampler.
-    // On by default like the other sources; --no-counters opts out. Recording
-    // degrades to timebase-only sampling when the hardware lacks the counters.
-    counters: bool = true,
     workload_argv: std.ArrayList([]const u8) = .empty,
 
     pub fn deinit(self: *RecordArgs, gpa: std.mem.Allocator) void {
@@ -569,55 +559,41 @@ fn printRecordHelp() void {
     else
         "<command> [args...]";
 
-    var buf: [2048]u8 = undefined;
-    var w: usize = 0;
-    const writeStr = struct {
-        fn f(b: []u8, idx: *usize, s: []const u8) void {
-            const n = @min(s.len, b.len - idx.*);
-            @memcpy(b[idx.* .. idx.* + n], s[0..n]);
-            idx.* += n;
-        }
-    }.f;
-
-    writeStr(&buf, &w,
+    std.debug.print(
         "usage: sismo record [--output <path>] [--duration <dur>]\n" ++
-        "                    [--flight-recorder [--buffer <size>]]\n" ++
-        "                    [--no-instrumentation]\n",
+            "                    [--flight-recorder [--buffer <size>]]\n" ++
+            "                    [--no-instrumentation]\n",
+        .{},
     );
     if (comptime PlatformCaps.supports_sched) {
-        writeStr(&buf, &w, "                    [--no-sched | --external-sched]\n");
+        std.debug.print("                    [--no-sched | --external-sched]\n", .{});
     }
     if (comptime PlatformCaps.supports_cpu) {
-        writeStr(&buf, &w, "                    [--no-cpu | --external-cpu]\n");
-        writeStr(&buf, &w, "                    [--no-counters]\n");
+        std.debug.print("                    [--no-cpu | --external-cpu]\n", .{});
     }
     if (comptime PlatformCaps.supports_heap) {
-        writeStr(&buf, &w, "                    [--no-heap | --external-heap]\n");
+        std.debug.print("                    [--no-heap | --external-heap]\n", .{});
     }
     if (comptime PlatformCaps.supports_sched or PlatformCaps.supports_cpu or PlatformCaps.supports_heap) {
-        writeStr(&buf, &w, "                    [--all-external]\n");
+        std.debug.print("                    [--all-external]\n", .{});
     }
-    writeStr(&buf, &w, "                    ");
-    writeStr(&buf, &w, pid_synopsis);
-    writeStr(&buf, &w,
+    std.debug.print("                    {s}", .{pid_synopsis});
+    std.debug.print(
         "\n\n" ++
-        "  --no-X         disable data source X entirely.\n" ++
-        "  --external-X   data source X comes from a sidecar\n" ++
-        "                 `sudo sismo datasource X` (no sudo on this process).\n" ++
-        "  --all-external shorthand for --external for every privileged source.\n" ++
-        "  --no-counters  don't attach PMU hardware counters (IPC, frontend/\n" ++
-        "                 backend stalls, cache/branch misses) to CPU samples.\n" ++
-        "                 Counters are on by default and degrade to plain\n" ++
-        "                 sampling when the hardware can't provide them.\n",
+            "  --no-X         disable data source X entirely.\n" ++
+            "  --external-X   data source X comes from a sidecar\n" ++
+            "                 `sudo sismo datasource X` (no sudo on this process).\n" ++
+            "  --all-external shorthand for --external for every privileged source.\n",
+        .{},
     );
     if (comptime builtin.os.tag == .linux) {
-        writeStr(&buf, &w,
+        std.debug.print(
             "\nLinux requires CAP_PERFMON for perf_event_open and read access\n" ++
-            "to /sys/kernel/tracing for ftrace; running with sudo is the\n" ++
-            "easiest path.\n",
+                "to /sys/kernel/tracing for ftrace; running with sudo is the\n" ++
+                "easiest path.\n",
+            .{},
         );
     }
-    std.debug.print("{s}", .{buf[0..w]});
 }
 
 /// Parse `sismo record`'s arguments into a platform-independent
@@ -631,10 +607,10 @@ fn parseRecordArgs(
     iter: *std.process.Args.Iterator,
 ) ?RecordArgs {
     var args: RecordArgs = .{};
-    // Cleanup-on-failure: errdefer doesn't fire for `?T` returning
-    // null, only for `!T` errors. We have many `return null` paths
-    // (each user-input error), so a flag-flipped defer is the
-    // cleanest way to free workload_argv if any of them takes us out.
+    // Cleanup-on-failure: errdefer doesn't fire for `?T` returning null,
+    // only for `!T` errors. With many `return null` paths (one per
+    // user-input error), a flag-flipped defer frees workload_argv on any
+    // of them.
     var ok = false;
     defer if (!ok) args.deinit(gpa);
 
@@ -653,8 +629,8 @@ fn parseRecordArgs(
     }.f;
 
     while (iter.next()) |arg| {
-        // Once we see the first positional, every subsequent token is
-        // workload argv (so a workload can have its own --flags).
+        // After the first positional, every subsequent token is workload
+        // argv (so the workload can have its own --flags).
         if (args.workload_argv.items.len > 0 or !std.mem.startsWith(u8, arg, "--")) {
             args.workload_argv.append(gpa, arg) catch return null;
             continue;
@@ -740,9 +716,6 @@ fn parseRecordArgs(
             }
         } else if (std.mem.eql(u8, arg, "--no-instrumentation")) {
             args.no_instrumentation = true;
-        } else if (std.mem.eql(u8, arg, "--no-counters")) {
-            if (comptime !PlatformCaps.supports_cpu) return rejectUnsupported("--no-counters", "cpu");
-            args.counters = false;
         } else if (std.mem.eql(u8, arg, "--help")) {
             printRecordHelp();
             return null; // defer handles cleanup
@@ -825,10 +798,9 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     const workload_argv = &args.workload_argv;
 
     if (attach_pid) |pid| {
-        // Quick sanity check before tearing into setup. kill(pid, 0)
-        // returns 0 if we have permission to signal pid (i.e. it
-        // exists), -1 + ESRCH/EPERM otherwise. We don't distinguish —
-        // either way the user gave us a pid we can't use.
+        // Quick sanity check before setup. kill(pid, 0) returns 0 if the
+        // pid is signalable (i.e. it exists), -1 + ESRCH/EPERM otherwise.
+        // Either case means the pid is unusable — no need to distinguish.
         if (std.c.kill(pid, @enumFromInt(0)) != 0) {
             std.debug.print("sismo record: pid {d} not found (or not signalable)\n", .{pid});
             return;
@@ -836,19 +808,28 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     }
 
     // Privilege check: every privileged data source still in the
-    // in_process state needs root. Warn early so the user can ctrl-C
-    // and re-launch with sudo (or pass --external-X / --no-X) before
-    // we tear into spawning workloads, sockets, etc.
+    // in_process state needs root. Warn early so the user can ctrl-C and
+    // re-launch with sudo (or pass --external-X / --no-X) before any
+    // workloads or sockets are brought up.
     if (geteuid() != 0) {
         var unmet_buf: [3][]const u8 = undefined;
         var n_unmet: usize = 0;
-        if (sched_mode == .in_process) { unmet_buf[n_unmet] = "sched"; n_unmet += 1; }
-        if (cpu_mode == .in_process)   { unmet_buf[n_unmet] = "cpu";   n_unmet += 1; }
-        if (heap_mode == .in_process)  { unmet_buf[n_unmet] = "heap";  n_unmet += 1; }
+        if (sched_mode == .in_process) {
+            unmet_buf[n_unmet] = "sched";
+            n_unmet += 1;
+        }
+        if (cpu_mode == .in_process) {
+            unmet_buf[n_unmet] = "cpu";
+            n_unmet += 1;
+        }
+        if (heap_mode == .in_process) {
+            unmet_buf[n_unmet] = "heap";
+            n_unmet += 1;
+        }
         if (n_unmet > 0) {
             std.debug.print(
                 "sismo record: WARNING — running unprivileged. The following data\n" ++
-                "  sources need root and will fail to capture:\n",
+                    "  sources need root and will fail to capture:\n",
                 .{},
             );
             for (unmet_buf[0..n_unmet]) |name| {
@@ -856,11 +837,11 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
             }
             std.debug.print(
                 "  options:\n" ++
-                "    1. re-run with `sudo`     (simple — everything in one process as root)\n" ++
-                "    2. pass --external-{{X}}    + run `sudo sismo datasource X` in another\n" ++
-                "                                  shell (or --all-external + `sudo sismo\n" ++
-                "                                  datasource all-privileged`)\n" ++
-                "    3. pass --no-{{X}}          to skip the data source silently\n",
+                    "    1. re-run with `sudo`     (simple — everything in one process as root)\n" ++
+                    "    2. pass --external-{{X}}    + run `sudo sismo datasource X` in another\n" ++
+                    "                                  shell (or --all-external + `sudo sismo\n" ++
+                    "                                  datasource all-privileged`)\n" ++
+                    "    3. pass --no-{{X}}          to skip the data source silently\n",
                 .{},
             );
         }
@@ -869,9 +850,8 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     // Single-session lock. Two `sismo record` invocations would race on
     // unlink+bind of the well-known socket and corrupt each other's
     // sessions; flock detects that cleanly. The fd stays open for the
-    // lifetime of the recording — the OS releases the lock at exit.
-    // The lock file's contents are our pid as ASCII, so `sismo
-    // snapshot` can find us.
+    // recording's lifetime — the OS releases the lock at exit. The lock
+    // file holds the recorder pid as ASCII, so `sismo snapshot` can find it.
     const lock_fd = paths.acquireSessionLock(std.c.getpid()) catch |err| switch (err) {
         error.AlreadyHeld => {
             std.debug.print(
@@ -902,22 +882,17 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     _ = setenv("PERFETTO_PRODUCER_SOCK_NAME", prod_sock.ptr, 1);
     _ = setenv("PERFETTO_CONSUMER_SOCK_NAME", cons_sock.ptr, 1);
 
-    // 1. Embed traced (the IPC service host) on a worker thread.
     const svc = try traced.create(prod_sock, cons_sock);
     defer traced.destroy(svc);
 
-    // 2. Init our own producer connection. New shim path: connects to
-    //    the in-process traced via PERFETTO_PRODUCER_SOCK_NAME, which
-    //    we set above to `prod_sock`.
+    // Producer connection: connects to the in-process traced via
+    // PERFETTO_PRODUCER_SOCK_NAME (set to prod_sock above). Captures
+    // (sched, cpu, heap) self-register inside their Capture.init.
     c.sismo_init(prod_sock.ptr);
 
-    // 3. All three captures (sched, cpu, heap) self-register via the
-    //    new shim inside their Capture.init — no separate ds_alloc.
-
-    // 4. Acquire the workload — either spawn it (carrying
-    //    DYLD_INSERT_LIBRARIES so the target loads the heap preload's
-    //    dormant client) or attach to an already-running pid the user
-    //    presumably launched with `sismo prepare`.
+    // Acquire the workload — either spawn it (carrying DYLD_INSERT_LIBRARIES
+    // so the target loads the heap preload's dormant client) or attach to an
+    // already-running pid (launched via `sismo prepare`).
     const target: SpawnedChild = blk: {
         if (attach_pid) |pid| {
             std.debug.print("sismo record: attaching to pid={d}\n", .{pid});
@@ -947,12 +922,11 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         break :blk t;
     };
 
-    // 5. Spawn capture workers. Each spins up its worker thread, which
-    //    *waits for on_setup* before doing any heavy work (task_for_pid,
-    //    image enumeration, framehop, heap attach). on_setup arrives
-    //    when the consumer session starts up — that's where target_pid
-    //    flows in, via SismoXxxConfig embedded at field 2000 of each
-    //    DataSourceConfig.
+    // Spawn capture workers. Each worker waits for on_setup before doing
+    // any heavy work (task_for_pid, image enumeration, framehop, heap
+    // attach). on_setup arrives when the consumer session starts — that's
+    // where target_pid flows in, via SismoXxxConfig embedded at field 2000
+    // of each DataSourceConfig.
     const sched = blk: {
         if (sched_mode != .in_process) break :blk null;
         break :blk macos_sched_capture.Capture.init(gpa, io, .{}) catch |err| {
@@ -992,12 +966,9 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         };
     };
 
-    // 6. All captures (sched + cpu + heap) registered themselves via
-    //    the new shim path inside their Capture.init.
-
-    // 7. Build the per-DS sismo configs (field 2000 of each
-    //    DataSourceConfig), then build the TraceConfig + create + start
-    //    the consumer session.
+    // Build the per-DS sismo configs (field 2000 of each
+    // DataSourceConfig), then the TraceConfig + create + start the
+    // consumer session.
     const cpu_cfg = try sismo_config.macos_cpu_samples.encode(gpa, .{
         .target_pid = @intCast(target.pid),
     });
@@ -1016,10 +987,10 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     // modes need the name registered in the consumer's config; only
     // in_process gates the local Capture init above.
     //
-    // For external entries we also collect the on-the-wire data source
-    // names so we can poll for their producer registration before
-    // calling StartBlocking (otherwise the session would start without
-    // the external producer ever connecting).
+    // External entries also collect the on-the-wire data source names, so
+    // their producer registration can be polled before StartBlocking —
+    // otherwise the session would start without the external producer
+    // ever connecting.
     const perfetto_proto = @import("perfetto_proto.zig");
     var entries_buf: [4]perfetto_proto.DataSourceEntry = undefined;
     var n_entries: usize = 0;
@@ -1145,11 +1116,11 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         std.debug.print("sismo record: session started, recording until workload exits (or SIGINT)\n", .{});
     }
 
-    // 8. Wait for the workload to exit (or for SIGINT). Both events
-    //    funnel through a self-pipe: the SIGINT handler writes 'I',
-    //    a dedicated thread that blocks on `waitpid` writes 'X'. Main
-    //    just reads the pipe — single blocking syscall, no atomics,
-    //    no retry loop, no platform-specific event source.
+    // Wait for the workload to exit (or for SIGINT). Both events funnel
+    // through a self-pipe: the SIGINT handler writes 'I', a dedicated
+    // thread blocking on `waitpid` writes 'X'. Main just reads the pipe —
+    // single blocking syscall, no atomics, no retry loop, no platform-
+    // specific event source.
     var pipe_fds: [2]c_int = undefined;
     if (std.c.pipe(&pipe_fds) != 0) {
         std.debug.print("sismo record: pipe() failed\n", .{});
@@ -1174,9 +1145,9 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     defer wait_thr.join();
 
     // Optional --duration timer. Detached — the thread fires 'T' on the
-    // self-pipe and exits; we don't wait for it because if recording
-    // ends earlier (SIGINT or target exit), the timer thread can be
-    // left to wake up and write to a closed pipe (harmless).
+    // self-pipe and exits; it isn't joined because if recording ends
+    // earlier (SIGINT or target exit) the timer can be left to wake up
+    // and write to a closed pipe (harmless).
     var duration_ctx: DurationCtx = undefined;
     var duration_thr: ?std.Thread = null;
     if (duration_secs) |secs| {
@@ -1193,14 +1164,14 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         for (read_buf[0..@intCast(n)]) |b| switch (b) {
             'I' => {
                 if (attach_pid == null) {
-                    // Spawn mode: we own the workload, propagate SIGTERM
-                    // so it shuts down cleanly. Then break out — the
-                    // wait thread will fire 'X' once it actually exits.
+                    // Spawn mode: the workload is owned — propagate SIGTERM
+                    // for a clean shutdown. The wait thread fires 'X' once
+                    // it actually exits.
                     std.debug.print("sismo record: SIGINT — sending SIGTERM to workload pid={d}\n", .{target.pid});
                     _ = std.c.kill(target.pid, .TERM);
                 } else {
-                    // Attach mode: it's the user's process, we don't
-                    // signal it. Just stop recording.
+                    // Attach mode: the user's process is left unsignalled;
+                    // just stop recording.
                     std.debug.print("sismo record: SIGINT — stopping recording (attached pid={d} keeps running)\n", .{target.pid});
                     workload_done = true;
                 }
@@ -1219,13 +1190,11 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         };
     }
 
-    // 9. Stop the session. In FILE mode the data has been streaming
-    //    to disk via Perfetto's auto-write; on_stop fires per DS,
-    //    workers drain + ack, stop_blocking returns. In flight mode
-    //    we don't auto-flush — if the user wanted the buffer's
-    //    contents, they took a `sismo snapshot` already; otherwise
-    //    the buffer is dropped on stop. Snapshotting is exclusively
-    //    a clone operation, never a side-effect of stopping.
+    // Stop the session. In FILE mode the data has streamed to disk via
+    // Perfetto's auto-write; on_stop fires per DS, workers drain + ack,
+    // stop_blocking returns. Flight mode does NOT auto-flush — the buffer
+    // is dropped on stop, so a `sismo snapshot` (a clone, never a stop
+    // side-effect) must have already captured anything wanted.
     c.sismo_consumer_session_stop_blocking(session);
     if (flight_recorder) {
         std.debug.print("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)\n", .{});
@@ -1237,7 +1206,7 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         };
     }
 
-    // 11. Shut down captures (signals EXIT, joins worker, frees state).
+    // Shut down captures (signals EXIT, joins worker, frees state).
     if (heap) |s| {
         const stats = s.shutdown();
         std.debug.print(
@@ -1260,20 +1229,17 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         );
     }
 
-    // 12. Stop the embedded traced thread.
     traced.stop(svc);
 }
 
 // -----------------------------------------------------------------------------
 // Linux record path
 //
-// Same self-pipe wait-loop + lock + spawn skeleton as the macOS path,
-// but the data sources live inside upstream Perfetto producers we
-// embed as in-process threads (`linux_traced_probes` for ftrace +
-// procfs, `linux_traced_perf` for perf_event_open CPU sampling) rather
-// than bespoke Zig captures. The producers self-register their data
-// sources when the consumer's TraceConfig enables `linux.ftrace` /
-// `linux.perf`; sismo's only job is to spawn + tear down the threads.
+// Same self-pipe wait-loop + lock + spawn skeleton as the macOS path.
+// Sched rides upstream Perfetto's `linux_traced_probes` (ftrace + procfs)
+// embedded as an in-process thread, self-registering when the consumer's
+// TraceConfig enables `linux.ftrace`. CPU is `linux_bpf_capture`, a
+// bespoke in-process BPF collector (per-thread counters + stack samples).
 //
 // What this branch does NOT do today:
 //   - --pid attach: would need a pidfd-based exit watcher (Linux's
@@ -1286,12 +1252,10 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     const io = init.io;
 
     // Read fields off `args` into local names. The Linux runner doesn't
-    // currently honor sched_mode/cpu_mode/heap_mode beyond the
-    // shared-parser semantics (privileged-source toggles for the linux
-    // producers + sismo.heap aren't wired through this codepath yet —
-    // that's a follow-up to plan 10). What we *do* honor today is
-    // --no-sched, --no-cpu, --no-instrumentation and the buffer/output
-    // family.
+    // yet honor sched_mode/cpu_mode/heap_mode beyond the shared-parser
+    // semantics (external/heap toggles aren't wired here — follow-up to
+    // plan 10). Honored today: --no-sched, --no-cpu, --no-instrumentation
+    // and the buffer/output family.
     const output_path = args.output_path;
     const duration_secs = args.duration_secs;
     const flight_recorder = args.flight_recorder;
@@ -1335,35 +1299,28 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     const svc = try traced.create(prod_sock, cons_sock);
     defer traced.destroy(svc);
 
-    // 2. Embed traced_probes (ftrace + procfs) and traced_perf
-    //    (perf_event_open) as in-process producer threads. They both
-    //    connect to the in-process traced over the producer socket the
-    //    service just bound. defer LIFO order tears them down before
-    //    the service.
+    // Initialize the in-process C++ SDK producer client against the service's
+    // producer socket. Needed by `sismo_ds_register` for the BPF CPU collector
+    // (the traced_probes producer connects through its own glue).
+    c.sismo_init(prod_sock.ptr);
+
+    // Embed traced_probes (ftrace + procfs) as an in-process producer
+    // thread, connecting to the in-process traced over the producer socket
+    // the service just bound. (defer LIFO tears it down before the service.)
     const probes = if (no_sched)
         null
-    else linux_traced_probes.create(prod_sock) catch |err| blk: {
-        std.debug.print(
-            "sismo record: traced_probes attach failed: {s} — sched events disabled\n",
-            .{@errorName(err)},
-        );
-        break :blk null;
-    };
+    else
+        linux_traced_probes.create(prod_sock) catch |err| blk: {
+            std.debug.print(
+                "sismo record: traced_probes attach failed: {s} — sched events disabled\n",
+                .{@errorName(err)},
+            );
+            break :blk null;
+        };
     defer if (probes) |p| linux_traced_probes.destroy(p);
 
-    const perf = if (no_cpu)
-        null
-    else linux_traced_perf.create(prod_sock) catch |err| blk: {
-        std.debug.print(
-            "sismo record: traced_perf attach failed: {s} — CPU samples disabled\n",
-            .{@errorName(err)},
-        );
-        break :blk null;
-    };
-    defer if (perf) |p| linux_traced_perf.destroy(p);
-
-    // 3. Spawn the workload. No DYLD_INSERT_LIBRARIES — that's macOS.
-    //    The Linux LD_PRELOAD heap interceptor is a separate pillar.
+    // Spawn the workload. No DYLD_INSERT_LIBRARIES — that's macOS; the
+    // Linux LD_PRELOAD heap interceptor is a separate pillar.
     const workload_cmd = workload_argv.items[0];
     const workload_args = workload_argv.items[1..];
     const target = maybeSpawn(gpa, workload_cmd, workload_args, &.{
@@ -1374,10 +1331,27 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     };
     std.debug.print("sismo record: spawned '{s}' pid={d}\n", .{ workload_cmd, target.pid });
 
-    // 4. Build the TraceConfig in Zig. Linux producers (traced_probes,
-    //    traced_perf) get the Perfetto-native FtraceConfig /
-    //    PerfEventConfig nested submessages embedded inside the
-    //    DataSourceConfig — see perfetto_proto.zig.
+    // BPF CPU collector: per-thread cycle/instruction counters + stack
+    // sampling, scoped to the workload — the Linux CPU profiler. Drains on its
+    // own worker thread; shut down (and report) on the way out via defer.
+    const bpf = if (no_cpu)
+        null
+    else
+        linux_bpf_capture.Capture.init(gpa, @intCast(target.pid)) catch |err| blk: {
+            std.debug.print("sismo record: bpf capture init failed: {s} — CPU samples disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
+    defer if (bpf) |b| {
+        const s = b.shutdown();
+        std.debug.print(
+            "sismo record: bpf — {d} samples across {d} threads (busiest {d} cycles)\n",
+            .{ s.samples, s.threads, s.busiest_cycles },
+        );
+    };
+
+    // Build the TraceConfig in Zig. traced_probes gets the Perfetto-native
+    // FtraceConfig nested submessage embedded inside the DataSourceConfig;
+    // the BPF collector is a sismo vendor data source — see perfetto_proto.zig.
     const perfetto_proto = @import("perfetto_proto.zig");
     var entries_buf: [3]perfetto_proto.DataSourceEntry = undefined;
     var n_entries: usize = 0;
@@ -1392,24 +1366,10 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         entries_buf[n_entries] = .{ .linux_ftrace = .{} };
         n_entries += 1;
     }
-    // PMU counters are opt-out (--no-counters). Probe which the hardware can
-    // actually open so we only ask perfetto for those — it opens the sample
-    // group all-or-nothing, so an unsupported follower would sink CPU sampling.
-    var perf_counters: []const perfetto_proto.PerfCounter = &.{};
-    if (perf != null and args.counters) {
-        perf_counters = perf_counter_probe.probeSupported(gpa) catch &.{};
-    }
-    defer gpa.free(perf_counters);
-    if (perf != null) {
-        // 2048 pages = 8 MB per CPU. perfetto's 256-page default overflows at
-        // 1 kHz sampling with full DWARF stack snapshots; trace stats show
-        // hundreds of lost records per CPU under that default. 8 MB is what
-        // perfetto's docs recommend for "high frequency / large stacks".
-        entries_buf[n_entries] = .{ .linux_perf = .{
-            .target_pid = target.pid,
-            .ring_buffer_pages = 2048,
-            .counters = perf_counters,
-        } };
+    // The in-process BPF collector emits thread-scoped PerfSamples via its own
+    // producer; traced only activates it if the config names it.
+    if (bpf != null) {
+        entries_buf[n_entries] = .{ .sismo_vendor = .{ .name = linux_bpf_capture.DS_NAME } };
         n_entries += 1;
     }
     if (n_entries == 0) {
@@ -1455,7 +1415,7 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         std.debug.print("sismo record: session started, recording until workload exits (or SIGINT)\n", .{});
     }
 
-    // 5. Self-pipe wait loop, identical to the macOS path.
+    // Self-pipe wait loop, identical to the macOS path.
     var pipe_fds: [2]c_int = undefined;
     if (std.c.pipe(&pipe_fds) != 0) {
         std.debug.print("sismo record: pipe() failed\n", .{});
@@ -1474,7 +1434,7 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     const wait_ctx: WaitCtx = .{
         .pid = target.pid,
         .write_fd = pipe_fds[1],
-        .mode = .spawn,  // attach mode not yet supported on Linux
+        .mode = .spawn, // attach mode not yet supported on Linux
     };
     const wait_thr = try std.Thread.spawn(.{}, exitWatchThread, .{&wait_ctx});
     defer wait_thr.join();
@@ -1506,9 +1466,9 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         };
     }
 
-    // 6. Stop the session. The producers' on_stop callbacks fire on
-    //    their own threads; once stop_blocking returns, the trace is
-    //    flushed (FILE mode) or sitting in the ring (flight mode).
+    // Stop the session. The producers' on_stop callbacks fire on their
+    // own threads; once stop_blocking returns, the trace is flushed (FILE
+    // mode) or sitting in the ring (flight mode).
     c.sismo_consumer_session_stop_blocking(session);
     if (flight_recorder) {
         std.debug.print("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)\n", .{});
@@ -1518,15 +1478,13 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}) catch |err| {
             std.debug.print("sismo record: failed to write privileged marker: {s}\n", .{@errorName(err)});
         };
-        // Resolve perf sample frames to function names. traced_perf records
-        // them unsymbolized; this appends ModuleSymbols for the UI to join.
-        if (perf != null) perf_symbolize.symbolizeTrace(gpa, io, output_path);
+        // Resolve perf sample frames to function names. The BPF collector
+        // records them unsymbolized; this appends ModuleSymbols for the UI to join.
+        if (bpf != null) perf_symbolize.symbolizeTrace(gpa, io, output_path);
     }
 
-    // 7. Tear-down via Zig defer LIFO:
-    //      perf.destroy → probes.destroy → traced.destroy
-    //    Each destroy() Quits the producer's TaskRunner and joins the
-    //    worker thread, so producers fully detach before the service
-    //    tears down.
+    // Tear-down runs via defer LIFO (probes.destroy → traced.destroy):
+    // each destroy() quits the producer's TaskRunner and joins its worker
+    // thread, so producers fully detach before the service tears down.
     traced.stop(svc);
 }

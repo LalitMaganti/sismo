@@ -48,6 +48,21 @@
     flex-wrap: wrap;
   }
 
+  // "Analysing [CPU ▾]" — the muted lead-in makes it clear the dropdown picks
+  // the analysis domain rather than being a bare label.
+  &__domain-selector {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  &__selector-label {
+    font-size: var(--pf-font-size-s);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--pf-color-text-muted);
+  }
+
   &__subtitle {
     color: var(--pf-color-text-muted);
     font-size: var(--pf-font-size-l);
@@ -65,12 +80,12 @@
   }
 
   &__body {
-    padding: 16px 28px 24px;
+    padding: 24px 32px 32px;
 
     .pf-section {
       border: none;
       border-radius: 0;
-      margin-bottom: 28px;
+      margin-bottom: 36px;
 
       &:last-child {
         margin-bottom: 0;
@@ -78,7 +93,7 @@
 
       header {
         border-bottom: none;
-        margin-bottom: 8px;
+        margin-bottom: 16px;
         padding: 0;
 
         h1 {
@@ -97,8 +112,13 @@
         margin: 0;
       }
 
+      // Uniform vertical rhythm between a block's pieces (meters, stat rows,
+      // tables, callouts, footer) instead of each carrying its own margin.
       article {
         padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
       }
     }
 
@@ -279,13 +299,29 @@
     align-content: start;
   }
 
+  // Drill-link row at the foot of an Overview question block (reveal-in-
+  // timeline, see-all, hand-off to another domain).
+  &__question-footer {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    font-size: 13px;
+  }
+
   // Grid holding the meter cards (the Meter widget styles itself; see the
   // top-level .pf-sismo-meter block).
   &__meters {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
     gap: 16px;
-    margin-bottom: 16px;
+  }
+
+  // Responsive grid of the compact named-entity tables on the Overview's
+  // "where did it go" block (threads / processes / functions).
+  &__tables {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 16px;
   }
 
   // Two-column layout used by the Microarchitecture section to put the
@@ -294,7 +330,6 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     gap: 16px;
-    margin-bottom: 16px;
 
     @media (min-width: 900px) {
       grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
@@ -533,5 +568,158 @@
     display: flex;
     align-items: center;
     gap: 6px;
+  }
+}
+
+// Top-Down (TMA) Level-1 bar: pipeline slots split into Retiring / Bad-Spec /
+// Frontend / Backend (or the coarse Not-stalled / Frontend / Backend). Semantic
+// colours: green = useful work, red = wasted speculation, amber = frontend,
+// blue = backend.
+.pf-sismo-tma {
+  &__bar {
+    display: flex;
+    height: 16px;
+    border-radius: 4px;
+    overflow: hidden;
+    border: 1px solid var(--pf-color-border);
+  }
+
+  &__fill {
+    height: 100%;
+
+    &--retiring,
+    &--not-stalled {
+      background: #34a853;
+    }
+    &--bad-spec {
+      background: #ea4335;
+    }
+    &--frontend {
+      background: #fbbc04;
+    }
+    &--backend {
+      background: #4285f4;
+    }
+  }
+
+  &__legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-top: 8px;
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+
+  &__legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  &__swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    display: inline-block;
+  }
+}
+
+// Activity board: stacked metric lanes on one quantised time axis. Each lane is
+// a strip of clickable bucket columns; the filled height encodes the value, and
+// columns line up vertically across lanes so signals can be compared.
+.pf-sismo-board {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+
+  &__lane {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  &__lane-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--pf-font-size-s);
+    font-weight: 500;
+    color: var(--pf-color-text);
+  }
+
+  &__lane-label {
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  &__strip {
+    display: flex;
+    align-items: stretch;
+    height: 48px;
+    gap: 1px;
+    background: var(--pf-color-background-secondary);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  // Column with the fill pushed to the bottom, so bar height reads upward.
+  &__bucket {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    cursor: pointer;
+
+    &:hover {
+      background: rgba(128, 128, 128, 0.15);
+    }
+  }
+
+  &__fill {
+    width: 100%;
+
+    &--load {
+      background: #9aa0a6;
+    }
+    &--priv {
+      background: #3478f6;
+    }
+    &--churn {
+      background: #f5a623;
+    }
+    &--batch {
+      background: #34a853;
+    }
+    &--cycles {
+      background: #00897b;
+    }
+  }
+
+  &__axis {
+    display: flex;
+    justify-content: space-between;
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+}
+
+// Inline utilisation-over-time sparkline (Cores tab): a compact row of thin
+// bars, one per time-bucket, each scaled by that bucket's busy fraction. Sits
+// in a table cell next to the aggregate busy bar.
+.pf-sismo-spark {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 24px;
+  min-width: 120px;
+
+  &__bar {
+    flex: 1 1 0;
+    min-width: 0;
+    background: #3478f6;
+    border-radius: 1px;
   }
 }

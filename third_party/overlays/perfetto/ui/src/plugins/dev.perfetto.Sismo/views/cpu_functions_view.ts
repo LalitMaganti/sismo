@@ -82,17 +82,10 @@ export function renderCpuFunctions(m_: MicroarchData): m.Children {
         renderHotMappingTable(m_.hotMappings),
       ),
     ),
-    m(
-      Callout,
-      {icon: 'science', intent: Intent.None},
-      'Hardware counters (IPC, branch mispredicts, cache misses) ' +
-        'are not yet recorded by `sismo record`. They unlock the ' +
-        '“cycles spent but unproductive” drilldown — coming soon.',
-    ),
   );
 }
 
-function renderHotSymbolTable(rows: ReadonlyArray<HotSymbolRow>): m.Children {
+export function renderHotSymbolTable(rows: ReadonlyArray<HotSymbolRow>): m.Children {
   if (rows.length === 0) {
     return m(EmptyState, {icon: 'code', title: 'No hot symbols'});
   }
@@ -121,7 +114,7 @@ function renderHotSymbolTable(rows: ReadonlyArray<HotSymbolRow>): m.Children {
   );
 }
 
-function renderHotMappingTable(rows: ReadonlyArray<HotMappingRow>): m.Children {
+export function renderHotMappingTable(rows: ReadonlyArray<HotMappingRow>): m.Children {
   if (rows.length === 0) {
     return m(EmptyState, {icon: 'inventory_2', title: 'No mapping data'});
   }

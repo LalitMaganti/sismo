@@ -15,7 +15,8 @@
 // Meter widget (meter.ts): a labelled card with a big readout, one or more
 // bars, an optional swatch legend and a caption. Colours are by role —
 // primary = in-focus / your processes (blue), secondary = everything else
-// (amber), idle = unused capacity (grey).
+// (amber), idle = unused capacity (grey). caution (red) and info (teal) extend
+// the palette for categorical distributions with more than three named slices.
 .pf-sismo-meter {
   padding: 16px;
   background: var(--pf-color-background-secondary);
@@ -85,6 +86,12 @@
     }
     &--idle {
       background: #9aa0a6;
+    }
+    &--caution {
+      background: #e2554d;
+    }
+    &--info {
+      background: #19a39b;
     }
   }
 

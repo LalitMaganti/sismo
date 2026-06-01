@@ -38,7 +38,24 @@ extern "c" fn sismo_symbolizer_add_module(
     uuid_bytes: ?[*]const u8,
     arch_utf8: ?[*]const u8,
     arch_len: usize,
+    symbol_count_out: ?*u64,
+    err_out: ?[*]u8,
+    err_cap: usize,
 ) c_int;
+
+/// Optional out-params for `addModule`: why a module did or didn't load
+/// symbols. `symbol_count` is set on success; `err` (a NUL-trimmed slice
+/// into `err_buf`) is set when the symbol load failed. Caller stack-
+/// allocates one and passes it by pointer.
+pub const Diag = struct {
+    symbol_count: u64 = 0,
+    err_buf: [256]u8 = undefined,
+    err_len: usize = 0,
+
+    pub fn err(self: *const Diag) []const u8 {
+        return self.err_buf[0..self.err_len];
+    }
+};
 extern "c" fn sismo_symbolizer_resolve(
     s: *Symbolizer,
     avma: u64,
@@ -65,11 +82,17 @@ pub fn addModule(
     /// Optional architecture string ("arm64", "arm64e", "x86_64",
     /// "x86_64h"). Used as a fallback when UUID isn't available.
     arch: ?[]const u8,
+    /// Optional sink for the symbol count (on success) and the load-failure
+    /// reason (on `SymbolLoadFailed`). Pass `null` when not diagnosing.
+    diag: ?*Diag,
 ) Error!void {
     if (path.len == 0 or end_avma <= base_avma) return error.BadArgument;
     const uuid_ptr: ?[*]const u8 = if (uuid) |u| @ptrCast(u) else null;
     const arch_ptr: ?[*]const u8 = if (arch) |a| a.ptr else null;
     const arch_len: usize = if (arch) |a| a.len else 0;
+    const count_ptr: ?*u64 = if (diag) |d| &d.symbol_count else null;
+    const err_ptr: ?[*]u8 = if (diag) |d| &d.err_buf else null;
+    const err_cap: usize = if (diag) |d| d.err_buf.len else 0;
     const rc = sismo_symbolizer_add_module(
         s,
         base_avma,
@@ -79,7 +102,14 @@ pub fn addModule(
         uuid_ptr,
         arch_ptr,
         arch_len,
+        count_ptr,
+        err_ptr,
+        err_cap,
     );
+    if (diag) |d| {
+        // Rust wrote a NUL-terminated reason on failure; find its length.
+        d.err_len = std.mem.indexOfScalar(u8, &d.err_buf, 0) orelse 0;
+    }
     return switch (rc) {
         0 => {},
         1 => error.SymbolLoadFailed,

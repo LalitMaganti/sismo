@@ -15,7 +15,7 @@
 
 const std = @import("std");
 
-// Field on Perfetto's `DataSourceConfig` carrying our config bytes.
+// Field on Perfetto's `DataSourceConfig` carrying sismo's config bytes.
 pub const DSC_SISMO_CONFIG_FIELD_NUM: u64 = 2000;
 
 const WIRE_VARINT: u64 = 0;

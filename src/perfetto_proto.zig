@@ -77,41 +77,15 @@ pub const LinuxFtraceEntry = struct {
     // Today: hardcoded sched events. Future: configurable.
 };
 
-/// A PMU counter to attach as a perf follower event. `id` is the
-/// PerfEvents.Counter enum value (protos/perfetto/common/perf_events.proto);
-/// `name` is the trace-side display name.
-pub const PerfCounter = struct {
-    id: u32,
-    name: []const u8,
-};
-
-pub const LinuxPerfEntry = struct {
-    /// Scopes the producer to a single tgid via
-    /// `callstack_sampling.scope.target_pid`. 0 = system-wide.
-    target_pid: i32 = 0,
-    /// Per-CPU kernel perf ring buffer size, in 4K pages. Must be a power
-    /// of two. 0 leaves it at perfetto's 256-page (1 MB) default, which
-    /// overflows at 1 kHz sampling with stack snapshots — bump callers
-    /// pass through cmd_record.zig.
-    ring_buffer_pages: u32 = 0,
-    /// PMU counters to read on every sample as follower events (leader
-    /// sampling), giving each sample a counter vector for IPC / stall
-    /// analysis. The caller passes only counters it has already confirmed the
-    /// hardware can open (see perf_counter_probe.zig) — perfetto opens the
-    /// sample group all-or-nothing, so an unsupported follower here would sink
-    /// CPU sampling entirely. Empty = timebase-only sampling.
-    counters: []const PerfCounter = &.{},
-};
-
 /// One entry per `data_sources { config { ... } }` block in the
 /// TraceConfig. Sismo builds this set from per-DS toggles in
 /// cmd_record.zig; cmd_datasource.zig only ever has a producer-side
-/// view, never builds TraceConfigs.
+/// view, never builds TraceConfigs. Linux CPU sampling is the in-process BPF
+/// collector (a `sismo_vendor` source), not an upstream perf data source.
 pub const DataSourceEntry = union(enum) {
     track_event: TrackEventEntry,
     sismo_vendor: SismoVendorEntry,
     linux_ftrace: LinuxFtraceEntry,
-    linux_perf: LinuxPerfEntry,
 };
 
 pub const TraceConfig = struct {
@@ -131,7 +105,6 @@ pub const TraceConfig = struct {
 const DSC_SISMO_CONFIG_FIELD: u32 = 2000;
 const DSC_TRACK_EVENT_CONFIG_FIELD: u32 = 113;
 const DSC_FTRACE_CONFIG_FIELD: u32 = 100;
-const DSC_PERF_EVENT_CONFIG_FIELD: u32 = 111;
 const DSC_PROTOVM_CONFIG_FIELD: u32 = 12;
 
 fn encodeTrackEventConfig(gpa: std.mem.Allocator, te: TrackEventEntry) ![]u8 {
@@ -139,9 +112,9 @@ fn encodeTrackEventConfig(gpa: std.mem.Allocator, te: TrackEventEntry) ![]u8 {
     errdefer w.deinit();
     // TrackEventConfig.enabled_categories = repeated string field 2.
     // (Field 1 is `disabled_categories` — writing "*" there disables
-    // EVERYTHING, which is exactly the inverse of what we want.
-    // Caught after sample-target's track_event packets vanished from
-    // the trace; trace_config dump showed `disabled_categories: "*"`.)
+    // EVERYTHING, the exact inverse. Caught after sample-target's
+    // track_event packets vanished; trace_config dump showed
+    // `disabled_categories: "*"`.)
     for (te.enabled_categories) |cat| try w.writeString(2, cat);
     return w.buf.toOwnedSlice(gpa);
 }
@@ -179,60 +152,6 @@ fn encodeFtraceConfig(gpa: std.mem.Allocator, _: LinuxFtraceEntry) ![]u8 {
     return w.buf.toOwnedSlice(gpa);
 }
 
-/// PerfEventConfig: hand-rolled. Emits 1 kHz timebase + DWARF user
-/// unwinding + kernel frames, optionally scoped to target_pid. Field
-/// numbers per `protos/perfetto/config/profiling/perf_event_config.proto`:
-///   timebase = 15 (PerfEvents.Timebase submsg; .frequency = field 2)
-///   callstack_sampling = 16 (CallstackSampling submsg)
-///     .scope = 1 (Scope submsg; .target_pid = repeated int32 field 1)
-///     .kernel_frames = 2
-///     .user_frames = 3 (UnwindMode enum: UNWIND_DWARF = 2)
-fn encodePerfEventConfig(gpa: std.mem.Allocator, p: LinuxPerfEntry) ![]u8 {
-    var w = ProtoWriter.init(gpa);
-    errdefer w.deinit();
-
-    if (p.ring_buffer_pages > 0) {
-        try w.writeUint32(3, p.ring_buffer_pages); // ring_buffer_pages
-    }
-
-    var timebase = ProtoWriter.init(gpa);
-    defer timebase.deinit();
-    try timebase.writeUint64(2, 1000); // frequency = 1 kHz
-    try w.writeMessage(15, timebase.bytes());
-
-    var cs = ProtoWriter.init(gpa);
-    defer cs.deinit();
-    if (p.target_pid > 0) {
-        var scope = ProtoWriter.init(gpa);
-        defer scope.deinit();
-        try scope.writeUint32(1, @bitCast(p.target_pid)); // target_pid
-        try cs.writeMessage(1, scope.bytes());
-    }
-    try cs.writeBool(2, true); // kernel_frames
-    // UNWIND_FRAME_POINTER (3): kernel walks user frame pointers via
-    // PERF_SAMPLE_CALLCHAIN. No per-sample stack copy, no /proc/<pid>/mem
-    // reads, no DWARF parsing — far more robust than UNWIND_DWARF on
-    // workloads that spend time in libc/vdso. Requires every binary in the
-    // call chain (workload + libc) to keep frame pointers; sample-target
-    // adds -fno-omit-frame-pointer in build.zig, and modern Fedora glibc
-    // already keeps them.
-    try cs.writeUint32(3, 3); // user_frames = UNWIND_FRAME_POINTER
-    try w.writeMessage(16, cs.bytes());
-
-    // followers = 19 (repeated FollowerEvent). Each FollowerEvent: counter = 1
-    // (PerfEvents.Counter enum, varint), name = 4 (string). Read alongside the
-    // timebase on every sample via the kernel's leader-sampling group.
-    for (p.counters) |fc| {
-        var follower = ProtoWriter.init(gpa);
-        defer follower.deinit();
-        try follower.writeUint32(1, fc.id); // counter (enum)
-        try follower.writeString(4, fc.name); // name
-        try w.writeMessage(19, follower.bytes());
-    }
-
-    return w.buf.toOwnedSlice(gpa);
-}
-
 fn encodeDataSourceConfig(
     gpa: std.mem.Allocator,
     entry: DataSourceEntry,
@@ -267,12 +186,6 @@ fn encodeDataSourceConfig(
             const fc = try encodeFtraceConfig(gpa, lf);
             defer gpa.free(fc);
             try w.writeMessage(DSC_FTRACE_CONFIG_FIELD, fc);
-        },
-        .linux_perf => |lp| {
-            try w.writeString(1, "linux.perf");
-            const pec = try encodePerfEventConfig(gpa, lp);
-            defer gpa.free(pec);
-            try w.writeMessage(DSC_PERF_EVENT_CONFIG_FIELD, pec);
         },
     }
     return w.buf.toOwnedSlice(gpa);
@@ -347,28 +260,30 @@ pub fn encodeTraceConfig(
 // TracePacket envelope helpers
 //
 // `sismo_ds_emit(slot, packet_bytes, len)` accepts the *body* of a
-// TracePacket (the field-tagged contents that sit inside a
-// NewTracePacket() handle). The C++ glue wraps it; here we provide
-// builders that accept a payload + timestamp and emit the body bytes.
+// TracePacket (the field-tagged contents inside a NewTracePacket()
+// handle). The C++ glue wraps it; these builders take a payload +
+// timestamp and emit the body bytes.
 // ---------------------------------------------------------------------------
 
 const TP_FIELD_TIMESTAMP: u32 = 8;
 const TP_FIELD_SEQUENCE_FLAGS: u32 = 13;
 
-/// Build a TracePacket body containing (timestamp, payload-as-field).
-/// `payload_field_tag` is the field number inside TracePacket where
-/// the payload sits (e.g. 66 for perf_sample, 117 for
+/// Build a TracePacket body containing (timestamp, sequence_flags?,
+/// payload-as-field). `payload_field_tag` is the field number inside
+/// TracePacket where the payload sits (e.g. 66 for perf_sample, 117 for
 /// generic_kernel_task_state_event). `payload_bytes` is the already-
-/// encoded sub-message body.
+/// encoded sub-message body. Pass `sequence_flags = 0` to omit the field.
 pub fn encodeTracePacketBody(
     gpa: std.mem.Allocator,
     timestamp_ns: u64,
+    sequence_flags: u32,
     payload_field_tag: u32,
     payload_bytes: []const u8,
 ) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
     if (timestamp_ns != 0) try w.writeUint64(TP_FIELD_TIMESTAMP, timestamp_ns);
+    if (sequence_flags != 0) try w.writeUint32(TP_FIELD_SEQUENCE_FLAGS, sequence_flags);
     try w.writeMessage(payload_field_tag, payload_bytes);
     return w.buf.toOwnedSlice(gpa);
 }
@@ -386,27 +301,17 @@ pub fn encodeTracePacketBodyInto(
     try w.writeMessage(payload_field_tag, payload_bytes);
 }
 
-pub fn encodeTracePacketBodyWithFlags(
-    gpa: std.mem.Allocator,
-    timestamp_ns: u64,
-    sequence_flags: u32,
-    payload_field_tag: u32,
-    payload_bytes: []const u8,
-) ![]u8 {
-    var w = ProtoWriter.init(gpa);
-    errdefer w.deinit();
-    if (timestamp_ns != 0) try w.writeUint64(TP_FIELD_TIMESTAMP, timestamp_ns);
-    if (sequence_flags != 0) try w.writeUint32(TP_FIELD_SEQUENCE_FLAGS, sequence_flags);
-    try w.writeMessage(payload_field_tag, payload_bytes);
-    return w.buf.toOwnedSlice(gpa);
-}
-
 // ---------------------------------------------------------------------------
 // PerfSample (TracePacket field 17)
 // schema: protos/perfetto/trace/profiling/perf_sample.proto
 // ---------------------------------------------------------------------------
 
 pub const TP_FIELD_PERF_SAMPLE: u32 = 66;
+pub const TP_FIELD_TRACE_PACKET_DEFAULTS: u32 = 59;
+
+/// TracePacket.sequence_flags values (trace_packet.proto SequenceFlags).
+pub const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
+pub const SEQ_NEEDS_INCREMENTAL_STATE: u32 = 2;
 
 pub const PerfSample = struct {
     cpu: u32,
@@ -414,17 +319,107 @@ pub const PerfSample = struct {
     tid: u32,
     /// 0 = no callstack (proto absence semantic).
     callstack_iid: u64 = 0,
+    /// Cumulative timebase counter reading for this sample (field 6). 0 omits.
+    timebase_count: u64 = 0,
+    /// Cumulative follower counter readings (field 7), in the same order as
+    /// `PerfSampleDefaults.followers`.
+    follower_counts: []const u64 = &.{},
 };
 
 pub fn encodePerfSample(gpa: std.mem.Allocator, s: PerfSample) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
-    // PerfSample.cpu = 1, pid = 2, tid = 3, callstack_iid = 4 — matches
-    // the proto schema in profiling/perf_sample.proto.
+    // PerfSample.cpu = 1, pid = 2, tid = 3, callstack_iid = 4, timebase_count
+    // = 6, follower_counts = 7 — matches profiling/profile_packet.proto.
     try w.writeUint32(1, s.cpu);
     try w.writeUint32(2, s.pid);
     try w.writeUint32(3, s.tid);
     if (s.callstack_iid != 0) try w.writeUint64(4, s.callstack_iid);
+    if (s.timebase_count != 0) try w.writeUint64(6, s.timebase_count);
+    for (s.follower_counts) |fc| try w.writeUint64(7, fc);
+    return w.buf.toOwnedSlice(gpa);
+}
+
+// ---------------------------------------------------------------------------
+// PerfSampleDefaults + TracePacketDefaults
+// schema: profiling/profile_packet.proto, trace_packet_defaults.proto
+//
+// Emitted once per sequence on a SEQ_INCREMENTAL_STATE_CLEARED packet; every
+// later PerfSample on the same sequence inherits the timebase/follower names
+// and the sample scope.
+// ---------------------------------------------------------------------------
+
+/// PerfSampleDefaults.SampleScope (sismo extension). THREAD makes each sample's
+/// counters per-thread, routed to thread-scoped counter tracks.
+pub const SampleScope = enum(u32) {
+    unspecified = 0,
+    cpu = 1,
+    thread = 2,
+};
+
+/// A named counting event. `name` becomes the counter track's display name.
+pub const PerfEventName = struct {
+    name: []const u8,
+    /// PerfEvents.Timebase.frequency (informational; 0 omits). Only meaningful
+    /// on the timebase.
+    frequency: u64 = 0,
+};
+
+pub const PerfSampleDefaults = struct {
+    timebase: PerfEventName,
+    followers: []const PerfEventName = &.{},
+    sample_scope: SampleScope = .unspecified,
+};
+
+pub fn encodePerfSampleDefaults(
+    gpa: std.mem.Allocator,
+    d: PerfSampleDefaults,
+) ![]u8 {
+    var w = ProtoWriter.init(gpa);
+    errdefer w.deinit();
+
+    // timebase = 1 (PerfEvents.Timebase: frequency = 2, name = 10).
+    {
+        var tb = ProtoWriter.init(gpa);
+        defer tb.deinit();
+        if (d.timebase.frequency != 0) try tb.writeUint64(2, d.timebase.frequency);
+        try tb.writeString(10, d.timebase.name);
+        try w.writeMessage(1, tb.bytes());
+    }
+
+    // followers = 4 (repeated FollowerEvent: name = 4).
+    for (d.followers) |f| {
+        var fe = ProtoWriter.init(gpa);
+        defer fe.deinit();
+        try fe.writeString(4, f.name);
+        try w.writeMessage(4, fe.bytes());
+    }
+
+    // sample_scope = 5 (sismo extension).
+    if (d.sample_scope != .unspecified) {
+        try w.writeEnum(5, d.sample_scope);
+    }
+    return w.buf.toOwnedSlice(gpa);
+}
+
+/// BuiltinClock values (clock_snapshot.proto). MONOTONIC matches
+/// bpf_ktime_get_ns().
+pub const BUILTIN_CLOCK_MONOTONIC: u32 = 3;
+
+/// Wrap PerfSampleDefaults bytes in a TracePacketDefaults
+/// (perf_sample_defaults = field 12, timestamp_clock_id = field 58). The
+/// result is the payload for
+/// `encodeTracePacketBody(..., TP_FIELD_TRACE_PACKET_DEFAULTS, ...)`.
+/// `timestamp_clock_id` = 0 omits the field (inherits the trace default).
+pub fn encodeTracePacketDefaults(
+    gpa: std.mem.Allocator,
+    timestamp_clock_id: u32,
+    perf_sample_defaults: []const u8,
+) ![]u8 {
+    var w = ProtoWriter.init(gpa);
+    errdefer w.deinit();
+    if (timestamp_clock_id != 0) try w.writeUint32(58, timestamp_clock_id);
+    try w.writeMessage(12, perf_sample_defaults);
     return w.buf.toOwnedSlice(gpa);
 }
 
@@ -474,11 +469,11 @@ pub fn encodeKernelTaskStateEventInto(
     // Cap comm at 64 chars defensively (Mach thread name max in
     // practice). The C-side did this; preserve.
     const comm_capped = if (e.comm.len > 64) e.comm[0..64] else e.comm;
-    try w.writeUint32(1, @bitCast(e.cpu));
+    try w.writeInt32(1, e.cpu);
     if (comm_capped.len > 0) try w.writeString(2, comm_capped);
-    try w.writeUint64(3, @bitCast(e.tid));
-    try w.writeUint32(4, @intFromEnum(e.state));
-    try w.writeUint32(5, @bitCast(e.prio));
+    try w.writeInt64(3, e.tid);
+    try w.writeEnum(4, e.state);
+    try w.writeInt32(5, e.prio);
 }
 
 // ---------------------------------------------------------------------------
@@ -512,8 +507,8 @@ fn encodeProcess(gpa: std.mem.Allocator, p: ProcessEntry) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
     // Process.pid = 1, ppid = 2, cmdline = 3.
-    try w.writeUint64(1, @bitCast(p.pid));
-    if (p.ppid != 0) try w.writeUint64(2, @bitCast(p.ppid));
+    try w.writeInt64(1, p.pid);
+    if (p.ppid != 0) try w.writeInt64(2, p.ppid);
     if (p.cmdline.len > 0) try w.writeString(3, p.cmdline);
     return w.buf.toOwnedSlice(gpa);
 }
@@ -522,8 +517,8 @@ fn encodeThread(gpa: std.mem.Allocator, t: ThreadEntry) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
     // Thread.tid = 1, pid = 2, comm = 3, is_main_thread = 4, is_idle = 5.
-    try w.writeUint64(1, @bitCast(t.tid));
-    try w.writeUint64(2, @bitCast(t.pid));
+    try w.writeInt64(1, t.tid);
+    try w.writeInt64(2, t.pid);
     if (t.comm.len > 0) try w.writeString(3, t.comm);
     if (t.is_main_thread) try w.writeBool(4, true);
     if (t.is_idle) try w.writeBool(5, true);
@@ -664,7 +659,7 @@ pub const Instruction = struct {
 fn encodeSelect(gpa: std.mem.Allocator, s: Select) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
-    if (s.cursor != .unspecified) try w.writeUint32(1, @intFromEnum(s.cursor));
+    if (s.cursor != .unspecified) try w.writeEnum(1, s.cursor);
     for (s.relative_path) |pc| {
         const pcb = try encodePathComponent(gpa, pc);
         defer gpa.free(pcb);
@@ -677,7 +672,7 @@ fn encodeSelect(gpa: std.mem.Allocator, s: Select) ![]u8 {
 fn encodeRegLoad(gpa: std.mem.Allocator, r: RegLoad) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
-    if (r.cursor != .unspecified) try w.writeUint32(1, @intFromEnum(r.cursor));
+    if (r.cursor != .unspecified) try w.writeEnum(1, r.cursor);
     try w.writeUint32(2, r.dst_register);
     return w.buf.toOwnedSlice(gpa);
 }
@@ -718,7 +713,7 @@ fn encodeInstruction(gpa: std.mem.Allocator, ins: Instruction) ![]u8 {
         },
     }
     if (ins.abort_level != .unset) {
-        try w.writeUint32(6, @intFromEnum(ins.abort_level));
+        try w.writeEnum(6, ins.abort_level);
     }
     for (ins.nested) |n| {
         const nb = try encodeInstruction(gpa, n);
@@ -776,13 +771,13 @@ pub fn encodeVmProgram(gpa: std.mem.Allocator, prog: VmProgram) ![]u8 {
 /// `ProtoVmIncrementalTracing::TryProcessPatch` synthesizes a
 /// TracePacket from the DST by serializing the DST's root *directly*
 /// into a `TracePacket*`, so the DST's top-level fields end up as
-/// TracePacket's fields. We therefore key the DST under field 122
+/// TracePacket's fields. So the DST is keyed under field 122
 /// (`TracePacket.generic_kernel_process_tree`) — anything else would
-/// alias TracePacket's field 1 as `FtraceEventBundle`, and the first
-/// pid we ever stored would be reinterpreted as `FtraceEventBundle.cpu`,
-/// tripping trace_processor's `cpu < 1024` corruption check on
-/// load. (Caught the hard way 2026-05-02 by traceconv refusing to
-/// parse: "CPU 80881 is greater than maximum allowed of 1024".)
+/// alias TracePacket's field 1 as `FtraceEventBundle`, reinterpreting the
+/// first stored pid as `FtraceEventBundle.cpu` and tripping
+/// trace_processor's `cpu < 1024` corruption check on load. (Caught
+/// 2026-05-02 by traceconv: "CPU 80881 is greater than maximum allowed
+/// of 1024".)
 pub fn macosSchedVmProgram(gpa: std.mem.Allocator) ![]u8 {
     // Field numbers — mirrored across SRC and DST. SRC patches are
     // emitted as TracePackets carrying `generic_kernel_process_tree`
@@ -803,11 +798,11 @@ pub fn macosSchedVmProgram(gpa: std.mem.Allocator) ![]u8 {
         // SRC pointed at the Process body so the nested instructions
         // can read its fields and key its DST counterpart.
         .op = .{ .select = .{
-            .relative_path = &.{ .{ .field_id = f_processes, .is_repeated = true } },
+            .relative_path = &.{.{ .field_id = f_processes, .is_repeated = true }},
         } },
-        // SKIP_CURRENT: if the patch has no `processes` field at all,
-        // skip this block but still try the threads block. Default
-        // BREAK_OUTER would also skip threads, which we don't want.
+        // SKIP_CURRENT: if the patch has no `processes` field, skip this
+        // block but still try the threads block. Default BREAK_OUTER would
+        // wrongly skip threads too.
         .abort_level = .skip_current,
         .nested = &.{
             // Read Process.pid → R0
@@ -839,7 +834,7 @@ pub fn macosSchedVmProgram(gpa: std.mem.Allocator) ![]u8 {
 
     const thread_block: Instruction = .{
         .op = .{ .select = .{
-            .relative_path = &.{ .{ .field_id = f_threads, .is_repeated = true } },
+            .relative_path = &.{.{ .field_id = f_threads, .is_repeated = true }},
         } },
         .abort_level = .skip_current,
         .nested = &.{
@@ -865,9 +860,8 @@ pub fn macosSchedVmProgram(gpa: std.mem.Allocator) ![]u8 {
     };
 
     // Top-level: descend SRC into TracePacket.generic_kernel_process_tree.
-    // For non-tree packets (sched events from this same producer)
-    // the field is absent and the program halts via the default
-    // BREAK_OUTER — exactly what we want.
+    // For non-tree packets (sched events from this same producer) the
+    // field is absent, so the program halts via the default BREAK_OUTER.
     const top: Instruction = .{
         .op = .{ .select = .{
             .relative_path = &.{.{ .field_id = tp_tree }},
@@ -925,14 +919,13 @@ test "encodeKernelProcessTree single thread" {
 }
 
 test "macosSchedVmProgram matches Perfetto's gen-proto serialization byte-for-byte" {
-    // Reference bytes come from a `protos::gen::VmProgram` built with
-    // the same structure (TracePacket field 122 → foreach Process →
-    // merge into DST.processes; foreach Thread → merge into DST.threads),
-    // serialized via SerializeAsString() and hex-dumped. If our Zig
-    // encoder ever drifts from the proto wire format this assertion
-    // catches it before the bytes reach traced. Regenerate with the
-    // C++ scratch program in the encoder doc-comment if the program
-    // structure intentionally changes.
+    // Reference bytes come from a `protos::gen::VmProgram` of the same
+    // structure (TracePacket field 122 → foreach Process → merge into
+    // DST.processes; foreach Thread → merge into DST.threads), serialized
+    // via SerializeAsString() and hex-dumped. Any drift in the Zig encoder
+    // from the proto wire format is caught here before the bytes reach
+    // traced. Regenerate via the C++ scratch program in the encoder
+    // doc-comment if the program structure intentionally changes.
     const expected_hex =
         "126e0a041202087a3a320a0612040801280130013a0c0a04120208013a041" ++
         "20210003a180a1208021202087a1202080112041801300018013a021a003" ++
@@ -949,6 +942,46 @@ test "macosSchedVmProgram matches Perfetto's gen-proto serialization byte-for-by
     try std.testing.expectEqualSlices(u8, expected_hex, hex_buf[0..i]);
 }
 
+test "encodePerfSample carries timebase + follower counts" {
+    const counts = [_]u64{ 100, 200 };
+    const bytes = try encodePerfSample(std.testing.allocator, .{
+        .cpu = 1,
+        .pid = 7,
+        .tid = 9,
+        .timebase_count = 4242,
+        .follower_counts = &counts,
+    });
+    defer std.testing.allocator.free(bytes);
+    // timebase_count is field 6 (tag 6<<3|0 = 0x30); follower_counts field 7
+    // (tag 7<<3|0 = 0x38) appears once per value.
+    var saw_timebase = false;
+    var followers: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] == 0x30) saw_timebase = true;
+        if (bytes[i] == 0x38) followers += 1;
+    }
+    try std.testing.expect(saw_timebase);
+    try std.testing.expectEqual(@as(usize, 2), followers);
+}
+
+test "encodePerfSampleDefaults emits thread scope" {
+    const followers = [_]PerfEventName{.{ .name = "instructions" }};
+    const bytes = try encodePerfSampleDefaults(std.testing.allocator, .{
+        .timebase = .{ .name = "cpu-cycles", .frequency = 1000 },
+        .followers = &followers,
+        .sample_scope = .thread,
+    });
+    defer std.testing.allocator.free(bytes);
+    // sample_scope = field 5 (tag 5<<3|0 = 0x28), value 2 (THREAD).
+    var found = false;
+    var i: usize = 0;
+    while (i + 1 < bytes.len) : (i += 1) {
+        if (bytes[i] == 0x28 and bytes[i + 1] == 0x02) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "encodeDataSourceConfig sismo_vendor with protovm_memory_limit" {
     const entry: DataSourceEntry = .{ .sismo_vendor = .{
         .name = "sismo.x",
@@ -962,8 +995,7 @@ test "encodeDataSourceConfig sismo_vendor with protovm_memory_limit" {
     var found = false;
     var i: usize = 0;
     while (i + 4 < bytes.len) : (i += 1) {
-        if (bytes[i] == 0x62 and bytes[i + 1] == 0x03 and bytes[i + 2] == 0x08
-            and bytes[i + 3] == 0x80 and bytes[i + 4] == 0x01) {
+        if (bytes[i] == 0x62 and bytes[i + 1] == 0x03 and bytes[i + 2] == 0x08 and bytes[i + 3] == 0x80 and bytes[i + 4] == 0x01) {
             found = true;
             break;
         }

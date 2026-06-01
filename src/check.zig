@@ -2,17 +2,14 @@
 // Licensed under the MIT License.
 
 //! Cross-platform compile sentinel. `zig build check -Dtarget=…` builds
-//! this file as an object (no link, no install) for the current target,
-//! exercising every module that's expected to compile on the OSes we
-//! claim to support. Catches cross-platform regressions in
-//! OS-portable code (heap_wire, proto_writer, sismo_config, …) and in
-//! the per-OS dispatcher modules (heap_protocol, heap_ring) without
-//! needing Perfetto or rust-bridge.
+//! this file as an object (no link, no install) for the target, catching
+//! cross-platform regressions in OS-portable code (heap_wire,
+//! proto_writer, sismo_config, …) and the per-OS dispatcher modules
+//! (heap_protocol, heap_ring) without needing Perfetto or rust-bridge.
 //!
-//! The body calls each public function so Zig's semantic analyzer
-//! visits the bodies. Runtime correctness isn't the point — the calls
-//! are wrapped in `catch {}` and may be entered with garbage args; this
-//! file is never executed.
+//! Calling each public function forces the semantic analyzer to visit
+//! its body. The file is never executed — calls are wrapped in `catch {}`
+//! and may run with garbage args; correctness isn't the point.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,16 +29,10 @@ comptime {
 }
 
 pub export fn sismo_check_cmds() void {
-    // Force semantic analysis of every subcommand body. The `init` value
-    // is undefined (this function is never executed); the goal is just
-    // for the analyzer to walk the function bodies and surface any
-    // cross-platform regression at `zig build check` time.
-    //
-    // Windows is excluded because the cmd_* subcommands use POSIX
-    // primitives (sismo_paths' flock-based session lock, posix_spawnp,
-    // POSIX Args.iterate) that don't have direct equivalents. The
-    // Windows port lives in sibling _windows files once we're ready;
-    // until then the Windows build is sample-target only.
+    // Windows excluded: the cmd_* subcommands use POSIX primitives
+    // (flock-based session lock, posix_spawnp, POSIX Args.iterate) with
+    // no direct Windows equivalents yet, so the Windows build is
+    // sample-target only.
     if (comptime builtin.os.tag == .windows) return;
     const init: std.process.Init = undefined;
     @import("sismo.zig").main(init) catch {};

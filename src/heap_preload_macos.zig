@@ -44,22 +44,18 @@ fn nowNs() u64 {
 
 // ---- Per-thread re-entrancy guard ----------------------------------------
 // Without this, the listener thread's own pthread_create / mmap / etc. would
-// recurse into our shim and probably deadlock on the ring's spinlock (or
-// at minimum produce nonsense records about our own allocations).
+// recurse into the shim and probably deadlock on the ring's spinlock (or
+// at minimum produce nonsense records about the shim's own allocations).
 threadlocal var in_capture: bool = false;
 
 // ---- Per-thread Poisson sampler ------------------------------------------
-// Direct port of heapprofd's `sampler.h::Sampler`. Each thread keeps an
-// `interval_to_next_sample` countdown drawn from `Exponential(1/interval)`;
-// each malloc decrements it by `alloc_sz`; when it hits ≤ 0, the alloc is
-// sampled with weight = sampling_interval × num_crossings (so the recorded
-// `sample_size` ≈ unbiased estimate of the byte mass this sample represents
-// in the unsampled population).
-//
-// Allocations larger than the interval are always sampled at their real size.
-//
-// Seed per thread from clock + thread-local self pointer to avoid
-// correlated sequences across threads.
+// Direct port of heapprofd's `sampler.h::Sampler`: a per-thread countdown
+// drawn from Exponential(1/interval), decremented by each alloc's size; on
+// crossing ≤ 0 the alloc is sampled with weight = sampling_interval ×
+// num_crossings, so `sample_size` is an unbiased estimate of the byte mass
+// it represents. Allocations larger than the interval are always sampled at
+// real size. Seed per thread from clock + thread-local self pointer to
+// decorrelate sequences across threads.
 
 const Sampler = struct {
     sampling_interval: u64,
@@ -157,9 +153,8 @@ fn listenerThreadEntry(_: ?*anyopaque) callconv(.c) ?*anyopaque {
         debugLog("sismo-heap: listenForAttach failed\n");
         return null;
     };
-    // Don't `defer listener.close()` — we want the socket to outlive
-    // any single attach session. The listener stays bound for the
-    // lifetime of the process.
+    // No `defer listener.close()` — the listener stays bound for the
+    // process lifetime so the socket outlives any single attach session.
 
     while (true) {
         var attach = protocol.acceptAndReceive(&listener) catch {
@@ -169,8 +164,8 @@ fn listenerThreadEntry(_: ?*anyopaque) callconv(.c) ?*anyopaque {
             continue;
         };
 
-        // Attach the ring. We dynamically allocate it (via libc malloc,
-        // which our own shim will skip because in_capture is true).
+        // Attach the ring, allocating it via libc malloc (the shim skips
+        // this alloc because in_capture is true).
         const rb_storage = std.c.malloc(@sizeOf(ring.RingBuffer)) orelse {
             attach.closeAll();
             continue;
@@ -200,9 +195,8 @@ fn listenerThreadEntry(_: ?*anyopaque) callconv(.c) ?*anyopaque {
         ) catch "sismo-heap: attached\n";
         _ = std.c.write(2, m2.ptr, m2.len);
 
-        // Block on the control connection until EOF. Any byte that
-        // arrives is a no-op for now; we use the connection as a
-        // liveness signal only.
+        // Block on the control connection until EOF. It's a liveness
+        // signal only — any byte that arrives is a no-op.
         var b: [1]u8 = undefined;
         _ = std.c.read(attach.conn_fd, &b, 1);
 
@@ -257,9 +251,8 @@ export const sismo_heap_ctor linksection("__DATA,__mod_init_func") =
 
 // ---- Malloc intercept (data plane) ---------------------------------------
 
-/// Bytes of stack we copy on each captured allocation.
-/// 8 KB is heapprofd's default — enough to cover most call chains
-/// while keeping the per-record cost bounded.
+/// Bytes of stack copied on each captured allocation. 8 KB is heapprofd's
+/// default — covers most call chains while keeping per-record cost bounded.
 const STACK_SNAPSHOT_BYTES: usize = 8192;
 
 /// register_data layout for arch == .arm64 (sismo convention):
@@ -274,9 +267,9 @@ const RegBlockArm64 = extern struct {
     _padding: u64 = 0,
 };
 
-/// Read our own caller's regs by walking one FP-chain frame back. Our
-/// shim's prologue has saved [user_fp | user_lr] at our_fp[0..16];
-/// user_sp at the call site is just past that block.
+/// Read the caller's regs by walking one FP-chain frame back. The shim
+/// prologue saved [user_fp | user_lr] at fp[0..16]; user_sp at the call
+/// site is just past that block.
 inline fn captureUserSnapshot() RegBlockArm64 {
     const pc: u64 = @returnAddress();
     const our_fp_addr: usize = @frameAddress();
@@ -289,7 +282,7 @@ inline fn captureUserSnapshot() RegBlockArm64 {
 }
 
 inline fn captureUserSp() u64 {
-    // user_sp at the call site = byte just above our saved (fp,lr) block.
+    // user_sp at the call site = byte just above the saved (fp,lr) block.
     return @as(u64, @frameAddress()) + 16;
 }
 
@@ -297,23 +290,23 @@ fn sismoMallocShim(size: usize) callconv(.c) ?*anyopaque {
     // FAST PATH: dormant. One acquire-load + branch.
     if (!g_enabled.load(.acquire)) return malloc(size);
 
-    // Re-entrancy guard. If our own capture path allocated, fall
+    // Re-entrancy guard: if the capture path itself allocated, fall
     // through to the real malloc without recursing.
     if (in_capture) return malloc(size);
 
     in_capture = true;
     defer in_capture = false;
 
-    // Poisson sampling decision (heapprofd-style). Done BEFORE we
-    // touch the ring or capture stacks — for unsampled allocs we just
-    // pay the threadlocal sampler decrement, which is sub-nanosecond
-    // when the countdown stays positive.
+    // Poisson sampling decision (heapprofd-style), BEFORE touching the
+    // ring or capturing stacks — an unsampled alloc pays only the
+    // threadlocal sampler decrement, sub-nanosecond while the countdown
+    // stays positive.
     const sampler = ensureSamplerForThisThread();
     const sample_size = sampler.sampleSize(size);
     if (sample_size == 0) return malloc(size);
 
-    // Capture caller registers BEFORE doing the real malloc — once
-    // we call into libc, our frame might be modified.
+    // Capture caller registers BEFORE the real malloc — once libc runs,
+    // the frame may be modified.
     const regs = captureUserSnapshot();
     const user_sp = captureUserSp();
 
@@ -341,11 +334,9 @@ fn sismoMallocShim(size: usize) callconv(.c) ?*anyopaque {
             const reg_block: *RegBlockArm64 = @ptrCast(@alignCast(&meta.register_data));
             reg_block.* = regs;
 
-            // Snapshot 8 KB of stack starting at user_sp. The stack
-            // grows down; we copy upward (toward higher addresses).
-            // The pages between sp and sp+8KB are part of the user's
-            // stack region (assumed mapped — main thread always is;
-            // pthread defaults are 512KB).
+            // Snapshot 8 KB of stack from user_sp upward (the stack grows
+            // down). Pages between sp and sp+8KB are assumed mapped — the
+            // main thread always is; pthread defaults are 512KB.
             const snapshot_dst: [*]u8 = s.ptr + @sizeOf(wire.AllocMetadata);
             const snapshot_src: [*]const u8 = @ptrFromInt(user_sp);
             @memcpy(snapshot_dst[0..STACK_SNAPSHOT_BYTES], snapshot_src[0..STACK_SNAPSHOT_BYTES]);

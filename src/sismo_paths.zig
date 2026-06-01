@@ -6,9 +6,9 @@
 //! future subcommand agree on the same constants — the whole point of
 //! "well-known" is that nothing computes them ad-hoc.
 //!
-//! Sockets are sismo-owned (not Perfetto's defaults) so we can rename
-//! or relocate them as the project moves toward the wrapped sismo SDK
-//! without breaking anyone outside our tree.
+//! Sockets are sismo-owned (not Perfetto's defaults) so they can be
+//! renamed or relocated as the project moves toward the wrapped sismo SDK
+//! without breaking anything external.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -16,7 +16,7 @@ const builtin = @import("builtin");
 comptime {
     // /tmp Unix sockets + flock-based session locking are POSIX-only.
     // The Windows analog (`\\.\pipe\sismo-*` named pipes + `LockFileEx`)
-    // belongs in a sibling module once we get there.
+    // belongs in a sibling module.
     if (builtin.os.tag == .windows) {
         @compileError("sismo_paths is POSIX-only; Windows analog TBD");
     }
@@ -58,7 +58,7 @@ pub fn acquireSessionLock(pid: c_int) LockError!c_int {
         _ = std.c.close(fd);
         return error.AlreadyHeld;
     }
-    // Replace any prior contents with our pid as ASCII. Truncate first
+    // Replace any prior contents with the pid as ASCII. Truncate first
     // (a previous run could have left a longer pid string), then write
     // at offset 0.
     _ = std.c.ftruncate(fd, 0);
@@ -98,8 +98,8 @@ pub fn readRecorderPid() ReadPidError!c_int {
 /// binary's directory. Layout assumption matches what `zig build`
 /// produces: `zig-out/bin/sismo` + `zig-out/lib/libsismo_heap.dylib`.
 /// When sismo ships installed (homebrew libexec layout), this becomes
-/// `<bindir>/../libexec/sismo/libsismo_heap.dylib`; we try that first
-/// and fall back to the dev-tree layout.
+/// `<bindir>/../libexec/sismo/libsismo_heap.dylib`, tried first with a
+/// fall back to the dev-tree layout.
 ///
 /// Caller frees the returned slice.
 pub fn heapDylibPath(io: std.Io, allocator: std.mem.Allocator) ![:0]u8 {

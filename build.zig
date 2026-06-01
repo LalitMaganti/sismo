@@ -30,7 +30,6 @@ const c_sources = [_]CSource{
     .{ .path = "src/c/sismo_trace_query.cc", .language = .cpp, .component = .sismo_unix },
     .{ .path = "src/c/perfetto_ds.cc", .language = .cpp, .component = .sismo_unix },
     .{ .path = "src/c/sismo_traced_probes.cc", .language = .cpp, .component = .sismo_linux },
-    .{ .path = "src/c/sismo_traced_perf.cc", .language = .cpp, .component = .sismo_linux },
 };
 
 // Linux gets `-D_GNU_SOURCE` so Perfetto's public headers (which call
@@ -156,6 +155,7 @@ fn addUnixPipeline(
 ) void {
     const os_tag = target.result.os.tag;
     const is_macos = os_tag == .macos;
+    const is_linux = os_tag == .linux;
 
     // Perfetto out dir per target. Cross-compiled targets live in
     // sibling dirs so a macOS host can keep both `out/sismo` (native)
@@ -228,6 +228,10 @@ fn addUnixPipeline(
             .name = "sample-target",
             .root_module = target_mod,
         });
+        // Emit a GNU build-id so CPU-sample stacks into this binary can be
+        // symbolized: trace_processor's symbolization query drops mappings
+        // with no build-id.
+        target_exe.build_id = .fast;
         linkPerfetto(target_mod, &target_exe.step, repo_root_include, lib_a, &perfetto_build.step, os_tag);
         b.installArtifact(target_exe);
 
@@ -277,12 +281,24 @@ fn addUnixPipeline(
             .link_libcpp = true,
         });
         addComponentSources(b, sismo_mod, .sismo_unix, is_macos);
-        // Linux-only: embedded Perfetto producers run in-process as
-        // worker threads (mirroring sismo_traced.cc). traced_probes
-        // covers ftrace + procfs; traced_perf covers perf_event_open
-        // CPU sampling. Both are gated `is_linux` upstream — their
-        // source sets aren't built on macOS.
-        if (!is_macos) addComponentSources(b, sismo_mod, .sismo_linux, is_macos);
+        // Linux-only: the embedded traced_probes producer runs in-process
+        // as a worker thread (mirroring sismo_traced.cc), covering ftrace +
+        // procfs. CPU sampling is the in-process BPF collector (no upstream
+        // traced_perf). Gated `is_linux` — not built on macOS.
+        if (is_linux) {
+            addComponentSources(b, sismo_mod, .sismo_linux, is_macos);
+            // BPF CPU collector: compile the kernel-side hooks with clang to a
+            // BPF object and embed it, so the Zig loader can hand the bytes to
+            // libbpf at runtime. vmlinux.h + sismo_bpf.h resolve from the
+            // -I include dir.
+            const bpf_inc = b.fmt("-I{s}", .{b.path("src/c/sismo_bpf").getPath(b)});
+            const bpf_compile = b.addSystemCommand(&.{ "clang", "-target", "bpf", "-D__TARGET_ARCH_x86", bpf_inc, "-Wno-missing-declarations", "-O2", "-g", "-c" });
+            bpf_compile.addFileArg(b.path("src/c/sismo_bpf/sched.bpf.c"));
+            bpf_compile.addArg("-o");
+            const bpf_o = bpf_compile.addOutputFileArg("sched.bpf.o");
+            sismo_mod.addAnonymousImport("sched.bpf.o", .{ .root_source_file = bpf_o });
+            sismo_mod.linkSystemLibrary("bpf", .{});
+        }
         sismo_mod.addIncludePath(perfetto_root.path(b, "include"));
         // Linux producer shims include "src/profiling/perf/perf_producer.h"
         // and "src/traced/probes/probes_producer.h" — both are
@@ -318,6 +334,23 @@ fn addUnixPipeline(
         b.installArtifact(sismo_exe);
         const sismo_step = b.step("sismo", "Build the sismo CLI (subcommand dispatcher)");
         sismo_step.dependOn(&b.addInstallArtifact(sismo_exe, .{}).step);
+    }
+
+    // sismo-run: capability-stable launcher (Linux only). File caps live on
+    // this tiny binary (it rebuilds only when its own source changes), so
+    // `sismo` never needs re-setcap after a build — the launcher raises the
+    // BPF caps to ambient and exec's the sibling `sismo`. See src/sismo_run.zig.
+    if (is_linux) {
+        const run_mod = b.createModule(.{
+            .root_source_file = b.path("src/sismo_run.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const run_exe = b.addExecutable(.{ .name = "sismo-run", .root_module = run_mod });
+        b.installArtifact(run_exe);
+        const run_step = b.step("sismo-run", "Build the capability-stable BPF launcher");
+        run_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     }
 }
 

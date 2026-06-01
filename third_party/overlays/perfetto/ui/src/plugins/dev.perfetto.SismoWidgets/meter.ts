@@ -14,16 +14,23 @@
 
 // Meter: a labelled card with a headline readout, one or more proportion bars,
 // an optional swatch legend and a caption. Shared by every Sismo overview gauge
-// (cycle budget / CPU usage / parallelism). Colours are by role, not by data
-// source: `primary` is the thing in focus (your processes), `secondary` is
-// everything else, `idle` is unused capacity.
+// (cycle budget / CPU usage / parallelism). The first three colours are by
+// role, not by data source: `primary` is the thing in focus (your processes),
+// `secondary` is everything else, `idle` is unused capacity. `caution` (red)
+// and `info` (teal) extend the palette for categorical distributions — e.g. a
+// thread-state breakdown — where more than three named slices share one bar.
 
 import m from 'mithril';
 import {Card} from '../../widgets/card';
 import {Icon} from '../../widgets/icon';
 import {Tooltip} from '../../widgets/tooltip';
 
-export type MeterColor = 'primary' | 'secondary' | 'idle';
+export type MeterColor =
+  | 'primary'
+  | 'secondary'
+  | 'idle'
+  | 'caution'
+  | 'info';
 
 // One slice of a bar. `frac` is the width as a fraction of the bar (0..1);
 // null renders as empty.
@@ -78,14 +85,21 @@ export class Meter implements m.ClassComponent<MeterAttrs> {
   }
 }
 
-// A bare stacked bar with no surrounding card — for inline use (e.g. a busy
-// gauge inside a table cell). Same segment model and colours as the Meter's
-// own bar.
-export class MeterBar implements m.ClassComponent<{
+// A stacked bar with no surrounding card — for inline use (e.g. a busy gauge
+// inside a table cell) or as a small breakdown under a row of scorecards. Same
+// segment model and colours as the Meter's own bar. An optional legend names
+// the segments so the colours aren't cryptic.
+export interface MeterBarAttrs {
   readonly segments: ReadonlyArray<MeterSegment>;
-}> {
-  view({attrs}: m.CVnode<{segments: ReadonlyArray<MeterSegment>}>): m.Children {
-    return renderBar(attrs.segments);
+  readonly legend?: ReadonlyArray<MeterLegendItem>;
+}
+
+export class MeterBar implements m.ClassComponent<MeterBarAttrs> {
+  view({attrs}: m.CVnode<MeterBarAttrs>): m.Children {
+    return [
+      renderBar(attrs.segments),
+      attrs.legend && renderLegend(attrs.legend),
+    ];
   }
 }
 

@@ -89,7 +89,6 @@ pub const Capture = struct {
     target_pid: c_int,
 
     thread: ?std.Thread,
-    setup_failed: std.atomic.Value(bool),
 
     samples: std.atomic.Value(u64),
     active_samples: std.atomic.Value(u64),
@@ -114,21 +113,20 @@ pub const Capture = struct {
             .setup_config = .{},
             .target_pid = 0,
             .thread = null,
-            .setup_failed = std.atomic.Value(bool).init(false),
             .samples = std.atomic.Value(u64).init(0),
             .active_samples = std.atomic.Value(u64).init(0),
         };
 
-        // New shim path: descriptor built in Zig, registered via the
-        // public C++ SDK. The returned slot is what `sismo_ds_emit`
-        // identifies us by.
+        // Descriptor built in Zig, registered via the C++ SDK; the
+        // returned slot keys every `sismo_ds_emit` call.
         const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
             allocator,
             .{ .name = DS_NAME, .will_notify_on_stop = true },
         );
         defer allocator.free(desc_bytes);
         const slot = perfetto.sismo_ds_register(
-            desc_bytes.ptr, desc_bytes.len,
+            desc_bytes.ptr,
+            desc_bytes.len,
             onSetupTrampoline,
             onStartTrampoline,
             onStopTrampoline,
@@ -201,8 +199,7 @@ fn exitRequestedAbort(ctx: ?*anyopaque) bool {
 }
 
 fn workerEntry(self: *Capture) void {
-    // Wait for on_setup so we know which PID to attach to. Worker
-    // can't do `task_for_pid` until the consumer's
+    // Wait for on_setup: `task_for_pid` can't run until the consumer's
     // SismoMacosCpuSamplesConfig.target_pid arrives.
     while (!self.exit_requested.load(.acquire) and !self.setup_received.load(.acquire)) {
         self.wakeup.reset();
@@ -220,7 +217,6 @@ fn workerEntry(self: *Capture) void {
 
     if (target_pid == 0) {
         std.debug.print("cpu_sampler: SismoMacosCpuSamplesConfig.target_pid not set — bailing\n", .{});
-        self.setup_failed.store(true, .release);
         parkUntilExit(self);
         return;
     }
@@ -230,10 +226,9 @@ fn workerEntry(self: *Capture) void {
     const task = sampler.taskForPid(target_pid) catch |err| {
         std.debug.print(
             "cpu_sampler: task_for_pid({d}) failed: {s} — need sudo or the\n" ++
-            "  com.apple.security.cs.debugger entitlement.\n",
+                "  com.apple.security.cs.debugger entitlement.\n",
             .{ target_pid, @errorName(err) },
         );
-        self.setup_failed.store(true, .release);
         parkUntilExit(self);
         return;
     };
@@ -250,7 +245,6 @@ fn workerEntry(self: *Capture) void {
         exitRequestedAbort,
     ) catch |err| {
         std.debug.print("cpu_sampler: enumerateImagesWaitReady failed: {s}\n", .{@errorName(err)});
-        self.setup_failed.store(true, .release);
         parkUntilExit(self);
         return;
     };
@@ -263,7 +257,6 @@ fn workerEntry(self: *Capture) void {
 
     const u = unwinder.create() catch |err| {
         std.debug.print("cpu_sampler: unwinder.create failed: {s}\n", .{@errorName(err)});
-        self.setup_failed.store(true, .release);
         parkUntilExit(self);
         return;
     };
@@ -330,7 +323,7 @@ fn workerEntry(self: *Capture) void {
 }
 
 /// Setup-failure path: park honoring stop and exit so the
-/// orchestrator's `shutdown()` still joins us cleanly.
+/// orchestrator's `shutdown()` still joins cleanly.
 fn parkUntilExit(self: *Capture) void {
     while (true) {
         self.wakeup.reset();
@@ -387,10 +380,9 @@ fn sampleOnce(self: *Capture, state: *ThreadState, u: *unwinder.Unwinder, ctx: *
     sampler.threadResume(state.thread) catch {};
     _ = n; // callstack interning is a follow-up; emit leaf-only sample for now
 
-    // Build PerfSample → wrap in TracePacket body → emit. All bytes
-    // built in Zig; C++ shim just wraps them in NewTracePacket().
+    // Build PerfSample → wrap in TracePacket body → emit.
     const sample_bytes = perfetto_proto.encodePerfSample(self.allocator, .{
-        .cpu = 0, // we don't track which core
+        .cpu = 0, // core not tracked
         .pid = @intCast(self.target_pid),
         .tid = @intCast(state.tid),
         .callstack_iid = 0,
@@ -399,6 +391,7 @@ fn sampleOnce(self: *Capture, state: *ThreadState, u: *unwinder.Unwinder, ctx: *
     const body = perfetto_proto.encodeTracePacketBody(
         self.allocator,
         nowMonotonicNs(),
+        0,
         perfetto_proto.TP_FIELD_PERF_SAMPLE,
         sample_bytes,
     ) catch return;

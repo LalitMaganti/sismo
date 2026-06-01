@@ -14,9 +14,9 @@
 //!     wire 2 = LEN     (length-delimited: string, bytes, sub-message)
 //!     wire 5 = I32     (4-byte fixed)
 //!
-//! For nested messages we encode the sub-message into a separate
-//! ProtoWriter, get its bytes, and emit them as a length-delimited
-//! field on the parent. Two-pass via a temp buffer.
+//! Nested messages: encode the sub-message into a separate ProtoWriter,
+//! then pass its bytes to `writeMessage` on the parent, which prepends
+//! the length prefix.
 
 const std = @import("std");
 
@@ -32,11 +32,8 @@ pub const ProtoWriter = struct {
         self.buf.deinit(self.gpa);
     }
 
-    /// Reset for reuse, retaining the underlying capacity. Lets a
-    /// hot-path caller hold one persistent `ProtoWriter`, clear it
-    /// between iterations, and avoid per-message alloc churn — once
-    /// the buffer has grown to the peak message size it never
-    /// reallocates.
+    /// Reset for reuse, retaining capacity — a caller that clears between
+    /// iterations stops reallocating once the buffer hits peak message size.
     pub fn clear(self: *ProtoWriter) void {
         self.buf.clearRetainingCapacity();
     }
@@ -71,6 +68,21 @@ pub const ProtoWriter = struct {
     pub fn writeBool(self: *ProtoWriter, field: u32, value: bool) !void {
         try self.writeTag(field, 0);
         try self.writeVarint(if (value) 1 else 0);
+    }
+
+    /// proto int32/int64: two's-complement varint (NOT zigzag). Negatives
+    /// keep the bit pattern of their width — i32 → 5-byte varint, i64 →
+    /// 10-byte. Width is load-bearing, so the two are kept distinct.
+    pub fn writeInt32(self: *ProtoWriter, field: u32, value: i32) !void {
+        try self.writeUint32(field, @bitCast(value));
+    }
+
+    pub fn writeInt64(self: *ProtoWriter, field: u32, value: i64) !void {
+        try self.writeUint64(field, @bitCast(value));
+    }
+
+    pub fn writeEnum(self: *ProtoWriter, field: u32, value: anytype) !void {
+        try self.writeUint32(field, @intFromEnum(value));
     }
 
     pub fn writeString(self: *ProtoWriter, field: u32, str: []const u8) !void {

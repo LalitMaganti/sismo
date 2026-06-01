@@ -25,6 +25,7 @@ import {Intent} from '../../widgets/common';
 import {Button, ButtonVariant} from '../../widgets/button';
 import {MenuItem, PopupMenu} from '../../widgets/menu';
 import {Tabs} from '../../widgets/tabs';
+import {Section} from '../../widgets/section';
 import {goToTimeline, renderPrivilegedBanner} from './page_common';
 import {loadCpuDetail, type CpuDetail} from './cpu_data';
 import {
@@ -41,15 +42,17 @@ import {
   type SismoNav,
 } from './nav_state';
 import {renderCpuOverview} from './views/cpu_overview_view';
-import {renderCpuCores} from './views/cpu_cores_view';
+import {CpuCoresView} from './views/cpu_cores_view';
 import {CpuConsumersView} from './views/cpu_consumers_view';
-import {renderCpuFunctions} from './views/cpu_functions_view';
-import {CpuMicroarchView} from './views/cpu_microarch_view';
+import {CpuActivityView} from './views/cpu_activity_view';
 import {CpuFlamegraphView} from './views/cpu_flamegraph_view';
+import {CpuCalltreeView} from './views/cpu_calltree_view';
+import {renderCpuFunctions} from './views/cpu_functions_view';
+import {CpuBottleneckView} from './views/cpu_bottleneck_view';
 import {LatencyView} from './views/latency_view';
 import {renderMemoryView} from './views/memory_view';
 
-export interface SismoPageAttrs {
+interface SismoPageAttrs {
   readonly trace: Trace;
   readonly subpage: string | undefined;
 }
@@ -93,15 +96,19 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
   private renderDomainSelector(nav: SismoNav): m.Children {
     const active = DOMAINS.find((d) => d.key === nav.domain) ?? DOMAINS[0];
     return m(
-      PopupMenu,
-      {
-        trigger: m(Button, {
-          label: active.title,
-          icon: active.icon,
-          rightIcon: 'arrow_drop_down',
-          variant: ButtonVariant.Outlined,
-        }),
-      },
+      '.pf-sismo-page__domain-selector',
+      m('span.pf-sismo-page__selector-label', 'Analysing'),
+      m(
+        PopupMenu,
+        {
+          trigger: m(Button, {
+            label: active.title,
+            icon: active.icon,
+            rightIcon: 'arrow_drop_down',
+            variant: ButtonVariant.Outlined,
+            title: 'Switch analysis domain (CPU / Latency / Memory)',
+          }),
+        },
       DOMAINS.map((d) =>
         m(MenuItem, {
           label: d.deferred ? `${d.title} (soon)` : d.title,
@@ -109,6 +116,7 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
           active: d.key === nav.domain,
           onclick: () => navigate({domain: d.key, view: 'overview'}),
         }),
+      ),
       ),
     );
   }
@@ -171,8 +179,9 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
     });
   }
 
-  // Builds the active CPU view. The flamegraph runs its own query, so it's only
-  // constructed when its tab is active to keep page load light.
+  // Builds the active CPU view. The Code and Efficiency lenses run their own
+  // queries (flamegraph / PMU counters), so they're only constructed when their
+  // tab is active to keep page load light.
   private renderCpuView(
     trace: Trace,
     d: CpuDetail,
@@ -181,26 +190,55 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
   ): m.Children {
     switch (view) {
       case 'overview':
-        return renderCpuOverview(trace, d.summary);
+        return renderCpuOverview(trace, d, this.privileged);
+      case 'activity':
+        // Runs its own bucketed query; only build when active.
+        return active === 'activity'
+          ? m(CpuActivityView, {trace, priv: this.privileged})
+          : undefined;
+      case 'threads':
+        return m(CpuConsumersView, {trace, data: d, priv: this.privileged});
+      case 'cores':
+        return m(CpuCoresView, {
+          trace,
+          summary: d.summary,
+          perCore: d.perCore,
+        });
       case 'flamegraph':
+        // Flamegraph + the flat hot-functions / hot-libraries breakdown. Heavy
+        // query inside the panel, so only build when active.
         return active === 'flamegraph'
-          ? m(CpuFlamegraphView, {
+          ? [
+              m(
+                Section,
+                {
+                  title: 'Flamegraph',
+                  subtitle:
+                    'Your code as a sampled flamegraph — click to zoom into a ' +
+                    'subtree. The flat breakdown is below; the expandable tree ' +
+                    'is on the Calltree tab.',
+                },
+                m(CpuFlamegraphView, {
+                  trace,
+                  priv: this.privileged,
+                  hasSamples: d.microarch.hasSamples,
+                }),
+              ),
+              renderCpuFunctions(d.microarch),
+            ]
+          : undefined;
+      case 'calltree':
+        return active === 'calltree'
+          ? m(CpuCalltreeView, {
               trace,
               priv: this.privileged,
               hasSamples: d.microarch.hasSamples,
             })
           : undefined;
-      case 'functions':
-        return renderCpuFunctions(d.microarch);
-      case 'microarch':
-        // Runs its own counter queries; only build when active.
-        return active === 'microarch'
-          ? m(CpuMicroarchView, {trace, priv: this.privileged})
+      case 'bottleneck':
+        return active === 'bottleneck'
+          ? m(CpuBottleneckView, {trace, priv: this.privileged})
           : undefined;
-      case 'cores':
-        return renderCpuCores(trace, d.summary, d.perCore);
-      case 'consumers':
-        return m(CpuConsumersView, {trace, data: d});
     }
   }
 

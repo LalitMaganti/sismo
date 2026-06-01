@@ -22,33 +22,42 @@
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
-import {Section} from '../../../widgets/section';
-import {Card} from '../../../widgets/card';
-import {Icon} from '../../../widgets/icon';
-import {Tooltip} from '../../../widgets/tooltip';
-import type {CpuSummary} from '../cpu_data';
+import {Callout} from '../../../widgets/callout';
+import {Intent} from '../../../widgets/common';
+import type {ConcurrencyDist, CpuDetail, CpuSummary} from '../cpu_data';
 import {Meter, meterReadout} from '../../dev.perfetto.SismoWidgets/meter';
 import {
-  fmtCount,
-  fmtDuration,
-  fmtFreqKhz,
-  fmtMegacycles,
-  fmtMegacyclesNum,
-  fmtPercent,
-} from '../format';
+  renderQuestionBlock,
+  renderSeeAllLink,
+  renderStatCard,
+  type StatCard,
+} from '../page_common';
+import {CpuTriageView} from './cpu_triage_view';
+import {CpuBottleneckOverview} from './cpu_bottleneck_view';
+import {renderProcessTable, renderThreadTable} from './cpu_consumers_view';
+import {
+  renderHotMappingTable,
+  renderHotSymbolTable,
+} from './cpu_functions_view';
+import type {PrivilegedSet} from '../privileged_set';
+import {fmtDuration, fmtPercent} from '../format';
 
-export function renderCpuOverview(trace: Trace, s: CpuSummary): m.Children {
-  const meters: m.Children[] = [];
-  // Cycle budget needs cpufreq data to compute the peak-frequency denominator.
-  // Without it we can still show usage and parallelism, which only need sched.
-  if (s.peakMegacycles !== null && s.megacycles !== null) {
-    meters.push(renderCycleBudgetMeter(s));
-  }
-  meters.push(renderUsageMeter(s));
-  meters.push(renderParallelismMeter(s));
+// Compact top-N shown on the Overview; the full lists live on the lens tabs.
+const TOP_N = 6;
 
-  // Secondary stat row: orientation facts that don't need a meter.
-  const cards: HeadlineCard[] = [
+export function renderCpuOverview(
+  trace: Trace,
+  d: CpuDetail,
+  priv: PrivilegedSet,
+): m.Children {
+  const s = d.summary;
+  const hasPriv = priv.upids.length > 0;
+
+  // #1 magnitude: occupancy of the machine over the whole trace.
+  const magnitudeMeters: m.Children[] = [renderUsageMeter(s)];
+
+  // Orientation facts about the machine the work ran on.
+  const orientation: StatCard[] = [
     {
       label: 'Walltime',
       value: fmtDuration(trace, s.walltimeNs),
@@ -61,64 +70,201 @@ export function renderCpuOverview(trace: Trace, s: CpuSummary): m.Children {
           ? `${s.numCpus} (${s.numClusters} clusters)`
           : `${s.numCpus}`,
     },
+  ];
+
+  // "Who used it" — your things first, in names you recognise. Top-N here; the
+  // full lists are one click away on the Threads tab. (Functions get their own
+  // block above; this one is the thread/process breakdown of the magnitude.)
+  const threads = hasPriv ? d.privilegedThreads : d.topContextThreads;
+  const processes = hasPriv ? d.privilegedProcesses : d.topContextProcesses;
+  const tables: m.Children[] = [];
+  if (threads.length > 0) {
+    tables.push(
+      namedTable(
+        'Busiest threads',
+        renderThreadTable(trace, s, threads.slice(0, TOP_N)),
+      ),
+    );
+  }
+  // Only worth a processes table when there's more than one to compare; a
+  // single profiled process is already named in the banner.
+  if (processes.length > 1) {
+    tables.push(
+      namedTable(
+        'Busiest processes',
+        renderProcessTable(trace, s, processes.slice(0, TOP_N)),
+      ),
+    );
+  }
+
+  const whereFooter = [
+    renderSeeAllLink(trace, 'All threads & processes', 'threads'),
+  ];
+
+  // #2 is only a question when there's more than one thread to parallelise.
+  const multiThreaded = hasPriv
+    ? d.privilegedThreads.length > 1
+    : s.numThreads > 1;
+
+  // #3 shape: burst the work into runs and idle gaps. Many short bursts keep
+  // the frequency governor from ramping; long sustained bursts let it.
+  const b = d.bursts;
+  const wallSec = s.walltimeNs !== null ? Number(s.walltimeNs) / 1e9 : null;
+  const churn = wallSec !== null && wallSec > 0 ? b.numBursts / wallSec : null;
+  const avgBurstNs =
+    b.numBursts > 0 ? b.activeNs / BigInt(b.numBursts) : null;
+  const shapeCards: StatCard[] = [
     {
-      label: 'Avg freq',
-      value: fmtFreqKhz(s.avgFreqKhz),
-      help: 'Runtime-weighted average across (cpu, frequency).',
+      label: 'Wake-ups',
+      value: churn === null ? '—' : `${fmtRate(churn)} /s`,
+      help:
+        'How often the work started running again after going idle (bursts ' +
+        'per second). Higher means more frequent, shorter bursts.',
     },
     {
-      label: 'Peak freq',
-      value: fmtFreqKhz(s.maxFreqKhz),
-      help: 'Highest CPU frequency observed during the trace.',
-    },
-    {
-      label: 'Processes',
-      value: fmtCount(s.numProcesses),
-    },
-    {
-      label: 'Threads',
-      value: fmtCount(s.numThreads),
+      label: 'Avg burst',
+      value: fmtDuration(trace, avgBurstNs),
+      help: 'Mean length of a continuous run before the work next went idle.',
     },
   ];
 
-  return m(
-    Section,
-    {
-      title: 'CPU at a glance',
-      subtitle:
-        'How much of the machine your processes held over the whole trace ' +
-        '(usage), and how many cores they kept busy while actually running ' +
-        '(parallelism) — measured against everything else on the system.',
-    },
-    m('.pf-sismo-page__meters', meters),
-    m('.pf-sismo-page__stat-row', cards.map(renderHeadlineCard)),
+  return [
+    // On/off-CPU guard first (per-function CPU time only means something once
+    // you know the work was actually on-CPU), then where the code spent it.
+    m(CpuTriageView, {trace, priv}),
+    renderCodeBlock(trace, d),
+    renderQuestionBlock(
+      {
+        question: 'How much CPU did you use, and who used it?',
+        why:
+          'Your share of the machine over the whole trace, and the threads ' +
+          'and processes that share is made of.',
+        footer: whereFooter,
+      },
+      // Scorecards first, then the breakdowns (meters, then the per-entity
+      // tables): aggregated → broken down.
+      m('.pf-sismo-page__stat-row', orientation.map(renderStatCard)),
+      m('.pf-sismo-page__meters', magnitudeMeters),
+      tables.length > 0 && m('.pf-sismo-page__tables', tables),
+    ),
+    multiThreaded &&
+      renderQuestionBlock(
+        {
+          question:
+            'Were your threads actually running in parallel, or serialized?',
+          why:
+            'Whether multithreading bought you width: how many cores your work ' +
+            'kept busy while it was actually running.',
+        },
+        // The average (parallelism meter) next to its distribution (the
+        // concurrency mix), both as meters rather than bare scorecards.
+        m('.pf-sismo-page__meters', [
+          renderParallelismMeter(s),
+          d.concurrency.hasData && renderConcurrencyMeter(d.concurrency),
+        ]),
+      ),
+    b.hasData &&
+      renderQuestionBlock(
+        {
+          question: 'Steady work, or lots of tiny bursts?',
+          why:
+            'How the work is spread in time. Short, frequent bursts can keep ' +
+            'the CPU from ramping to full speed; long sustained bursts let it.',
+        },
+        m('.pf-sismo-page__stat-row', shapeCards.map(renderStatCard)),
+        m('.pf-sismo-page__meters', [
+          m(Meter, {
+            label: 'Burst lengths',
+            help:
+              'How active time splits between sustained runs and short ' +
+              'bursts. Bursts under 30 ms can be too short for the CPU ' +
+              'frequency governor to ramp to full speed.',
+            primary: meterReadout(
+              fmtPercent(pctOf(b.shortBurstNs, b.activeNs)),
+              ' in short bursts (<30 ms)',
+            ),
+            bar: [
+              {color: 'primary', frac: pctOf(b.longBurstNs, b.activeNs)},
+              {color: 'secondary', frac: pctOf(b.shortBurstNs, b.activeNs)},
+            ],
+            legend: [
+              {
+                color: 'primary',
+                label: 'Sustained (≥30 ms)',
+                value: fmtPercent(pctOf(b.longBurstNs, b.activeNs)),
+              },
+              {
+                color: 'secondary',
+                label: 'Short (<30 ms)',
+                value: fmtPercent(pctOf(b.shortBurstNs, b.activeNs)),
+              },
+            ],
+          }),
+        ]),
+      ),
+    m(CpuBottleneckOverview, {trace, priv}),
+  ];
+}
+
+// The headline "where did your code spend time" block: hot functions (leaf
+// self-time) beside the libraries they live in. Driven by CPU samples, scoped
+// to the profiled set. Omitted entirely when the trace has no samples; when it
+// has samples but none symbolised, a note points at the fix rather than a table.
+function renderCodeBlock(trace: Trace, d: CpuDetail): m.Children {
+  const ma = d.microarch;
+  if (!ma.hasSamples) return undefined;
+  const question = 'Where did your program spend its time?';
+  const why =
+    'The functions your CPU samples landed in — leaf-frame self time, so ' +
+    'where the cycles were actually being spent — and the libraries they ' +
+    'live in.';
+  if (!ma.hasSymbols) {
+    return renderQuestionBlock(
+      {question, why},
+      m(
+        Callout,
+        {icon: 'info', intent: Intent.Primary},
+        'CPU samples were captured but none were symbolised. Make sure debug ' +
+          'info is available — unstripped binaries on Linux, dSYMs on macOS — ' +
+          'to see which functions the time went to.',
+      ),
+    );
+  }
+  return renderQuestionBlock(
+    {question, why, footer: renderSeeAllLink(trace, 'All functions', 'flamegraph')},
+    m(
+      '.pf-sismo-page__microarch',
+      m(
+        '.pf-sismo-page__microarch-col',
+        m('.pf-sismo-page__tab-pane-label', 'Hot functions'),
+        renderHotSymbolTable(ma.hotSymbols.slice(0, TOP_N)),
+      ),
+      ma.hotMappings.length > 0 &&
+        m(
+          '.pf-sismo-page__microarch-col',
+          m('.pf-sismo-page__tab-pane-label', 'Hot libraries'),
+          renderHotMappingTable(ma.hotMappings.slice(0, TOP_N)),
+        ),
+    ),
   );
 }
 
-interface HeadlineCard {
-  readonly label: string;
-  readonly value: string;
-  readonly help?: string;
+// Fraction a/b as a number in [0,1], or null when the denominator is empty.
+function pctOf(a: bigint, b: bigint): number | null {
+  return b > 0n ? Number(a) / Number(b) : null;
 }
 
-// Cycles delivered vs the peak-frequency budget — a frequency story (were
-// cores running fast), complementary to the occupancy story below.
-function renderCycleBudgetMeter(s: CpuSummary): m.Children {
-  const pct = s.bandwidthUtilization ?? 0;
-  return m(Meter, {
-    label: 'Cycles spent',
-    help:
-      'Cycles delivered across all cores / cycles that would have been ' +
-      'delivered if every core ran at its peak observed frequency for the ' +
-      'full walltime. Requires cpufreq data.',
-    primary: [
-      m('span.pf-sismo-meter__big', fmtMegacycles(s.megacycles)),
-      m('span.pf-sismo-meter__caption', ' of '),
-      m('span.pf-sismo-meter__big', fmtMegacyclesNum(s.peakMegacycles)),
-    ],
-    bar: [{color: 'primary', frac: pct}],
-    sub: `${fmtPercent(pct)} of peak-frequency budget`,
-  });
+// Compact rate readout: one decimal below 10, whole numbers above.
+function fmtRate(n: number): string {
+  return n >= 10 ? n.toFixed(0) : n.toFixed(1);
+}
+
+function namedTable(label: string, table: m.Children): m.Children {
+  return m(
+    '.pf-sismo-page__tab-pane',
+    m('.pf-sismo-page__tab-pane-label', label),
+    table,
+  );
 }
 
 // CPU usage: share of the machine's total core-time the set held over the
@@ -216,6 +362,38 @@ function renderParallelismMeter(s: CpuSummary): m.Children {
   });
 }
 
+// The distribution behind the parallelism mean: of the active window, how it
+// splits across exactly one core (serial), 2–4, and 5+. Neutral — whether
+// serial is "bad" is up to the workload; the bands are just named categories,
+// not a good/bad scale.
+function renderConcurrencyMeter(c: ConcurrencyDist): m.Children {
+  const serial = pctOf(c.serialNs, c.activeNs);
+  const few = pctOf(c.fewNs, c.activeNs);
+  const many = pctOf(c.manyNs, c.activeNs);
+  return m(Meter, {
+    label: 'Concurrency mix',
+    help:
+      'How the active window splits by how many cores ran the work at once: ' +
+      'exactly one (serial), 2–4, or 5 or more. The distribution behind the ' +
+      'average parallelism above.',
+    primary: meterReadout(fmtPercent(serial), ' ran on a single core (serial)'),
+    bar: [
+      {color: 'idle', frac: serial},
+      {color: 'secondary', frac: few},
+      {color: 'primary', frac: many},
+    ],
+    legend: [
+      {color: 'idle', label: 'Serial (1)', value: fmtPercent(serial)},
+      {color: 'secondary', label: '2–4 cores', value: fmtPercent(few)},
+      {color: 'primary', label: 'Wide (5+)', value: fmtPercent(many)},
+    ],
+    sub:
+      c.maxConcurrency > 0
+        ? `Peak ${c.maxConcurrency} cores running at once`
+        : undefined,
+  });
+}
+
 // Avg cores = runtime ÷ window (both ns). Null if either is missing or the
 // window is empty.
 function avgCores(
@@ -240,27 +418,4 @@ function activeFrac(activeNs: bigint | null, wall: bigint | null): number | null
 function fmtCoresFrac(cores: number | null, ncpus: number): string {
   if (cores === null || !isFinite(cores)) return '—';
   return `${cores.toFixed(1)} / ${ncpus}`;
-}
-
-function renderHeadlineCard({label, value, help}: HeadlineCard): m.Children {
-  return m(
-    Card,
-    {className: 'pf-sismo-page__stat-card'},
-    m(
-      '.pf-sismo-page__stat-label',
-      label,
-      help &&
-        m(
-          Tooltip,
-          {
-            trigger: m(Icon, {
-              icon: 'help_outline',
-              className: 'pf-sismo-page__help-icon',
-            }),
-          },
-          help,
-        ),
-    ),
-    m('.pf-sismo-page__stat-value', value),
-  );
 }

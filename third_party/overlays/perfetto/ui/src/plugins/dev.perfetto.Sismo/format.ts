@@ -32,22 +32,13 @@ export function fmtCount(n: number | bigint | null): string {
   return Number(n).toLocaleString();
 }
 
-export function fmtFreqKhz(khz: bigint | null): string {
-  if (khz === null) return '—';
-  const v = Number(khz);
-  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)} GHz`;
-  if (v >= 1_000) return `${(v / 1_000).toFixed(0)} MHz`;
-  return `${v} kHz`;
-}
-
 export function fmtMegacycles(m: bigint | null): string {
   if (m === null) return '—';
   return fmtMegacyclesNum(Number(m));
 }
 
-// Same as fmtMegacycles but accepts a plain number — useful for derived
-// quantities (peak cycle budget) that aren't naturally bigint.
-export function fmtMegacyclesNum(v: number | null): string {
+// Megacycle count with an engineering suffix (Mcyc / Gcyc / Tcyc).
+function fmtMegacyclesNum(v: number | null): string {
   if (v === null || !isFinite(v)) return '—';
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)} Tcyc`;
   if (v >= 1_000) return `${(v / 1_000).toFixed(2)} Gcyc`;

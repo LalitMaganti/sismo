@@ -3,14 +3,13 @@
 
 //! Wire-format record types for the sismo heap profiler IPC. Layouts
 //! mirror heapprofd's `wire_protocol.h` closely (same fields, same
-//! ordering, same atomicity rules) — see plans/05-heap-research.md
-//! for the close-reading and what we drop vs keep.
+//! ordering, same atomicity rules) — see plans/05-heap-research.md.
 //!
 //! ABI stability: the structs are `extern` with explicit alignment so
-//! they're invariant across Zig versions and the same when produced by
-//! the in-process client and consumed by the orchestrator. They are
-//! NOT necessarily byte-identical to heapprofd's structs (we don't
-//! need their daemon); sismo's own client+consumer are the contract.
+//! they're invariant across Zig versions and identical between the
+//! in-process client (producer) and the orchestrator (consumer), which
+//! are the contract. They are NOT necessarily byte-identical to
+//! heapprofd's structs.
 
 const std = @import("std");
 
@@ -22,11 +21,9 @@ pub const RecordType = enum(u64) {
     heap_name = 2,
 };
 
-/// Max register-block size across architectures we plan to support.
-/// arm64: 33 × u64 = 264 bytes. x86_64: 17 × u64 = 136 bytes. We round
-/// up to 272 so we can drop in arm64e + future archs without an ABI
-/// break. Cost is ~136 bytes of slack on x86_64 — negligible vs the
-/// 8 KB stack snapshot that follows.
+/// Max register-block size across supported architectures, rounded up
+/// to absorb arm64e + future archs without an ABI break. arm64: 33 ×
+/// u64 = 264 bytes; x86_64: 17 × u64 = 136 bytes; padded to 272.
 pub const MAX_REGISTER_DATA_BYTES: usize = 272;
 
 /// Architecture tag — written into AllocMetadata.arch so the consumer
@@ -85,7 +82,7 @@ pub const HeapName = extern struct {
     heap_name: [HEAP_NAME_BYTES]u8,
 };
 
-// Compile-time assertions so we catch ABI drift across Zig versions.
+// Compile-time assertions that catch ABI drift across Zig versions.
 comptime {
     // 6 × u64 = 48; register block 272; heap_id+arch with 8-byte align
     // constraint = 8. Total 328.

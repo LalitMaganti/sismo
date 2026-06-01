@@ -303,7 +303,7 @@ fn workerEntry(self: *Capture) void {
         const end_avma = @min(claimed_end, next_base);
 
         const arch = dyld_images.archString(image.cputype, image.cpusubtype);
-        symbolizer.addModule(sym, img.base_avma, end_avma, img.path, &image.uuid, arch) catch {};
+        symbolizer.addModule(sym, img.base_avma, end_avma, img.path, &image.uuid, arch, null) catch {};
         unwinder.addModule(u, img.base_avma, image.bytes) catch continue;
     }
 

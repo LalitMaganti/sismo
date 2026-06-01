@@ -105,9 +105,7 @@ pub fn addModule(u: *Unwinder, base_avma: u64, image: []const u8) Error!void {
         0 => {},
         -1 => error.InvalidMachO,
         -2 => error.NoUnwindInfo,
-        // Rust side returns only {0, -1, -2}; treat anything else as a
-        // protocol violation by aliasing to InvalidMachO rather than
-        // silently swallowing.
+        // Rust returns only {0, -1, -2}; alias anything else to InvalidMachO.
         else => error.InvalidMachO,
     };
 }

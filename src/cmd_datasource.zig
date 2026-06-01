@@ -25,7 +25,7 @@
 //! `--all-external` for the common case).
 //!
 //! Config (target_pid for cpu/heap, sizing knobs for sched) arrives via
-//! the on_setup callback when a session enables our DS, decoded from
+//! the on_setup callback when a session enables a DS, decoded from
 //! `DataSourceConfig.sismo_config` (field 2000) — see
 //! `src/sismo_config.zig`. The producer's CLI doesn't take any
 //! tracing-config flags; a session is what configures the producer.
@@ -53,8 +53,8 @@ const heap_capture = switch (builtin.os.tag) {
     else => struct {},
 };
 
-// Set by SIGINT/SIGTERM handlers to break the run loop. Async-signal-
-// safe (atomic store), so we don't touch any locks in the handler.
+// Set by SIGINT/SIGTERM handlers to break the run loop. Async-signal-safe
+// (atomic store), so the handler touches no locks.
 var g_should_stop = std.atomic.Value(bool).init(false);
 
 fn handleStopSignal(sig: std.c.SIG) callconv(.c) void {
@@ -111,8 +111,8 @@ pub fn runDatasource(init: std.process.Init) !void {
     _ = iter.next(); // exe path
     _ = iter.next(); // "datasource" subcommand token
 
-    // Collect requested kinds, deduplicating. Eight slots is well
-    // above any plausible request count (we only have three kinds today).
+    // Collect requested kinds, deduplicating. Eight slots is well above
+    // any plausible request count (only three kinds exist today).
     var kinds_buf: [8]Kind = undefined;
     var n_kinds: usize = 0;
 
@@ -154,7 +154,7 @@ pub fn runDatasource(init: std.process.Init) !void {
 }
 
 /// One slot per registered data source. Holds whichever Capture pointer
-/// applies + the C-side DS handle so we can free both at shutdown.
+/// applies, freed at shutdown.
 const Slot = struct {
     kind: Kind,
     sched: ?*macos_sched_capture.Capture = null,
@@ -163,9 +163,8 @@ const Slot = struct {
 };
 
 fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
-    // New shim path: connect to the producer socket via the public
-    // C++ SDK. Captures' Capture.init internally builds + registers
-    // the DataSourceDescriptor.
+    // Connect to the producer socket via the public C++ SDK; each
+    // Capture.init builds + registers its own DataSourceDescriptor.
     const paths = @import("sismo_paths.zig");
     c.sismo_init(paths.producer_sock.ptr);
 
@@ -174,9 +173,9 @@ fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
 
     installStopHandlers();
 
-    // Register each requested kind. If any single registration fails,
-    // we bail out and free what we already set up — partial state isn't
-    // useful since the user expected the full set.
+    // Register each requested kind. A single registration failure bails
+    // out and frees what's already set up — partial state is useless when
+    // the user expected the full set.
     errdefer {
         var i: usize = n_slots;
         while (i > 0) {
@@ -189,8 +188,6 @@ fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
         var slot: Slot = .{ .kind = kind };
         switch (kind) {
             .sched => {
-                // New API: Capture.init builds the descriptor + calls
-                // sismo_ds_register internally; no separate ds_alloc.
                 slot.sched = try macos_sched_capture.Capture.init(init.gpa, init.io, .{});
                 std.debug.print("sismo datasource: sismo.macos_sched registered\n", .{});
             },
@@ -249,10 +246,9 @@ fn shutdownSlot(slot: Slot) void {
 }
 
 fn blockUntilStopped() void {
-    // Coarse poll. The signal handler can't safely touch a condvar /
-    // event (no async-signal-safety guarantee), so we just check the
-    // atomic on a short interval — wakeup latency = 100 ms, which is
-    // fine for an SIGTERM.
+    // Coarse poll. The signal handler can't safely touch a condvar / event
+    // (no async-signal-safety guarantee), so the atomic is checked on a
+    // short interval — 100 ms wakeup latency, fine for SIGTERM.
     const ts: std.c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
     while (!g_should_stop.load(.acquire)) {
         _ = std.c.nanosleep(&ts, null);

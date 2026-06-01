@@ -11,6 +11,7 @@ Cargo.lock
 # Hermetic build deps + source clones installed by tools/install-build-deps.
 third_party/bin/
 third_party/src/
+third_party/perfmon/
 
 # Tool-specific Python virtualenvs (e.g. tools/e2e-all-sources bootstraps
 # one with the `perfetto` package).

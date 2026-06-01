@@ -20,15 +20,19 @@
 
 export type SismoDomain = 'cpu' | 'latency' | 'memory';
 
-// Views within the CPU domain, in display order. Latency/Memory have a single
-// view today (their `view` is always 'overview').
+// Views within the CPU domain, in funnel order matching the Overview blocks:
+// overview → where your code spent time, as a Flamegraph and an expandable
+// Calltree (the Overview's lead deep-dive) → Activity (the time-quantized zoom
+// step toward the Timeline) → the remaining lens tabs, who → hardware → why.
+// Latency/Memory have a single view today (their `view` is always 'overview').
 export type CpuView =
   | 'overview'
   | 'flamegraph'
-  | 'functions'
-  | 'microarch'
+  | 'calltree'
+  | 'activity'
+  | 'threads'
   | 'cores'
-  | 'consumers';
+  | 'bottleneck';
 
 export interface SismoNav {
   readonly domain: SismoDomain;
@@ -36,18 +40,19 @@ export interface SismoNav {
   readonly view: CpuView;
 }
 
-export const DEFAULT_NAV: SismoNav = {domain: 'cpu', view: 'overview'};
+const DEFAULT_NAV: SismoNav = {domain: 'cpu', view: 'overview'};
 
 export const CPU_VIEWS: ReadonlyArray<{key: CpuView; title: string}> = [
   {key: 'overview', title: 'Overview'},
   {key: 'flamegraph', title: 'Flamegraph'},
-  {key: 'functions', title: 'Functions'},
-  {key: 'microarch', title: 'Microarchitecture'},
+  {key: 'calltree', title: 'Calltree'},
+  {key: 'activity', title: 'Activity'},
+  {key: 'threads', title: 'Threads'},
   {key: 'cores', title: 'Cores'},
-  {key: 'consumers', title: 'Consumers'},
+  {key: 'bottleneck', title: 'Bottleneck'},
 ];
 
-export interface DomainSpec {
+interface DomainSpec {
   readonly key: SismoDomain;
   readonly title: string;
   readonly icon: string;
@@ -69,7 +74,7 @@ function isCpuView(s: string): s is CpuView {
 
 // Encodes nav as the page subpage (the part after `#!/sismo`). The CPU overview
 // is the default and maps to the empty subpage so `#!/sismo` lands there.
-export function navToSubpage(nav: SismoNav): string {
+function navToSubpage(nav: SismoNav): string {
   switch (nav.domain) {
     case 'cpu':
       return nav.view === 'overview' ? '' : `cpu/${nav.view}`;
@@ -96,7 +101,17 @@ export function subpageToNav(subpage: string | undefined): SismoNav {
   if (path === 'latency') return {domain: 'latency', view: 'overview'};
   if (path === 'memory') return {domain: 'memory', view: 'overview'};
   // CPU views, with or without the 'cpu/' prefix.
-  const bare = path.startsWith('cpu/') ? path.slice('cpu/'.length) : path;
+  let bare = path.startsWith('cpu/') ? path.slice('cpu/'.length) : path;
+  // Back-compat: the pre-merge view names still resolve to their new homes so
+  // old links keep working.
+  const aliases: Record<string, CpuView> = {
+    code: 'flamegraph',
+    functions: 'calltree',
+    microarch: 'bottleneck',
+    efficiency: 'bottleneck',
+    consumers: 'threads',
+  };
+  if (bare in aliases) bare = aliases[bare];
   if (isCpuView(bare)) return {domain: 'cpu', view: bare};
   return DEFAULT_NAV;
 }

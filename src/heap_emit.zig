@@ -1,18 +1,14 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Encodes sismo-heap's aggregated allocations into a Perfetto
-//! ProfilePacket-bearing .pftrace file. trace_processor populates the
-//! `heap_profile_allocation` table from this.
+//! Encodes sismo-heap's aggregated allocations into Perfetto
+//! ProfilePacket TracePackets. trace_processor populates the
+//! `heap_profile_allocation` table from these.
 //!
-//! Wire format details:
-//!   - Top-level Trace message has `repeated TracePacket packet = 1`,
-//!     so the file is a stream of (tag=0x0a)(varint length)(packet bytes).
-//!   - Two packets emitted per call:
-//!       (1) TracePacket with InternedData (mappings, frames, callstacks,
-//!           function names, mapping paths) and SEQ_INCREMENTAL_STATE_CLEARED
-//!       (2) TracePacket with ProfilePacket → ProcessHeapSamples → HeapSample[]
-//!   - Both share `trusted_packet_sequence_id = 1`.
+//! Interned tables (strings/mappings/frames/callstacks) are embedded
+//! INSIDE profile_packet using the legacy Android-Q field layout —
+//! trace_processor's profile parser reads them from there, not from
+//! TracePacket.interned_data.
 //!
 //! Field numbers cross-referenced from the vendored protos in
 //! third_party/src/perfetto/protos/perfetto/trace/...
@@ -26,14 +22,9 @@ const proto = @import("proto_writer.zig");
 const TRACE_PACKET = 1;
 
 // TracePacket
-const TP_TIMESTAMP = 8;
-const TP_TRUSTED_PACKET_SEQUENCE_ID = 10;
-const TP_INTERNED_DATA = 12;
-const TP_SEQUENCE_FLAGS = 13;
 const TP_CLOCK_SNAPSHOT = 6;
 const TP_PROFILE_PACKET = 37;
 const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
-const SEQ_NEEDS_INCREMENTAL_STATE: u32 = 2;
 
 // ClockSnapshot
 const CS_CLOCKS = 1;
@@ -43,13 +34,6 @@ const CLOCK_TIMESTAMP = 2;
 // BuiltinClock IDs (from protos/perfetto/common/builtin_clock.proto).
 const BUILTIN_CLOCK_BOOTTIME: u32 = 6;
 const BUILTIN_CLOCK_MONOTONIC_COARSE: u32 = 4;
-
-// InternedData
-const ID_FUNCTION_NAMES = 5;
-const ID_MAPPING_PATHS = 17;
-const ID_MAPPINGS = 19;
-const ID_FRAMES = 6;
-const ID_CALLSTACKS = 7;
 
 // InternedString
 const IS_IID = 1;
@@ -98,7 +82,7 @@ const HS_ALLOC_COUNT = 5;
 
 pub const Mapping = struct {
     iid: u64,
-    path_string_iid: u64,  // ref into mapping_paths string table
+    path_string_iid: u64, // ref into mapping_paths string table
     start: u64,
     end: u64,
     load_bias: u64,
@@ -106,7 +90,7 @@ pub const Mapping = struct {
 
 pub const Frame = struct {
     iid: u64,
-    function_name_iid: u64,  // ref into function_names string table
+    function_name_iid: u64, // ref into function_names string table
     mapping_iid: u64,
     rel_pc: u64,
 };
@@ -137,157 +121,95 @@ pub const TraceData = struct {
 
 // ---- Encoding ------------------------------------------------------------
 
-fn encodeInternedString(gpa: std.mem.Allocator, iid: u64, str: []const u8) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
+// Leaf encoders write their fields into a caller-owned scratch writer;
+// the caller copies the result into the parent with `writeMessage`, so
+// no per-submessage heap slice is allocated.
+
+fn encodeInternedStringInto(w: *proto.ProtoWriter, iid: u64, str: []const u8) !void {
     try w.writeUint64(IS_IID, iid);
     try w.writeString(IS_STR, str);
-    return gpa.dupe(u8, w.bytes());
 }
 
-fn encodeMapping(gpa: std.mem.Allocator, m: Mapping) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
+fn encodeMappingInto(w: *proto.ProtoWriter, m: Mapping) !void {
     try w.writeUint64(MAP_IID, m.iid);
     try w.writeUint64(MAP_START, m.start);
     try w.writeUint64(MAP_END, m.end);
     try w.writeUint64(MAP_LOAD_BIAS, m.load_bias);
     // path_string_ids is repeated; emit one entry.
     try w.writeUint64(MAP_PATH_STRING_IDS, m.path_string_iid);
-    return gpa.dupe(u8, w.bytes());
 }
 
-fn encodeFrame(gpa: std.mem.Allocator, f: Frame) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
+fn encodeFrameInto(w: *proto.ProtoWriter, f: Frame) !void {
     try w.writeUint64(FRAME_IID, f.iid);
     try w.writeUint64(FRAME_FUNCTION_NAME_ID, f.function_name_iid);
     try w.writeUint64(FRAME_MAPPING_ID, f.mapping_iid);
     try w.writeUint64(FRAME_REL_PC, f.rel_pc);
-    return gpa.dupe(u8, w.bytes());
 }
 
-fn encodeCallstack(gpa: std.mem.Allocator, cs: Callstack) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
+fn encodeCallstackInto(w: *proto.ProtoWriter, cs: Callstack) !void {
     try w.writeUint64(CS_IID, cs.iid);
     for (cs.frame_iids) |fid| try w.writeUint64(CS_FRAME_IDS, fid);
-    return gpa.dupe(u8, w.bytes());
 }
 
-fn encodeHeapSample(gpa: std.mem.Allocator, s: HeapSample) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
+fn encodeHeapSampleInto(w: *proto.ProtoWriter, s: HeapSample) !void {
     try w.writeUint64(HS_CALLSTACK_ID, s.callstack_iid);
     try w.writeUint64(HS_SELF_ALLOCATED, s.self_allocated);
     try w.writeUint64(HS_ALLOC_COUNT, s.alloc_count);
-    return gpa.dupe(u8, w.bytes());
 }
 
-fn encodeProcessHeapSamples(gpa: std.mem.Allocator, td: TraceData) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
+fn encodeProcessHeapSamplesInto(
+    w: *proto.ProtoWriter,
+    scratch: *proto.ProtoWriter,
+    td: TraceData,
+) !void {
     try w.writeUint64(PHS_PID, td.pid);
     try w.writeUint64(PHS_TIMESTAMP, td.timestamp_ns);
     try w.writeString(PHS_HEAP_NAME, "libc.malloc");
     try w.writeUint64(PHS_SAMPLING_INTERVAL_BYTES, td.sampling_interval_bytes);
     for (td.samples) |s| {
-        const bytes = try encodeHeapSample(gpa, s);
-        defer gpa.free(bytes);
-        try w.writeMessage(PHS_SAMPLES, bytes);
+        scratch.clear();
+        try encodeHeapSampleInto(scratch, s);
+        try w.writeMessage(PHS_SAMPLES, scratch.bytes());
     }
-    return gpa.dupe(u8, w.bytes());
 }
 
 fn encodeProfilePacket(gpa: std.mem.Allocator, td: TraceData) ![]u8 {
     var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
+    errdefer w.deinit();
+
+    // One scratch writer, reused (cleared) for every leaf sub-message.
+    var child: proto.ProtoWriter = .init(gpa);
+    defer child.deinit();
 
     // Embedded interned tables (legacy Android-Q layout — what
-    // trace_processor's heap parser actually reads). Field order
-    // matters for parser efficiency: strings → mappings → frames →
-    // callstacks → process_dumps.
+    // trace_processor's heap parser reads). Field order is
+    // strings → mappings → frames → callstacks → process_dumps.
     for (td.strings, 1..) |str, i| {
-        const bytes = try encodeInternedString(gpa, i, str);
-        defer gpa.free(bytes);
-        try w.writeMessage(PP_STRINGS, bytes);
+        child.clear();
+        try encodeInternedStringInto(&child, i, str);
+        try w.writeMessage(PP_STRINGS, child.bytes());
     }
     for (td.mappings) |m| {
-        const bytes = try encodeMapping(gpa, m);
-        defer gpa.free(bytes);
-        try w.writeMessage(PP_MAPPINGS, bytes);
+        child.clear();
+        try encodeMappingInto(&child, m);
+        try w.writeMessage(PP_MAPPINGS, child.bytes());
     }
     for (td.frames) |f| {
-        const bytes = try encodeFrame(gpa, f);
-        defer gpa.free(bytes);
-        try w.writeMessage(PP_FRAMES, bytes);
+        child.clear();
+        try encodeFrameInto(&child, f);
+        try w.writeMessage(PP_FRAMES, child.bytes());
     }
     for (td.callstacks) |cs| {
-        const bytes = try encodeCallstack(gpa, cs);
-        defer gpa.free(bytes);
-        try w.writeMessage(PP_CALLSTACKS, bytes);
+        child.clear();
+        try encodeCallstackInto(&child, cs);
+        try w.writeMessage(PP_CALLSTACKS, child.bytes());
     }
 
-    const phs_bytes = try encodeProcessHeapSamples(gpa, td);
-    defer gpa.free(phs_bytes);
-    try w.writeMessage(PP_PROCESS_DUMPS, phs_bytes);
-    return gpa.dupe(u8, w.bytes());
-}
-
-fn encodeInternedDataPacket(gpa: std.mem.Allocator, td: TraceData) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
-
-    for (td.function_names, 1..) |str, i| {
-        const bytes = try encodeInternedString(gpa, i, str);
-        defer gpa.free(bytes);
-        try w.writeMessage(ID_FUNCTION_NAMES, bytes);
-    }
-    for (td.mapping_paths, 1..) |str, i| {
-        const bytes = try encodeInternedString(gpa, i, str);
-        defer gpa.free(bytes);
-        try w.writeMessage(ID_MAPPING_PATHS, bytes);
-    }
-    for (td.mappings) |m| {
-        const bytes = try encodeMapping(gpa, m);
-        defer gpa.free(bytes);
-        try w.writeMessage(ID_MAPPINGS, bytes);
-    }
-    for (td.frames) |f| {
-        const bytes = try encodeFrame(gpa, f);
-        defer gpa.free(bytes);
-        try w.writeMessage(ID_FRAMES, bytes);
-    }
-    for (td.callstacks) |cs| {
-        const bytes = try encodeCallstack(gpa, cs);
-        defer gpa.free(bytes);
-        try w.writeMessage(ID_CALLSTACKS, bytes);
-    }
-
-    return gpa.dupe(u8, w.bytes());
-}
-
-fn encodeTracePacketWithInternedData(gpa: std.mem.Allocator, td: TraceData) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
-    try w.writeUint64(TP_TIMESTAMP, td.timestamp_ns);
-    try w.writeUint32(TP_TRUSTED_PACKET_SEQUENCE_ID, 1);
-    try w.writeUint32(TP_SEQUENCE_FLAGS, SEQ_INCREMENTAL_STATE_CLEARED);
-    const id_bytes = try encodeInternedDataPacket(gpa, td);
-    defer gpa.free(id_bytes);
-    try w.writeMessage(TP_INTERNED_DATA, id_bytes);
-    return gpa.dupe(u8, w.bytes());
-}
-
-fn encodeTracePacketWithProfile(gpa: std.mem.Allocator, td: TraceData) ![]u8 {
-    var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
-    try w.writeUint64(TP_TIMESTAMP, td.timestamp_ns);
-    try w.writeUint32(TP_TRUSTED_PACKET_SEQUENCE_ID, 1);
-    const pp_bytes = try encodeProfilePacket(gpa, td);
-    defer gpa.free(pp_bytes);
-    try w.writeMessage(TP_PROFILE_PACKET, pp_bytes);
-    return gpa.dupe(u8, w.bytes());
+    var phs: proto.ProtoWriter = .init(gpa);
+    defer phs.deinit();
+    try encodeProcessHeapSamplesInto(&phs, &child, td);
+    try w.writeMessage(PP_PROCESS_DUMPS, phs.bytes());
+    return w.buf.toOwnedSlice(gpa);
 }
 
 // ---- Public emission via data source -----------------------------------
@@ -315,13 +237,17 @@ pub fn emitToDataSource(
     // process_dumps entry is skipped silently — heap_profile_allocation
     // stays empty (`clock_sync_failure_unknown_source_clock` stat fires).
     //
-    // We use clock_gettime(CLOCK_MONOTONIC) which is close enough to
-    // BOOTTIME for our purposes; the 1:1 mapping tells trace_processor
-    // the two clocks share the same nanosecond timeline.
+    // clock_gettime(CLOCK_MONOTONIC) is close enough to BOOTTIME here; the
+    // 1:1 mapping tells trace_processor the two clocks share the same
+    // nanosecond timeline.
     const cs_payload = try encodeClockSnapshot(gpa, td.timestamp_ns);
     defer gpa.free(cs_payload);
     const cs_body = try perfetto_proto.encodeTracePacketBody(
-        gpa, td.timestamp_ns, TP_CLOCK_SNAPSHOT, cs_payload,
+        gpa,
+        td.timestamp_ns,
+        0,
+        TP_CLOCK_SNAPSHOT,
+        cs_payload,
     );
     defer gpa.free(cs_body);
     c.sismo_ds_emit(ds_slot, cs_body.ptr, cs_body.len);
@@ -332,9 +258,12 @@ pub fn emitToDataSource(
     // reads from there, not from TracePacket.interned_data.
     const profile_payload = try encodeProfilePacket(gpa, td);
     defer gpa.free(profile_payload);
-    const pp_body = try perfetto_proto.encodeTracePacketBodyWithFlags(
-        gpa, td.timestamp_ns, SEQ_INCREMENTAL_STATE_CLEARED,
-        TP_PROFILE_PACKET, profile_payload,
+    const pp_body = try perfetto_proto.encodeTracePacketBody(
+        gpa,
+        td.timestamp_ns,
+        SEQ_INCREMENTAL_STATE_CLEARED,
+        TP_PROFILE_PACKET,
+        profile_payload,
     );
     defer gpa.free(pp_body);
     c.sismo_ds_emit(ds_slot, pp_body.ptr, pp_body.len);
@@ -342,13 +271,14 @@ pub fn emitToDataSource(
 
 fn encodeClockSnapshot(gpa: std.mem.Allocator, ts_ns: u64) ![]u8 {
     var w: proto.ProtoWriter = .init(gpa);
-    defer w.deinit();
+    errdefer w.deinit();
+    var clock: proto.ProtoWriter = .init(gpa);
+    defer clock.deinit();
     inline for (.{ BUILTIN_CLOCK_BOOTTIME, BUILTIN_CLOCK_MONOTONIC_COARSE }) |clock_id| {
-        var clock: proto.ProtoWriter = .init(gpa);
-        defer clock.deinit();
+        clock.clear();
         try clock.writeUint32(CLOCK_CLOCK_ID, clock_id);
         try clock.writeUint64(CLOCK_TIMESTAMP, ts_ns);
         try w.writeMessage(CS_CLOCKS, clock.bytes());
     }
-    return gpa.dupe(u8, w.bytes());
+    return w.buf.toOwnedSlice(gpa);
 }

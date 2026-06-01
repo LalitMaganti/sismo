@@ -7,11 +7,9 @@
 //! `DuplicateHandle` to hand the shm section across processes.
 //!
 //! Not implemented yet — this file exists so `heap_protocol.zig`'s
-//! per-OS dispatch compiles when targeting Windows and so the public
-//! API surface (types + function names) is documented in one place
-//! both implementations have to honour. The bodies are stubs that
-//! return `error.Unimplemented` so any caller paths that get here at
-//! runtime fail loudly rather than silently.
+//! per-OS dispatch compiles when targeting Windows, and so the public
+//! API surface (types + function names) is documented in one place both
+//! implementations honour. The bodies return `error.Unimplemented`.
 
 const std = @import("std");
 const builtin = @import("builtin");

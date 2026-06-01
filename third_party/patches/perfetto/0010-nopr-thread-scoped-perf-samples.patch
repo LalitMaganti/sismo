@@ -1,0 +1,327 @@
+diff --git a/protos/perfetto/trace/perfetto_trace.proto b/protos/perfetto/trace/perfetto_trace.proto
+index 6b9b3bd7..6f314602 100644
+--- a/protos/perfetto/trace/perfetto_trace.proto
++++ b/protos/perfetto/trace/perfetto_trace.proto
+@@ -17907,6 +17907,19 @@ message PerfSampleDefaults {
+   // of those bins was selected. Never changes for the duration of a trace.
+   optional uint32 process_shard_count = 2;
+   optional uint32 chosen_process_shard = 3;
++
++  // Sismo extension: what each PerfSample of this sequence is scoped to. CPU
++  // (or the unspecified default, for upstream producers) is a per-cpu sample —
++  // its |timebase_count| / |follower_counts| are cpu-cumulative and routed to
++  // cpu-scoped counter tracks. THREAD is a per-thread sample — the readings are
++  // thread-cumulative, keyed by the sample's tid, and routed to thread-scoped
++  // counter tracks.
++  enum SampleScope {
++    SAMPLE_SCOPE_UNSPECIFIED = 0;
++    SAMPLE_SCOPE_CPU = 1;
++    SAMPLE_SCOPE_THREAD = 2;
++  }
++  optional SampleScope sample_scope = 5;
+ }
+ 
+ // End of protos/perfetto/trace/profiling/profile_packet.proto
+diff --git a/protos/perfetto/trace/profiling/profile_packet.proto b/protos/perfetto/trace/profiling/profile_packet.proto
+index 6f763952..1126c128 100644
+--- a/protos/perfetto/trace/profiling/profile_packet.proto
++++ b/protos/perfetto/trace/profiling/profile_packet.proto
+@@ -369,4 +369,17 @@ message PerfSampleDefaults {
+   // of those bins was selected. Never changes for the duration of a trace.
+   optional uint32 process_shard_count = 2;
+   optional uint32 chosen_process_shard = 3;
++
++  // Sismo extension: what each PerfSample of this sequence is scoped to. CPU
++  // (or the unspecified default, for upstream producers) is a per-cpu sample —
++  // its |timebase_count| / |follower_counts| are cpu-cumulative and routed to
++  // cpu-scoped counter tracks. THREAD is a per-thread sample — the readings are
++  // thread-cumulative, keyed by the sample's tid, and routed to thread-scoped
++  // counter tracks.
++  enum SampleScope {
++    SAMPLE_SCOPE_UNSPECIFIED = 0;
++    SAMPLE_SCOPE_CPU = 1;
++    SAMPLE_SCOPE_THREAD = 2;
++  }
++  optional SampleScope sample_scope = 5;
+ }
+diff --git a/src/trace_processor/importers/common/tracks_common.h b/src/trace_processor/importers/common/tracks_common.h
+index bbc128a4..c4c2c211 100644
+--- a/src/trace_processor/importers/common/tracks_common.h
++++ b/src/trace_processor/importers/common/tracks_common.h
+@@ -284,6 +284,19 @@ inline constexpr auto kPerfCpuCounterBlueprint = tracks::CounterBlueprint(
+         tracks::kNameFromTraceDimensionBlueprint),
+     tracks::DynamicNameBlueprint());
+ 
++// Thread-scoped counterpart of kPerfCpuCounterBlueprint: a perf sample's
++// timebase/follower readings accumulated per-thread (see
++// PerfSampleDefaults.SAMPLE_SCOPE_THREAD). The utid dimension nests the
++// counter under its thread in the UI.
++inline constexpr auto kPerfThreadCounterBlueprint = tracks::CounterBlueprint(
++    "perf_thread_counter",
++    tracks::UnknownUnitBlueprint(),
++    tracks::DimensionBlueprints(
++        tracks::kThreadDimensionBlueprint,
++        tracks::UintDimensionBlueprint("perf_session_id"),
++        tracks::kNameFromTraceDimensionBlueprint),
++    tracks::DynamicNameBlueprint());
++
+ inline constexpr auto kGlobalGpuMemoryBlueprint = tracks::CounterBlueprint(
+     "gpu_memory",
+     tracks::kBytesUnitBlueprint,
+diff --git a/src/trace_processor/importers/proto/perf_sample_tracker.cc b/src/trace_processor/importers/proto/perf_sample_tracker.cc
+index 92a1438c..b3738f60 100644
+--- a/src/trace_processor/importers/proto/perf_sample_tracker.cc
++++ b/src/trace_processor/importers/proto/perf_sample_tracker.cc
+@@ -24,6 +24,7 @@
+ #include "perfetto/base/logging.h"
+ #include "perfetto/ext/base/string_utils.h"
+ #include "perfetto/ext/base/string_view.h"
++#include "src/trace_processor/importers/common/process_tracker.h"
+ #include "src/trace_processor/importers/common/stats_tracker.h"
+ #include "src/trace_processor/importers/common/track_tracker.h"
+ #include "src/trace_processor/importers/common/tracks.h"
+@@ -153,6 +154,8 @@ PerfSampleTracker::PerfSampleTracker(TraceProcessorContext* context)
+ PerfSampleTracker::SamplingStreamInfo PerfSampleTracker::GetSamplingStreamInfo(
+     uint32_t seq_id,
+     uint32_t cpu,
++    uint32_t pid,
++    uint32_t tid,
+     protos::pbzero::TracePacketDefaults::Decoder* nullable_defaults) {
+   using protos::pbzero::FollowerEvent;
+   using protos::pbzero::PerfEvents;
+@@ -165,16 +168,44 @@ PerfSampleTracker::SamplingStreamInfo PerfSampleTracker::GetSamplingStreamInfo(
+   SequenceState* seq_state = &seq_it->second;
+   tables::PerfSessionTable::Id session_id = seq_state->perf_session_id;
+ 
+-  auto cpu_it = seq_state->per_cpu.find(cpu);
+-  if (cpu_it != seq_state->per_cpu.end())
+-    return {seq_state->perf_session_id, cpu_it->second.timebase_track_id,
+-            cpu_it->second.follower_track_ids};
+-
+   std::optional<PerfSampleDefaults::Decoder> perf_defaults;
+   if (nullable_defaults && nullable_defaults->has_perf_sample_defaults()) {
+     perf_defaults.emplace(nullable_defaults->perf_sample_defaults());
+   }
+ 
++  // Sismo extension: per-thread samples key their tracks on the running
++  // thread's utid instead of the cpu (see PerfSampleDefaults.SampleScope).
++  const bool thread_scoped =
++      perf_defaults.has_value() &&
++      perf_defaults->sample_scope() == PerfSampleDefaults::SAMPLE_SCOPE_THREAD;
++  const uint32_t scope_key =
++      thread_scoped ? context_->process_tracker->UpdateThread(tid, pid) : cpu;
++  auto& scope_map = thread_scoped ? seq_state->per_utid : seq_state->per_cpu;
++
++  auto cached = scope_map.find(scope_key);
++  if (cached != scope_map.end())
++    return {session_id, cached->second.timebase_track_id,
++            cached->second.follower_track_ids};
++
++  // Interns one counter track for this sequence's scope, against the cpu- or
++  // thread-keyed blueprint as appropriate.
++  auto intern_track = [&](StringId track_name_id, bool is_timebase) -> TrackId {
++    base::StringView track_name = context_->storage->GetString(track_name_id);
++    auto args = [this, is_timebase](ArgsTracker::BoundInserter& inserter) {
++      inserter.AddArg(is_timebase_id_, Variadic::Boolean(is_timebase));
++    };
++    if (thread_scoped) {
++      return context_->track_tracker->InternTrack(
++          tracks::kPerfThreadCounterBlueprint,
++          tracks::Dimensions(scope_key, session_id.value, track_name),
++          tracks::DynamicName(track_name_id), args);
++    }
++    return context_->track_tracker->InternTrack(
++        tracks::kPerfCpuCounterBlueprint,
++        tracks::Dimensions(scope_key, session_id.value, track_name),
++        tracks::DynamicName(track_name_id), args);
++  };
++
+   StringId name_id = kNullStringId;
+   if (perf_defaults.has_value()) {
+     PerfEvents::Timebase::Decoder timebase(perf_defaults->timebase());
+@@ -186,34 +217,20 @@ PerfSampleTracker::SamplingStreamInfo PerfSampleTracker::GetSamplingStreamInfo(
+         StringifyCounter(protos::pbzero::PerfEvents::SW_CPU_CLOCK));
+   }
+ 
+-  base::StringView name = context_->storage->GetString(name_id);
+-  TrackId timebase_track_id = context_->track_tracker->InternTrack(
+-      tracks::kPerfCpuCounterBlueprint,
+-      tracks::Dimensions(cpu, session_id.value, name),
+-      tracks::DynamicName(name_id),
+-      [this](ArgsTracker::BoundInserter& inserter) {
+-        inserter.AddArg(is_timebase_id_, Variadic::Boolean(true));
+-      });
++  TrackId timebase_track_id = intern_track(name_id, /*is_timebase=*/true);
+ 
+   std::vector<TrackId> follower_track_ids;
+   if (perf_defaults.has_value()) {
+     for (auto it = perf_defaults->followers(); it; ++it) {
+       FollowerEvent::Decoder follower(*it);
+       StringId follower_name_id = InternCounterName(follower, context_);
+-      base::StringView follower_name =
+-          context_->storage->GetString(follower_name_id);
+-      follower_track_ids.push_back(context_->track_tracker->InternTrack(
+-          tracks::kPerfCpuCounterBlueprint,
+-          tracks::Dimensions(cpu, session_id.value, follower_name),
+-          tracks::DynamicName(follower_name_id),
+-          [this](ArgsTracker::BoundInserter& inserter) {
+-            inserter.AddArg(is_timebase_id_, Variadic::Boolean(false));
+-          }));
++      follower_track_ids.push_back(
++          intern_track(follower_name_id, /*is_timebase=*/false));
+     }
+   }
+ 
+-  seq_state->per_cpu.emplace(
+-      cpu, CpuSequenceState{timebase_track_id, follower_track_ids});
++  scope_map.emplace(scope_key,
++                    ScopeSequenceState{timebase_track_id, follower_track_ids});
+ 
+   // If the config requested process sharding, record in the stats table which
+   // shard was chosen for the trace. It should be the same choice for all data
+diff --git a/src/trace_processor/importers/proto/perf_sample_tracker.h b/src/trace_processor/importers/proto/perf_sample_tracker.h
+index 70a99f93..54c2e90f 100644
+--- a/src/trace_processor/importers/proto/perf_sample_tracker.h
++++ b/src/trace_processor/importers/proto/perf_sample_tracker.h
+@@ -51,25 +51,33 @@ class PerfSampleTracker {
+ 
+   explicit PerfSampleTracker(TraceProcessorContext* context);
+ 
++  // |pid|/|tid| are only consulted for thread-scoped sequences (see
++  // PerfSampleDefaults.SAMPLE_SCOPE_THREAD), where the timebase/follower tracks
++  // are keyed by the sample's thread (utid) rather than its cpu.
+   SamplingStreamInfo GetSamplingStreamInfo(
+       uint32_t seq_id,
+       uint32_t cpu,
++      uint32_t pid,
++      uint32_t tid,
+       protos::pbzero::TracePacketDefaults_Decoder* nullable_defaults);
+ 
+  private:
+-  struct CpuSequenceState {
++  // Per-scope (cpu or thread) interned tracks for one sequence. Same shape for
++  // both; only the dimension the tracks are keyed on differs.
++  struct ScopeSequenceState {
+     TrackId timebase_track_id = kInvalidTrackId;
+     std::vector<TrackId> follower_track_ids;
+ 
+-    CpuSequenceState(TrackId _timebase_track_id,
+-                     std::vector<TrackId> _follower_track_ids)
++    ScopeSequenceState(TrackId _timebase_track_id,
++                       std::vector<TrackId> _follower_track_ids)
+         : timebase_track_id(_timebase_track_id),
+           follower_track_ids(std::move(_follower_track_ids)) {}
+   };
+ 
+   struct SequenceState {
+     tables::PerfSessionTable::Id perf_session_id;
+-    std::unordered_map<uint32_t, CpuSequenceState> per_cpu;
++    std::unordered_map<uint32_t, ScopeSequenceState> per_cpu;
++    std::unordered_map<uint32_t, ScopeSequenceState> per_utid;
+ 
+     explicit SequenceState(tables::PerfSessionTable::Id _perf_session_id)
+         : perf_session_id(_perf_session_id) {}
+diff --git a/src/trace_processor/importers/proto/perf_sample_tracker_unittest.cc b/src/trace_processor/importers/proto/perf_sample_tracker_unittest.cc
+index 92a75239..62396594 100644
+--- a/src/trace_processor/importers/proto/perf_sample_tracker_unittest.cc
++++ b/src/trace_processor/importers/proto/perf_sample_tracker_unittest.cc
+@@ -100,9 +100,9 @@ TEST_F(PerfSampleTrackerTest, PerCpuCounterTracks) {
+   uint32_t cpu1 = 1;
+ 
+   auto stream = perf_sample_tracker->GetSamplingStreamInfo(
+-      seq_id, cpu0, /*nullable_defaults=*/nullptr);
++      seq_id, cpu0, /*pid=*/0, /*tid=*/0, /*nullable_defaults=*/nullptr);
+   auto stream2 = perf_sample_tracker->GetSamplingStreamInfo(
+-      seq_id, cpu1, /*nullable_defaults=*/nullptr);
++      seq_id, cpu1, /*pid=*/0, /*tid=*/0, /*nullable_defaults=*/nullptr);
+ 
+   // same session, different counter tracks
+   EXPECT_EQ(stream.perf_session_id, stream2.perf_session_id);
+@@ -110,7 +110,7 @@ TEST_F(PerfSampleTrackerTest, PerCpuCounterTracks) {
+ 
+   // re-querying one of the existing streams gives the same ids
+   auto stream3 = perf_sample_tracker->GetSamplingStreamInfo(
+-      seq_id, cpu1, /*nullable_defaults=*/nullptr);
++      seq_id, cpu1, /*pid=*/0, /*tid=*/0, /*nullable_defaults=*/nullptr);
+ 
+   EXPECT_EQ(stream2.perf_session_id, stream3.perf_session_id);
+   EXPECT_EQ(stream2.timebase_track_id, stream3.timebase_track_id);
+@@ -128,7 +128,7 @@ TEST_F(PerfSampleTrackerTest, TimebaseTrackName_Counter) {
+   auto defaults_pb = defaults.SerializeAsString();
+   protos::pbzero::TracePacketDefaults::Decoder defaults_decoder(defaults_pb);
+ 
+-  auto stream = perf_sample_tracker->GetSamplingStreamInfo(seq_id, cpu0,
++  auto stream = perf_sample_tracker->GetSamplingStreamInfo(seq_id, cpu0, /*pid=*/0, /*tid=*/0,
+                                                            &defaults_decoder);
+ 
+   TrackId track_id = stream.timebase_track_id;
+@@ -167,7 +167,7 @@ TEST_F(PerfSampleTrackerTest, TimebaseTrackName_Tracepoint) {
+   auto defaults_pb = defaults.SerializeAsString();
+   protos::pbzero::TracePacketDefaults::Decoder defaults_decoder(defaults_pb);
+ 
+-  auto stream = perf_sample_tracker->GetSamplingStreamInfo(seq_id, cpu0,
++  auto stream = perf_sample_tracker->GetSamplingStreamInfo(seq_id, cpu0, /*pid=*/0, /*tid=*/0,
+                                                            &defaults_decoder);
+ 
+   TrackId track_id = stream.timebase_track_id;
+@@ -199,7 +199,7 @@ TEST_F(PerfSampleTrackerTest, UnknownCounterTreatedAsCpuClock) {
+   uint32_t cpu0 = 0;
+ 
+   auto stream = perf_sample_tracker->GetSamplingStreamInfo(
+-      seq_id, cpu0, /*nullable_defaults=*/nullptr);
++      seq_id, cpu0, /*pid=*/0, /*tid=*/0, /*nullable_defaults=*/nullptr);
+ 
+   TrackId track_id = stream.timebase_track_id;
+   const auto& track_table = context.storage->track_table();
+@@ -241,7 +241,7 @@ TEST_F(PerfSampleTrackerTest, TimebaseTrackName_ConfigSuppliedName) {
+   auto defaults_pb = defaults.SerializeAsString();
+   protos::pbzero::TracePacketDefaults::Decoder defaults_decoder(defaults_pb);
+ 
+-  auto stream = perf_sample_tracker->GetSamplingStreamInfo(seq_id, cpu0,
++  auto stream = perf_sample_tracker->GetSamplingStreamInfo(seq_id, cpu0, /*pid=*/0, /*tid=*/0,
+                                                            &defaults_decoder);
+ 
+   TrackId track_id = stream.timebase_track_id;
+@@ -298,7 +298,7 @@ TEST_F(PerfSampleTrackerTest, FollowersTracks) {
+   auto defaults_pb = defaults.SerializeAsString();
+   protos::pbzero::TracePacketDefaults::Decoder defaults_decoder(defaults_pb);
+ 
+-  auto stream = perf_sample_tracker->GetSamplingStreamInfo(seq_id, cpu_id,
++  auto stream = perf_sample_tracker->GetSamplingStreamInfo(seq_id, cpu_id, /*pid=*/0, /*tid=*/0,
+                                                            &defaults_decoder);
+ 
+   ASSERT_EQ(stream.follower_track_ids.size(), 3u);
+@@ -357,15 +357,15 @@ TEST_F(PerfSampleTrackerTest, ProcessShardingStatsEntries) {
+ 
+   // Two per-cpu lookups for first sequence
+   auto stream = perf_sample_tracker->GetSamplingStreamInfo(
+-      /*seq_id=*/42, cpu0, &defaults_decoder);
++      /*seq_id=*/42, cpu0, /*pid=*/0, /*tid=*/0, &defaults_decoder);
+   perf_sample_tracker->GetSamplingStreamInfo(
+-      /*seq_id=*/42, cpu1, &defaults_decoder);
++      /*seq_id=*/42, cpu1, /*pid=*/0, /*tid=*/0, &defaults_decoder);
+ 
+   // Second sequence
+   auto stream2 = perf_sample_tracker->GetSamplingStreamInfo(
+-      /*seq_id=*/100, cpu0, &defaults_decoder);
++      /*seq_id=*/100, cpu0, /*pid=*/0, /*tid=*/0, &defaults_decoder);
+   perf_sample_tracker->GetSamplingStreamInfo(
+-      /*seq_id=*/100, cpu1, &defaults_decoder);
++      /*seq_id=*/100, cpu1, /*pid=*/0, /*tid=*/0, &defaults_decoder);
+ 
+   EXPECT_NE(stream.perf_session_id, stream2.perf_session_id);
+ 
+diff --git a/src/trace_processor/importers/proto/profile_module.cc b/src/trace_processor/importers/proto/profile_module.cc
+index a8618aa4..ed5af465 100644
+--- a/src/trace_processor/importers/proto/profile_module.cc
++++ b/src/trace_processor/importers/proto/profile_module.cc
+@@ -249,7 +249,8 @@ void ProfileModule::ParsePerfSample(
+   uint32_t seq_id = decoder.trusted_packet_sequence_id();
+   PerfSampleTracker::SamplingStreamInfo sampling_stream =
+       perf_sample_tracker_.GetSamplingStreamInfo(
+-          seq_id, sample.cpu(), sequence_state->GetTracePacketDefaults());
++          seq_id, sample.cpu(), sample.pid(), sample.tid(),
++          sequence_state->GetTracePacketDefaults());
+ 
+   // Not a sample, but an indication of data loss in the ring buffer shared with
+   // the kernel.

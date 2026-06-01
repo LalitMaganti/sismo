@@ -5,18 +5,15 @@
 //! loaded mach-o image list to produce `(base_avma, path)` tuples — the
 //! inputs framehop needs in `add_module`.
 //!
-//! Same data path samply uses (`proc_maps.rs::DyldInfoManager`):
-//!   1. `task_info(target, TASK_DYLD_INFO)` returns the address of the
-//!      target's `dyld_all_image_infos` struct.
-//!   2. `mach_vm_read_overwrite` that struct → grab `infoArrayCount`
-//!      and `infoArray` (a pointer in the target's address space).
-//!   3. `mach_vm_read_overwrite` the array → for each
-//!      `dyld_image_info` we get `imageLoadAddress` (= base avma) and
-//!      `imageFilePath` (a `const char*` we then read separately).
+//! Same data path as samply's `proc_maps.rs::DyldInfoManager`:
+//! `task_info(target, TASK_DYLD_INFO)` gives the address of the target's
+//! `dyld_all_image_infos`; `mach_vm_read_overwrite` reads it for
+//! `infoArrayCount` + `infoArray`; reading that array yields each
+//! `dyld_image_info`'s `imageLoadAddress` (= base avma) and
+//! `imageFilePath` (a `const char*` read separately).
 //!
-//! Works on `taskSelf()` without root (you always have full access to
-//! your own task). For sibling tasks via `task_for_pid` it requires the
-//! same root/entitlement that the sampler does.
+//! Works on `taskSelf()` without root. Sibling tasks via `task_for_pid`
+//! need the same root/entitlement the sampler does.
 
 const std = @import("std");
 const sampler = @import("mach_sampler.zig");
@@ -35,7 +32,7 @@ pub const TASK_DYLD_INFO_COUNT: u32 =
     @sizeOf(TaskDyldInfoData) / @sizeOf(u32);
 
 /// First three fields of `dyld_all_image_infos` (in the target's address
-/// space). The struct is much larger but we only need the head.
+/// space). The full struct is much larger; only the head is needed.
 pub const DyldAllImageInfosHeader = extern struct {
     version: u32,
     info_array_count: u32,
@@ -215,8 +212,8 @@ pub const ImageRead = struct {
 };
 
 /// Map (cputype, cpusubtype) to wholesym's arch string. Returns `null`
-/// for unknown archs. Used to disambiguate fat binaries on disk: the
-/// in-memory image is a single arch; we tell wholesym which one to pick.
+/// for unknown archs. Disambiguates fat binaries on disk: the in-memory
+/// image is a single arch, so this tells wholesym which one to pick.
 pub fn archString(cputype: u32, cpusubtype: u32) ?[]const u8 {
     // Mach-O constants (from <mach/machine.h>):
     //   CPU_TYPE_X86_64 = 0x01000007, CPU_TYPE_ARM64 = 0x0100000C
@@ -250,24 +247,22 @@ pub fn readImageMachO(
     base_avma: u64,
     gpa: std.mem.Allocator,
 ) ImageReadError!ImageRead {
-    // 1. Header (32 B).
+    // Header (32 B).
     var hdr: MachHeader64 = undefined;
     const got_hdr = try sampler.vmReadInto(task, base_avma, std.mem.asBytes(&hdr));
     if (got_hdr < @sizeOf(MachHeader64)) return error.VmReadFailed;
     if (hdr.magic != MH_MAGIC_64) return error.NotMachO64;
 
-    // 2. Load commands.
+    // Load commands.
     const cmds = try gpa.alloc(u8, hdr.sizeofcmds);
     defer gpa.free(cmds);
     const got_cmds = try sampler.vmReadInto(task, base_avma + @sizeOf(MachHeader64), cmds);
     if (got_cmds < hdr.sizeofcmds) return error.VmReadFailed;
 
-    // 3. Find LC_SEGMENT_64 __TEXT to learn vmsize — the size of the
-    //    image's executable footprint, used by callers as the strict
-    //    end of this image's address range. samply does this same
-    //    thing in `proc_maps.rs::DyldInfoManager::get_dyld_image_info`.
-    //    Reads fields by offset to avoid alignment hassles on the byte
-    //    buffer.
+    // Find LC_SEGMENT_64 __TEXT to learn vmsize — the image's executable
+    // footprint, used by callers as the strict end of its address range
+    // (same as samply's `DyldInfoManager::get_dyld_image_info`). Reads
+    // fields by offset to avoid alignment hassles on the byte buffer.
     var text_vmsize: u64 = 0;
     var uuid: [16]u8 = @splat(0);
     var off: usize = 0;
@@ -294,9 +289,9 @@ pub fn readImageMachO(
     }
     if (text_vmsize == 0) return error.NoTextSegment;
 
-    // 4. Read the full __TEXT segment in one shot. Short reads can
-    //    happen near the end of a mapping — return whatever we got;
-    //    framehop's mach-o parser tolerates partial section data.
+    // Read the full __TEXT segment in one shot. Short reads can happen
+    // near the end of a mapping — return whatever was read; framehop's
+    // mach-o parser tolerates partial section data.
     const buf = try gpa.alloc(u8, @intCast(text_vmsize));
     errdefer gpa.free(buf);
     const got = try sampler.vmReadInto(task, base_avma, buf);

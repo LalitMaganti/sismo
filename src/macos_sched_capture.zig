@@ -3,32 +3,17 @@
 
 //! In-process kdebug → `sismo.macos_sched` producer.
 //!
-//! Lifecycle (the "muxer" pattern shared by all sismo producers):
+//! Muxer pattern (shared by all sismo producers): `init()` spawns one
+//! worker thread that owns all state and does the heavy setup (buffers,
+//! mach_timebase, kdebug session) on its own stack, then loops. The
+//! worker is the sole consumer of state, so no mutex is needed — only a
+//! few atomic flags. Between drains it blocks on
+//! `wakeup_event.waitTimeout(io, drain_interval)`: O(drain_interval)
+//! latency on a normal cycle, ~0 on stop/shutdown, no busy poll.
 //!
-//!   process startup:
-//!     `init()` spawns a single worker thread. The worker does the
-//!     heavy setup (allocates buffers, queries mach_timebase, brings
-//!     up the kernel kdebug session) on its own stack, then enters
-//!     the main loop.
-//!
-//!   main loop:
-//!     The worker is the only consumer of state — there's no
-//!     contention between worker and trampolines beyond a few atomic
-//!     flag updates, so no mutex is needed. Between drain cycles the
-//!     worker calls `wakeup_event.waitTimeout(io, drain_interval)`,
-//!     which blocks until either the timeout expires or someone
-//!     calls `wakeup_event.set(io)`. That gives us O(drain_interval)
-//!     latency on a normal cycle and ~0 latency on a stop / shutdown
-//!     signal — no busy polling.
-//!
-//!   trampolines (called from Perfetto's IO thread):
-//!     `onStartTrampoline`  — store running=true, set event.
-//!     `onStopTrampoline`   — store stopper handle, set event.
-//!     `onFlushTrampoline`  — kdebug emits continuously, no buffered
-//!                            state; ack on the IO thread.
-//!     `shutdown()` (orchestrator) — store exit=true, set event,
-//!                                   join. The worker's next observe
-//!                                   sees exit and returns.
+//! Trampolines (Perfetto IO thread) each set the wakeup event: onStart
+//! sets running=true, onStop stores the stopper handle, onFlush acks
+//! inline (kdebug has no buffered state), shutdown() sets exit=true.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -44,12 +29,11 @@ const perfetto = @cImport({
 
 const DS_NAME = "sismo.macos_sched";
 
-// Per-tid cache entry. `thread_pid` identifies the owning process at the
-// time the cache was populated; if a later threadmap snapshot reports a
-// different pid for the same tid we invalidate (pid reuse — mach tids
-// themselves don't reuse, but the (tid, pid) pair can if the owning
-// process exits + the pid is reassigned + a new thread happens to land
-// on the same tid value, which is vanishingly rare but not impossible).
+// Per-tid cache entry. `pid` identifies the owning process when the cache
+// was populated; a later threadmap snapshot reporting a different pid for
+// the same tid invalidates it (pid reuse — mach tids don't reuse, but the
+// (tid, pid) pair can if the owner exits, the pid is reassigned, and a new
+// thread lands on the same tid value: vanishingly rare, not impossible).
 const ThreadEntry = struct {
     pid: i32,
     name_buf: [64]u8,
@@ -62,7 +46,7 @@ const ThreadEntry = struct {
 
 // Per-pid cache entry. cmdline_buf holds the proc_pidpath result;
 // cmdline_len is its byte length. Empty cmdline = pidpath failed
-// (kernel-only or zombie pid) — still cache so we don't keep retrying.
+// (kernel-only or zombie pid) — still cached to avoid retrying.
 const ProcessEntry = struct {
     ppid: i32,
     cmdline_buf: [process_tree.MAXPATHLEN]u8,
@@ -73,11 +57,10 @@ const ProcessEntry = struct {
     }
 };
 
-// First-seen timestamp accumulator: we only emit a Thread / Process
-// entry into the GenericKernelProcessTree packet on the drain that
-// first observed it; subsequent drains hit the cache and skip the
-// emit. trace_processor's process tree is incremental — repeating
-// entries is harmless but wasteful.
+// First-seen cache: a Thread / Process entry is emitted into the
+// GenericKernelProcessTree packet only on the drain that first observed
+// it; later drains hit the cache and skip the emit. trace_processor's
+// process tree is incremental — repeating entries is harmless but wasteful.
 const ProcessTreeCache = struct {
     threads: std.AutoHashMapUnmanaged(u64, ThreadEntry),
     processes: std.AutoHashMapUnmanaged(i32, ProcessEntry),
@@ -110,14 +93,11 @@ pub const Config = struct {
     /// it wakes earlier on any signal.
     drain_interval_ns: u64 = 100 * std.time.ns_per_ms,
 
-    /// Per-drain user-space staging buffer, in events. Sized to match
-    /// `kernel_buffer_events` so a single `KDREADTR` always pulls
-    /// every queued event in one call. Anything smaller leaves a
-    /// residue that grows when the worker is slow (per-emit allocator
-    /// + SDK Trace() costs), and once the residue exceeds
-    /// kernel_buffer_events the kernel overwrites our oldest queued
-    /// events mid-cycle — manifests as 100s-of-ms gaps in the
-    /// timeline between otherwise normal-looking sched stretches.
+    /// Per-drain staging buffer, in events. Sized to match
+    /// `kernel_buffer_events` so one `KDREADTR` drains everything.
+    /// Undersizing leaves a residue that grows when the worker lags;
+    /// once it exceeds kernel_buffer_events the kernel overwrites its
+    /// oldest queued events mid-cycle, showing as 100s-of-ms timeline gaps.
     drain_capacity_events: usize = 256 * 1024,
 
     /// Capacity for the per-drain thread-map snapshot.
@@ -130,19 +110,16 @@ pub const Stats = struct {
 };
 
 /// xnu emits each context switch as TWO kdebug events on the same CPU:
-///   1. MACH_SCHED (or MACH_STACK_HANDOFF) — fired in `thread_invoke` BEFORE
-///      the register switch. Carries timestamp, both TIDs, and both
-///      priorities, but NOT the outgoing thread's finalized `thread->state`.
-///   2. MACH_DISPATCH — fired in `thread_dispatch` AFTER the switch, from
-///      the incoming thread's stack. Carries the outgoing TID and its
-///      finalized state bits (TH_WAIT/TH_SUSP/TH_UNINT/...).
+///   - MACH_SCHED (or MACH_STACK_HANDOFF), in `thread_invoke` BEFORE the
+///     register switch: timestamp, both TIDs, both priorities — but NOT
+///     the outgoing thread's finalized `thread->state`.
+///   - MACH_DISPATCH, in `thread_dispatch` AFTER the switch: the outgoing
+///     TID and its finalized state bits (TH_WAIT/TH_SUSP/TH_UNINT/...).
 ///
-/// To recover the correct off-CPU state we buffer the MACH_SCHED half here
-/// keyed by `cpuid`; the matching MACH_DISPATCH on the same CPU completes
-/// the pair. The buffer is per-CPU (not per-TID) because the kdebug stream
-/// guarantees per-CPU ordering and at most one switch is in flight per CPU.
-/// Persisting across drain batches matters: a drain can land between the
-/// two events.
+/// The MACH_SCHED half is buffered here keyed by `cpuid`; the matching
+/// MACH_DISPATCH on the same CPU completes the pair. Per-CPU (not per-TID)
+/// because kdebug guarantees per-CPU ordering with at most one switch in
+/// flight per CPU. Must persist across drains — a drain can split the pair.
 pub const PendingSwitch = struct {
     valid: bool = false,
     timestamp: u64 = 0,
@@ -152,9 +129,9 @@ pub const PendingSwitch = struct {
     incoming_pri: u32 = 0,
 };
 
-/// Cap of distinct cpuids we track. macOS surfaces ~32 logical CPUs at the
-/// extreme high end (e.g. M2 Ultra) plus a handful of IOP cpuids, so 256 is
-/// comfortably oversized. Events on out-of-range cpuids are dropped.
+/// Cap of distinct cpuids tracked. macOS tops out at ~32 logical CPUs
+/// (M2 Ultra) plus a few IOP cpuids, so 256 is comfortably oversized;
+/// events on out-of-range cpuids are dropped.
 pub const MAX_CPUS: usize = 256;
 
 pub const Capture = struct {
@@ -254,15 +231,12 @@ pub const Capture = struct {
         };
 
         // Register the data source via the new C++-SDK-backed shim.
-        // Zig builds the descriptor; C++ parses + Register's it. The
-        // returned slot index is what every later `sismo_ds_emit` call
-        // identifies us by.
-        //
-        // The descriptor carries a ProtoVM program that mirrors our
-        // GenericKernelProcessTree packets into the per-buffer DST
-        // state. Traced applies the program on overwritten packets in
-        // ring/flight mode; the DST is surfaced to the consumer at
-        // trace-read time. Inert in file mode (no overwrites).
+        // The returned slot index keys every later `sismo_ds_emit` call.
+        // The descriptor carries a ProtoVM program that mirrors the
+        // GenericKernelProcessTree packets into per-buffer DST state:
+        // traced applies it to overwritten packets in ring/flight mode and
+        // surfaces the DST at trace-read time. Inert in file mode (no
+        // overwrites).
         const protovm_program = try perfetto_proto.macosSchedVmProgram(allocator);
         defer allocator.free(protovm_program);
         const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
@@ -275,7 +249,8 @@ pub const Capture = struct {
         );
         defer allocator.free(desc_bytes);
         const slot = perfetto.sismo_ds_register(
-            desc_bytes.ptr, desc_bytes.len,
+            desc_bytes.ptr,
+            desc_bytes.len,
             onSetupTrampoline,
             onStartTrampoline,
             onStopTrampoline,
@@ -289,10 +264,9 @@ pub const Capture = struct {
         return self;
     }
 
-    /// Invoked from traced's IO thread when our DS is set up for a
-    /// session. `dsc_bytes` is the serialized `DataSourceConfig`; we
-    /// pull our vendor extension (field 2000) and decode the
-    /// macos_sched config inside.
+    /// Invoked from traced's IO thread at DS setup. `dsc_bytes` is the
+    /// serialized `DataSourceConfig`; the vendor extension (field 2000)
+    /// carries the macos_sched config decoded here.
     pub fn onSetupTrampoline(
         user_arg: ?*anyopaque,
         dsc_bytes_ptr: ?*const anyopaque,
@@ -355,10 +329,9 @@ pub const Capture = struct {
 };
 
 fn workerEntry(self: *Capture) void {
-    // Wait for on_setup (or shutdown). on_setup carries the
-    // SismoMacosSchedConfig from the consumer, which may override
-    // our producer-side defaults — we don't want to bring up the
-    // kernel kdebug session with a stale buffer size.
+    // Wait for on_setup (or shutdown). on_setup carries the consumer's
+    // SismoMacosSchedConfig, which may override producer-side defaults —
+    // so the kdebug session isn't brought up with a stale buffer size.
     while (!self.exit_requested.load(.acquire) and !self.setup_received.load(.acquire)) {
         self.wakeup.reset();
         if (self.exit_requested.load(.acquire) or self.setup_received.load(.acquire)) break;
@@ -461,12 +434,10 @@ fn drainOnce(self: *Capture) void {
     _ = self.events_emitted.fetchAdd(emitted, .monotonic);
     const drain_idx = self.drain_calls.fetchAdd(1, .monotonic);
 
-    // Diagnostic logging: first cycle only (the cold-cache warm-up that
-    // exercises every proc_pidinfo lookup), plus any cycle where the
-    // kernel ring saturated (`n_evt` near the buffer cap = events were
-    // overwritten before we could read them — the failure mode that
-    // produces multi-hundred-ms gaps in the timeline). Steady-state
-    // cycles are silent.
+    // Diagnostic logging: first cycle only (cold-cache warm-up), plus any
+    // cycle where the kernel ring saturated (`n_evt` near the buffer cap =
+    // events overwritten before being read, the cause of multi-hundred-ms
+    // timeline gaps). Steady-state cycles are silent.
     const overflow_threshold = @as(usize, @intCast(self.config.kernel_buffer_events)) * 9 / 10;
     if (drain_idx == 0 or n_evt >= overflow_threshold) {
         const drain_ns = nsBetween(t0, t_drain);
@@ -488,39 +459,31 @@ fn nsBetween(a: std.c.timespec, b: std.c.timespec) u64 {
 }
 
 /// Walk the kdebug threadmap, populate the per-tid + per-pid name cache
-/// for any new entries via `proc_pidinfo`, and emit a single
+/// for new entries via `proc_pidinfo`, and emit one
 /// `GenericKernelProcessTree` packet listing the deltas.
 ///
-/// Cache key = mach thread id (`KdThreadMap.thread`). Mach tids do
-/// not reuse system-wide (xnu allocates from a 64-bit monotonic
-/// counter), so a hit always points at the same thread that owned the
-/// id when we cached it. Pids do reuse, but only after the previous
-/// owner is fully reaped — within a typical sismo recording window
-/// (~minutes) that's rare enough to ignore for v0. A future patch can
-/// subscribe to `BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXIT)` events for
-/// fast invalidation; today we accept the accuracy gap.
+/// Cache key = mach thread id (`KdThreadMap.thread`), which xnu allocates
+/// from a 64-bit monotonic counter and never reuses system-wide, so a hit
+/// always points at the same thread. Pids DO reuse, but only after the
+/// prior owner is reaped — rare within a ~minutes recording, accepted for
+/// v0. (A future patch could subscribe to BSD_PROC_EXIT for fast
+/// invalidation.)
 fn refreshAndEmitTree(self: *Capture, thread_map: []const kdebug.KdThreadMap) void {
     const gpa = self.allocator;
 
-    // Per-emit arena. Each new entry's name/cmdline gets dup'd into
-    // this arena so the slices in new_threads_buf / new_processes_buf
-    // outlive the loop iteration that produced them. Without this, the
-    // slices alias `entry`/`pe` — local variables whose stack slot the
-    // compiler reuses each iteration — so by emit time every slice
-    // points at the LAST iteration's stack content. (Caught in the
-    // wild by traceconv showing wildly cross-contaminated cmdlines:
-    // pid=1 emitting "/usr/libexec/", sample-target emitting
-    // "UserEventAgent", thread comms reading "mds\xAA\xAA…" past the
-    // real 3-char name.) The arena is freed at function exit.
+    // Per-emit arena. Each new entry's name/cmdline is dup'd here so the
+    // slices in new_threads_buf / new_processes_buf outlive the loop
+    // iteration. Without it they alias `entry`/`pe` — locals whose stack
+    // slot the compiler reuses each iteration — so by emit time every slice
+    // points at the LAST iteration's content (seen in the wild as cross-
+    // contaminated cmdlines/comms in traceconv). Freed at function exit.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Two stack-bounded staging buffers for new entries this drain.
-    // Threadmap is bounded by `thread_map_capacity` (16K by default);
-    // a drain rarely surfaces more than a few new threads, so 256 is
-    // a comfortable cap. Anything beyond that we silently truncate
-    // — the next drain picks them up.
+    // Stack-bounded staging for new entries this drain. A drain rarely
+    // surfaces more than a few new threads, so these caps are generous;
+    // overflow is silently truncated and picked up next drain.
     var new_threads_buf: [256]perfetto_proto.ThreadEntry = undefined;
     var n_new_threads: usize = 0;
     var new_processes_buf: [128]perfetto_proto.ProcessEntry = undefined;
@@ -534,9 +497,8 @@ fn refreshAndEmitTree(self: *Capture, thread_map: []const kdebug.KdThreadMap) vo
         const t_gop = self.pt_cache.threads.getOrPut(gpa, tid) catch continue;
         if (t_gop.found_existing and t_gop.value_ptr.pid == pid) continue;
 
-        // New tid (or stale tid where pid changed under us — pid reuse).
-        // Re-query proc_pidinfo for the pth_name. Fallback comm comes
-        // from the threadmap if proc_pidinfo gives us nothing.
+        // New tid (or pid changed — reuse). Re-query proc_pidinfo for the
+        // pth_name; fall back to the threadmap comm if it returns nothing.
         var name_buf: [64]u8 = undefined;
         const fetched = process_tree.threadName(pid, tid, &name_buf);
         const name: []const u8 = if (fetched) |n|
@@ -603,7 +565,8 @@ fn refreshAndEmitTree(self: *Capture, thread_map: []const kdebug.KdThreadMap) vo
     const body = perfetto_proto.encodeTracePacketBody(
         gpa,
         0, // no per-packet timestamp; trace_processor reads ProcessTree
-           // entries as time-independent metadata.
+        // entries as time-independent metadata.
+        0, // sequence_flags
         perfetto_proto.TP_FIELD_GENERIC_KERNEL_PROCESS_TREE,
         tree_bytes,
     ) catch return;
@@ -612,15 +575,13 @@ fn refreshAndEmitTree(self: *Capture, thread_map: []const kdebug.KdThreadMap) vo
 }
 
 /// Resolve a tid → comm. Cache hit (populated by `refreshAndEmitTree`)
-/// returns the proc_pidinfo `pth_name` if available, otherwise the
-/// kdebug threadmap's 16-char `command`. Cache miss falls back to a
-/// linear scan of the threadmap (slow path, only hit during the first
-/// drain after a thread spawned mid-recording).
+/// returns the proc_pidinfo `pth_name`, else the kdebug threadmap's
+/// 16-char `command`. Cache miss does a linear threadmap scan (slow path,
+/// only on the first drain after a mid-recording spawn).
 ///
-/// Uses `getPtr` (not `get`) so the returned slice aliases the
-/// hashmap's stable storage rather than a freshly-copied local that
-/// would die at return — which is what produced the corrupt
-/// "\000\000…" / 0xAA-padded comms in early tracing runs.
+/// Uses `getPtr` (not `get`) so the slice aliases the hashmap's stable
+/// storage, not a freshly-copied local that would die at return — the
+/// source of early corrupt "\000…"/0xAA-padded comms.
 fn lookupComm(
     threads: []const kdebug.KdThreadMap,
     cache: *ProcessTreeCache,
@@ -629,10 +590,9 @@ fn lookupComm(
     if (cache.threads.getPtr(tid)) |entry| {
         if (entry.name_len > 0) return entry.name();
     }
-    // Cache miss — fall back to the kdebug threadmap. Iterate by
-    // pointer; capturing by value would copy the entry onto the local
-    // stack, and the returned `sliceTo(&t.command, 0)` would alias
-    // that local copy and dangle once we return.
+    // Cache miss — fall back to the kdebug threadmap. Iterate by pointer:
+    // by-value would copy the entry to a local and the returned
+    // `sliceTo(&t.command, 0)` would alias it and dangle after return.
     for (threads) |*t| {
         if (t.thread == tid) return std.mem.sliceTo(&t.command, 0);
     }
@@ -705,18 +665,15 @@ fn emitBatch(
 ) u64 {
     var emitted: u64 = 0;
     for (events) |*e| {
-        // We care about exactly three DBG_MACH_SCHED codes:
-        //   MACH_SCHED          (0x00) — preempted / scheduler choice
-        //   MACH_STACK_HANDOFF  (0x02) — voluntary yield (sync prims,
-        //                                fast IPC).
-        //   MACH_DISPATCH       (0x20) — context switch completed; carries
-        //                                the OUTGOING thread's finalized
-        //                                `thread->state`.
-        // MACH_SCHED/STACK_HANDOFF give us the timestamp + both TIDs +
-        // priorities, MACH_DISPATCH gives us the outgoing state. They're
-        // emitted strictly in that order on the same cpuid, so we buffer
-        // the first half per-CPU and emit the Perfetto pair when the
-        // second half arrives.
+        // Three DBG_MACH_SCHED codes matter:
+        //   MACH_SCHED         (0x00) — preempted / scheduler choice
+        //   MACH_STACK_HANDOFF (0x02) — voluntary yield (sync prims, IPC)
+        //   MACH_DISPATCH      (0x20) — switch completed; carries the
+        //                               OUTGOING thread's finalized state.
+        // 0x00/0x02 carry timestamp + both TIDs + priorities, 0x20 the
+        // outgoing state. They arrive strictly in that order per cpuid, so
+        // the first half is buffered per-CPU and the Perfetto pair emitted
+        // when the second arrives.
         const code = kdebug.extractCode(e.debugid);
         if (e.cpuid >= MAX_CPUS) continue;
 
@@ -740,10 +697,9 @@ fn emitBatch(
                 const args = kdebug.MachDispatchArgs.fromBuf(e);
                 const slot = &pending[e.cpuid];
                 if (!slot.valid) continue;
-                // TID mismatch means the MACH_SCHED/MACH_DISPATCH pair on
-                // this CPU got broken (e.g. capture started mid-switch,
-                // or our drain dropped events). Discard the stale
-                // MACH_SCHED rather than mis-attribute state.
+                // TID mismatch means the pair on this CPU broke (capture
+                // started mid-switch, or a drain dropped events). Discard
+                // the stale MACH_SCHED rather than mis-attribute state.
                 if (slot.outgoing_tid != args.outgoing_tid) {
                     slot.valid = false;
                     continue;
@@ -753,7 +709,10 @@ fn emitBatch(
                 const off_comm = lookupComm(thread_map, cache, slot.outgoing_tid);
                 const off_state = outgoingTaskState(args.outgoing_state);
                 emitTaskState(
-                    ds_slot, event_w, packet_w, ts_ns,
+                    ds_slot,
+                    event_w,
+                    packet_w,
+                    ts_ns,
                     @intCast(e.cpuid),
                     off_comm,
                     @intCast(slot.outgoing_tid),
@@ -762,7 +721,10 @@ fn emitBatch(
                 );
                 const on_comm = lookupComm(thread_map, cache, slot.incoming_tid);
                 emitTaskState(
-                    ds_slot, event_w, packet_w, ts_ns,
+                    ds_slot,
+                    event_w,
+                    packet_w,
+                    ts_ns,
                     @intCast(e.cpuid),
                     on_comm,
                     @intCast(slot.incoming_tid),

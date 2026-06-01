@@ -17,24 +17,111 @@
 import m from 'mithril';
 import type {Trace} from '../../public/trace';
 import {Anchor} from '../../widgets/anchor';
+import {Card} from '../../widgets/card';
 import {Icon} from '../../widgets/icon';
+import {Section} from '../../widgets/section';
+import {Tooltip} from '../../widgets/tooltip';
+import {Time} from '../../base/time';
 import {getThreadOrProcUri} from '../../public/utils';
+import {navToHash, type CpuView, type SismoDomain} from './nav_state';
 import type {PrivilegedSet} from './privileged_set';
+
+// A navigable summary target: the time window and/or entities a stat was
+// derived from. Carrying provenance is the whole point — any aggregate that
+// knows where it came from can hand it here to open the timeline on it.
+interface TimelineTarget {
+  readonly timeRange?: {readonly start: bigint; readonly end: bigint};
+  readonly upids?: ReadonlyArray<number>;
+  readonly utids?: ReadonlyArray<number>;
+  readonly cpus?: ReadonlyArray<number>;
+}
+
+// Opens the timeline focused on `target`: a time range + tracks makes an area
+// selection over them; a range alone frames the window; tracks alone scroll the
+// first into view.
+export function revealInTimeline(trace: Trace, target: TimelineTarget): void {
+  trace.navigate('#!/viewer');
+  const uris = resolveTrackUris(trace, target);
+  const {timeRange} = target;
+  if (timeRange !== undefined) {
+    const start = Time.fromRaw(timeRange.start);
+    const end = Time.fromRaw(timeRange.end);
+    if (uris.length > 0) {
+      trace.selection.selectArea(
+        {start, end, trackUris: uris},
+        {scrollToSelection: true},
+      );
+    } else {
+      trace.scrollTo({time: {start, end, behavior: 'focus'}});
+    }
+    return;
+  }
+  if (uris.length > 0) {
+    trace.scrollTo({track: {uri: uris[0], expandGroup: true}});
+  }
+}
+
+// Processes/threads resolve to their well-known URIs; CPUs are found by their
+// track tag.
+function resolveTrackUris(trace: Trace, target: TimelineTarget): string[] {
+  const uris: string[] = [];
+  for (const upid of target.upids ?? []) {
+    uris.push(getThreadOrProcUri(upid, null));
+  }
+  for (const utid of target.utids ?? []) {
+    uris.push(getThreadOrProcUri(null, utid));
+  }
+  for (const cpu of target.cpus ?? []) {
+    const track = trace.tracks.findTrack((t) => t.tags?.cpu === cpu);
+    if (track !== undefined) uris.push(track.uri);
+  }
+  return uris;
+}
 
 export function goToTimeline(
   trace: Trace,
   target?: {upid?: number; utid?: number},
 ): void {
-  trace.navigate('#!/viewer');
-  if (target === undefined) return;
-  const uri =
-    target.upid !== undefined
-      ? getThreadOrProcUri(target.upid, null)
-      : target.utid !== undefined
-        ? getThreadOrProcUri(null, target.utid)
-        : undefined;
-  if (uri === undefined) return;
-  trace.scrollTo({track: {uri, expandGroup: true}});
+  if (target === undefined) {
+    trace.navigate('#!/viewer');
+    return;
+  }
+  revealInTimeline(trace, {
+    upids: target.upid !== undefined ? [target.upid] : undefined,
+    utids: target.utid !== undefined ? [target.utid] : undefined,
+  });
+}
+
+// Switches the Sismo page to another domain, mirroring the in-page domain
+// selector. Lets the triage block hand off to the Latency domain.
+export function goToSismoDomain(trace: Trace, domain: SismoDomain): void {
+  trace.navigate(navToHash({domain, view: 'overview'}));
+}
+
+// Switches to another CPU lens tab — the "see all →" jump from an Overview
+// question block down into the full view that answers it.
+function goToCpuView(trace: Trace, view: CpuView): void {
+  trace.navigate(navToHash({domain: 'cpu', view}));
+}
+
+// "See all →" footer link into a lens tab.
+export function renderSeeAllLink(
+  trace: Trace,
+  label: string,
+  view: CpuView,
+): m.Children {
+  return m(
+    Anchor,
+    {
+      href: navToHash({domain: 'cpu', view}),
+      icon: 'arrow_forward',
+      onclick: (e: Event) => {
+        e.preventDefault();
+        goToCpuView(trace, view);
+      },
+    },
+    label,
+  );
 }
 
 export function renderPrivilegedBanner(priv: PrivilegedSet): m.Children {
@@ -95,5 +182,57 @@ export function renderThreadLink(
     },
     threadName,
     tid !== null && m('span.pf-sismo-page__muted', ` (tid ${tid})`),
+  );
+}
+
+// One labelled number, with the metric's meaning behind a help tooltip. The
+// scorecard primitive the Overview is built from.
+export interface StatCard {
+  readonly label: string;
+  readonly value: string;
+  readonly help?: string;
+}
+
+export function renderStatCard({label, value, help}: StatCard): m.Children {
+  return m(
+    Card,
+    {className: 'pf-sismo-page__stat-card'},
+    m(
+      '.pf-sismo-page__stat-label',
+      label,
+      help !== undefined &&
+        m(
+          Tooltip,
+          {
+            trigger: m(Icon, {
+              icon: 'help_outline',
+              className: 'pf-sismo-page__help-icon',
+            }),
+          },
+          help,
+        ),
+    ),
+    m('.pf-sismo-page__stat-value', value),
+  );
+}
+
+// An Overview "question block": the user's question as the heading, a one-line
+// motivation, the evidence that answers it, and an optional footer of drill
+// links. The whole page is a stack of these — the question is the unit, not the
+// widget.
+export function renderQuestionBlock(
+  attrs: {
+    readonly question: string;
+    readonly why: string;
+    readonly footer?: m.Children;
+  },
+  ...body: m.Children[]
+): m.Children {
+  return m(
+    Section,
+    {title: attrs.question, subtitle: attrs.why},
+    body,
+    attrs.footer !== undefined &&
+      m('.pf-sismo-page__question-footer', attrs.footer),
   );
 }

@@ -12,10 +12,9 @@
 //! Stack unwinding is not done here — that's framehop's job (via rust-bridge).
 //! This layer surfaces (PC, FP, LR, SP) so the unwinder can walk back.
 //!
-//! NOTE on cImport: we deliberately do NOT `@cImport` `mach/mach.h` or even
-//! `mach/mach_port.h` — translate-c trips on `mach_msg_mac_trailer_t`'s
-//! static_asserts. The Mach API surface we touch is small enough to declare
-//! by hand.
+//! cImport is deliberately avoided for `mach/mach.h` / `mach/mach_port.h`
+//! — translate-c trips on `mach_msg_mac_trailer_t`'s static_asserts. The
+//! Mach API surface used here is small enough to declare by hand.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -93,9 +92,9 @@ extern "c" fn mach_vm_deallocate(
     size: mach_vm_size_t,
 ) kern_return_t;
 
-/// Cross-task memory read. Copies `size` bytes from address `address` in
-/// `target_task`'s address space into `data` in our address space, writing
-/// the actual transferred byte count to `out_size`. Used for stack walking
+/// Cross-task memory read. Copies `size` bytes from `address` in
+/// `target_task`'s address space into `data` (the caller's address space),
+/// writing the transferred byte count to `out_size`. Used for stack walking
 /// and dyld image enumeration on a sibling process.
 extern "c" fn mach_vm_read_overwrite(
     target_task: task_t,
@@ -208,81 +207,6 @@ pub fn threadId(thread: thread_t) SamplerError!u64 {
     return info.thread_id;
 }
 
-/// In-process FP-chain stack walker. ARM64 ABI: at each non-leaf frame, the
-/// frame pointer (x29) points to a (saved_fp, saved_lr) pair on the stack.
-/// We follow saved_fp upward and emit each saved_lr as a return address.
-///
-/// Limitations vs. real unwinders (framehop / compact unwind):
-///   - Misses **leaf functions** that don't establish a frame.
-///   - Walks past tail-call bounces silently.
-///   - Trips on functions compiled without `-fno-omit-frame-pointer` (rare
-///     on macOS — Apple ABI requires FP).
-///
-/// Sufficient for "good enough" sampling on macOS, where the system ABI
-/// keeps frame pointers. framehop (via rust-bridge) is the higher-fidelity
-/// option once we wire it in here.
-///
-/// Returns the number of frames written to `out_pcs`. The current PC is
-/// always the first entry; saved LRs follow.
-pub fn walkFpChainSelf(
-    state: ArmThreadState64,
-    out_pcs: []u64,
-) usize {
-    if (out_pcs.len == 0) return 0;
-    out_pcs[0] = state.cleanPC();
-    var n: usize = 1;
-
-    var fp = state.cleanFP();
-    while (n < out_pcs.len and fp != 0) {
-        // Each frame: [saved_fp, saved_lr] at *fp. Validate alignment.
-        if (fp & 0x7 != 0) break;
-        const frame: *const [2]u64 = @ptrFromInt(fp);
-        const saved_fp = ArmThreadState64.stripPAC(frame[0]);
-        const saved_lr = ArmThreadState64.stripPAC(frame[1]);
-        if (saved_lr == 0) break;
-        out_pcs[n] = saved_lr;
-        n += 1;
-        if (saved_fp <= fp) break; // stacks grow down; FP must increase
-        fp = saved_fp;
-    }
-    return n;
-}
-
-/// Cross-task FP-chain walker. Same shape as `walkFpChainSelf`, but each
-/// `(saved_fp, saved_lr)` pair lives in `task`'s address space, so we read
-/// the frames via `mach_vm_read_overwrite` instead of dereferencing
-/// in-process. A failed/short read terminates the walk silently — same
-/// outcome as walking off the bottom of the stack.
-///
-/// Caller still owns suspending the thread before calling: `state` must be
-/// a coherent snapshot, and the stack must not shift mid-walk.
-pub fn walkFpChainForeign(
-    task: task_t,
-    state: ArmThreadState64,
-    out_pcs: []u64,
-) usize {
-    if (out_pcs.len == 0) return 0;
-    out_pcs[0] = state.cleanPC();
-    var n: usize = 1;
-
-    var fp = state.cleanFP();
-    while (n < out_pcs.len and fp != 0) {
-        if (fp & 0x7 != 0) break;
-        var frame: [2]u64 = undefined;
-        const got = vmReadInto(task, fp, std.mem.asBytes(&frame)) catch break;
-        if (got < @sizeOf(@TypeOf(frame))) break;
-        const saved_fp = ArmThreadState64.stripPAC(frame[0]);
-        const saved_lr = ArmThreadState64.stripPAC(frame[1]);
-        if (saved_lr == 0) break;
-        out_pcs[n] = saved_lr;
-        n += 1;
-        if (saved_fp <= fp) break;
-        fp = saved_fp;
-    }
-    return n;
-}
-
-
 // -- Public API -------------------------------------------------------------
 pub const SamplerError = error{
     TaskThreadsFailed,
@@ -306,8 +230,8 @@ pub fn threadList(task: task_t) SamplerError![]thread_t {
 }
 
 /// Free the thread-port array returned by `threadList`. Mach allocates it
-/// out-of-line via vm_allocate; we deallocate it and also drop our refs on
-/// each thread port.
+/// out-of-line via vm_allocate; deallocates that and drops the ref on each
+/// thread port.
 pub fn freeThreadList(task: task_t, threads: []thread_t) void {
     for (threads) |t| {
         _ = std.c.mach_port_deallocate(task, t);

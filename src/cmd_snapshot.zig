@@ -33,9 +33,9 @@ const c = @cImport({
 // the C++ SDK reads.
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
-/// Build a UTC timestamp like "20260502-171530" suitable for use in a
-/// filename. Buffer must be at least 16 bytes.
-fn formatTimestamp(buf: []u8, io: std.Io) ![]u8 {
+/// Build the default output path `./sismo-<UTC-ISO8601>.pftrace`
+/// (timestamp like 20260502-171530) into `buf`.
+fn defaultOutputPath(buf: []u8, io: std.Io) ![]u8 {
     // std.time has only constants in 0.16 — no `timestamp()`. Wall
     // clock comes from std.Io.Clock.now(.real, io), in nanoseconds.
     const ts = std.Io.Clock.now(.real, io);
@@ -46,7 +46,7 @@ fn formatTimestamp(buf: []u8, io: std.Io) ![]u8 {
     const yd = day.calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = epoch_secs.getDaySeconds();
-    return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+    return std.fmt.bufPrint(buf, "./sismo-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.pftrace", .{
         yd.year,
         md.month.numeric(),
         md.day_index + 1,
@@ -101,9 +101,9 @@ pub fn runSnapshot(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--help")) {
             std.debug.print(
                 "usage: sismo snapshot [--output <path>]\n" ++
-                "\n" ++
-                "  Capture a snapshot of the currently-running flight-recorder\n" ++
-                "  session. Default output: ./sismo-<UTC>.pftrace.\n",
+                    "\n" ++
+                    "  Capture a snapshot of the currently-running flight-recorder\n" ++
+                    "  session. Default output: ./sismo-<UTC>.pftrace.\n",
                 .{},
             );
             return;
@@ -113,15 +113,12 @@ pub fn runSnapshot(init: std.process.Init) !void {
         }
     }
 
-    var ts_buf: [16]u8 = undefined;
-    const ts = formatTimestamp(&ts_buf, io) catch return;
     var default_buf: [128]u8 = undefined;
-    const default_path = std.fmt.bufPrint(&default_buf, "./sismo-{s}.pftrace", .{ts}) catch return;
-    const output_path = output_arg orelse default_path;
+    const output_path = output_arg orelse (defaultOutputPath(&default_buf, io) catch return);
 
     // Point the C++ SDK at the well-known sockets sismo-record hosts.
     // Without these, NewTrace(kSystemBackend) defaults to Perfetto's
-    // built-in path which won't reach our in-process service.
+    // built-in path which won't reach the in-process service.
     _ = setenv("PERFETTO_PRODUCER_SOCK_NAME", paths.producer_sock.ptr, 1);
     _ = setenv("PERFETTO_CONSUMER_SOCK_NAME", paths.consumer_sock.ptr, 1);
 

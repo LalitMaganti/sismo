@@ -26,27 +26,38 @@ import {Callout} from '../../../widgets/callout';
 import {Intent} from '../../../widgets/common';
 import {Tabs} from '../../../widgets/tabs';
 import {
+  loadCpuTriage,
   loadLatencyDetail,
   type CpuBlameRow,
   type CpuIdleStateRow,
   type CpuThreadBlameRow,
+  type CpuTriage,
   type LatencyDetail,
 } from '../cpu_data';
 import {fmtDuration} from '../format';
 import {renderProcessLink, renderThreadLink} from '../page_common';
 import type {PrivilegedSet} from '../privileged_set';
+import {
+  renderOffCpuBreakdownMeter,
+  renderOnOffCpuMeter,
+  renderTriageRoute,
+  triageShares,
+} from './triage_meters';
 
-export interface LatencyViewAttrs {
+interface LatencyViewAttrs {
   readonly trace: Trace;
   readonly privileged: PrivilegedSet;
 }
 
 export class LatencyView implements m.ClassComponent<LatencyViewAttrs> {
   private data?: LatencyDetail;
+  private triage?: CpuTriage;
   private error?: string;
   private blameTab: 'processes' | 'threads' = 'processes';
+  private scope = 'all threads';
 
   oninit({attrs}: m.CVnode<LatencyViewAttrs>) {
+    this.scope = attrs.privileged.upids.length > 0 ? 'your threads' : 'all threads';
     this.load(attrs.trace, attrs.privileged);
   }
 
@@ -70,10 +81,41 @@ export class LatencyView implements m.ClassComponent<LatencyViewAttrs> {
       );
     }
     return [
+      this.renderTriage(attrs.trace),
       this.renderBlame(attrs.trace, d),
       this.renderIdleStates(d.idleStates),
       this.renderComingSoon(),
     ];
+  }
+
+  // Mirror of the CPU tab's triage gauge, with the route reversed: on-CPU vs
+  // off-CPU, then a breakdown of the off-CPU time by why, plus a standing link
+  // back to the CPU views for the on-CPU half.
+  private renderTriage(trace: Trace): m.Children {
+    const d = this.triage;
+    if (d === undefined || !d.hasData) return undefined;
+    const scope = this.scope;
+    const s = triageShares(d);
+    return m(
+      Section,
+      {
+        title: 'Was your time on CPU, or off it?',
+        subtitle:
+          `Scheduling latency lives in off-CPU time. This splits ${scope}’ ` +
+          'tracked thread-time on vs off the CPU, then breaks the off-CPU part ' +
+          'down by why.',
+      },
+      m('.pf-sismo-page__meters', [
+        renderOnOffCpuMeter(d, scope),
+        s.offCpuNs > 0 && renderOffCpuBreakdownMeter(d, scope),
+      ]),
+      renderTriageRoute(trace, {
+        icon: 'memory',
+        message: `On-CPU time is where ${scope} actually ran; the CPU view breaks down where it went.`,
+        linkText: 'Open the CPU view',
+        domain: 'cpu',
+      }),
+    );
   }
 
   private renderIdleStates(rows: CpuIdleStateRow[]): m.Children {
@@ -200,7 +242,12 @@ export class LatencyView implements m.ClassComponent<LatencyViewAttrs> {
 
   private async load(trace: Trace, priv: PrivilegedSet): Promise<void> {
     try {
-      this.data = await loadLatencyDetail(trace.engine, priv);
+      const [detail, triage] = await Promise.all([
+        loadLatencyDetail(trace.engine, priv),
+        loadCpuTriage(trace.engine, priv).catch(() => undefined),
+      ]);
+      this.data = detail;
+      this.triage = triage;
     } catch (e) {
       this.error =
         e instanceof Error ? e.message : 'Failed to load latency detail';
