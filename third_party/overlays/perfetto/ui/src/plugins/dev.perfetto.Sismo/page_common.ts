@@ -196,11 +196,15 @@ export function renderPrivilegedBanner(priv: PrivilegedSet): m.Children {
       " No profiled processes detected — sections below show the system undifferentiated. Record with `sismo record` to tag the processes you're profiling.",
     );
   }
-  const pidList = priv.pids.map((p) => `pid ${p}`).join(', ');
+  // Prefer process names; fall back to pids when names didn't resolve.
+  const label =
+    priv.labels.length > 0
+      ? priv.labels.join(', ')
+      : priv.pids.map((p) => `pid ${p}`).join(', ');
   return m(
     '.pf-sismo-page__priv-banner',
     m(Icon, {icon: 'star', filled: true}),
-    ` Profiling ${pidList}`,
+    ` Profiling ${label}`,
     priv.upids.length < priv.pids.length &&
       m(
         'span.pf-sismo-page__muted',

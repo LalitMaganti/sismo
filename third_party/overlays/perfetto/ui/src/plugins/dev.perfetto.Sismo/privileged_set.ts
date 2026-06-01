@@ -13,16 +13,22 @@
 // limitations under the License.
 
 import type {Trace} from '../../public/trace';
-import {NUM, NUM_NULL} from '../../trace_processor/query_result';
+import {NUM, NUM_NULL, STR_NULL} from '../../trace_processor/query_result';
 
 // The processes Sismo is profiling, as picked at record time by `sismo
 // record`. Everything else in the trace is "context".
 export interface PrivilegedSet {
   readonly pids: ReadonlyArray<number>;
   readonly upids: ReadonlyArray<number>;
+  // Display label per resolved process: its name, or `pid N` when unnamed.
+  readonly labels: ReadonlyArray<string>;
 }
 
-export const EMPTY_PRIVILEGED_SET: PrivilegedSet = {pids: [], upids: []};
+export const EMPTY_PRIVILEGED_SET: PrivilegedSet = {
+  pids: [],
+  upids: [],
+  labels: [],
+};
 
 // TODO: replace with a real JSON-in-zip sidecar. The marker-event mechanism
 // this reads is a deliberate hack — see the matching emit site in
@@ -33,8 +39,8 @@ const MARKER_SLICE_NAME = 'sismo_temporary_privileged_pid_marker';
 export async function loadPrivilegedSet(trace: Trace): Promise<PrivilegedSet> {
   const pids = await readMarkerPids(trace);
   if (pids.length === 0) return EMPTY_PRIVILEGED_SET;
-  const upids = await resolveUpids(trace, pids);
-  return {pids, upids};
+  const {upids, labels} = await resolveProcesses(trace, pids);
+  return {pids, upids, labels};
 }
 
 async function readMarkerPids(trace: Trace): Promise<number[]> {
@@ -55,18 +61,24 @@ async function readMarkerPids(trace: Trace): Promise<number[]> {
   return pids;
 }
 
-async function resolveUpids(
+async function resolveProcesses(
   trace: Trace,
   pids: ReadonlyArray<number>,
-): Promise<number[]> {
-  if (pids.length === 0) return [];
+): Promise<{upids: number[]; labels: string[]}> {
+  if (pids.length === 0) return {upids: [], labels: []};
   const pidList = pids.join(',');
   const res = await trace.engine.query(`
-    SELECT upid FROM process WHERE pid IN (${pidList})
+    SELECT upid, pid, name FROM process WHERE pid IN (${pidList})
   `);
   const upids: number[] = [];
-  for (const it = res.iter({upid: NUM}); it.valid(); it.next()) {
+  const labels: string[] = [];
+  for (
+    const it = res.iter({upid: NUM, pid: NUM_NULL, name: STR_NULL});
+    it.valid();
+    it.next()
+  ) {
     upids.push(it.upid);
+    labels.push(it.name ?? `pid ${it.pid}`);
   }
-  return upids;
+  return {upids, labels};
 }

@@ -19,19 +19,104 @@ index e8911136..3b0f9d2d 100644
  }
  
  export interface MetricsFromTableOrSubqueryOptions {
+diff --git a/ui/src/widgets/flamegraph.scss b/ui/src/widgets/flamegraph.scss
+index fc6db29a..5199b82f 100644
+--- a/ui/src/widgets/flamegraph.scss
++++ b/ui/src/widgets/flamegraph.scss
+@@ -25,10 +25,18 @@
+   }
+ 
+   .filter-bar {
+-    margin: 6px 8px;
++    // Seat as a toolbar with inner padding (not outer margin) so the left and
++    // right insets are symmetric and read as deliberate, like the DataGrid
++    // toolbar — outer margin previously left the bar misaligned against the
++    // full-bleed canvas below it.
++    margin: 0;
++    padding: 6px 8px;
++    border-bottom: 1px solid var(--pf-color-border);
++    background: var(--pf-color-background);
+     display: flex;
+-    column-gap: 6px;
+-    align-items: baseline;
++    flex-wrap: wrap;
++    gap: 8px;
++    align-items: center;
+ 
+     .pf-tag-input {
+       flex-grow: 1;
+@@ -175,3 +183,12 @@
+     color: var(--pf-color-warning);
+   }
+ }
++
++.pf-flamegraph-column-visibility {
++  &__row {
++    display: flex;
++    flex-wrap: wrap;
++    gap: 6px;
++    margin-top: 6px;
++  }
++}
 diff --git a/ui/src/widgets/flamegraph.ts b/ui/src/widgets/flamegraph.ts
-index b3e9e73f..0706fa03 100644
+index b3e9e73f..29889102 100644
 --- a/ui/src/widgets/flamegraph.ts
 +++ b/ui/src/widgets/flamegraph.ts
-@@ -17,6 +17,7 @@ import m from 'mithril';
- import {assertExists, assertTrue} from '../base/assert';
- import {Monitor} from '../base/monitor';
- import {Button, ButtonBar} from './button';
-+import {Checkbox} from './checkbox';
- import {Chip} from './chip';
- import {Intent} from './common';
- import {copyToClipboard} from '../base/clipboard';
-@@ -177,17 +178,41 @@ export const FLAMEGRAPH_STATE_SCHEMA = z
+@@ -25,6 +25,7 @@ import {EmptyState} from './empty_state';
+ import {Form, FormLabel} from './form';
+ import {Icon} from './icon';
+ import {MiddleEllipsis} from './middle_ellipsis';
++import {PopupMultiSelect} from './multiselect';
+ import {Popup, PopupPosition} from './popup';
+ import {Select} from './select';
+ import {Spinner} from './spinner';
+@@ -38,7 +39,13 @@ import {
+   VirtualOverlayCanvas,
+   type VirtualOverlayCanvasApi,
+ } from './virtual_overlay_canvas';
+-import {MenuItem, type MenuItemAttrs, PopupMenu} from './menu';
++import {
++  MenuDivider,
++  MenuItem,
++  type MenuItemAttrs,
++  MenuTitle,
++  PopupMenu,
++} from './menu';
+ import {type Color, HSLColor} from '../base/color';
+ import {hash} from '../base/hash';
+ import type {MithrilEvent} from '../base/mithril_utils';
+@@ -86,6 +93,18 @@ interface ZoomRegion {
+   readonly type: 'ABOVE_ROOT' | 'BELOW_ROOT' | 'ROOT';
+ }
+ 
++// Grouping for a node action in the tooltip menu. FOCUS changes your vantage
++// point without removing data; FILTER adds a rule that reshapes which
++// frames/samples are shown (and shows up as a chip on the top filter bar); OPEN
++// leaves the flamegraph (jump elsewhere or copy).
++export type ActionCategory = 'FOCUS' | 'FILTER' | 'OPEN';
++
++const CATEGORY_LABELS: Record<ActionCategory, string> = {
++  FOCUS: 'Focus',
++  FILTER: 'Filter',
++  OPEN: 'Open',
++};
++
+ // Context passed to a FlamegraphOptionalAction's execute callback.
+ //
+ // `properties` is the (reduced) kv map of the user-declared
+@@ -102,6 +121,11 @@ export interface FlamegraphOptionalAction {
+   readonly name: string;
+   execute?: (ctx: FlamegraphActionContext) => void;
+   readonly subActions?: FlamegraphOptionalAction[];
++  // Presentation metadata for the categorized node menu. Absent → the action
++  // falls under OPEN with no icon and no description.
++  readonly icon?: string;
++  readonly description?: m.Children;
++  readonly category?: ActionCategory;
+ }
+ 
+ export interface FlamegraphOptionalMarker {
+@@ -177,17 +201,41 @@ export const FLAMEGRAPH_STATE_SCHEMA = z
      selectedMetricName: z.string().readonly(),
      filters: z.array(FLAMEGRAPH_FILTER_SCHEMA),
      view: FLAMEGRAPH_VIEW_SCHEMA,
@@ -73,15 +158,99 @@ index b3e9e73f..0706fa03 100644
  }
  
  export interface FlamegraphAttrs {
-@@ -363,6 +388,7 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
-   private attrs: FlamegraphAttrs;
+@@ -207,8 +255,15 @@ type FilterType =
  
+ interface FilterTypeOption {
+   readonly value: FilterType;
++  // The original, profiler-jargon name. Kept so familiar users still recognise
++  // the operation: it is surfaced as "(a.k.a. <label>)" in the node menu.
+   readonly label: string;
++  // The user-facing name shown everywhere the operation is offered.
++  readonly friendlyLabel: string;
+   readonly shortLabel: string;
++  // Material icon used in the node action menu.
++  readonly icon: string;
++  readonly category: ActionCategory;
+   readonly description: string;
+ }
+ 
+@@ -216,42 +271,47 @@ const FILTER_TYPES: ReadonlyArray<FilterTypeOption> = [
+   {
+     value: 'SHOW_STACK',
+     label: 'Show Stack',
++    friendlyLabel: 'Keep stacks through here',
+     shortLabel: 'SS',
+-    description:
+-      'Keep only samples whose stack contains a matching frame. ' +
+-      'Non-matching samples are removed entirely.',
++    icon: 'visibility',
++    category: 'FILTER',
++    description: 'Keep only samples whose stack passes through a matching frame.',
+   },
+   {
+     value: 'HIDE_STACK',
+     label: 'Hide Stack',
++    friendlyLabel: 'Drop stacks through here',
+     shortLabel: 'HS',
+-    description:
+-      'Remove samples whose stack contains a matching frame. ' +
+-      'Also called "Drop function" in other profilers.',
++    icon: 'visibility_off',
++    category: 'FILTER',
++    description: 'Remove samples whose stack passes through a matching frame.',
+   },
+   {
+     value: 'SHOW_FROM_FRAME',
+     label: 'Show From Frame',
++    friendlyLabel: 'Focus on subtree',
+     shortLabel: 'SFF',
+-    description:
+-      'Keep only matching frames and their descendants, removing ancestors. ' +
+-      'Also called "Focus on subtree" in other profilers.',
++    icon: 'center_focus_strong',
++    category: 'FOCUS',
++    description: 'Show only matching frames and what they call, dropping ancestors.',
+   },
+   {
+     value: 'HIDE_FRAME',
+     label: 'Hide Frame',
++    friendlyLabel: 'Merge into caller',
+     shortLabel: 'HF',
+-    description:
+-      'Remove matching frames from all stacks, collapsing children into parent. ' +
+-      'Also called "Merge function" in other profilers.',
++    icon: 'call_merge',
++    category: 'FILTER',
++    description: 'Collapse matching frames, folding their time into the caller.',
+   },
+   {
+     value: 'PIVOT',
+     label: 'Pivot',
++    friendlyLabel: 'Pivot here',
+     shortLabel: 'P',
+-    description:
+-      'Re-root the flamegraph at matching frames. ' +
+-      'Shows callers above and callees below the pivot point.',
++    icon: 'account_tree',
++    category: 'FOCUS',
++    description: 'Re-root the flamegraph: callers above, callees below.',
+   },
+ ];
+ 
+@@ -365,6 +425,12 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
    private showFilterBuilder: boolean = false;
-+  private showHideOptions: boolean = false;
    private quickAddValue: string = '';
  
++  // Distinct values ever seen per (metric, colourable column), accumulated
++  // across renders. Hiding a value drops its frames from the filtered data the
++  // checklist is derived from, so without this memory a just-hidden value would
++  // vanish from the "Hide" menu and could never be un-hidden.
++  private seenPropertyValues = new Map<string, Set<string>>();
++
    private dataChangeMonitor = new Monitor([() => this.attrs.data]);
-@@ -644,6 +670,8 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+   private zoomRegion?: ZoomRegion;
+   private canvasApi?: VirtualOverlayCanvasApi;
+@@ -644,6 +710,8 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
      return {
        filters: state.filters,
        view: state.view,
@@ -90,7 +259,7 @@ index b3e9e73f..0706fa03 100644
        selectedMetricName: metricStillExists
          ? state.selectedMetricName
          : metrics[0].name,
-@@ -728,8 +756,17 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+@@ -728,8 +796,17 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
          name = '(merged)';
          colorScheme = getFlamegraphColorScheme(name, state === 'PARTIAL');
        } else {
@@ -110,146 +279,171 @@ index b3e9e73f..0706fa03 100644
        }
        const bgColor = hover ? colorScheme.variant : colorScheme.base;
        const textColor = hover ? colorScheme.textVariant : colorScheme.textBase;
-@@ -928,9 +965,164 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+@@ -886,6 +963,7 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+           className: 'pf-filter-builder',
+         },
+         m(FilterBuilder, {onAdd: addFilterFn, hasPivot}),
++        this.renderColumnVisibility(),
+       ),
+       m(CopyToClipboardButton(), {
+         textToCopy: () => tags.join(' '),
+@@ -928,9 +1006,181 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
            m(RadioGroup.Button, {value: 'bottom-up'}, 'Bottom Up'),
          ],
        ),
-+      this.renderBreakdownSelect(),
-+      this.renderColorBySelect(),
-+      this.renderHideOptions(),
++      this.renderDisplayOptions(),
 +    );
 +  }
 +
-+  // "Break down by": splits the flamegraph's top level along a metric-declared
-+  // dimension (e.g. thread, process). The widget only records the choice in
-+  // state.breakdownBy; the embedder rebuilds the tree to match.
-+  private renderBreakdownSelect() {
++  // "Display" menu: a single settings button gathering everything that governs
++  // how the flamegraph is presented — how the tree is broken down, how frames
++  // are coloured, and which frames are hidden. Modelled on the workspace
++  // switcher: one PopupMenu of flat MenuTitle sections rather than a button per
++  // control. Hidden entirely when the metric declares no presentation options.
++  private renderDisplayOptions() {
 +    const dims = this.selectedMetric?.breakdownDimensions ?? [];
-+    if (dims.length === 0) {
-+      return undefined;
-+    }
-+    const selected = this.attrs.state.breakdownBy ?? dims[0].key;
-+    return [
-+      m('.pf-flamegraph-filter-bar-separator'),
-+      m('span.pf-flamegraph-filter-label', 'Break down:'),
-+      m(
-+        Select,
-+        {
-+          value: selected,
-+          onchange: (e: Event) => {
-+            const el = e.target as HTMLSelectElement;
-+            this.attrs.onStateChange({
-+              ...this.attrs.state,
-+              breakdownBy: el.value,
-+            });
-+          },
-+        },
-+        dims.map((d) => m('option', {value: d.key}, d.label)),
-+      ),
-+    ];
-+  }
-+
-+  // "Color by": frame name (default) or any unaggregatable property the metric
-+  // declares (e.g. mapping, code type). Hidden when the metric exposes no
-+  // colourable properties, since name-only offers no choice.
-+  private renderColorBySelect() {
 +    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
-+    if (columns.length === 0) {
++    if (dims.length === 0 && columns.length === 0) {
 +      return undefined;
 +    }
-+    const nameLabel = this.selectedMetric?.nameColumnLabel ?? 'Name';
-+    return [
-+      m('.pf-flamegraph-filter-bar-separator'),
-+      m('span.pf-flamegraph-filter-label', 'Color:'),
-+      m(
-+        Select,
-+        {
-+          value: this.attrs.state.colorBy ?? COLOR_BY_NAME,
-+          onchange: (e: Event) => {
-+            const el = e.target as HTMLSelectElement;
-+            this.attrs.onStateChange({
-+              ...this.attrs.state,
-+              colorBy: el.value,
-+            });
-+          },
-+        },
-+        [
-+          m('option', {value: COLOR_BY_NAME}, nameLabel),
-+          ...columns.map((c) => m('option', {value: c.name}, c.displayName)),
-+        ],
-+      ),
-+    ];
-+  }
++    const items: m.Children[] = [];
 +
-+  // "Hide" popup: per colourable column, a checklist of its distinct values.
-+  // Unticking a value adds a HIDE_FRAME filter that collapses those frames into
-+  // their parent (e.g. hide all kernel frames, or one noisy library). The
-+  // checkboxes are derived from the live filter list, so they stay in sync with
-+  // filters added by hand in the bar.
-+  private renderHideOptions() {
-+    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
-+    if (columns.length === 0 || this.attrs.data === undefined) {
-+      return undefined;
++    // "Break down by": splits the flamegraph's top level along a metric-declared
++    // dimension (e.g. thread, process). The widget only records the choice in
++    // state.breakdownBy; the embedder rebuilds the tree to match.
++    if (dims.length > 0) {
++      const selected = this.attrs.state.breakdownBy ?? dims[0].key;
++      items.push(
++        m(MenuTitle, {label: 'Break down'}),
++        dims.map((d) =>
++          this.radioItem(d.label, d.key === selected, () =>
++            this.attrs.onStateChange({...this.attrs.state, breakdownBy: d.key}),
++          ),
++        ),
++      );
 +    }
++
++    // "Color by": frame name (default) or any unaggregatable property the metric
++    // declares (e.g. mapping, code type).
++    if (columns.length > 0) {
++      if (items.length > 0) items.push(m(MenuDivider));
++      const nameLabel = this.selectedMetric?.nameColumnLabel ?? 'Name';
++      const selected = this.attrs.state.colorBy ?? COLOR_BY_NAME;
++      const options = [
++        {value: COLOR_BY_NAME, label: nameLabel},
++        ...columns.map((c) => ({value: c.name, label: c.displayName})),
++      ];
++      items.push(
++        m(MenuTitle, {label: 'Color'}),
++        options.map((o) =>
++          this.radioItem(o.label, o.value === selected, () =>
++            this.attrs.onStateChange({...this.attrs.state, colorBy: o.value}),
++          ),
++        ),
++      );
++    }
++
++    // Show/hide by column lives in the filter panel (renderColumnVisibility),
++    // not here — it produces HIDE_FRAME filters, so it belongs with the filters.
++
 +    return [
 +      m('.pf-flamegraph-filter-bar-separator'),
 +      m(
-+        Popup,
++        PopupMenu,
 +        {
 +          trigger: m(Button, {
-+            icon: 'visibility',
-+            label: 'Hide',
++            icon: 'tune',
++            label: 'Display',
 +            compact: true,
-+            active: this.showHideOptions,
-+            onclick: () => {
-+              this.showHideOptions = !this.showHideOptions;
-+            },
 +          }),
-+          isOpen: this.showHideOptions,
-+          onChange: (shouldOpen: boolean) => {
-+            this.showHideOptions = shouldOpen;
-+          },
 +          position: PopupPosition.RightStart,
-+          closeOnOutsideClick: true,
-+          closeOnEscape: true,
 +        },
-+        this.renderHideOptionsContent(columns),
++        items,
 +      ),
 +    ];
 +  }
 +
-+  private renderHideOptionsContent(
-+    columns: ReadonlyArray<{name: string; displayName: string}>,
-+  ) {
-+    const data = assertExists(this.attrs.data);
++  // Show/hide by column, rendered into the filter panel: one PopupMultiSelect per
++  // colourable column (e.g. mapping, code type), each a searchable checklist of
++  // that column's values. Everything is checked (shown) by default; unticking a
++  // value adds an exact-match HIDE_FRAME filter that collapses those frames into
++  // their parent (e.g. drop all kernel frames, or one noisy library). Lives here
++  // rather than the Display menu because it is, semantically, a filter.
++  private renderColumnVisibility(): m.Children {
++    if (this.attrs.data === undefined) return undefined;
++    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
++    if (columns.length === 0) return undefined;
++    const {nodes} = this.attrs.data;
++    const metricName = this.attrs.state.selectedMetricName;
++    const selects: m.Children[] = [];
++    for (const c of columns) {
++      const values = this.columnValues(metricName, c.name, nodes);
++      if (values.length === 0) continue;
++      selects.push(
++        m(PopupMultiSelect, {
++          label: `Show ${c.displayName.toLowerCase()}`,
++          icon: 'visibility',
++          compact: true,
++          showSelectAllButton: true,
++          position: PopupPosition.RightStart,
++          options: values.map((v) => ({
++            id: v,
++            name: v === '' ? '(none)' : v,
++            checked: !this.isValueHidden(v),
++          })),
++          onChange: (diffs) => {
++            for (const {id, checked} of diffs) {
++              // `checked` = shown; toggle when the desired shown-state
++              // contradicts the current hidden-state.
++              if (checked === this.isValueHidden(id)) {
++                this.toggleHiddenValue(id);
++              }
++            }
++          },
++        }),
++      );
++    }
++    if (selects.length === 0) return undefined;
 +    return m(
-+      '.pf-flamegraph-hide-options',
-+      {
-+        style: {
-+          maxHeight: '420px',
-+          overflowY: 'auto',
-+          padding: '8px 12px',
-+          minWidth: '200px',
-+        },
-+      },
-+      columns.map((c) => {
-+        const values = distinctPropertyValues(data.nodes, c.name);
-+        if (values.length === 0) return null;
-+        return m(
-+          '.pf-flamegraph-hide-group',
-+          m(FormLabel, c.displayName),
-+          values.map((v) =>
-+            m(Checkbox, {
-+              label: v === '' ? '(none)' : v,
-+              checked: !this.isValueHidden(v),
-+              onchange: () => this.toggleHiddenValue(v),
-+            }),
-+          ),
-+        );
-+      }),
++      '.pf-flamegraph-column-visibility',
++      m('.pf-filter-builder__separator'),
++      m('.pf-filter-builder__help-title', 'Show / hide by column'),
++      m('.pf-flamegraph-column-visibility__row', selects),
      );
    }
  
++  // Distinct values of `key`, unioned with every value previously seen for this
++  // (metric, column) so a hidden value stays listed even after it drops out of
++  // the filtered data. Keyed by metric so switching metric starts fresh.
++  private columnValues(
++    metricName: string,
++    key: string,
++    nodes: ReadonlyArray<FlamegraphNode>,
++  ): string[] {
++    const cacheKey = `${metricName} ${key}`;
++    let seen = this.seenPropertyValues.get(cacheKey);
++    if (seen === undefined) {
++      seen = new Set<string>();
++      this.seenPropertyValues.set(cacheKey, seen);
++    }
++    for (const v of distinctPropertyValues(nodes, key)) {
++      seen.add(v);
++    }
++    return Array.from(seen).sort();
++  }
++
++  // A single-select menu row: like the workspace switcher, the chosen option
++  // carries a filled radio glyph and the rest an empty one. Stays open on click
++  // so several settings can be adjusted without reopening the menu.
++  private radioItem(label: string, selected: boolean, onclick: () => void) {
++    return m(MenuItem, {
++      label,
++      icon: selected ? 'radio_button_checked' : 'radio_button_unchecked',
++      closePopupOnClick: false,
++      onclick,
++    });
++  }
++
 +  // A value is "hidden" iff an exact-match HIDE_FRAME filter for it exists.
 +  private hideFilterFor(value: string): string {
 +    return `^${value}$`;
@@ -275,7 +469,7 @@ index b3e9e73f..0706fa03 100644
    private renderTooltip() {
      if (this.tooltipPos === undefined) {
        return undefined;
-@@ -1562,6 +1754,20 @@ function addFilter(
+@@ -1562,6 +1812,20 @@ function addFilter(
    };
  }
  

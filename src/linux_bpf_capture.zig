@@ -470,11 +470,11 @@ pub const Capture = struct {
 
         try self.attach("on_sched_switch");
 
-        // Per-CPU timer → on_tick (the sampler + counter flush).
+        // Per-CPU cycles-PMU overflow → on_tick (the sampler + counter flush).
         const tick_prog = c.bpf_object__find_program_by_name(obj, "on_tick") orelse return error.NoProg;
         cpu = 0;
         while (cpu < ncpu) : (cpu += 1) {
-            const tfd = openTimer(cpu) orelse continue;
+            const tfd = openSampler(cpu) orelse continue;
             const link = c.bpf_program__attach_perf_event(tick_prog, tfd);
             if (link) |l| {
                 try self.links.append(gpa, l);
@@ -937,13 +937,17 @@ fn openCounter(cpu: u32, src: Src, group_fd: i32) ?i32 {
     return if (s < 0) null else @intCast(s);
 }
 
-fn openTimer(cpu: u32) ?i32 {
+// Sample on the cycles PMU (CPU_CLK_UNHALTED) at a fixed period rather than a
+// wall-clock timer, so every sample is an equal slice of cycles — the same
+// denominator the TMA/IPC/MPKI attribution uses. A prime period avoids aliasing
+// against code that runs on a regular cadence. ~1M cycles lands near 1-3 kHz
+// depending on core clock.
+fn openSampler(cpu: u32) ?i32 {
     var attr = std.mem.zeroes(linux.perf_event_attr);
-    attr.type = .SOFTWARE;
+    attr.type = .HARDWARE;
     attr.size = @sizeOf(linux.perf_event_attr);
-    attr.config = @intFromEnum(linux.PERF.COUNT.SW.CPU_CLOCK);
-    attr.sample_period_or_freq = 1000; // Hz
-    attr.flags.freq = true;
+    attr.config = @intFromEnum(linux.PERF.COUNT.HW.CPU_CYCLES);
+    attr.sample_period_or_freq = 1_000_003; // cycles (freq mode left off)
     const rc = linux.perf_event_open(&attr, -1, @intCast(cpu), -1, 0);
     const s: isize = @bitCast(rc);
     return if (s < 0) null else @intCast(s);

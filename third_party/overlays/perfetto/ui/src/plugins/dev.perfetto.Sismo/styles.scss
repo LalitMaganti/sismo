@@ -222,7 +222,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: var(--pf-font-size-s);
+    font-size: var(--pf-font-size-m);
     font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -890,7 +890,7 @@
     margin-top: 4px;
     max-width: 72ch;
     color: var(--pf-color-text-muted);
-    font-size: var(--pf-font-size-s);
+    font-size: var(--pf-font-size-m);
     line-height: 1.45;
   }
 }
@@ -916,12 +916,65 @@
   }
 }
 
+// The CPU domain's tab shell. The bar spans full width under the header; align
+// the handles and content with the header padding so the header divider lines
+// up with the tabs below it.
+.pf-sismo-cpu-tabs {
+  > .pf-tabs__tabs {
+    padding: 0 28px;
+  }
+
+  .pf-tabs__content {
+    padding: 20px 28px 28px;
+  }
+}
+
+// A deep-dive tab body: a mode bar, a one-line caption, then the active view.
+.pf-sismo-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  &__modebar {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  &__body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+  }
+
+  // Every mode renders into the same fixed-height viewport with internal
+  // scrolling, so switching modes feels consistent.
+  &__view {
+    height: 600px;
+    overflow: auto;
+    border: 1px solid var(--pf-color-border);
+    border-radius: 4px;
+
+    // Let an embedded grid fill the viewport; the viewport does the scrolling.
+    .pf-sismo-grid {
+      max-height: none;
+      margin-top: 0;
+    }
+  }
+
+  &__flamegraph {
+    height: 600px;
+    min-height: 360px;
+  }
+}
+
 // A labelled sub-section within a question block (e.g. "By function").
 .pf-sismo-subsection {
   margin-top: 12px;
 
   &__title {
-    font-size: var(--pf-font-size-s);
+    font-size: var(--pf-font-size-m);
     font-weight: 600;
     color: var(--pf-color-text-muted);
     text-transform: uppercase;
@@ -940,6 +993,11 @@
 
   & + & {
     margin-top: 14px;
+  }
+
+  // No per-grid toolbar — filtering/sorting is a tab-level control instead.
+  .pf-data-grid__toolbar {
+    display: none;
   }
 }
 

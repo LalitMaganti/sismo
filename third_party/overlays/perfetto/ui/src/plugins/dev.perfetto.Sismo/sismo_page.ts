@@ -28,7 +28,7 @@ import {
   type PrivilegedSet,
 } from './privileged_set';
 import {DOMAINS, navToHash, subpageToNav, type SismoNav} from './nav_state';
-import {CpuLandingPage} from './cpu/landing';
+import {CpuTabsView} from './cpu/cpu_tabs';
 import {LatencyView} from './views/latency_view';
 import {renderMemoryView} from './views/memory_view';
 
@@ -102,10 +102,9 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
   private renderDomain(trace: Trace, nav: SismoNav): m.Children {
     switch (nav.domain) {
       case 'cpu':
-        return m(
-          '.pf-sismo-page__body',
-          m(CpuLandingPage, {trace, priv: this.privileged}),
-        );
+        // Rendered full-width (no __body padding) so the tab bar sits flush
+        // under the header divider; the tabs pad their own content.
+        return m(CpuTabsView, {trace, priv: this.privileged});
       case 'latency':
         return m(
           '.pf-sismo-page__body',
