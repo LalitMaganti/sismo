@@ -1,0 +1,298 @@
+diff --git a/ui/src/components/query_flamegraph.ts b/ui/src/components/query_flamegraph.ts
+index e8911136..3b0f9d2d 100644
+--- a/ui/src/components/query_flamegraph.ts
++++ b/ui/src/components/query_flamegraph.ts
+@@ -118,6 +118,16 @@ export interface QueryFlamegraphMetric {
+   //
+   // Examples include marking inlined functions, optimized code, etc.
+   readonly optionalMarker?: FlamegraphOptionalMarker;
++
++  // Optional "Break down by" dimensions. When present the widget shows a
++  // selector populated with these; the selected `key` is written to
++  // `FlamegraphState.breakdownBy`. Reshaping the tree for a chosen breakdown is
++  // up to the embedder (it rebuilds the metric in response) — the widget only
++  // surfaces the control and the selection.
++  readonly breakdownDimensions?: ReadonlyArray<{
++    readonly key: string;
++    readonly label: string;
++  }>;
+ }
+ 
+ export interface MetricsFromTableOrSubqueryOptions {
+diff --git a/ui/src/widgets/flamegraph.ts b/ui/src/widgets/flamegraph.ts
+index b3e9e73f..0706fa03 100644
+--- a/ui/src/widgets/flamegraph.ts
++++ b/ui/src/widgets/flamegraph.ts
+@@ -17,6 +17,7 @@ import m from 'mithril';
+ import {assertExists, assertTrue} from '../base/assert';
+ import {Monitor} from '../base/monitor';
+ import {Button, ButtonBar} from './button';
++import {Checkbox} from './checkbox';
+ import {Chip} from './chip';
+ import {Intent} from './common';
+ import {copyToClipboard} from '../base/clipboard';
+@@ -177,17 +178,41 @@ export const FLAMEGRAPH_STATE_SCHEMA = z
+     selectedMetricName: z.string().readonly(),
+     filters: z.array(FLAMEGRAPH_FILTER_SCHEMA),
+     view: FLAMEGRAPH_VIEW_SCHEMA,
++    // Column whose value drives a node's colour. 'name' (the default) hashes the
++    // frame name; any unaggregatable property name (e.g. 'mapping_name') colours
++    // by that property instead. Absent on older persisted states → treated as
++    // 'name'.
++    colorBy: z.string().optional(),
++    // Selected "Break down by" dimension key (from the metric's
++    // breakdownDimensions). The embedder reshapes the tree to match; the widget
++    // just records the choice. Absent → no breakdown.
++    breakdownBy: z.string().optional(),
+   })
+   .readonly();
+ 
+ export type FlamegraphState = z.infer<typeof FLAMEGRAPH_STATE_SCHEMA>;
+ 
++// Sentinel `colorBy` value: hash the frame name (the default colouring).
++const COLOR_BY_NAME = 'name';
++
+ interface FlamegraphMetric {
+   readonly name: string;
+   readonly unit: string;
+   // Label for the name column in copy stack table and tooltip.
+   // Examples: "Symbol", "Slice", "Class". Defaults to "Name".
+   readonly nameColumnLabel?: string;
++  // Unaggregatable properties the metric attaches to each node. Exposed here so
++  // the widget can offer them as "Color by" options (the same objects the
++  // QueryFlamegraphMetric declares).
++  readonly unaggregatableProperties?: ReadonlyArray<{
++    readonly name: string;
++    readonly displayName: string;
++  }>;
++  // "Break down by" dimensions, if the metric supports the breakdown control.
++  readonly breakdownDimensions?: ReadonlyArray<{
++    readonly key: string;
++    readonly label: string;
++  }>;
+ }
+ 
+ export interface FlamegraphAttrs {
+@@ -363,6 +388,7 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+   private attrs: FlamegraphAttrs;
+ 
+   private showFilterBuilder: boolean = false;
++  private showHideOptions: boolean = false;
+   private quickAddValue: string = '';
+ 
+   private dataChangeMonitor = new Monitor([() => this.attrs.data]);
+@@ -644,6 +670,8 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+     return {
+       filters: state.filters,
+       view: state.view,
++      colorBy: state.colorBy,
++      breakdownBy: state.breakdownBy,
+       selectedMetricName: metricStillExists
+         ? state.selectedMetricName
+         : metrics[0].name,
+@@ -728,8 +756,17 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+         name = '(merged)';
+         colorScheme = getFlamegraphColorScheme(name, state === 'PARTIAL');
+       } else {
+-        name = nodes[source.queryIdx].name;
+-        colorScheme = getFlamegraphColorScheme(name, state === 'PARTIAL');
++        const node = nodes[source.queryIdx];
++        name = node.name;
++        // The label is always the frame name; only the colour key varies. When
++        // colouring by a property, frames sharing that property value (e.g. all
++        // frames from one mapping, or all kernel frames) get the same hue.
++        const colorBy = this.attrs.state.colorBy ?? COLOR_BY_NAME;
++        const colorKey =
++          colorBy === COLOR_BY_NAME
++            ? name
++            : (node.properties.get(colorBy)?.value ?? name);
++        colorScheme = getFlamegraphColorScheme(colorKey, state === 'PARTIAL');
+       }
+       const bgColor = hover ? colorScheme.variant : colorScheme.base;
+       const textColor = hover ? colorScheme.textVariant : colorScheme.textBase;
+@@ -928,9 +965,164 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+           m(RadioGroup.Button, {value: 'bottom-up'}, 'Bottom Up'),
+         ],
+       ),
++      this.renderBreakdownSelect(),
++      this.renderColorBySelect(),
++      this.renderHideOptions(),
++    );
++  }
++
++  // "Break down by": splits the flamegraph's top level along a metric-declared
++  // dimension (e.g. thread, process). The widget only records the choice in
++  // state.breakdownBy; the embedder rebuilds the tree to match.
++  private renderBreakdownSelect() {
++    const dims = this.selectedMetric?.breakdownDimensions ?? [];
++    if (dims.length === 0) {
++      return undefined;
++    }
++    const selected = this.attrs.state.breakdownBy ?? dims[0].key;
++    return [
++      m('.pf-flamegraph-filter-bar-separator'),
++      m('span.pf-flamegraph-filter-label', 'Break down:'),
++      m(
++        Select,
++        {
++          value: selected,
++          onchange: (e: Event) => {
++            const el = e.target as HTMLSelectElement;
++            this.attrs.onStateChange({
++              ...this.attrs.state,
++              breakdownBy: el.value,
++            });
++          },
++        },
++        dims.map((d) => m('option', {value: d.key}, d.label)),
++      ),
++    ];
++  }
++
++  // "Color by": frame name (default) or any unaggregatable property the metric
++  // declares (e.g. mapping, code type). Hidden when the metric exposes no
++  // colourable properties, since name-only offers no choice.
++  private renderColorBySelect() {
++    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
++    if (columns.length === 0) {
++      return undefined;
++    }
++    const nameLabel = this.selectedMetric?.nameColumnLabel ?? 'Name';
++    return [
++      m('.pf-flamegraph-filter-bar-separator'),
++      m('span.pf-flamegraph-filter-label', 'Color:'),
++      m(
++        Select,
++        {
++          value: this.attrs.state.colorBy ?? COLOR_BY_NAME,
++          onchange: (e: Event) => {
++            const el = e.target as HTMLSelectElement;
++            this.attrs.onStateChange({
++              ...this.attrs.state,
++              colorBy: el.value,
++            });
++          },
++        },
++        [
++          m('option', {value: COLOR_BY_NAME}, nameLabel),
++          ...columns.map((c) => m('option', {value: c.name}, c.displayName)),
++        ],
++      ),
++    ];
++  }
++
++  // "Hide" popup: per colourable column, a checklist of its distinct values.
++  // Unticking a value adds a HIDE_FRAME filter that collapses those frames into
++  // their parent (e.g. hide all kernel frames, or one noisy library). The
++  // checkboxes are derived from the live filter list, so they stay in sync with
++  // filters added by hand in the bar.
++  private renderHideOptions() {
++    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
++    if (columns.length === 0 || this.attrs.data === undefined) {
++      return undefined;
++    }
++    return [
++      m('.pf-flamegraph-filter-bar-separator'),
++      m(
++        Popup,
++        {
++          trigger: m(Button, {
++            icon: 'visibility',
++            label: 'Hide',
++            compact: true,
++            active: this.showHideOptions,
++            onclick: () => {
++              this.showHideOptions = !this.showHideOptions;
++            },
++          }),
++          isOpen: this.showHideOptions,
++          onChange: (shouldOpen: boolean) => {
++            this.showHideOptions = shouldOpen;
++          },
++          position: PopupPosition.RightStart,
++          closeOnOutsideClick: true,
++          closeOnEscape: true,
++        },
++        this.renderHideOptionsContent(columns),
++      ),
++    ];
++  }
++
++  private renderHideOptionsContent(
++    columns: ReadonlyArray<{name: string; displayName: string}>,
++  ) {
++    const data = assertExists(this.attrs.data);
++    return m(
++      '.pf-flamegraph-hide-options',
++      {
++        style: {
++          maxHeight: '420px',
++          overflowY: 'auto',
++          padding: '8px 12px',
++          minWidth: '200px',
++        },
++      },
++      columns.map((c) => {
++        const values = distinctPropertyValues(data.nodes, c.name);
++        if (values.length === 0) return null;
++        return m(
++          '.pf-flamegraph-hide-group',
++          m(FormLabel, c.displayName),
++          values.map((v) =>
++            m(Checkbox, {
++              label: v === '' ? '(none)' : v,
++              checked: !this.isValueHidden(v),
++              onchange: () => this.toggleHiddenValue(v),
++            }),
++          ),
++        );
++      }),
+     );
+   }
+ 
++  // A value is "hidden" iff an exact-match HIDE_FRAME filter for it exists.
++  private hideFilterFor(value: string): string {
++    return `^${value}$`;
++  }
++
++  private isValueHidden(value: string): boolean {
++    const f = this.hideFilterFor(value);
++    return this.attrs.state.filters.some(
++      (x) => x.kind === 'HIDE_FRAME' && x.filter === f,
++    );
++  }
++
++  private toggleHiddenValue(value: string) {
++    const f = this.hideFilterFor(value);
++    const filters = this.isValueHidden(value)
++      ? this.attrs.state.filters.filter(
++          (x) => !(x.kind === 'HIDE_FRAME' && x.filter === f),
++        )
++      : this.attrs.state.filters.concat([{kind: 'HIDE_FRAME', filter: f}]);
++    this.attrs.onStateChange({...this.attrs.state, filters});
++  }
++
+   private renderTooltip() {
+     if (this.tooltipPos === undefined) {
+       return undefined;
+@@ -1562,6 +1754,20 @@ function addFilter(
+   };
+ }
+ 
++// Distinct values of property `key` across the nodes, sorted — the checklist
++// the "Hide" popup offers for a column.
++function distinctPropertyValues(
++  nodes: ReadonlyArray<FlamegraphNode>,
++  key: string,
++): string[] {
++  const seen = new Set<string>();
++  for (const n of nodes) {
++    const p = n.properties.get(key);
++    if (p !== undefined) seen.add(p.value);
++  }
++  return Array.from(seen).sort();
++}
++
+ // Split text into individual filters by finding filter type prefixes
+ // e.g. 'Show Stack: main Hide Frame: alloc' -> ['Show Stack: main', 'Hide Frame: alloc']
+ // e.g. 'SS: foo HF: bar' -> ['SS: foo', 'HF: bar']

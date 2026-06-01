@@ -59,6 +59,7 @@
     color: var(--pf-color-text);
     letter-spacing: -0.01em;
     font-variant-numeric: tabular-nums;
+    margin-right: 8px;
   }
 
   &__caption {
@@ -131,9 +132,9 @@
   &__legend {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px 14px;
-    font-size: var(--pf-font-size-s);
-    color: var(--pf-color-text-muted);
+    gap: 8px 18px;
+    font-size: 13px;
+    color: var(--pf-color-text);
     font-variant-numeric: tabular-nums;
   }
 
@@ -144,8 +145,8 @@
   }
 
   &__swatch {
-    width: 10px;
-    height: 10px;
+    width: 12px;
+    height: 12px;
     border-radius: 2px;
     flex-shrink: 0;
   }

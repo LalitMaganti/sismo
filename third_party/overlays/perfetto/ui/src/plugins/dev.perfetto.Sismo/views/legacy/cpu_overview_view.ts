@@ -21,17 +21,17 @@
 // between them is how idle the set was.
 
 import m from 'mithril';
-import type {Trace} from '../../../public/trace';
-import {Callout} from '../../../widgets/callout';
-import {Intent} from '../../../widgets/common';
-import type {ConcurrencyDist, CpuDetail, CpuSummary} from '../cpu_data';
-import {Meter, meterReadout} from '../../dev.perfetto.SismoWidgets/meter';
+import type {Trace} from '../../../../public/trace';
+import {Callout} from '../../../../widgets/callout';
+import {Intent} from '../../../../widgets/common';
+import type {ConcurrencyDist, CpuDetail, CpuSummary} from '../../cpu_data';
+import {Meter, meterReadout} from '../../../dev.perfetto.SismoWidgets/meter';
 import {
   renderQuestionBlock,
   renderSeeAllLink,
   renderStatCard,
   type StatCard,
-} from '../page_common';
+} from '../../page_common';
 import {CpuTriageView} from './cpu_triage_view';
 import {CpuBottleneckOverview} from './cpu_bottleneck_view';
 import {renderProcessTable, renderThreadTable} from './cpu_consumers_view';
@@ -39,8 +39,8 @@ import {
   renderHotMappingTable,
   renderHotSymbolTable,
 } from './cpu_functions_view';
-import type {PrivilegedSet} from '../privileged_set';
-import {fmtDuration, fmtPercent} from '../format';
+import type {PrivilegedSet} from '../../privileged_set';
+import {fmtDuration, fmtPercent} from '../../format';
 
 // Compact top-N shown on the Overview; the full lists live on the lens tabs.
 const TOP_N = 6;

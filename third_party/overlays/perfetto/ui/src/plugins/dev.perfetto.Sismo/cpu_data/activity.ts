@@ -13,7 +13,12 @@
 // limitations under the License.
 
 import type {Engine} from '../../../trace_processor/engine';
-import {LONG_NULL, NUM} from '../../../trace_processor/query_result';
+import {
+  LONG_NULL,
+  NUM,
+  NUM_NULL,
+  STR_NULL,
+} from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
 import {sampleScopePredicate} from './sql';
 
@@ -210,4 +215,66 @@ export async function loadActivityBoard(
   }
 
   return {hasData, numCpus, bucketWidthNs: width, buckets};
+}
+
+// Top threads active in an arbitrary time window [loTs, hiTs), by their runtime
+// clipped to that window. Drives the Activity board's "who was busy in this
+// slice" drill. `upid` lets the view mark which rows are the profiled set.
+export interface WindowThreadRow {
+  utid: number;
+  tid: number | null;
+  upid: number | null;
+  threadName: string;
+  processName: string | null;
+  runtimeNs: bigint;
+}
+
+export async function loadWindowConsumers(
+  engine: Engine,
+  loTs: bigint,
+  hiTs: bigint,
+  limit = 10,
+): Promise<WindowThreadRow[]> {
+  const res = await engine.query(`
+    SELECT
+      th.utid AS utid,
+      th.tid AS tid,
+      th.upid AS upid,
+      coalesce(th.name, '[utid ' || th.utid || ']') AS thread_name,
+      p.name AS process_name,
+      sum(min(sched.ts + sched.dur, ${hiTs}) - max(sched.ts, ${loTs})) AS rt
+    FROM sched
+    JOIN thread th USING (utid)
+    LEFT JOIN process p ON p.upid = th.upid
+    WHERE sched.dur > 0
+      AND sched.ts < ${hiTs}
+      AND sched.ts + sched.dur > ${loTs}
+      AND NOT (th.utid IN (SELECT utid FROM thread WHERE is_idle))
+    GROUP BY th.utid
+    ORDER BY rt DESC
+    LIMIT ${limit}
+  `);
+  const rows: WindowThreadRow[] = [];
+  for (
+    const it = res.iter({
+      utid: NUM,
+      tid: NUM_NULL,
+      upid: NUM_NULL,
+      thread_name: STR_NULL,
+      process_name: STR_NULL,
+      rt: LONG_NULL,
+    });
+    it.valid();
+    it.next()
+  ) {
+    rows.push({
+      utid: it.utid,
+      tid: it.tid,
+      upid: it.upid,
+      threadName: it.thread_name ?? '<unknown>',
+      processName: it.process_name,
+      runtimeNs: it.rt ?? 0n,
+    });
+  }
+  return rows;
 }

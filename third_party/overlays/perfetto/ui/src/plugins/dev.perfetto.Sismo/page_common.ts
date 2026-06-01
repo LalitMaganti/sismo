@@ -22,6 +22,7 @@ import {Icon} from '../../widgets/icon';
 import {Section} from '../../widgets/section';
 import {Tooltip} from '../../widgets/tooltip';
 import {Time} from '../../base/time';
+import {LONG_NULL} from '../../trace_processor/query_result';
 import {getThreadOrProcUri} from '../../public/utils';
 import {navToHash, type CpuView, type SismoDomain} from './nav_state';
 import type {PrivilegedSet} from './privileged_set';
@@ -92,6 +93,69 @@ export function goToTimeline(
   });
 }
 
+// The active span of a thread/process: the window of the trace where it was
+// actually on-CPU or sampled. This is the "region of importance" a link should
+// frame — dumping the user on a track at the current zoom hides where the work
+// happened. Returns undefined when the entity has no sched/sample rows.
+async function queryEntitySpan(
+  trace: Trace,
+  target: {upid?: number; utid?: number},
+): Promise<{start: bigint; end: bigint} | undefined> {
+  const utidClause =
+    target.utid !== undefined
+      ? `utid = ${target.utid}`
+      : target.upid !== undefined
+        ? `utid IN (SELECT utid FROM thread WHERE upid = ${target.upid})`
+        : undefined;
+  if (utidClause === undefined) return undefined;
+
+  // sched gives the on-CPU span; perf_sample covers sample-only threads with no
+  // scheduling data. Either source may be absent, so each is queried softly and
+  // the union taken.
+  const spanFrom = async (sql: string) => {
+    try {
+      const row = (await trace.engine.query(sql)).firstRow({
+        lo: LONG_NULL,
+        hi: LONG_NULL,
+      });
+      if (row.lo === null || row.hi === null || row.hi <= row.lo) {
+        return undefined;
+      }
+      return {lo: row.lo, hi: row.hi};
+    } catch {
+      return undefined;
+    }
+  };
+  const spans = [
+    await spanFrom(
+      `SELECT min(ts) AS lo, max(ts + dur) AS hi FROM sched WHERE ${utidClause}`,
+    ),
+    await spanFrom(
+      `SELECT min(ts) AS lo, max(ts) AS hi FROM perf_sample WHERE ${utidClause}`,
+    ),
+  ].filter((s): s is {lo: bigint; hi: bigint} => s !== undefined);
+  if (spans.length === 0) return undefined;
+  const start = spans.reduce((a, s) => (s.lo < a ? s.lo : a), spans[0].lo);
+  const end = spans.reduce((a, s) => (s.hi > a ? s.hi : a), spans[0].hi);
+  return {start, end};
+}
+
+// Reveal a thread/process AND frame the window where it was active, so the link
+// lands you on the region that matters rather than the current viewport. Falls
+// back to a plain track reveal if the span can't be determined.
+export function revealEntityWindow(
+  trace: Trace,
+  target: {upid?: number; utid?: number},
+): void {
+  const tracks = {
+    upids: target.upid !== undefined ? [target.upid] : undefined,
+    utids: target.utid !== undefined ? [target.utid] : undefined,
+  };
+  queryEntitySpan(trace, target)
+    .then((span) => revealInTimeline(trace, {...tracks, timeRange: span}))
+    .catch(() => revealInTimeline(trace, tracks));
+}
+
 // Switches the Sismo page to another domain, mirroring the in-page domain
 // selector. Lets the triage block hand off to the Latency domain.
 export function goToSismoDomain(trace: Trace, domain: SismoDomain): void {
@@ -157,7 +221,7 @@ export function renderProcessLink(
       href: '#!/viewer',
       onclick: (e: Event) => {
         e.preventDefault();
-        goToTimeline(trace, {upid});
+        revealEntityWindow(trace, {upid});
       },
     },
     name,
@@ -177,7 +241,7 @@ export function renderThreadLink(
       href: '#!/viewer',
       onclick: (e: Event) => {
         e.preventDefault();
-        goToTimeline(trace, {utid});
+        revealEntityWindow(trace, {utid});
       },
     },
     threadName,

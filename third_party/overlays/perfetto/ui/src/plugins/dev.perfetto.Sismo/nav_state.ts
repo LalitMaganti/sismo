@@ -25,6 +25,9 @@ export type SismoDomain = 'cpu' | 'latency' | 'memory';
 // Calltree (the Overview's lead deep-dive) → Activity (the time-quantized zoom
 // step toward the Timeline) → the remaining lens tabs, who → hardware → why.
 // Latency/Memory have a single view today (their `view` is always 'overview').
+// Non-'overview' keys are legacy-only routing: unreachable from CpuFeedView,
+// kept solely because views/legacy/ still calls renderSeeAllLink with these
+// literals. Collapse to 'overview' once views/legacy/ is excluded from the build.
 export type CpuView =
   | 'overview'
   | 'flamegraph'

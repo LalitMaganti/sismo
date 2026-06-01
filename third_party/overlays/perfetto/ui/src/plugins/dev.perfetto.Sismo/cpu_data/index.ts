@@ -17,12 +17,23 @@
 // tabs consume so importers keep a single `./cpu_data` entry point.
 
 export {
+  type FocusWindow,
+  tsRangeClause,
+  overlapClause,
+  clipDurExpr,
+  focusKey,
+} from './focus_window';
+
+export {
   type CallTree,
   type CallTreeNode,
+  type CallTreeDirection,
   type HeaviestFunctionRow,
+  type RepresentativeSample,
   type SampleListRow,
   loadCallTree,
   loadHeaviestFunctions,
+  loadRepresentativeSample,
   loadSampleList,
 } from './calltree';
 
@@ -37,26 +48,46 @@ export {
 
 export {
   type CoreActivityRow,
+  type CoreContentionRow,
   type CoreSeries,
+  type CoreThreadDetail,
+  type CoreThreadRow,
   type CpuBlameRow,
   type CpuCoreRow,
   type CpuIdleStateRow,
   type CpuProcessRow,
   type CpuThreadBlameRow,
   type CpuThreadRow,
+  type CpuRuntimeTotals,
   type ThreadStateRow,
   loadCoreActivity,
+  loadCoreContention,
   loadCoreSeries,
+  loadCoreThreads,
+  loadCpuTotals,
+  loadPerCore,
+  loadProcessRows,
+  loadThreadRows,
   loadThreadStates,
 } from './cores';
 
 export {
   type ActivityBoard,
   type ActivityBucket,
+  type WindowThreadRow,
   loadActivityBoard,
+  loadWindowConsumers,
 } from './activity';
 
 export {type CpuTriage, loadCpuTriage} from './triage';
+
+export {
+  type DrillLens,
+  type Observation,
+  type ObservationDrill,
+  type ObservationKind,
+  loadObservations,
+} from './observations';
 
 export {
   type HotMappingRow,
@@ -68,6 +99,7 @@ export {
   type TmaBucket,
   type TmaModel,
   computeTma,
+  loadMicroarch,
   loadMicroarchCounters,
   loadRealCycles,
 } from './microarch';

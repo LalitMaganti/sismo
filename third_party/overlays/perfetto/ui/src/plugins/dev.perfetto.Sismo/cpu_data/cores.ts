@@ -21,6 +21,12 @@ import {
 } from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
 import {privInClause, privNotInClause} from './sql';
+import {
+  clipDurExpr,
+  overlapClause,
+  tsRangeClause,
+  type FocusWindow,
+} from './focus_window';
 
 export interface CpuCoreRow {
   cpu: number;
@@ -43,6 +49,7 @@ export interface CpuProcessRow {
 export interface CpuThreadRow {
   utid: number;
   tid: number | null;
+  upid: number | null;
   threadName: string;
   processName: string | null;
   runtimeNs: bigint;
@@ -89,32 +96,71 @@ export interface CpuThreadBlameRow {
   blockedNs: bigint;
 }
 
+// Total non-idle CPU time in the window (or whole trace), and the profiled
+// set's slice of it. The denominator for "% of CPU" on the windowed Threads and
+// Cores tables — the preloaded whole-trace summary's total can't be reused once
+// a focus is set.
+export interface CpuRuntimeTotals {
+  totalNs: bigint;
+  privilegedNs: bigint | null;
+}
+
+export async function loadCpuTotals(
+  engine: Engine,
+  priv: PrivilegedSet,
+  window?: FocusWindow,
+): Promise<CpuRuntimeTotals> {
+  const clip = clipDurExpr(window, 'sched.ts', 'sched.dur');
+  const overlap = overlapClause(window, 'sched.ts', 'sched.dur');
+  const hasPriv = priv.upids.length > 0;
+  const privIn = privInClause(priv);
+  const res = await engine.query(`
+    SELECT
+      sum(${clip}) AS total,
+      sum(CASE WHEN thread.upid ${privIn} THEN ${clip} ELSE 0 END) AS priv
+    FROM sched
+    JOIN thread USING (utid)
+    WHERE sched.dur > 0
+      AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))${overlap}
+  `);
+  const r = res.firstRow({total: LONG_NULL, priv: LONG_NULL});
+  return {
+    totalNs: r.total ?? 0n,
+    privilegedNs: hasPriv ? (r.priv ?? 0n) : null,
+  };
+}
+
 export async function loadPerCore(
   engine: Engine,
   priv: PrivilegedSet,
+  window?: FocusWindow,
 ): Promise<CpuCoreRow[]> {
   // Aggregate by `ucpu` not `cpu` so multi-machine traces don't collapse CPUs
   // that share a number across machines.
   const privIn = privInClause(priv);
+  const bareOverlap = overlapClause(window, 'ts', 'dur');
+  const bareClip = clipDurExpr(window, 'ts', 'dur');
+  const overlap = overlapClause(window, 'sched.ts', 'sched.dur');
+  const clip = clipDurExpr(window, 'sched.ts', 'sched.dur');
   const res = await engine.query(`
     WITH sched_per_cpu AS (
       SELECT
         ucpu,
-        sum(dur) AS runtime
+        sum(${bareClip}) AS runtime
       FROM sched
       WHERE dur > 0
-        AND NOT (utid IN (SELECT utid FROM thread WHERE is_idle))
+        AND NOT (utid IN (SELECT utid FROM thread WHERE is_idle))${bareOverlap}
       GROUP BY ucpu
     ),
     priv_per_cpu AS (
       SELECT
         sched.ucpu AS ucpu,
-        sum(sched.dur) AS runtime
+        sum(${clip}) AS runtime
       FROM sched
       JOIN thread USING (utid)
       WHERE thread.upid ${privIn}
         AND sched.dur > 0
-        AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))
+        AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))${overlap}
       GROUP BY sched.ucpu
     )
     SELECT
@@ -161,22 +207,25 @@ export async function loadProcessRows(
   priv: PrivilegedSet,
   kind: 'privileged' | 'context',
   limit?: number,
+  window?: FocusWindow,
 ): Promise<CpuProcessRow[]> {
   if (kind === 'privileged' && priv.upids.length === 0) return [];
   const upidClause =
     kind === 'privileged' ? privInClause(priv) : privNotInClause(priv);
   const limitClause = limit !== undefined ? `LIMIT ${limit}` : '';
+  const clip = clipDurExpr(window, 'sched.ts', 'sched.dur');
+  const overlap = overlapClause(window, 'sched.ts', 'sched.dur');
   const res = await engine.query(`
     WITH per_process AS (
       SELECT
         thread.upid AS upid,
-        sum(sched.dur) AS runtime_ns
+        sum(${clip}) AS runtime_ns
       FROM sched
       JOIN thread USING (utid)
       WHERE thread.upid IS NOT NULL
         AND thread.upid ${upidClause}
         AND sched.dur > 0
-        AND NOT (utid IN (SELECT utid FROM thread WHERE is_idle))
+        AND NOT (utid IN (SELECT utid FROM thread WHERE is_idle))${overlap}
       GROUP BY thread.upid
     )
     SELECT
@@ -215,27 +264,31 @@ export async function loadThreadRows(
   priv: PrivilegedSet,
   kind: 'privileged' | 'context',
   limit?: number,
+  window?: FocusWindow,
 ): Promise<CpuThreadRow[]> {
   if (kind === 'privileged' && priv.upids.length === 0) return [];
   const upidClause =
     kind === 'privileged' ? privInClause(priv) : privNotInClause(priv);
   const limitClause = limit !== undefined ? `LIMIT ${limit}` : '';
+  const clip = clipDurExpr(window, 'sched.ts', 'sched.dur');
+  const overlap = overlapClause(window, 'sched.ts', 'sched.dur');
   const res = await engine.query(`
     WITH per_thread AS (
       SELECT
         sched.utid AS utid,
-        sum(sched.dur) AS runtime_ns
+        sum(${clip}) AS runtime_ns
       FROM sched
       JOIN thread USING (utid)
       WHERE thread.upid IS NOT NULL
         AND thread.upid ${upidClause}
         AND sched.dur > 0
-        AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))
+        AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))${overlap}
       GROUP BY sched.utid
     )
     SELECT
       thread.utid AS utid,
       thread.tid AS tid,
+      thread.upid AS upid,
       coalesce(thread.name, '[utid ' || thread.utid || ']') AS thread_name,
       process.name AS process_name,
       per_thread.runtime_ns AS runtime_ns
@@ -250,6 +303,7 @@ export async function loadThreadRows(
     const it = res.iter({
       utid: NUM,
       tid: NUM_NULL,
+      upid: NUM_NULL,
       thread_name: STR_NULL,
       process_name: STR_NULL,
       runtime_ns: LONG_NULL,
@@ -260,6 +314,7 @@ export async function loadThreadRows(
     rows.push({
       utid: it.utid,
       tid: it.tid,
+      upid: it.upid,
       threadName: it.thread_name ?? '<unknown>',
       processName: it.process_name,
       runtimeNs: it.runtime_ns ?? 0n,
@@ -479,28 +534,31 @@ export async function loadThreadStates(
   engine: Engine,
   priv: PrivilegedSet,
   limit = 100,
+  window?: FocusWindow,
 ): Promise<ThreadStateRow[]> {
   const upidFilter =
     priv.upids.length > 0 ? `AND th.upid IN (${priv.upids.join(',')})` : '';
+  const cd = clipDurExpr(window, 'ts.ts', 'ts.dur');
+  const overlap = overlapClause(window, 'ts.ts', 'ts.dur');
   const res = await engine.query(`
     SELECT
       th.utid AS utid,
       th.tid AS tid,
       coalesce(th.name, '[utid ' || th.utid || ']') AS thread_name,
       p.name AS process_name,
-      sum(CASE WHEN ts.state = 'Running' THEN ts.dur ELSE 0 END) AS running,
-      sum(CASE WHEN ts.state IN ('R', 'R+') THEN ts.dur ELSE 0 END) AS runnable,
-      sum(CASE WHEN ts.state = 'D' THEN ts.dur ELSE 0 END) AS uninterruptible,
-      sum(CASE WHEN ts.state = 'S' THEN ts.dur ELSE 0 END) AS sleeping,
+      sum(CASE WHEN ts.state = 'Running' THEN ${cd} ELSE 0 END) AS running,
+      sum(CASE WHEN ts.state IN ('R', 'R+') THEN ${cd} ELSE 0 END) AS runnable,
+      sum(CASE WHEN ts.state = 'D' THEN ${cd} ELSE 0 END) AS uninterruptible,
+      sum(CASE WHEN ts.state = 'S' THEN ${cd} ELSE 0 END) AS sleeping,
       sum(CASE WHEN ts.state NOT IN ('Running', 'R', 'R+', 'D', 'S')
-               THEN ts.dur ELSE 0 END) AS other,
+               THEN ${cd} ELSE 0 END) AS other,
       sum(CASE WHEN ts.state = 'Running' THEN 1 ELSE 0 END) AS num_run_slices
     FROM thread_state ts
     JOIN thread th USING (utid)
     LEFT JOIN process p USING (upid)
     WHERE ts.dur > 0
       AND NOT (th.utid IN (SELECT utid FROM thread WHERE is_idle))
-      ${upidFilter}
+      ${upidFilter}${overlap}
     GROUP BY th.utid
     ORDER BY running DESC
     LIMIT ${limit}
@@ -589,18 +647,37 @@ export interface CoreSeries {
 // busy% to *when* it was busy.
 export async function loadCoreSeries(
   engine: Engine,
+  priv?: PrivilegedSet,
   numBuckets = 48,
+  window?: FocusWindow,
 ): Promise<CoreSeries> {
-  const bounds = await engine.query(
-    `SELECT min(ts) AS lo, max(ts + dur) AS hi FROM sched WHERE dur > 0`,
-  );
-  const b = bounds.firstRow({lo: LONG_NULL, hi: LONG_NULL});
-  if (b.lo === null || b.hi === null || b.hi <= b.lo) {
-    return {numBuckets, byCpu: new Map()};
+  // When focused, the sparkline spans the window; otherwise the whole trace.
+  let lo: bigint;
+  let hi: bigint;
+  if (window !== undefined) {
+    lo = window.start;
+    hi = window.end;
+  } else {
+    const bounds = await engine.query(
+      `SELECT min(ts) AS lo, max(ts + dur) AS hi FROM sched WHERE dur > 0`,
+    );
+    const b = bounds.firstRow({lo: LONG_NULL, hi: LONG_NULL});
+    if (b.lo === null || b.hi === null || b.hi <= b.lo) {
+      return {numBuckets, byCpu: new Map()};
+    }
+    lo = b.lo;
+    hi = b.hi;
   }
-  const lo = b.lo;
-  const span = b.hi - lo;
+  const span = hi - lo;
   const width = span / BigInt(numBuckets) > 0n ? span / BigInt(numBuckets) : 1n;
+  // Scope to the profiled set when asked, so the sparklines read "your work's
+  // utilisation of this core over time" rather than the whole machine's.
+  const privClause =
+    priv !== undefined && priv.upids.length > 0
+      ? `AND sched.utid IN (
+           SELECT utid FROM thread WHERE upid IN (${priv.upids.join(',')})
+         )`
+      : '';
   const res = await engine.query(`
     WITH s AS (
       SELECT
@@ -611,6 +688,7 @@ export async function loadCoreSeries(
       JOIN cpu USING (ucpu)
       WHERE sched.dur > 0
         AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))
+        ${privClause}
     )
     SELECT cpu, bucket, sum(dur) AS busy
     FROM s
@@ -633,4 +711,144 @@ export async function loadCoreSeries(
     arr[it.bucket] = Math.max(0, Math.min(1, Number(it.busy ?? 0n) / widthNum));
   }
   return {numBuckets, byCpu};
+}
+
+// Per-core contention signals from sched: how many distinct threads shared the
+// core, and how many times a thread migrated onto it (its previous slice ran on
+// a different core). Machine-wide (not privileged-scoped) — this is about the
+// core, not your set. Keyed by cpu.
+export interface CoreContentionRow {
+  threads: number;
+  migrationsIn: number;
+}
+
+export async function loadCoreContention(
+  engine: Engine,
+  window?: FocusWindow,
+): Promise<Map<number, CoreContentionRow>> {
+  const byCpu = new Map<number, CoreContentionRow>();
+  const res = await engine
+    .query(`
+      WITH s AS (
+        SELECT
+          cpu.cpu AS cpu,
+          sched.utid AS utid,
+          lag(cpu.cpu) OVER (PARTITION BY sched.utid ORDER BY sched.ts) AS prev_cpu
+        FROM sched
+        JOIN cpu USING (ucpu)
+        WHERE sched.dur > 0
+          AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))${tsRangeClause(window, 'sched.ts')}
+      )
+      SELECT
+        cpu,
+        count(DISTINCT utid) AS threads,
+        sum(CASE WHEN prev_cpu IS NOT NULL AND prev_cpu != cpu THEN 1 ELSE 0 END)
+          AS migrations_in
+      FROM s
+      GROUP BY cpu
+    `)
+    .catch(() => undefined);
+  if (res === undefined) return byCpu;
+  for (
+    const it = res.iter({cpu: NUM_NULL, threads: NUM, migrations_in: NUM});
+    it.valid();
+    it.next()
+  ) {
+    if (it.cpu === null) continue;
+    byCpu.set(it.cpu, {threads: it.threads, migrationsIn: it.migrations_in});
+  }
+  return byCpu;
+}
+
+// Top threads that ran on each core, by their runtime on that specific core.
+// Drives the per-core "what ran here" drill-down. Keyed by cpu, each list
+// already truncated to `perCpuLimit` and runtime-descending.
+export interface CoreThreadRow {
+  utid: number;
+  tid: number | null;
+  threadName: string;
+  processName: string | null;
+  runtimeNs: bigint;
+}
+
+// The per-core drill, focused on the profiled set: `threads` are YOUR top
+// threads on the core (or the top threads overall when nothing is profiled);
+// `othersNs` is the time everything else spent on the core — a side total, not
+// the focus.
+export interface CoreThreadDetail {
+  threads: CoreThreadRow[];
+  othersNs: bigint;
+}
+
+export async function loadCoreThreads(
+  engine: Engine,
+  priv: PrivilegedSet,
+  perCpuLimit = 6,
+  window?: FocusWindow,
+): Promise<Map<number, CoreThreadDetail>> {
+  const byCpu = new Map<number, CoreThreadDetail>();
+  const clip = clipDurExpr(window, 'sched.ts', 'sched.dur');
+  const overlap = overlapClause(window, 'sched.ts', 'sched.dur');
+  const res = await engine
+    .query(`
+      WITH per AS (
+        SELECT cpu.cpu AS cpu, sched.utid AS utid, sum(${clip}) AS rt
+        FROM sched
+        JOIN cpu USING (ucpu)
+        WHERE sched.dur > 0
+          AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))${overlap}
+        GROUP BY cpu.cpu, sched.utid
+      )
+      SELECT
+        per.cpu AS cpu,
+        per.utid AS utid,
+        th.upid AS upid,
+        th.tid AS tid,
+        coalesce(th.name, '[utid ' || th.utid || ']') AS thread_name,
+        p.name AS process_name,
+        per.rt AS rt
+      FROM per
+      JOIN thread th USING (utid)
+      LEFT JOIN process p ON p.upid = th.upid
+      ORDER BY per.cpu, per.rt DESC
+    `)
+    .catch(() => undefined);
+  if (res === undefined) return byCpu;
+  const privSet = new Set(priv.upids);
+  const hasPriv = priv.upids.length > 0;
+  for (
+    const it = res.iter({
+      cpu: NUM_NULL,
+      utid: NUM,
+      upid: NUM_NULL,
+      tid: NUM_NULL,
+      thread_name: STR_NULL,
+      process_name: STR_NULL,
+      rt: LONG_NULL,
+    });
+    it.valid();
+    it.next()
+  ) {
+    if (it.cpu === null) continue;
+    let d = byCpu.get(it.cpu);
+    if (d === undefined) {
+      d = {threads: [], othersNs: 0n};
+      byCpu.set(it.cpu, d);
+    }
+    const mine = hasPriv ? it.upid !== null && privSet.has(it.upid) : true;
+    if (mine) {
+      if (d.threads.length < perCpuLimit) {
+        d.threads.push({
+          utid: it.utid,
+          tid: it.tid,
+          threadName: it.thread_name ?? '<unknown>',
+          processName: it.process_name,
+          runtimeNs: it.rt ?? 0n,
+        });
+      }
+    } else {
+      d.othersNs += it.rt ?? 0n;
+    }
+  }
+  return byCpu;
 }

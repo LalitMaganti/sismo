@@ -21,6 +21,7 @@ import {
 } from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
 import {frameNameExpr, sampleScopePredicate} from './sql';
+import {tsRangeClause, type FocusWindow} from './focus_window';
 
 export interface HotSymbolRow {
   name: string;
@@ -62,6 +63,7 @@ export const EMPTY_MICROARCH: MicroarchData = {
 export async function loadMicroarch(
   engine: Engine,
   priv: PrivilegedSet,
+  window?: FocusWindow,
 ): Promise<MicroarchData> {
   // perf_sample is only populated when a sampling data source ran (linux.perf
   // on Linux, sismo's mach_sampler on macOS). Missing table or empty table
@@ -82,14 +84,15 @@ export async function loadMicroarch(
            SELECT utid FROM thread WHERE upid IN (${priv.upids.join(',')})
          )`
       : '';
+  const win = tsRangeClause(window, 's.ts');
 
   const totalsRes = await engine.query(`
     SELECT
       (SELECT count() FROM perf_sample s
-        WHERE s.callsite_id IS NOT NULL ${scope}
+        WHERE s.callsite_id IS NOT NULL ${scope}${win}
       ) AS total_with_stack,
       (SELECT count() FROM perf_sample s
-        WHERE s.callsite_id IS NOT NULL ${scope}
+        WHERE s.callsite_id IS NOT NULL ${scope}${win}
           AND s.callsite_id IN (
             SELECT c.id
             FROM stack_profile_callsite c
@@ -128,7 +131,7 @@ export async function loadMicroarch(
     JOIN stack_profile_callsite c ON c.id = s.callsite_id
     JOIN stack_profile_frame spf ON spf.id = c.frame_id
     LEFT JOIN stack_profile_mapping spm ON spm.id = spf.mapping
-    WHERE s.callsite_id IS NOT NULL ${scope}
+    WHERE s.callsite_id IS NOT NULL ${scope}${win}
     GROUP BY 1, 2
     ORDER BY samples DESC
     LIMIT 20
@@ -159,7 +162,7 @@ export async function loadMicroarch(
     JOIN stack_profile_callsite c ON c.id = s.callsite_id
     JOIN stack_profile_frame spf ON spf.id = c.frame_id
     LEFT JOIN stack_profile_mapping spm ON spm.id = spf.mapping
-    WHERE s.callsite_id IS NOT NULL ${scope}
+    WHERE s.callsite_id IS NOT NULL ${scope}${win}
     GROUP BY spm.name
     ORDER BY samples DESC
     LIMIT 20
@@ -256,13 +259,18 @@ export interface MicroarchFuncRow {
   name: string;
   mappingName: string | null;
   samples: number;
-  instructions: number | null;
-  cycles: number | null;
-  ipc: number | null;
-  // Stalled cycles as a fraction of this function's cycles.
-  feStallPct: number | null;
-  beStallPct: number | null;
+  // Per-function microarchitecture, derived by crediting each sample interval's
+  // counter delta to the stack sampled at the interval's end, then running the
+  // same computeTma() the whole-process bar uses. APPROXIMATE — see the note on
+  // FUNC_TMA_MIN_SAMPLES. null when the function has too few samples to derive
+  // anything stable (we show the sample count but no ratios).
+  tma: TmaModel | null;
 }
+
+// Below this many samples a function's counter sums are too noisy to derive
+// IPC/TMA/MPKI from — the per-interval deltas haven't averaged out — so we leave
+// `tma` null rather than print a number that looks precise but isn't.
+const FUNC_TMA_MIN_SAMPLES = 30;
 
 export interface MicroarchCounters {
   state: MicroarchState;
@@ -277,9 +285,11 @@ export async function loadMicroarchCounters(
   engine: Engine,
   priv: PrivilegedSet,
   limit = 100,
+  window?: FocusWindow,
 ): Promise<MicroarchCounters> {
   await engine.query('INCLUDE PERFETTO MODULE linux.perf.counters;');
   const scope = sampleScopePredicate(priv);
+  const win = tsRangeClause(window, 's.ts');
 
   // Counter values are CUMULATIVE per thread: the BPF collector accumulates and
   // carries the running per-thread total on every sample, and the counters land
@@ -293,14 +303,17 @@ export async function loadMicroarchCounters(
   const samplesRes = await engine.query(`
     SELECT count(DISTINCT s.sample_id) AS n
     FROM linux_perf_sample_with_counters s
-    WHERE s.callsite_id IS NOT NULL ${scope}
+    WHERE s.callsite_id IS NOT NULL ${scope}${win}
   `);
   const totalSamples = samplesRes.firstRow({n: NUM}).n;
 
-  // Counter totals in long form: per-thread max (cumulative counters; see
-  // above) summed over threads, one row per counter name. The catalog maps each
-  // name to its role, so there's no per-counter SQL column to maintain.
-  const totRes = await engine.query(`
+  // Counter totals in long form, one row per counter name; the catalog maps
+  // each name to its role. Whole-trace: per-thread max (cumulative counters;
+  // see above) summed over threads. Windowed: the same consecutive-sample delta
+  // accounting as the per-function breakdown, restricted to the window.
+  const totQuery =
+    window === undefined
+      ? `
     WITH pt AS (
       SELECT s.utid AS utid, t.name AS cname, max(s.counter_value) AS v
       FROM linux_perf_sample_with_counters s
@@ -308,8 +321,22 @@ export async function loadMicroarchCounters(
       WHERE s.callsite_id IS NOT NULL ${scope}
       GROUP BY s.utid, t.name
     )
-    SELECT cname, sum(v) AS total FROM pt GROUP BY cname
-  `);
+    SELECT cname, sum(v) AS total FROM pt GROUP BY cname`
+      : `
+    WITH d AS (
+      SELECT
+        t.name AS cname,
+        s.ts AS ts,
+        s.counter_value - lag(s.counter_value) OVER (
+          PARTITION BY s.utid, s.track_id ORDER BY s.ts
+        ) AS dv
+      FROM linux_perf_sample_with_counters s
+      JOIN track t ON t.id = s.track_id
+      WHERE s.callsite_id IS NOT NULL ${scope}
+    )
+    SELECT cname, sum(CASE WHEN dv > 0 THEN dv ELSE 0 END) AS total
+    FROM d WHERE 1${tsRangeClause(window, 'ts')} GROUP BY cname`;
+  const totRes = await engine.query(totQuery);
   const roleMap = new Map<CounterRole, number>();
   for (
     const it = totRes.iter({cname: STR_NULL, total: NUM_NULL});
@@ -342,6 +369,7 @@ export async function loadMicroarchCounters(
       SELECT
         s.callsite_id AS callsite_id,
         s.sample_id AS sample_id,
+        s.ts AS ts,
         t.name AS cname,
         s.counter_value - lag(s.counter_value) OVER (
           PARTITION BY s.utid, s.track_id ORDER BY s.ts
@@ -354,14 +382,24 @@ export async function loadMicroarchCounters(
       ${frameNameExpr('spf')} AS name,
       spm.name AS mapping_name,
       count(DISTINCT d.sample_id) AS samples,
-      sum(CASE WHEN cname = 'instructions' THEN dv END) AS instructions,
       sum(CASE WHEN cname = 'cpu-cycles' THEN dv END) AS cycles,
-      sum(CASE WHEN cname = 'stalled-cycles-frontend' THEN dv END) AS fe,
-      sum(CASE WHEN cname = 'stalled-cycles-backend' THEN dv END) AS be
+      sum(CASE WHEN cname = 'instructions' THEN dv END) AS instructions,
+      sum(CASE WHEN cname = 'cache-misses' THEN dv END) AS cache_miss,
+      sum(CASE WHEN cname = 'branch-misses' THEN dv END) AS branch_miss,
+      sum(CASE WHEN cname = 'stalled-cycles-frontend' THEN dv END) AS stall_fe,
+      sum(CASE WHEN cname = 'stalled-cycles-backend' THEN dv END) AS stall_be,
+      sum(CASE WHEN cname = 'op-retired' THEN dv END) AS arm_retired,
+      sum(CASE WHEN cname = 'op-spec' THEN dv END) AS arm_spec,
+      sum(CASE WHEN cname = 'stall-slot-frontend' THEN dv END) AS arm_fe,
+      sum(CASE WHEN cname = 'stall-slot-backend' THEN dv END) AS arm_be,
+      sum(CASE WHEN cname = 'slots' THEN dv END) AS intel_slots,
+      sum(CASE WHEN cname = 'topdown-slots-retired' THEN dv END) AS intel_retired,
+      sum(CASE WHEN cname = 'topdown-fetch-bubbles' THEN dv END) AS intel_fe
     FROM d
     JOIN stack_profile_callsite c ON c.id = d.callsite_id
     JOIN stack_profile_frame spf ON spf.id = c.frame_id
     LEFT JOIN stack_profile_mapping spm ON spm.id = spf.mapping
+    WHERE 1${tsRangeClause(window, 'd.ts')}
     GROUP BY 1, 2
     ORDER BY cycles IS NULL, cycles DESC
     LIMIT ${limit}
@@ -372,24 +410,48 @@ export async function loadMicroarchCounters(
       name: STR_NULL,
       mapping_name: STR_NULL,
       samples: NUM,
-      instructions: NUM_NULL,
       cycles: NUM_NULL,
-      fe: NUM_NULL,
-      be: NUM_NULL,
+      instructions: NUM_NULL,
+      cache_miss: NUM_NULL,
+      branch_miss: NUM_NULL,
+      stall_fe: NUM_NULL,
+      stall_be: NUM_NULL,
+      arm_retired: NUM_NULL,
+      arm_spec: NUM_NULL,
+      arm_fe: NUM_NULL,
+      arm_be: NUM_NULL,
+      intel_slots: NUM_NULL,
+      intel_retired: NUM_NULL,
+      intel_fe: NUM_NULL,
     });
     it.valid();
     it.next()
   ) {
-    const cyc = it.cycles;
+    // Same role catalog as the whole-process totals, so the per-function bar
+    // uses the identical computeTma strategy + self-guards (a bucket >100%
+    // bails). Only roles whose counter was recorded go in.
+    const roles = new Map<CounterRole, number>();
+    const put = (role: CounterRole, v: number | null) => {
+      if (v !== null) roles.set(role, v);
+    };
+    put('cycles', it.cycles);
+    put('instructions', it.instructions);
+    put('cache-miss', it.cache_miss);
+    put('branch-miss', it.branch_miss);
+    put('stall-frontend', it.stall_fe);
+    put('stall-backend', it.stall_be);
+    put('arm-retired', it.arm_retired);
+    put('arm-spec', it.arm_spec);
+    put('arm-slot-frontend', it.arm_fe);
+    put('arm-slot-backend', it.arm_be);
+    put('intel-slots', it.intel_slots);
+    put('intel-retired', it.intel_retired);
+    put('intel-fetch-bubbles', it.intel_fe);
     perFunc.push({
       name: it.name ?? '[unsymbolised]',
       mappingName: it.mapping_name,
       samples: it.samples,
-      instructions: it.instructions,
-      cycles: cyc,
-      ipc: it.instructions !== null && cyc ? it.instructions / cyc : null,
-      feStallPct: it.fe !== null && cyc ? it.fe / cyc : null,
-      beStallPct: it.be !== null && cyc ? it.be / cyc : null,
+      tma: it.samples >= FUNC_TMA_MIN_SAMPLES ? computeTma(roles) : null,
     });
   }
   return {state: 'ok', totalSamples, roles: roleMap, perFunc};
@@ -449,7 +511,14 @@ const STRATEGIES: ReadonlyArray<TmaStrategy> = [
       const spec = r.get('arm-spec');
       const fe = r.get('arm-slot-frontend');
       const be = r.get('arm-slot-backend');
-      if (!cycles || ret == null || spec == null || fe == null || be == null) {
+      if (
+        cycles === undefined ||
+        cycles === 0 ||
+        ret == null ||
+        spec == null ||
+        fe == null ||
+        be == null
+      ) {
         return null;
       }
       const slots = cycles * ARM_SLOT_WIDTH;
@@ -475,7 +544,9 @@ const STRATEGIES: ReadonlyArray<TmaStrategy> = [
       const slots = r.get('intel-slots');
       const ret = r.get('intel-retired');
       const fe = r.get('intel-fetch-bubbles');
-      if (!slots || ret == null || fe == null) return null;
+      if (slots === undefined || slots === 0 || ret == null || fe == null) {
+        return null;
+      }
       const retiring = ret / slots;
       const frontend = fe / slots;
       const backend = Math.max(0, 1 - retiring - frontend);
@@ -494,7 +565,9 @@ const STRATEGIES: ReadonlyArray<TmaStrategy> = [
       const cycles = r.get('cycles');
       const fe = r.get('stall-frontend');
       const be = r.get('stall-backend');
-      if (!cycles || (fe == null && be == null)) return null;
+      if (cycles === undefined || cycles === 0 || (fe == null && be == null)) {
+        return null;
+      }
       const ff = (fe ?? 0) / cycles;
       const bf = (be ?? 0) / cycles;
       return [
@@ -541,7 +614,10 @@ export function computeTma(roles: RoleTotals): TmaModel | null {
     tier,
     buckets,
     dominant,
-    ipc: instructions !== null && cycles ? instructions / cycles : null,
+    ipc:
+      instructions !== null && cycles !== null && cycles !== 0
+        ? instructions / cycles
+        : null,
     instructions,
     cycles,
     cacheMpki: mpki(roles.get('cache-miss') ?? null, instructions),
@@ -549,49 +625,104 @@ export function computeTma(roles: RoleTotals): TmaModel | null {
   };
 }
 
-// Real cycles delivered, per thread and per process, from the eBPF cpu-cycles
-// counter. The counter is cumulative per thread, so a thread's total is its max
-// reading; processes sum their threads. This is the cpufreq-free replacement
-// for the cpu_cycles (frequency × time) megacycles. Empty on traces without
-// perf counters.
+// Real cycles and instructions delivered, per thread and per process, from the
+// eBPF cpu-cycles / instructions counters. Each counter is cumulative per
+// thread, so a thread's total is its max reading; processes sum their threads.
+// `byUtid`/`byUpid` are cycles (the cpufreq-free replacement for the cpu_cycles
+// megacycles); `instrByUtid`/`instrByUpid` drive per-entity IPC. Empty on
+// traces without perf counters.
 export interface RealCycles {
   byUtid: Map<number, bigint>;
   byUpid: Map<number, bigint>;
+  instrByUtid: Map<number, bigint>;
+  instrByUpid: Map<number, bigint>;
 }
 
-export async function loadRealCycles(engine: Engine): Promise<RealCycles> {
-  const empty: RealCycles = {byUtid: new Map(), byUpid: new Map()};
+export async function loadRealCycles(
+  engine: Engine,
+  window?: FocusWindow,
+): Promise<RealCycles> {
+  const empty: RealCycles = {
+    byUtid: new Map(),
+    byUpid: new Map(),
+    instrByUtid: new Map(),
+    instrByUpid: new Map(),
+  };
   const has = await engine
     .query(`SELECT name FROM sqlite_master WHERE name = 'perf_sample' LIMIT 1`)
     .catch(() => undefined);
   if (has === undefined || has.numRows() === 0) return empty;
   try {
     await engine.query('INCLUDE PERFETTO MODULE linux.perf.counters;');
-    const res = await engine.query(`
-      WITH pt AS (
-        SELECT s.utid AS utid, max(s.counter_value) AS cyc
+    // Whole-trace: a thread's cumulative counter total is just its max reading.
+    // Windowed: the counters are cumulative, so the work inside the window is
+    // the sum of positive consecutive-sample deltas whose sample falls in it —
+    // the same delta accounting the Activity board uses per bucket.
+    const ptCte =
+      window === undefined
+        ? `pt AS (
+        SELECT s.utid AS utid, t.name AS cname, max(s.counter_value) AS v
         FROM linux_perf_sample_with_counters s
         JOIN track t ON t.id = s.track_id
-        WHERE t.name = 'cpu-cycles' AND s.callsite_id IS NOT NULL
-        GROUP BY s.utid
-      )
-      SELECT pt.utid AS utid, th.upid AS upid, pt.cyc AS cyc
-      FROM pt JOIN thread th USING (utid)
+        WHERE t.name IN ('cpu-cycles', 'instructions')
+          AND s.callsite_id IS NOT NULL
+        GROUP BY s.utid, t.name
+      )`
+        : `deltas AS (
+        SELECT
+          s.utid AS utid,
+          t.name AS cname,
+          s.ts AS ts,
+          s.counter_value - lag(s.counter_value)
+            OVER (PARTITION BY s.utid, s.track_id ORDER BY s.ts) AS delta
+        FROM linux_perf_sample_with_counters s
+        JOIN track t ON t.id = s.track_id
+        WHERE t.name IN ('cpu-cycles', 'instructions')
+          AND s.callsite_id IS NOT NULL
+      ),
+      pt AS (
+        SELECT utid, cname, sum(CASE WHEN delta > 0 THEN delta ELSE 0 END) AS v
+        FROM deltas
+        WHERE 1${tsRangeClause(window, 'ts')}
+        GROUP BY utid, cname
+      )`;
+    const res = await engine.query(`
+      WITH ${ptCte}
+      SELECT
+        pt.utid AS utid,
+        th.upid AS upid,
+        sum(CASE WHEN cname = 'cpu-cycles' THEN v ELSE 0 END) AS cyc,
+        sum(CASE WHEN cname = 'instructions' THEN v ELSE 0 END) AS instr
+      FROM pt
+      JOIN thread th USING (utid)
+      GROUP BY pt.utid
     `);
     const byUtid = new Map<number, bigint>();
     const byUpid = new Map<number, bigint>();
+    const instrByUtid = new Map<number, bigint>();
+    const instrByUpid = new Map<number, bigint>();
+    const add = (m: Map<number, bigint>, k: number, v: bigint) =>
+      m.set(k, (m.get(k) ?? 0n) + v);
     for (
-      const it = res.iter({utid: NUM, upid: NUM_NULL, cyc: LONG_NULL});
+      const it = res.iter({
+        utid: NUM,
+        upid: NUM_NULL,
+        cyc: LONG_NULL,
+        instr: LONG_NULL,
+      });
       it.valid();
       it.next()
     ) {
       const cyc = it.cyc ?? 0n;
+      const instr = it.instr ?? 0n;
       byUtid.set(it.utid, cyc);
+      instrByUtid.set(it.utid, instr);
       if (it.upid !== null) {
-        byUpid.set(it.upid, (byUpid.get(it.upid) ?? 0n) + cyc);
+        add(byUpid, it.upid, cyc);
+        add(instrByUpid, it.upid, instr);
       }
     }
-    return {byUtid, byUpid};
+    return {byUtid, byUpid, instrByUtid, instrByUpid};
   } catch {
     return empty;
   }

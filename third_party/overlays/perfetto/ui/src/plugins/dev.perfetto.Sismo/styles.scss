@@ -219,6 +219,9 @@
   }
 
   &__stat-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     font-size: var(--pf-font-size-s);
     font-weight: 500;
     text-transform: uppercase;
@@ -237,7 +240,7 @@
 
   &__help-icon {
     font-size: var(--pf-font-size-m);
-    margin-left: 6px;
+    flex: 0 0 auto;
     color: var(--pf-color-text-muted);
     opacity: 0.6;
     cursor: default;
@@ -297,6 +300,38 @@
     grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
     gap: 12px;
     align-content: start;
+  }
+
+  // "Your work | Full system" segmented toggle (Cores utilisation basis).
+  &__seg-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+    font-size: var(--pf-font-size-s);
+  }
+
+  &__seg {
+    padding: 3px 12px;
+    border: 1px solid var(--pf-color-border);
+    background: var(--pf-color-background);
+    color: var(--pf-color-text-muted);
+    cursor: pointer;
+    font-size: var(--pf-font-size-s);
+
+    &:first-of-type {
+      border-radius: 4px 0 0 4px;
+    }
+    &:last-of-type {
+      border-radius: 0 4px 4px 0;
+      border-left: none;
+    }
+
+    &--active {
+      background: #3478f6;
+      color: #fff;
+      border-color: #3478f6;
+    }
   }
 
   // Drill-link row at the foot of an Overview question block (reveal-in-
@@ -662,6 +697,8 @@
     border: 1px solid var(--pf-color-border);
     border-radius: 4px;
     overflow: hidden;
+    // Columns are draggable to brush a time range; don't select page text.
+    user-select: none;
   }
 
   // Column with the fill pushed to the bottom, so bar height reads upward.
@@ -675,6 +712,11 @@
 
     &:hover {
       background: rgba(128, 128, 128, 0.15);
+    }
+
+    // The slice whose "who was busy" detail is open below the board.
+    &--selected {
+      background: rgba(52, 120, 246, 0.28);
     }
   }
 
@@ -721,5 +763,212 @@
     min-width: 0;
     background: #3478f6;
     border-radius: 1px;
+  }
+}
+
+// ---- CPU observation feed --------------------------------------------------
+// The ranked card stream that replaces the CPU tabs. Each card pairs a headline
+// QUESTION with a contrast Meter, an expand-to-evidence lens and a timeline
+// jump. Cards are laid out one per row by the CardStack; these rules style the
+// per-card chrome (head row, kind chip, actions, inline evidence).
+.pf-sismo-feed {
+  width: 100%;
+
+  &__stack {
+    width: 100%;
+  }
+
+  &__intro {
+    margin-bottom: 16px;
+  }
+
+  &__intro-title {
+    font-size: var(--pf-font-size-l);
+    font-weight: 600;
+  }
+
+  &__intro-sub {
+    margin-top: 4px;
+    max-width: 70ch;
+    color: var(--pf-color-text-muted);
+    font-size: var(--pf-font-size-s);
+    line-height: 1.45;
+  }
+
+  &__foot {
+    margin-top: 12px;
+    color: var(--pf-color-text-muted);
+    font-size: var(--pf-font-size-s);
+  }
+}
+
+.pf-sismo-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+
+  &__head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  &__kind {
+    flex: 0 0 auto;
+  }
+
+  &__question {
+    flex: 1 1 auto;
+    font-size: var(--pf-font-size-l);
+    font-weight: 500;
+    min-width: 0;
+  }
+
+  &__approx {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex: 0 0 auto;
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    cursor: help;
+  }
+
+  &__actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  &__evidence {
+    border-top: 1px solid var(--pf-color-border);
+    padding-top: 12px;
+  }
+
+  &__lens-caption {
+    margin-bottom: 8px;
+    color: var(--pf-color-text-muted);
+    font-size: var(--pf-font-size-s);
+  }
+
+  &__flamegraph {
+    height: 480px;
+    min-height: 320px;
+  }
+
+  &__muted {
+    color: var(--pf-color-text-muted);
+  }
+
+  &__row--focus {
+    font-weight: 600;
+  }
+}
+
+// ---- CPU landing (question blocks) -----------------------------------------
+// The always-populated landing: a stack of question-blocks, each stating what
+// the trace says about one question, with a drill into its deep-dive tab.
+.pf-sismo-landing {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+
+  &__intro {
+    margin-bottom: 4px;
+  }
+
+  &__intro-title {
+    font-size: var(--pf-font-size-l);
+    font-weight: 600;
+  }
+
+  &__intro-sub {
+    margin-top: 4px;
+    max-width: 72ch;
+    color: var(--pf-color-text-muted);
+    font-size: var(--pf-font-size-s);
+    line-height: 1.45;
+  }
+}
+
+.pf-sismo-qblock {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+
+  &__q {
+    font-size: var(--pf-font-size-l);
+    font-weight: 500;
+  }
+
+
+  &__route {
+    margin-top: 2px;
+  }
+
+  &__deeper {
+    margin-top: 2px;
+  }
+}
+
+// A labelled sub-section within a question block (e.g. "By function").
+.pf-sismo-subsection {
+  margin-top: 12px;
+
+  &__title {
+    font-size: var(--pf-font-size-s);
+    font-weight: 600;
+    color: var(--pf-color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 6px;
+  }
+}
+
+// A breakdown DataGrid embedded in a question block, plus the mini-bar that
+// renders inside its "share" cell.
+.pf-sismo-grid {
+  // Cap the height so the grid doesn't try to fill the page; it scrolls
+  // internally past a handful of rows.
+  max-height: 300px;
+  margin-top: 8px;
+
+  & + & {
+    margin-top: 14px;
+  }
+}
+
+.pf-sismo-cellbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+
+  &__track {
+    flex: 1 1 auto;
+    min-width: 40px;
+    height: 8px;
+    background: var(--pf-color-background);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  &__fill {
+    height: 100%;
+    background: #3478f6;
+  }
+
+  &__pct {
+    flex: 0 0 auto;
+    min-width: 40px;
+    text-align: right;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
   }
 }

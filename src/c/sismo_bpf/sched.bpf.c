@@ -78,6 +78,71 @@ struct {
   __uint(max_entries, 1 << 22);  // 4 MiB
 } events SEC(".maps");
 
+// Kernel-symbol interning. ksym_ids maps a kernel address to the id we assigned
+// it; LRU so a long session self-bounds — an evicted address is just re-resolved
+// and gets a fresh id, harmless because userspace dedups by name. ksym_next is
+// the monotonic id allocator (value 0 is reserved for "unresolved").
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 8192);
+  __type(key, __u64);
+  __type(value, __u32);
+} ksym_ids SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u64);
+} ksym_next SEC(".maps");
+
+// Per-CPU scratch for the kernel stack: bpf_get_stack writes the addresses here
+// (kept off the 512-byte BPF stack and out of the shipped record); the resolve
+// loop then fills `id` in place.
+struct sismo_kstack {
+  __u64 addr[SISMO_MAX_KERNEL_STACK];
+  __u32 id[SISMO_MAX_KERNEL_STACK];
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct sismo_kstack);
+} kstack_scratch SEC(".maps");
+
+// Resolve a kernel address to a symbol id, assigning + emitting a SISMO_EVT_KSYM
+// definition on first sight. The address is used only as a lookup key and to
+// drive the in-kernel `%pB` kallsyms lookup; it never leaves the kernel, so the
+// KASLR slide can't be reconstructed from the trace. Returns 0 if no id could
+// be assigned (userspace renders such frames as "[kernel]").
+static __always_inline __u32 resolve_ksym(__u64 addr) {
+  __u32 *idp = bpf_map_lookup_elem(&ksym_ids, &addr);
+  if (idp)
+    return *idp;
+
+  __u32 zero = 0;
+  __u64 *next = bpf_map_lookup_elem(&ksym_next, &zero);
+  if (!next)
+    return 0;
+  // Atomic so concurrent CPUs get distinct ids. A race can still mint two ids
+  // for one address (both miss the lookup); that yields two definitions of the
+  // same name, which userspace collapses — no correctness issue.
+  __u32 id = (__u32)__sync_fetch_and_add(next, 1) + 1;
+  bpf_map_update_elem(&ksym_ids, &addr, &id, BPF_ANY);
+
+  struct sismo_ksym_rec *k = bpf_ringbuf_reserve(&events, sizeof(*k), 0);
+  if (k) {
+    k->type = SISMO_EVT_KSYM;
+    k->id = id;
+    // %pB: kallsyms symbol for a return address (it subtracts 1 before the
+    // lookup). Emits "name+0xoff/0xsize"; userspace keeps the bare name.
+    __u64 args[1] = {addr};
+    bpf_snprintf(k->name, sizeof(k->name), "%pB", args, sizeof(args));
+    bpf_ringbuf_submit(k, 0);
+  }
+  return id;
+}
+
 static __always_inline __u32 target_tgid(void) {
   __u32 zero = 0;
   __u32 *t = bpf_map_lookup_elem(&cfg, &zero);
@@ -176,6 +241,25 @@ int on_tick(struct bpf_perf_event_data *ctx) {
   if (!tc)
     return 0;
 
+  // Kernel stack first (no BPF_F_USER_STACK): empty for samples that fired in
+  // pure userspace, otherwise the in-kernel frames the tick interrupted. Each
+  // address is resolved to an id now — committing any new KSYM definitions to
+  // the ringbuf *before* the sample below, so userspace sees a frame's name
+  // defined ahead of the sample that uses it.
+  __u32 zero = 0;
+  struct sismo_kstack *ks = bpf_map_lookup_elem(&kstack_scratch, &zero);
+  __u32 nr_kernel = 0;
+  if (ks) {
+    long kn = bpf_get_stack(ctx, ks->addr, sizeof(ks->addr), 0);
+    nr_kernel = (kn > 0) ? (__u32)(kn / 8) : 0;
+    if (nr_kernel > SISMO_MAX_KERNEL_STACK)
+      nr_kernel = SISMO_MAX_KERNEL_STACK;
+    // A real bounded loop, not #pragma unroll: resolve_ksym inlines a ringbuf
+    // reserve + bpf_snprintf, so 64 unrolled copies blow the 512-byte BPF stack.
+    for (int i = 0; i < SISMO_MAX_KERNEL_STACK && i < nr_kernel; i++)
+      ks->id[i] = resolve_ksym(ks->addr[i]);
+  }
+
   struct sismo_sample_rec *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (!e)
     return 0;
@@ -183,13 +267,15 @@ int on_tick(struct bpf_perf_event_data *ctx) {
   e->hdr.tid = BPF_CORE_READ(cur, pid);
   e->hdr.pid = tgid;
   e->hdr.cpu = bpf_get_smp_processor_id();
-  e->hdr._pad = 0;
+  e->hdr.nr_kernel_frames = nr_kernel;
   e->hdr.ts = bpf_ktime_get_ns();
 #pragma unroll
   for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
     e->counters[s] = tc->v[s];
   long n = bpf_get_stack(ctx, e->stack, sizeof(e->stack), BPF_F_USER_STACK);
   e->hdr.nr_frames = (n > 0) ? (__u32)(n / 8) : 0;
+  for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
+    e->kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
   bpf_ringbuf_submit(e, 0);
   return 0;
 }

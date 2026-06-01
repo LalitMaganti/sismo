@@ -110,6 +110,16 @@ fn roleGroup(role: pmu.Role) u8 {
     };
 }
 
+// The slot-based Top-Down set: only meaningful when the `slots` fixed counter
+// is present (slots is the denominator; retired/fetch_bubbles are its numerators
+// and feed no other strategy). Gated together on CPUID-enumerated slots support.
+fn isTopdownRole(role: pmu.Role) bool {
+    return switch (role) {
+        .slots, .retired, .fetch_bubbles => true,
+        else => false,
+    };
+}
+
 const CpuId = struct { family: u16, model: u16, stepping: u8 };
 
 // Reads the running CPU's vendor/family/model/stepping from /proc/cpuinfo.
@@ -146,9 +156,74 @@ fn cpuinfoField(text: []const u8, key: []const u8) ?u64 {
     return null;
 }
 
+fn cpuidLeaf(leaf: u32, subleaf: u32) [4]u32 {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [a] "={eax}" (eax),
+          [b] "={ebx}" (ebx),
+          [cc] "={ecx}" (ecx),
+          [d] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [sub] "{ecx}" (subleaf),
+    );
+    return .{ eax, ebx, ecx, edx };
+}
+
+// Whether the slots fixed counter + PERF_METRICS Top-Down are present, read from
+// CPUID leaf 0x0A (Architectural Performance Monitoring) — the SAME enumeration
+// the kernel/perf use (`union cpuid10_eax/edx` in arch/x86; slots is fixed
+// counter 3). Version >= 5 with fixed-counter-3 in the ECX support bitmap is the
+// architectural signal. A KVM guest exposing only a v2 PMU reports false here
+// even where the host counter would physically pass through — which is correct:
+// perf likewise refuses `slots`/--topdown in that case. We trust the
+// enumeration, never a counts-it-tick probe.
+fn topdownEnumerated() bool {
+    if (builtin.cpu.arch != .x86_64) return false;
+    const r = cpuidLeaf(0x0A, 0);
+    const version = r[0] & 0xff; // eax.split.version_id
+    const fixed_support = r[2]; // ecx: per-fixed-counter support bitmap (v>=5)
+    return version >= 5 and (fixed_support & (@as(u32, 1) << 3)) != 0;
+}
+
+// vvvvvvvvvvvvvvvvvvvvvvvvvvvvvv  TEMPORARY HACK  vvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+// DO NOT GENERALISE. DELETE once the L1 TMA UI is validated on real ICL+ silicon
+// or a mediated-vPMU host. This exists ONLY to unblock UI work on one dev VM.
+//
+// That VM spoofs its CPUID as family 6 / model 134 / stepping 0 so perf sees a
+// non-hybrid PMU; KVM consequently exposes only a v2 vPMU, so CPUID 0x0A (and
+// thus topdownEnumerated(), correctly) reports NO slots fixed counter. But the
+// real silicon underneath is Golden Cove, which DOES service raw 0x400/0x2c2/
+// 0x19c via passthrough (verified: r0400 == 6*cycles). So the slot-based TMA
+// counters physically work even though nothing enumerates them.
+//
+// This forces exactly those counters for that one spoofed signature, gated on
+// the hypervisor bit so it can never fire on real Snowridge hardware. It is a
+// lie about the PMU; the honest path is topdownEnumerated() below.
+const VM_HACK_COUNTERS = [_]Counter{
+    .{ .group = 0, .src = .{ .raw = 0x3c }, .name = "cpu-cycles" },
+    .{ .group = 0, .src = .{ .raw = 0xc0 }, .name = "instructions" },
+    .{ .group = 0, .src = .{ .raw = 0x400 }, .name = "slots" },
+    .{ .group = 0, .src = .{ .raw = 0x2c2 }, .name = "topdown-slots-retired" },
+    .{ .group = 0, .src = .{ .raw = 0x19c }, .name = "topdown-fetch-bubbles" },
+    .{ .group = 1, .src = .{ .raw = 0x412e }, .name = "cache-misses" },
+    .{ .group = 1, .src = .{ .raw = 0xc5 }, .name = "branch-misses" },
+};
+fn vmSlotsHackCounters() ?[]const Counter {
+    if (builtin.cpu.arch != .x86_64) return null;
+    const id = readCpuId() orelse return null;
+    if (id.family != 6 or id.model != 134 or id.stepping != 0) return null;
+    if ((cpuidLeaf(1, 0)[2] & (@as(u32, 1) << 31)) == 0) return null; // hypervisor bit
+    return &VM_HACK_COUNTERS;
+}
+// ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  TEMPORARY HACK  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 // The active candidate counters for this host: on x86 resolved from the perfmon
 // table by CPUID (into `buf`), else the comptime fallback for the build arch.
 fn selectCounters(buf: *[c.SISMO_MAX_COUNTERS]Counter) []const Counter {
+    if (vmSlotsHackCounters()) |list| return list; // TEMPORARY — see hack above.
     if (builtin.cpu.arch == .x86_64) {
         if (countersFromTable(buf)) |list| return list;
     }
@@ -169,9 +244,14 @@ fn countersFromTable(buf: *[c.SISMO_MAX_COUNTERS]Counter) ?[]const Counter {
         if (!std.mem.eql(u8, m.core, "Atom")) break; // prefer P-core / non-hybrid
     }
     const m = best orelse return null;
+    // Trust the PMU's own enumeration: if the slots fixed counter isn't present,
+    // drop the whole slot-based Top-Down set (matching perf), keeping only the
+    // counters the hardware actually advertises.
+    const td = topdownEnumerated();
     var n: usize = 0;
     for (m.events) |ev| {
         if (n >= buf.len) break;
+        if (isTopdownRole(ev.role) and !td) continue;
         buf[n] = .{
             .group = roleGroup(ev.role),
             .src = .{ .raw = @intCast(ev.config) },
@@ -192,7 +272,10 @@ pub const Stats = struct {
 };
 
 /// Frame interning key: a module-relative pc within a given mapping.
-const FrameKey = struct { mapping_iid: u64, rel_pc: u64 };
+// `name_iid` is 0 for the usual offline-symbolized frame (named later from
+// mapping + rel_pc) and non-zero for frames we name inline — kernel frames,
+// whose name is interned into function_names and whose rel_pc is 0.
+const FrameKey = struct { mapping_iid: u64, rel_pc: u64, name_iid: u64 };
 
 /// Per-sequence callstack interning state. Mirrors the iids written into the
 /// trace's InternedData tables so each entry is emitted exactly once; reset
@@ -201,11 +284,13 @@ const FrameKey = struct { mapping_iid: u64, rel_pc: u64 };
 const Interner = struct {
     paths: std.StringHashMapUnmanaged(u64) = .empty,
     build_ids: std.StringHashMapUnmanaged(u64) = .empty, // raw build-id bytes -> iid
+    func_names: std.StringHashMapUnmanaged(u64) = .empty, // function name -> iid
     mappings: std.AutoHashMapUnmanaged(u64, u64) = .empty, // map.start -> iid
     frames: std.AutoHashMapUnmanaged(FrameKey, u64) = .empty,
     callstacks: std.StringHashMapUnmanaged(u64) = .empty, // frame-id bytes -> iid
     next_path: u64 = 1,
     next_build_id: u64 = 1,
+    next_func_name: u64 = 1,
     next_mapping: u64 = 1,
     next_frame: u64 = 1,
     next_callstack: u64 = 1,
@@ -213,9 +298,11 @@ const Interner = struct {
     fn reset(self: *Interner, gpa: std.mem.Allocator) void {
         freeKeys(&self.paths, gpa);
         freeKeys(&self.build_ids, gpa);
+        freeKeys(&self.func_names, gpa);
         freeKeys(&self.callstacks, gpa);
         self.paths.deinit(gpa);
         self.build_ids.deinit(gpa);
+        self.func_names.deinit(gpa);
         self.mappings.deinit(gpa);
         self.frames.deinit(gpa);
         self.callstacks.deinit(gpa);
@@ -252,6 +339,14 @@ pub const Capture = struct {
     last_maps_ns: u64,
     interner: Interner,
 
+    /// Session-global kernel-symbol dictionary: BPF-assigned id -> name. Fed by
+    /// SISMO_EVT_KSYM records. Unlike `interner` this is NOT reset between
+    /// incremental-state-cleared sequences — the BPF program defines each id
+    /// once for the whole recording, so a later sequence must still resolve ids
+    /// it saw defined in an earlier one. Names are owned by `ksym_arena`.
+    ksym_names: std.AutoHashMapUnmanaged(u32, []const u8),
+    ksym_arena: std.heap.ArenaAllocator,
+
     /// The active candidate counters for this host (perfmon table on x86, else
     /// the comptime fallback), backed by `counters_buf` when table-derived.
     counters: []const Counter,
@@ -287,6 +382,8 @@ pub const Capture = struct {
             .target_pid = target_pid,
             .maps = null,
             .maps_tried = false,
+            .ksym_names = .empty,
+            .ksym_arena = std.heap.ArenaAllocator.init(gpa),
             .last_maps_ns = 0,
             .interner = .{},
             .counters = &.{},
@@ -421,6 +518,8 @@ pub const Capture = struct {
         self.perf_fds.deinit(self.gpa);
         self.acc.deinit();
         self.interner.reset(self.gpa);
+        self.ksym_names.deinit(self.gpa);
+        self.ksym_arena.deinit();
         if (self.maps) |*m| m.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
@@ -428,6 +527,13 @@ pub const Capture = struct {
     }
 
     fn handle(self: *Capture, hdr: *const c.struct_sismo_hdr) void {
+        // KSYM definitions are recorded unconditionally (even before the source
+        // is active): the BPF program emits each id once for the whole session,
+        // so we must capture every definition or later samples can't resolve it.
+        if (hdr.type == c.SISMO_EVT_KSYM) {
+            self.handleKsym(@ptrCast(@alignCast(hdr)));
+            return;
+        }
         if (hdr.type != c.SISMO_EVT_SAMPLE) return;
         self.samples += 1;
         const rec: *const c.struct_sismo_sample_rec = @ptrCast(@alignCast(hdr));
@@ -447,6 +553,24 @@ pub const Capture = struct {
             self.emitDefaults();
         }
         self.emitSample(rec);
+    }
+
+    /// Record a kernel-symbol definition. Stores id -> bare function name in the
+    /// session dictionary, stripping the `+0xoff/0xsize` suffix `%pB` appends
+    /// (symbol-relative, so KASLR-safe, but the flamegraph wants the name). Each
+    /// id is defined once; repeats are ignored.
+    fn handleKsym(self: *Capture, rec: *const c.struct_sismo_ksym_rec) void {
+        const gop = self.ksym_names.getOrPut(self.gpa, rec.id) catch return;
+        if (gop.found_existing) return;
+
+        var name: []const u8 = &rec.name;
+        if (std.mem.indexOfScalar(u8, name, 0)) |z| name = name[0..z];
+        if (std.mem.indexOfScalar(u8, name, '+')) |p| name = name[0..p];
+
+        gop.value_ptr.* = self.ksym_arena.allocator().dupe(u8, name) catch {
+            _ = self.ksym_names.remove(rec.id);
+            return;
+        };
     }
 
     fn emitDefaults(self: *Capture) void {
@@ -552,46 +676,82 @@ pub const Capture = struct {
         self.maps = fresh;
     }
 
-    /// Resolve each user PC to (mapping, file-offset), interning the frames and
-    /// the callstack. Returns the callstack iid, or 0 if no frame resolved.
+    /// Intern the sample's full callstack and return its iid (0 if empty).
+    ///
+    /// The frame_ids list is "bottom frame first" (root first, leaf last) — the
+    /// order trace_processor assigns depth in, taking the last frame as the leaf
+    /// the sample's callsite points to. BPF hands us each section leaf-first, so
+    /// we flip each before appending. Kernel frames sit above (are called from)
+    /// the user section — a syscall/interrupt boundary — so they come after the
+    /// user frames, making the kernel leaf the innermost frame.
     fn internCallstack(self: *Capture, rec: *const c.struct_sismo_sample_rec, idw: *ProtoWriter) u64 {
-        self.ensureMaps(rec.hdr.ts);
-        if (self.maps == null) return 0;
+        var combined: [c.SISMO_MAX_STACK + c.SISMO_MAX_KERNEL_STACK]u64 = undefined;
+        var total: usize = 0;
 
-        const nr: usize = @min(rec.hdr.nr_frames, @as(u32, @intCast(c.SISMO_MAX_STACK)));
-        var fids: [c.SISMO_MAX_STACK]u64 = undefined;
-        var n: usize = 0;
-        var reparsed = false;
-        var i: usize = 0;
-        while (i < nr) : (i += 1) {
-            const pc = rec.stack[i];
-            if (pc == 0) continue;
-            var m = self.maps.?.find(pc);
-            if (m == null and !reparsed) {
-                // A miss may be a freshly dlopen()'d library — reparse once.
-                reparsed = true;
-                self.reparseMaps(rec.hdr.ts);
-                m = self.maps.?.find(pc);
+        // User section: resolve each PC to (mapping, file-offset). Skipped when
+        // the target's maps couldn't be parsed; kernel frames can still stand.
+        self.ensureMaps(rec.hdr.ts);
+        if (self.maps != null) {
+            const nr: usize = @min(rec.hdr.nr_frames, @as(u32, @intCast(c.SISMO_MAX_STACK)));
+            var fids: [c.SISMO_MAX_STACK]u64 = undefined;
+            var n: usize = 0;
+            var reparsed = false;
+            var i: usize = 0;
+            while (i < nr) : (i += 1) {
+                const pc = rec.stack[i];
+                if (pc == 0) continue;
+                var m = self.maps.?.find(pc);
+                if (m == null and !reparsed) {
+                    // A miss may be a freshly dlopen()'d library — reparse once.
+                    reparsed = true;
+                    self.reparseMaps(rec.hdr.ts);
+                    m = self.maps.?.find(pc);
+                }
+                const mm = m orelse continue;
+                // rel_pc is the absolute pc; paired with load_bias = base_avma
+                // (see internMapping), `rel_pc - load_bias` is the image-relative
+                // address the symbolizer resolves, with a positive per-module base.
+                const rel_pc = pc;
+                const mapping_iid = self.internMapping(mm, idw) catch return 0;
+                const frame_iid = self.internFrame(.{ .mapping_iid = mapping_iid, .rel_pc = rel_pc, .name_iid = 0 }, idw) catch return 0;
+                fids[n] = frame_iid;
+                n += 1;
             }
-            const mm = m orelse continue;
-            // rel_pc is the absolute pc; paired with load_bias = base_avma (see
-            // internMapping), `rel_pc - load_bias` is the image-relative address
-            // the symbolizer resolves, with a positive per-module base.
-            const rel_pc = pc;
-            const mapping_iid = self.internMapping(mm, idw) catch return 0;
-            const frame_iid = self.internFrame(.{ .mapping_iid = mapping_iid, .rel_pc = rel_pc }, idw) catch return 0;
-            fids[n] = frame_iid;
-            n += 1;
+            std.mem.reverse(u64, fids[0..n]);
+            for (fids[0..n]) |fid| {
+                combined[total] = fid;
+                total += 1;
+            }
         }
-        if (n == 0) return 0;
-        // BPF hands us the stack leaf-first (stack[0] = innermost PC), but
-        // Callstack.frame_ids is "bottom frame first" — root (outermost)
-        // first, leaf last. trace_processor assigns depth in that order and
-        // takes the last frame as the leaf the sample's callsite_id points
-        // to; writing leaf-first inverts the tree and pins all self time on
-        // the outermost frame (_start). Flip to bottom-first.
-        std.mem.reverse(u64, fids[0..n]);
-        return self.internCallstackIds(fids[0..n], idw) catch 0;
+
+        // Kernel section: each id names a frame in the [kernel.kallsyms] mapping
+        // (rel_pc 0, name inline). Unknown ids — a definition we never saw, or a
+        // kallsyms miss — fall back to "[kernel]".
+        const knr: usize = @min(rec.hdr.nr_kernel_frames, @as(u32, @intCast(c.SISMO_MAX_KERNEL_STACK)));
+        if (knr > 0) {
+            var kfids: [c.SISMO_MAX_KERNEL_STACK]u64 = undefined;
+            var kn: usize = 0;
+            var kmap: u64 = 0; // 0 = not yet interned (iids start at 1)
+            var i: usize = 0;
+            while (i < knr) : (i += 1) {
+                const id = rec.kernel_ids[i];
+                if (id == 0) continue;
+                if (kmap == 0) kmap = self.internKernelMapping(idw) catch return 0;
+                const name = self.ksym_names.get(id) orelse "[kernel]";
+                const name_iid = self.internFuncName(name, idw) catch return 0;
+                const frame_iid = self.internFrame(.{ .mapping_iid = kmap, .rel_pc = 0, .name_iid = name_iid }, idw) catch return 0;
+                kfids[kn] = frame_iid;
+                kn += 1;
+            }
+            std.mem.reverse(u64, kfids[0..kn]);
+            for (kfids[0..kn]) |fid| {
+                combined[total] = fid;
+                total += 1;
+            }
+        }
+
+        if (total == 0) return 0;
+        return self.internCallstackIds(combined[0..total], idw) catch 0;
     }
 
     /// Intern `bytes` into `map`, emitting an InternedString { iid=1, str=2 }
@@ -627,6 +787,10 @@ pub const Capture = struct {
         return self.internString(&self.interner.build_ids, &self.interner.next_build_id, 16, raw, idw);
     }
 
+    fn internFuncName(self: *Capture, name: []const u8, idw: *ProtoWriter) !u64 {
+        return self.internString(&self.interner.func_names, &self.interner.next_func_name, 5, name, idw);
+    }
+
     fn internMapping(self: *Capture, m: *const proc_maps.Mapping, idw: *ProtoWriter) !u64 {
         const gop = try self.interner.mappings.getOrPut(self.gpa, m.start);
         if (gop.found_existing) return gop.value_ptr.*;
@@ -657,16 +821,39 @@ pub const Capture = struct {
         return iid;
     }
 
+    /// The synthetic mapping every kernel frame shares. Named "[kernel.kallsyms]"
+    /// so trace_processor classifies the frames as kernel; it carries no address
+    /// range or build-id, since kernel frames are named inline (function_name_id)
+    /// rather than symbolized offline. Keyed by the sentinel start 0 — real
+    /// mappings never start at 0.
+    fn internKernelMapping(self: *Capture, idw: *ProtoWriter) !u64 {
+        const gop = try self.interner.mappings.getOrPut(self.gpa, 0);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const iid = self.interner.next_mapping;
+        self.interner.next_mapping += 1;
+        gop.value_ptr.* = iid;
+        const path_iid = try self.internPath("[kernel.kallsyms]", idw);
+        var mp = ProtoWriter.init(self.gpa);
+        defer mp.deinit();
+        try mp.writeUint64(1, iid);
+        try mp.writeUint64(7, path_iid);
+        try idw.writeMessage(19, mp.bytes());
+        return iid;
+    }
+
     fn internFrame(self: *Capture, key: FrameKey, idw: *ProtoWriter) !u64 {
         const gop = try self.interner.frames.getOrPut(self.gpa, key);
         if (gop.found_existing) return gop.value_ptr.*;
         const iid = self.interner.next_frame;
         self.interner.next_frame += 1;
         gop.value_ptr.* = iid;
-        // InternedData.frames (6): Frame { iid=1, mapping_id=3, rel_pc=4 }.
+        // InternedData.frames (6): Frame { iid=1, function_name_id=2,
+        // mapping_id=3, rel_pc=4 }. function_name_id is set only for inline-named
+        // (kernel) frames; offline-symbolized user frames leave it 0.
         var f = ProtoWriter.init(self.gpa);
         defer f.deinit();
         try f.writeUint64(1, iid);
+        if (key.name_iid != 0) try f.writeUint64(2, key.name_iid);
         try f.writeUint64(3, key.mapping_iid);
         try f.writeUint64(4, key.rel_pc);
         try idw.writeMessage(6, f.bytes());

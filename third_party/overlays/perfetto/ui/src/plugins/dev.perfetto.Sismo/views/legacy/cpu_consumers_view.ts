@@ -17,35 +17,64 @@
 // system noise.
 
 import m from 'mithril';
-import type {Trace} from '../../../public/trace';
-import {Section} from '../../../widgets/section';
-import {Card} from '../../../widgets/card';
-import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
-import {EmptyState} from '../../../widgets/empty_state';
-import {Tabs} from '../../../widgets/tabs';
+import type {Trace} from '../../../../public/trace';
+import {Section} from '../../../../widgets/section';
+import {Card} from '../../../../widgets/card';
+import {Grid, GridCell, GridHeaderCell} from '../../../../widgets/grid';
+import {EmptyState} from '../../../../widgets/empty_state';
+import {Tabs} from '../../../../widgets/tabs';
+import {Anchor} from '../../../../widgets/anchor';
 import {
+  goToSismoDomain,
   renderProcessLink,
   renderStatCard,
   renderThreadLink,
   type StatCard,
-} from '../page_common';
+} from '../../page_common';
 import type {
   CpuDetail,
   CpuProcessRow,
   CpuSummary,
   CpuThreadRow,
+  FocusWindow,
   RealCycles,
   ThreadStateRow,
-} from '../cpu_data';
-import {loadRealCycles, loadThreadStates} from '../cpu_data';
-import {MeterBar, type MeterColor} from '../../dev.perfetto.SismoWidgets/meter';
-import type {PrivilegedSet} from '../privileged_set';
-import {fmtCount, fmtDuration, fmtMegacycles, fmtPercent} from '../format';
+} from '../../cpu_data';
+import {
+  loadCpuTotals,
+  loadProcessRows,
+  loadRealCycles,
+  loadThreadRows,
+  loadThreadStates,
+} from '../../cpu_data';
+import {MeterBar, type MeterColor} from '../../../dev.perfetto.SismoWidgets/meter';
+import type {PrivilegedSet} from '../../privileged_set';
+import {
+  fmtCount,
+  fmtDuration,
+  fmtIpc,
+  fmtMegacycles,
+  fmtPercent,
+} from '../../format';
 
 interface CpuConsumersViewAttrs {
   readonly trace: Trace;
   readonly data: CpuDetail;
   readonly priv: PrivilegedSet;
+  // The shared focus window; when set, the consumer tables, denominators and
+  // state breakdown are all recomputed for that region.
+  readonly focus?: FocusWindow;
+}
+
+// The consumer tables' data source: the whole-trace rows borrowed from
+// CpuDetail, or a windowed reload. `summary` carries the matching total so the
+// "% of CPU" denominator tracks the window.
+interface ConsumerRows {
+  privProc: ReadonlyArray<CpuProcessRow>;
+  ctxProc: ReadonlyArray<CpuProcessRow>;
+  privThread: ReadonlyArray<CpuThreadRow>;
+  ctxThread: ReadonlyArray<CpuThreadRow>;
+  summary: CpuSummary;
 }
 
 // State → meter colour, shared by the per-thread breakdown bars and the legend
@@ -69,9 +98,11 @@ export class CpuConsumersView
   private consumersTab: 'processes' | 'threads' = 'threads';
   private threadStates?: ThreadStateRow[];
   private cycles?: RealCycles;
+  private rows?: ConsumerRows;
 
   oninit({attrs}: m.CVnode<CpuConsumersViewAttrs>): void {
-    loadThreadStates(attrs.trace.engine, attrs.priv, 25)
+    const {trace, data: d, priv, focus} = attrs;
+    loadThreadStates(trace.engine, priv, 25, focus)
       .then((rows) => {
         this.threadStates = rows;
         m.redraw();
@@ -80,18 +111,54 @@ export class CpuConsumersView
         this.threadStates = [];
         m.redraw();
       });
-    loadRealCycles(attrs.trace.engine)
+    loadRealCycles(trace.engine, focus)
       .then((c) => {
         this.cycles = c;
         m.redraw();
       })
       .catch(() => {});
+    if (focus === undefined) {
+      // Whole-trace: reuse the rows the page already loaded into CpuDetail.
+      this.rows = {
+        privProc: d.privilegedProcesses,
+        ctxProc: d.topContextProcesses,
+        privThread: d.privilegedThreads,
+        ctxThread: d.topContextThreads,
+        summary: d.summary,
+      };
+    } else {
+      Promise.all([
+        loadProcessRows(trace.engine, priv, 'privileged', undefined, focus),
+        loadProcessRows(trace.engine, priv, 'context', 20, focus),
+        loadThreadRows(trace.engine, priv, 'privileged', undefined, focus),
+        loadThreadRows(trace.engine, priv, 'context', 20, focus),
+        loadCpuTotals(trace.engine, priv, focus),
+      ])
+        .then(([privProc, ctxProc, privThread, ctxThread, totals]) => {
+          this.rows = {
+            privProc,
+            ctxProc,
+            privThread,
+            ctxThread,
+            // Denominators scoped to the window; counts stay whole-trace (they
+            // describe the trace, not the window).
+            summary: {
+              ...d.summary,
+              totalRuntimeNs: totals.totalNs,
+              privilegedRuntimeNs: totals.privilegedNs,
+            },
+          };
+          m.redraw();
+        })
+        .catch(() => {});
+    }
   }
 
   view({attrs}: m.CVnode<CpuConsumersViewAttrs>): m.Children {
     const {trace, data: d} = attrs;
     const hasPriv =
       d.privilegedProcesses.length > 0 || d.privilegedThreads.length > 0;
+    const rows = this.rows;
     return [
       m(
         Section,
@@ -103,28 +170,35 @@ export class CpuConsumersView
             : 'Heaviest CPU consumers in the trace. No record-time marker found ' +
               '— your processes are not differentiated from the rest.',
         },
-        m(
-          '.pf-sismo-page__stat-row',
-          summaryCards(d, hasPriv).map(renderStatCard),
-        ),
-        m(Tabs, {
-          activeTabKey: this.consumersTab,
-          onTabChange: (key) => {
-            this.consumersTab = key as 'processes' | 'threads';
-          },
-          tabs: [
-            {
-              key: 'threads',
-              title: 'Threads',
-              content: this.renderThreadPane(trace, d),
-            },
-            {
-              key: 'processes',
-              title: 'Processes',
-              content: this.renderProcessPane(trace, d),
-            },
-          ],
-        }),
+        rows === undefined
+          ? m(EmptyState, {
+              icon: 'hourglass_empty',
+              title: 'Loading consumers…',
+            })
+          : [
+              m(
+                '.pf-sismo-page__stat-row',
+                summaryCards(rows, hasPriv).map(renderStatCard),
+              ),
+              m(Tabs, {
+                activeTabKey: this.consumersTab,
+                onTabChange: (key) => {
+                  this.consumersTab = key as 'processes' | 'threads';
+                },
+                tabs: [
+                  {
+                    key: 'threads',
+                    title: 'Threads',
+                    content: this.renderThreadPane(trace, rows),
+                  },
+                  {
+                    key: 'processes',
+                    title: 'Processes',
+                    content: this.renderProcessPane(trace, rows),
+                  },
+                ],
+              }),
+            ],
       ),
       this.renderStateBreakdown(trace),
     ];
@@ -139,11 +213,12 @@ export class CpuConsumersView
     return m(
       Section,
       {
-        title: 'Where threads spent their time',
+        title: 'Where threads spent their time, and how well',
         subtitle:
-          'Per thread, the split of tracked time between running on a core and ' +
-          'the off-CPU states (waiting for a core, blocked on I/O, asleep). ' +
-          'Click a thread to open it in the timeline.',
+          'Per thread: the split of tracked time between running and the ' +
+          'off-CPU states (waiting for a core, blocked on I/O, asleep), plus ' +
+          'how productive the on-CPU time was — IPC and effective clock from ' +
+          'the hardware counters. Click a thread to open it in the timeline.',
       },
       rows === undefined
         ? m(EmptyState, {
@@ -152,42 +227,56 @@ export class CpuConsumersView
           })
         : [
             renderStateLegend(),
-            renderThreadStateTable(trace, rows, this.cycles?.byUtid),
+            renderThreadStateTable(trace, rows, this.cycles),
+            offCpuHeavy(rows) &&
+              m(
+                '.pf-sismo-page__question-footer',
+                m(
+                  Anchor,
+                  {
+                    href: '#!/sismo/latency',
+                    icon: 'arrow_forward',
+                    onclick: (e: Event) => {
+                      e.preventDefault();
+                      goToSismoDomain(trace, 'latency');
+                    },
+                  },
+                  'Lots of off-CPU time (waiting, blocked, asleep)? The ' +
+                    'Latency view explains what they were waiting on',
+                ),
+              ),
           ],
     );
   }
 
-  private renderProcessPane(trace: Trace, d: CpuDetail): m.Children {
-    if (
-      d.privilegedProcesses.length === 0 &&
-      d.topContextProcesses.length === 0
-    ) {
+  private renderProcessPane(trace: Trace, rows: ConsumerRows): m.Children {
+    if (rows.privProc.length === 0 && rows.ctxProc.length === 0) {
       return m(EmptyState, {icon: 'apps', title: 'No process-level CPU data'});
     }
     return m(
       '.pf-sismo-page__tab-panes',
-      d.privilegedProcesses.length > 0 &&
+      rows.privProc.length > 0 &&
         m(
           '.pf-sismo-page__tab-pane',
           m('.pf-sismo-page__tab-pane-label', 'Your processes'),
-          renderProcessTable(trace, d.summary, d.privilegedProcesses),
+          renderProcessTable(trace, rows.summary, rows.privProc),
         ),
-      d.topContextProcesses.length > 0 &&
+      rows.ctxProc.length > 0 &&
         m(
           '.pf-sismo-page__tab-pane',
           m(
             '.pf-sismo-page__tab-pane-label',
-            d.privilegedProcesses.length > 0
+            rows.privProc.length > 0
               ? 'Other processes (top 20)'
               : 'Top processes by CPU time',
           ),
-          renderProcessTable(trace, d.summary, d.topContextProcesses),
+          renderProcessTable(trace, rows.summary, rows.ctxProc),
         ),
     );
   }
 
-  private renderThreadPane(trace: Trace, d: CpuDetail): m.Children {
-    if (d.privilegedThreads.length === 0 && d.topContextThreads.length === 0) {
+  private renderThreadPane(trace: Trace, rows: ConsumerRows): m.Children {
+    if (rows.privThread.length === 0 && rows.ctxThread.length === 0) {
       return m(EmptyState, {
         icon: 'developer_board',
         title: 'No thread-level CPU data',
@@ -195,45 +284,47 @@ export class CpuConsumersView
     }
     return m(
       '.pf-sismo-page__tab-panes',
-      d.privilegedThreads.length > 0 &&
+      rows.privThread.length > 0 &&
         m(
           '.pf-sismo-page__tab-pane',
           m('.pf-sismo-page__tab-pane-label', 'Your threads'),
-          renderThreadTable(trace, d.summary, d.privilegedThreads),
+          renderThreadTable(trace, rows.summary, rows.privThread),
         ),
-      d.topContextThreads.length > 0 &&
+      rows.ctxThread.length > 0 &&
         m(
           '.pf-sismo-page__tab-pane',
           m(
             '.pf-sismo-page__tab-pane-label',
-            d.privilegedThreads.length > 0
+            rows.privThread.length > 0
               ? 'Other threads (top 20)'
               : 'Top threads by CPU time',
           ),
-          renderThreadTable(trace, d.summary, d.topContextThreads),
+          renderThreadTable(trace, rows.summary, rows.ctxThread),
         ),
     );
   }
 }
 
 // Headline scorecards above the consumer tables: how many threads/processes
-// ran, the single busiest thread's share, and (when profiling) your slice.
-function summaryCards(d: CpuDetail, hasPriv: boolean): StatCard[] {
-  const total = Number(d.summary.totalRuntimeNs ?? 0n);
+// ran, the single busiest thread's share, and (when profiling) your slice. When
+// a focus is set, the rows + denominators come scoped to the window.
+function summaryCards(rows: ConsumerRows, hasPriv: boolean): StatCard[] {
+  const s = rows.summary;
+  const total = Number(s.totalRuntimeNs ?? 0n);
   let busiest = 0;
-  for (const t of [...d.privilegedThreads, ...d.topContextThreads]) {
+  for (const t of [...rows.privThread, ...rows.ctxThread]) {
     const frac = total > 0 ? Number(t.runtimeNs) / total : 0;
     if (frac > busiest) busiest = frac;
   }
   const cards: StatCard[] = [
     {
       label: 'Threads',
-      value: fmtCount(d.summary.numThreads),
+      value: fmtCount(s.numThreads),
       help: 'Distinct threads that ran on a CPU during the trace.',
     },
     {
       label: 'Processes',
-      value: fmtCount(d.summary.numProcesses),
+      value: fmtCount(s.numProcesses),
       help: 'Distinct processes that ran on a CPU during the trace.',
     },
     {
@@ -242,10 +333,10 @@ function summaryCards(d: CpuDetail, hasPriv: boolean): StatCard[] {
       help: 'Highest single-thread share of total CPU time.',
     },
   ];
-  if (hasPriv && d.summary.privilegedRuntimeNs !== null && total > 0) {
+  if (hasPriv && s.privilegedRuntimeNs !== null && total > 0) {
     cards.push({
       label: 'Your CPU share',
-      value: fmtPercent(Number(d.summary.privilegedRuntimeNs) / total),
+      value: fmtPercent(Number(s.privilegedRuntimeNs) / total),
       help: 'Your processes’ share of all CPU time in the trace.',
     });
   }
@@ -316,6 +407,21 @@ export function renderThreadTable(
   );
 }
 
+// Whether the shown threads spent a meaningful share of their tracked time
+// off-CPU — the cue to surface the Latency-view hand-off.
+function offCpuHeavy(rows: ReadonlyArray<ThreadStateRow>): boolean {
+  let on = 0;
+  let off = 0;
+  for (const s of rows) {
+    on += Number(s.runningNs);
+    off += Number(
+      s.runnableNs + s.uninterruptibleNs + s.sleepingNs + s.otherNs,
+    );
+  }
+  const total = on + off;
+  return total > 0 && off / total >= 0.2;
+}
+
 // Colour key for the per-thread state bars, rendered once above the table.
 function renderStateLegend(): m.Children {
   return m(
@@ -356,7 +462,7 @@ function renderStateBar(s: ThreadStateRow): m.Children {
 function renderThreadStateTable(
   trace: Trace,
   rows: ReadonlyArray<ThreadStateRow>,
-  cyclesByUtid: Map<number, bigint> | undefined,
+  cycles: RealCycles | undefined,
 ): m.Children {
   const data = rows.map((s) => {
     const total = Number(
@@ -367,6 +473,16 @@ function renderThreadStateTable(
         s.otherNs,
     );
     const onCpu = total > 0 ? Number(s.runningNs) / total : null;
+    const cyc = cycles?.byUtid.get(s.utid) ?? null;
+    const instr = cycles?.instrByUtid.get(s.utid) ?? null;
+    // IPC = instructions ÷ cycles; effective clock = cycles ÷ on-CPU time
+    // (cycles/ns = GHz) — the cpufreq-free "how fast it actually ran".
+    const ipc =
+      instr !== null && cyc !== null && cyc > 0n
+        ? Number(instr) / Number(cyc)
+        : null;
+    const ghz =
+      cyc !== null && s.runningNs > 0n ? Number(cyc) / Number(s.runningNs) : null;
     return [
       m(
         GridCell,
@@ -376,7 +492,9 @@ function renderThreadStateTable(
       m(GridCell, {wrap: true}, s.processName ?? '—'),
       m(GridCell, {align: 'right'}, fmtPercent(onCpu)),
       m(GridCell, renderStateBar(s)),
-      m(GridCell, {align: 'right'}, fmtMegacycles(cyclesByUtid?.get(s.utid) ?? null)),
+      m(GridCell, {align: 'right'}, fmtMegacycles(cyc)),
+      m(GridCell, {align: 'right'}, fmtIpc(ipc)),
+      m(GridCell, {align: 'right'}, ghz !== null ? `${ghz.toFixed(2)} GHz` : '—'),
       m(GridCell, {align: 'right'}, fmtCount(s.numRunSlices)),
     ];
   });
@@ -390,6 +508,8 @@ function renderThreadStateTable(
         {key: 'oncpu', header: m(GridHeaderCell, 'On-CPU %')},
         {key: 'split', header: m(GridHeaderCell, 'Time split')},
         {key: 'cyc', header: m(GridHeaderCell, 'Cycles')},
+        {key: 'ipc', header: m(GridHeaderCell, 'IPC')},
+        {key: 'clock', header: m(GridHeaderCell, 'Eff. clock')},
         {key: 'sw', header: m(GridHeaderCell, 'Switches')},
       ],
       rowData: data,

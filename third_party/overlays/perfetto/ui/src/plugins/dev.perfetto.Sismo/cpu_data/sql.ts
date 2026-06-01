@@ -44,20 +44,22 @@ export function sampleScopePredicate(priv: PrivilegedSet): string {
 // stdlib's `demangle(coalesce(s.name, f.name))` (with raw-name fallbacks for
 // the names `demangle` returns NULL on, i.e. already-demangled symbols).
 //
-// `frame` is the SQL alias of the stack_profile_frame row.
+// `frame` is the SQL alias of the stack_profile_frame row. `fallback` is the
+// string used when nothing resolves; pass `null` to yield SQL NULL instead
+// (for callers that build their own label, e.g. `binary+0xoffset`).
 export function frameNameExpr(
   frame: string,
-  fallback = '[unsymbolised]',
+  fallback: string | null = '[unsymbolised]',
 ): string {
   const sym = `(
     SELECT sps.name FROM stack_profile_symbol sps
     WHERE sps.symbol_set_id = ${frame}.symbol_set_id
     ORDER BY sps.id LIMIT 1
   )`;
+  const tail = fallback === null ? '' : `,\n    '${fallback}'`;
   return `coalesce(
     demangle(coalesce(${sym}, nullif(${frame}.name, ''))),
     ${sym},
-    nullif(${frame}.name, ''),
-    '${fallback}'
+    nullif(${frame}.name, '')${tail}
   )`;
 }

@@ -16,14 +16,14 @@
 // (leaf-frame self time) and by library/mapping. Driven by CPU samples.
 
 import m from 'mithril';
-import {Section} from '../../../widgets/section';
-import {Card} from '../../../widgets/card';
-import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
-import {EmptyState} from '../../../widgets/empty_state';
-import {Callout} from '../../../widgets/callout';
-import {Intent} from '../../../widgets/common';
-import type {HotMappingRow, HotSymbolRow, MicroarchData} from '../cpu_data';
-import {fmtCount, fmtPercent} from '../format';
+import {Section} from '../../../../widgets/section';
+import {Card} from '../../../../widgets/card';
+import {Grid, GridCell, GridHeaderCell} from '../../../../widgets/grid';
+import {EmptyState} from '../../../../widgets/empty_state';
+import {Callout} from '../../../../widgets/callout';
+import {Intent} from '../../../../widgets/common';
+import type {HotMappingRow, HotSymbolRow, MicroarchData} from '../../cpu_data';
+import {fmtCount, fmtPercent} from '../../format';
 
 export function renderCpuFunctions(m_: MicroarchData): m.Children {
   if (!m_.hasSamples) {

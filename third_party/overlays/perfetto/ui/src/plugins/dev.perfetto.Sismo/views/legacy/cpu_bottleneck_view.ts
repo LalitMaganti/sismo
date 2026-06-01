@@ -19,29 +19,30 @@
 // else a coarser cycle-stall split (labelled as such).
 
 import m from 'mithril';
-import type {Trace} from '../../../public/trace';
-import {Section} from '../../../widgets/section';
-import {Card} from '../../../widgets/card';
-import {Callout} from '../../../widgets/callout';
-import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
-import {Intent} from '../../../widgets/common';
-import {EmptyState} from '../../../widgets/empty_state';
+import type {Trace} from '../../../../public/trace';
+import {Section} from '../../../../widgets/section';
+import {Card} from '../../../../widgets/card';
+import {Callout} from '../../../../widgets/callout';
+import {Grid, GridCell, GridHeaderCell} from '../../../../widgets/grid';
+import {Intent} from '../../../../widgets/common';
+import {EmptyState} from '../../../../widgets/empty_state';
 import {
   computeTma,
   loadMicroarchCounters,
+  type FocusWindow,
   type MicroarchCounters,
   type MicroarchFuncRow,
   type TmaBucket,
   type TmaModel,
-} from '../cpu_data';
+} from '../../cpu_data';
 import {
   renderQuestionBlock,
   renderSeeAllLink,
   renderStatCard,
   type StatCard,
-} from '../page_common';
-import {fmtIpc, fmtMetric, fmtPercent} from '../format';
-import type {PrivilegedSet} from '../privileged_set';
+} from '../../page_common';
+import {fmtIpc, fmtMetric, fmtPercent} from '../../format';
+import type {PrivilegedSet} from '../../privileged_set';
 
 const EMPTY_COUNTERS: MicroarchCounters = {
   state: 'no-counters',
@@ -53,9 +54,10 @@ const EMPTY_COUNTERS: MicroarchCounters = {
 async function fetchCounters(
   trace: Trace,
   priv: PrivilegedSet,
+  window?: FocusWindow,
 ): Promise<MicroarchCounters> {
   try {
-    return await loadMicroarchCounters(trace.engine, priv);
+    return await loadMicroarchCounters(trace.engine, priv, 100, window);
   } catch {
     return EMPTY_COUNTERS;
   }
@@ -64,6 +66,9 @@ async function fetchCounters(
 interface CpuBottleneckViewAttrs {
   readonly trace: Trace;
   readonly priv: PrivilegedSet;
+  // The shared focus window; the Bottleneck lens scopes to it. The Overview
+  // block (CpuBottleneckOverview) leaves it unset — it stays whole-trace.
+  readonly focus?: FocusWindow;
 }
 
 const TITLE = 'Bottleneck';
@@ -99,6 +104,24 @@ function renderTmaBar(buckets: ReadonlyArray<TmaBucket>): m.Children {
   );
 }
 
+// Compact per-row Top-Down bar: the stacked fills only, no legend (the lens
+// shows the legend once above); per-segment tooltips carry the labels.
+function renderTmaBarMini(buckets: ReadonlyArray<TmaBucket>): m.Children {
+  return m(
+    '.pf-sismo-tma__bar',
+    buckets.map((b) =>
+      m(`.pf-sismo-tma__fill.pf-sismo-tma__fill--${b.key}`, {
+        style: {width: `${clamp01(b.frac) * 100}%`},
+        title: `${b.label} ${fmtPercent(b.frac)}`,
+      }),
+    ),
+  );
+}
+
+function fmtMpki(v: number | null): string {
+  return v === null ? '—' : v.toFixed(1);
+}
+
 // One-line plain-English read of the dominant bucket — the "why."
 function bottleneckVerdict(dominant: TmaBucket): string {
   switch (dominant.key) {
@@ -132,7 +155,7 @@ export class CpuBottleneckView
   private data?: MicroarchCounters;
 
   constructor({attrs}: m.CVnode<CpuBottleneckViewAttrs>) {
-    this.load(attrs.trace, attrs.priv);
+    this.load(attrs.trace, attrs.priv, attrs.focus);
   }
 
   view(): m.Children {
@@ -250,21 +273,18 @@ export class CpuBottleneckView
     if (rows.length === 0) {
       return m(EmptyState, {icon: 'code', title: 'No symbolised samples'});
     }
-    const hasStalls = rows.some(
-      (r) => r.feStallPct !== null || r.beStallPct !== null,
-    );
+    const anyBar = rows.some((r) => r.tma !== null && r.tma.buckets.length > 0);
     const columns = [
       {key: 'fn', header: m(GridHeaderCell, 'Function')},
       {key: 'samples', header: m(GridHeaderCell, 'Samples')},
       {key: 'ipc', header: m(GridHeaderCell, 'IPC')},
     ];
-    if (hasStalls) {
-      columns.push(
-        {key: 'fe', header: m(GridHeaderCell, 'Frontend stall')},
-        {key: 'be', header: m(GridHeaderCell, 'Backend stall')},
-      );
+    if (anyBar) {
+      columns.push({key: 'bar', header: m(GridHeaderCell, 'Where its slots went')});
     }
+    columns.push({key: 'cache', header: m(GridHeaderCell, 'Cache MPKI')});
     const data = rows.map((r) => {
+      const t = r.tma;
       const cells = [
         m(
           GridCell,
@@ -274,19 +294,32 @@ export class CpuBottleneckView
             m('span.pf-sismo-page__muted', ` — ${shortMapping(r.mappingName)}`),
         ),
         m(GridCell, {align: 'right'}, `${r.samples}`),
-        m(GridCell, {align: 'right'}, fmtIpc(r.ipc)),
+        m(GridCell, {align: 'right'}, fmtIpc(t?.ipc ?? null)),
       ];
-      if (hasStalls) {
+      if (anyBar) {
         cells.push(
-          m(GridCell, {align: 'right'}, fmtPercent(r.feStallPct)),
-          m(GridCell, {align: 'right'}, fmtPercent(r.beStallPct)),
+          m(
+            GridCell,
+            t !== null && t.buckets.length > 0
+              ? renderTmaBarMini(t.buckets)
+              : m('span.pf-sismo-page__muted', '—'),
+          ),
         );
       }
+      cells.push(m(GridCell, {align: 'right'}, fmtMpki(t?.cacheMpki ?? null)));
       return cells;
     });
     return m(
       '.pf-sismo-page__tab-pane',
       m('.pf-sismo-page__tab-pane-label', 'Which functions are paying'),
+      // The per-function numbers are an approximation; say so plainly.
+      m(
+        '.pf-sismo-page__muted',
+        'Approximate: each function’s counters are the per-sample deltas credited ' +
+          'to the call stack caught at the timer tick (sampled, not PEBS-precise), ' +
+          'so they smear toward the process average for functions that don’t ' +
+          'dominate their sample windows. Sparsely-sampled functions show no ratios.',
+      ),
       m(
         Card,
         {className: 'pf-sismo-page__table-card'},
@@ -295,8 +328,13 @@ export class CpuBottleneckView
     );
   }
 
-  private async load(trace: Trace, priv: PrivilegedSet): Promise<void> {
-    this.data = await fetchCounters(trace, priv);
+  private async load(
+    trace: Trace,
+    priv: PrivilegedSet,
+    window: FocusWindow | undefined,
+  ): Promise<void> {
+    this.data = await fetchCounters(trace, priv, window);
+    m.redraw();
   }
 }
 

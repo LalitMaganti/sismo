@@ -19,12 +19,12 @@
 // the Latency domain rather than pretending the CPU-usage views can help.
 
 import m from 'mithril';
-import type {Trace} from '../../../public/trace';
-import {EmptyState} from '../../../widgets/empty_state';
-import {loadCpuTriage, type CpuTriage} from '../cpu_data';
-import {renderQuestionBlock} from '../page_common';
-import type {PrivilegedSet} from '../privileged_set';
-import {renderOnOffCpuMeter, renderTriageRoute} from './triage_meters';
+import type {Trace} from '../../../../public/trace';
+import {EmptyState} from '../../../../widgets/empty_state';
+import {loadCpuTriage, type CpuTriage} from '../../cpu_data';
+import {renderQuestionBlock} from '../../page_common';
+import type {PrivilegedSet} from '../../privileged_set';
+import {renderOnOffCpuMeter, renderTriageRoute} from '../triage_meters';
 
 interface CpuTriageViewAttrs {
   readonly trace: Trace;

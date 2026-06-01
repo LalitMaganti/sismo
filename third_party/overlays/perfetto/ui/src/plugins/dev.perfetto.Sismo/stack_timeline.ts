@@ -18,6 +18,7 @@ import {TrackNode} from '../../public/workspace';
 import {SliceTrack} from '../../components/tracks/slice_track';
 import {SourceDataset} from '../../trace_processor/dataset';
 import {LONG, NUM, STR_NULL} from '../../trace_processor/query_result';
+import type {Engine} from '../../trace_processor/engine';
 import {materialColorScheme} from '../../components/colorizer';
 import {Time} from '../../base/time';
 import type {time} from '../../base/time';
@@ -39,7 +40,7 @@ import type {TrackEventDetailsPanel} from '../../public/details_panel';
 import type {VerticalBounds} from '../../base/geom';
 import type {SourceDataset as SourceDatasetType} from '../../trace_processor/dataset';
 import {FlamegraphPanel} from '../../components/flamegraph_panel';
-import {type QueryFlamegraphMetric} from '../../components/query_flamegraph';
+import type {QueryFlamegraphMetric} from '../../components/query_flamegraph';
 import {Flamegraph, type FlamegraphState} from '../../widgets/flamegraph';
 import type {PrivilegedSet} from './privileged_set';
 
@@ -143,7 +144,7 @@ async function createStackTable(trace: Trace, upidList: string): Promise<void> {
           f.depth AS depth,
           f.callsite_at_depth AS callsite_at_depth,
           f.frame_id AS frame_id,
-          ${frameNameExpr('spf')} AS frame_name,
+          ${frameNameExpr('spf', null)} AS frame_name,
           spf.mapping AS mapping_id,
           spf.rel_pc AS rel_pc,
           spm.name AS mapping_name
@@ -431,45 +432,352 @@ export function registerSismoFlamegraphTab(trace: Trace): void {
   });
 }
 
+// How the flamegraph's top level is split. 'none' is the plain call tree;
+// 'thread'/'process' insert a synthetic root per thread/process above the call
+// tree (the "breakdown dimension").
+export type BreakdownKind = 'none' | 'thread' | 'process';
+
+// `mapping_name LIKE` test for the kernel mapping. trace_processor renders the
+// kernel mapping as `/[kernel.kallsyms]` (it prepends '/' per path component),
+// so match the substring rather than the bare canonical name.
+const KERNEL_CODE_TYPE =
+  `case when mapping_name like '%[kernel.kallsyms]%' ` +
+  `then 'Kernel' else 'User' end as code_type`;
+
+// The plain call tree: the `_callstacks_for_callsites` stdlib macro (handles
+// inlined frames) over the scoped samples.
+function flatStatement(where: string): string {
+  return `
+    select
+      id,
+      parent_id as parentId,
+      name,
+      mapping_name,
+      ${KERNEL_CODE_TYPE},
+      source_file || ':' || line_number as source_location,
+      self_count as value
+    from _callstacks_for_callsites!((
+      select p.callsite_id
+      from perf_sample p
+      where ${where}
+    ))
+  `;
+}
+
+// The call tree split by thread/process: one synthetic root per group, with
+// that group's callsite subtree hung beneath it. Built by hand (rather than the
+// stdlib macro) because self counts must be per-group; the group's root
+// callsites are reparented onto the synthetic root. Inlined frames collapse to
+// their callsite frame here (the macro's inline expansion isn't available
+// per-group) — an accepted fidelity trade for the breakdown view.
+//
+// Ids must be DENSE and non-negative: the flamegraph's graph aggregation
+// (__intrinsic_graph_agg / NodeAgg) casts each id to uint32 and `resize`s a
+// vector to max_id+1, indexing by id. A negative id wraps to ~4e9 (OOM crash)
+// and sparse ids (group_index * BIG + callsite_id) inflate that vector. So
+// assign every reachable (group, callsite) a dense row_number, and place the
+// synthetic roots in the slots just above them.
+function breakdownStatement(where: string, kind: 'thread' | 'process'): string {
+  const groupExpr = kind === 'thread' ? 'th.utid' : 'th.upid';
+  const labelExpr =
+    kind === 'thread'
+      ? `coalesce(th.name, 'utid ' || th.utid) || ' (tid ' || th.tid || ')'`
+      : `coalesce(pr.name, 'upid ' || th.upid) || ' (pid ' || pr.pid || ')'`;
+  const procJoin = kind === 'process' ? 'join process pr on pr.upid = th.upid' : '';
+  return `
+    with recursive
+      samples as (
+        select p.callsite_id as cs, ${groupExpr} as grp
+        from perf_sample p
+        join thread th on th.utid = p.utid
+        ${procJoin}
+        where ${where}
+      ),
+      grp_idx as (
+        select grp, row_number() over (order by grp) as gidx, label
+        from (
+          select distinct ${groupExpr} as grp, ${labelExpr} as label
+          from perf_sample p
+          join thread th on th.utid = p.utid
+          ${procJoin}
+          where ${where}
+        )
+      ),
+      self_counts as (select grp, cs, count() as n from samples group by grp, cs),
+      walk(grp, cur, n) as (
+        select grp, cs, n from self_counts
+        union all
+        select w.grp, c.parent_id, w.n
+        from walk w
+        join stack_profile_callsite c on c.id = w.cur
+        where c.parent_id is not null
+      ),
+      reach as (select distinct grp, cur as cs from walk),
+      -- Dense 1..N id per reachable (group, callsite); roots take N+1..N+R.
+      node_ids as (
+        select grp, cs, row_number() over (order by grp, cs) as nid from reach
+      ),
+      node_count as (select count(*) as n from node_ids)
+    select
+      (select n from node_count) + gi.gidx as id,
+      cast(null as int) as parentId,
+      gi.label as name,
+      cast(null as text) as mapping_name,
+      cast(null as text) as code_type,
+      cast(null as text) as source_location,
+      0 as value
+    from grp_idx gi
+    union all
+    select
+      ni.nid as id,
+      case
+        when c.parent_id is null then (select n from node_count) + gi.gidx
+        else pn.nid
+      end as parentId,
+      ${frameNameExpr('f')} as name,
+      spm.name as mapping_name,
+      ${KERNEL_CODE_TYPE.replace('mapping_name', 'spm.name')},
+      cast(null as text) as source_location,
+      coalesce(sc.n, 0) as value
+    from node_ids ni
+    join grp_idx gi on gi.grp = ni.grp
+    join stack_profile_callsite c on c.id = ni.cs
+    join stack_profile_frame f on f.id = c.frame_id
+    left join stack_profile_mapping spm on spm.id = f.mapping
+    left join node_ids pn on pn.grp = ni.grp and pn.cs = c.parent_id
+    left join self_counts sc on sc.grp = ni.grp and sc.cs = ni.cs
+  `;
+}
+
+// A counter-weighted flat call tree: instead of counting samples, credit each
+// sample the per-interval delta of a hardware counter (its cumulative reading
+// minus the prior sample on the same thread+track) and sum it up the stack via
+// the stdlib weighted-callsites macro. So "weight by cache-misses" shows which
+// subtree the misses concentrate in, not just where wall-time went.
+//
+// APPROXIMATE — the same sampling attribution the sample-count tree makes, just
+// weighted: the interval's delta is credited to the stack caught at the tick
+// (timer-sampled, not PEBS), and negative deltas (counter reset / multiplexing)
+// are clamped to zero. `p` aliases the sample×counter view so the caller's
+// `p.`-qualified scope predicates bind unchanged.
+function counterWeightedStatement(where: string, counterName: string): string {
+  return `
+    with deltas as (
+      select
+        p.callsite_id as callsite_id,
+        p.counter_value - lag(p.counter_value) over (
+          partition by p.utid, p.track_id order by p.ts
+        ) as dv
+      from linux_perf_sample_with_counters p
+      join track t on t.id = p.track_id
+      where ${where}
+        and t.name = '${counterName}'
+    )
+    select
+      id,
+      parent_id as parentId,
+      name,
+      mapping_name,
+      ${KERNEL_CODE_TYPE},
+      source_file || ':' || line_number as source_location,
+      self_value as value
+    from _callstacks_for_callsites_weighted!((
+      select callsite_id, case when dv > 0 then dv else 0 end as value
+      from deltas
+    ))
+  `;
+}
+
+// Counter-weighted flamegraph views offered alongside "Sample count" (flat tree
+// only). Limited to the counters present in essentially every sismo recording;
+// a counter absent from a trace just yields an empty tree for that metric.
+const COUNTER_WEIGHTS: ReadonlyArray<{counter: string; label: string}> = [
+  {counter: 'cpu-cycles', label: 'CPU cycles (approx)'},
+  {counter: 'cache-misses', label: 'Cache misses (approx)'},
+  {counter: 'branch-misses', label: 'Branch misses (approx)'},
+];
+
+// The Top-Down slot counters the backend-bound view needs (slots = the
+// denominator, retired + fetch-bubbles = the Retiring/Frontend numerators).
+const BACKEND_SLOT_COUNTERS = [
+  'slots',
+  'topdown-slots-retired',
+  'topdown-fetch-bubbles',
+];
+
+// Weights the flame by BACKEND-BOUND slots per sample = slots − retiring −
+// frontend (the L1 Backend numerator), so it points straight at where the
+// pipeline stalled on the back end (cache/memory/execution) rather than where
+// wall-time went. Needs all three Top-Down slot counters; pivots them per sample
+// (each is a separate track), takes each one's per-interval delta, and clamps
+// the remainder at 0. Same approximate sampling attribution as the other
+// counter-weighted views.
+function backendSlotsStatement(where: string): string {
+  return `
+    with per_counter as (
+      select
+        p.sample_id as sample_id,
+        p.callsite_id as callsite_id,
+        t.name as cname,
+        p.counter_value - lag(p.counter_value) over (
+          partition by p.utid, p.track_id order by p.ts
+        ) as dv
+      from linux_perf_sample_with_counters p
+      join track t on t.id = p.track_id
+      where ${where}
+        and t.name in ('slots', 'topdown-slots-retired', 'topdown-fetch-bubbles')
+    ),
+    per_sample as (
+      select
+        sample_id,
+        max(callsite_id) as callsite_id,
+        max(case when cname = 'slots' then dv end) as slots,
+        max(case when cname = 'topdown-slots-retired' then dv end) as retired,
+        max(case when cname = 'topdown-fetch-bubbles' then dv end) as fetch_bubbles
+      from per_counter
+      group by sample_id
+    )
+    select
+      id,
+      parent_id as parentId,
+      name,
+      mapping_name,
+      ${KERNEL_CODE_TYPE},
+      source_file || ':' || line_number as source_location,
+      self_value as value
+    from _callstacks_for_callsites_weighted!((
+      select
+        callsite_id,
+        case
+          when slots is not null and retired is not null and fetch_bubbles is not null
+            and slots - retired - fetch_bubbles > 0
+          then slots - retired - fetch_bubbles
+          else 0
+        end as value
+      from per_sample
+    ))
+  `;
+}
+
+// Which perf counters this trace actually carries (by track name), scoped the
+// same way the flamegraph is. Lets the builder offer only the counter-weighted
+// views the data supports — empty set (or any error) ⇒ Sample count only.
+export async function loadPerfCounterNames(
+  engine: Engine,
+  scope: ReadonlyArray<string>,
+): Promise<ReadonlySet<string>> {
+  const out = new Set<string>();
+  try {
+    await engine.query('include perfetto module linux.perf.counters;');
+    const whereClause = scope.length > 0 ? `where ${scope.join(' and ')}` : '';
+    const res = await engine.query(`
+      select distinct t.name as name
+      from linux_perf_sample_with_counters p
+      join track t on t.id = p.track_id
+      ${whereClause}
+    `);
+    for (const it = res.iter({name: STR_NULL}); it.valid(); it.next()) {
+      if (it.name !== null) out.add(it.name);
+    }
+  } catch {
+    // No counters / table absent — leave empty.
+  }
+  return out;
+}
+
 // Builds the sismo sample flamegraph metric. `wherePredicates` are extra SQL
 // fragments ANDed onto the perf_sample selection (utid/time scoping); the
-// `callsite_id IS NOT NULL` guard is always applied.
+// `callsite_id IS NOT NULL` guard is always applied. Pass `breakdownBy` to
+// enable the breakdown dimension (declares the "Break down by" control and
+// reshapes the statement); omit it for a flat tree with no control.
 export function buildSampleFlamegraphMetrics(
   wherePredicates: ReadonlyArray<string>,
+  breakdownBy?: BreakdownKind,
+  // Counter track names present in this trace. When omitted, the common
+  // single-counter views are offered unconditionally (they almost always exist)
+  // and the backend-bound view — which needs the optional Top-Down counters — is
+  // withheld, so it never shows for a trace that can't support it.
+  availableCounters?: ReadonlySet<string>,
 ): QueryFlamegraphMetric[] {
   const where = ['p.callsite_id is not null', ...wherePredicates].join(
     '\n            and ',
   );
-  return [
+  const flat = breakdownBy === undefined || breakdownBy === 'none';
+  const statement = flat
+    ? flatStatement(where)
+    : breakdownStatement(where, breakdownBy);
+  // Shared across all metrics (sample count + counter-weighted).
+  const unaggregatableProperties = [
+    {name: 'mapping_name', displayName: 'Mapping'},
+    // Kernel vs user, derived from the mapping. Powers "Color by → Code type"
+    // and a one-click hide-kernel filter. Functionally dependent on
+    // mapping_name, so it adds no extra node merging.
+    {name: 'code_type', displayName: 'Code type'},
+  ];
+  const aggregatableProperties = [
+    {
+      name: 'source_location',
+      displayName: 'Source location',
+      mergeAggregation: 'ONE_OR_SUMMARY' as const,
+    },
+  ];
+  const metrics: QueryFlamegraphMetric[] = [
     {
       name: 'Sample count',
       unit: '',
       nameColumnLabel: 'Symbol',
       dependencySql: 'include perfetto module linux.perf.samples;',
-      statement: `
-        select
-          id,
-          parent_id as parentId,
-          name,
-          mapping_name,
-          source_file || ':' || line_number as source_location,
-          self_count as value
-        from _callstacks_for_callsites!((
-          select p.callsite_id
-          from perf_sample p
-          where ${where}
-        ))
-      `,
-      unaggregatableProperties: [
-        {name: 'mapping_name', displayName: 'Mapping'},
-      ],
-      aggregatableProperties: [
-        {
-          name: 'source_location',
-          displayName: 'Source location',
-          mergeAggregation: 'ONE_OR_SUMMARY' as const,
-        },
-      ],
+      statement,
+      breakdownDimensions:
+        breakdownBy === undefined
+          ? undefined
+          : [
+              {key: 'none', label: 'None'},
+              {key: 'thread', label: 'Thread'},
+              {key: 'process', label: 'Process'},
+            ],
+      unaggregatableProperties,
+      aggregatableProperties,
     },
   ];
+  // Counter-weighted views weight the same tree by a hardware counter instead of
+  // sample count. Flat-only: the breakdown statement is built for sample counts,
+  // so we offer these only when not breaking down. A counter missing from the
+  // trace just yields an empty tree for that metric.
+  if (flat) {
+    const present = (n: string) =>
+      availableCounters === undefined || availableCounters.has(n);
+    const counterDeps =
+      'include perfetto module linux.perf.samples;\n' +
+      'include perfetto module linux.perf.counters;';
+    for (const w of COUNTER_WEIGHTS) {
+      if (!present(w.counter)) continue;
+      metrics.push({
+        name: w.label,
+        unit: '',
+        nameColumnLabel: 'Symbol',
+        dependencySql: counterDeps,
+        statement: counterWeightedStatement(where, w.counter),
+        unaggregatableProperties,
+        aggregatableProperties,
+      });
+    }
+    // Backend-bound slots only when we've confirmed all three Top-Down counters
+    // are present (withheld under the undefined "unknown" case).
+    if (
+      availableCounters !== undefined &&
+      BACKEND_SLOT_COUNTERS.every((c) => availableCounters.has(c))
+    ) {
+      metrics.push({
+        name: 'Backend-bound slots (approx)',
+        unit: '',
+        nameColumnLabel: 'Symbol',
+        dependencySql: counterDeps,
+        statement: backendSlotsStatement(where),
+        unaggregatableProperties,
+        aggregatableProperties,
+      });
+    }
+  }
+  return metrics;
 }
