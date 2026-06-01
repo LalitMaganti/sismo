@@ -20,7 +20,7 @@ index e8911136..3b0f9d2d 100644
  
  export interface MetricsFromTableOrSubqueryOptions {
 diff --git a/ui/src/widgets/flamegraph.scss b/ui/src/widgets/flamegraph.scss
-index fc6db29a..5199b82f 100644
+index fc6db29a..82a8a6cc 100644
 --- a/ui/src/widgets/flamegraph.scss
 +++ b/ui/src/widgets/flamegraph.scss
 @@ -25,10 +25,18 @@
@@ -45,7 +45,7 @@ index fc6db29a..5199b82f 100644
  
      .pf-tag-input {
        flex-grow: 1;
-@@ -175,3 +183,12 @@
+@@ -175,3 +183,74 @@
      color: var(--pf-color-warning);
    }
  }
@@ -58,8 +58,70 @@ index fc6db29a..5199b82f 100644
 +    margin-top: 6px;
 +  }
 +}
++
++// The node action bar: one dropdown per category. Wider gap than the default
++// 2px button bar so the category buttons read as separate menus, and a little
++// breathing room above the tooltip metrics it sits under.
++.pf-button-bar.pf-flamegraph-action-bar {
++  gap: 8px;
++  margin-top: 6px;
++}
++
++// The category dropdown popup. Raise the default 350px popup cap so labels and
++// descriptions get room, but keep a ceiling so long text wraps within it instead
++// of growing the popup unbounded. The compound selector overrides .pf-popup's
++// own max-width.
++.pf-flamegraph-action-menu.pf-popup {
++  max-width: 460px;
++}
++
++.pf-flamegraph-action-menu {
++  .pf-menu {
++    padding-inline: 8px;
++    // Height cap so a long Filter menu scrolls vertically rather than off-screen.
++    max-height: min(60vh, 480px);
++    overflow-y: auto;
++    // overflow-y:auto would otherwise compute overflow-x to auto too, adding a
++    // spurious horizontal scrollbar — pin it off.
++    overflow-x: hidden;
++  }
++
++  // Let items shrink to the popup width rather than their widest content, so
++  // descriptions wrap instead of forcing the popup wider.
++  .pf-menu-item {
++    min-width: 0;
++  }
++}
++
++// Two-line node action menu item: friendly label on top, muted one-line
++// description beneath. Rendered inside a MenuItem label, which lives in a popup
++// portal outside .pf-flamegraph, so this is a top-level selector.
++.pf-flamegraph-action {
++  display: flex;
++  flex-direction: column;
++  // Fill the fixed-width menu; text wraps rather than scrolls.
++  min-width: 0;
++
++  &__title {
++    white-space: normal;
++    overflow-wrap: anywhere;
++    line-height: 1.3;
++  }
++
++  &__desc {
++    font-size: smaller;
++    color: var(--pf-color-text-muted);
++    white-space: normal;
++    overflow-wrap: anywhere;
++    line-height: 1.25;
++  }
++
++  &__aka {
++    font-style: italic;
++  }
++}
 diff --git a/ui/src/widgets/flamegraph.ts b/ui/src/widgets/flamegraph.ts
-index b3e9e73f..29889102 100644
+index b3e9e73f..b246dade 100644
 --- a/ui/src/widgets/flamegraph.ts
 +++ b/ui/src/widgets/flamegraph.ts
 @@ -25,6 +25,7 @@ import {EmptyState} from './empty_state';
@@ -85,38 +147,66 @@ index b3e9e73f..29889102 100644
  import {type Color, HSLColor} from '../base/color';
  import {hash} from '../base/hash';
  import type {MithrilEvent} from '../base/mithril_utils';
-@@ -86,6 +93,18 @@ interface ZoomRegion {
+@@ -86,6 +93,46 @@ interface ZoomRegion {
    readonly type: 'ABOVE_ROOT' | 'BELOW_ROOT' | 'ROOT';
  }
  
 +// Grouping for a node action in the tooltip menu. FOCUS changes your vantage
 +// point without removing data; FILTER adds a rule that reshapes which
-+// frames/samples are shown (and shows up as a chip on the top filter bar); OPEN
-+// leaves the flamegraph (jump elsewhere or copy).
-+export type ActionCategory = 'FOCUS' | 'FILTER' | 'OPEN';
++// frames/samples are shown (and shows up as a chip on the top filter bar); DRILL
++// jumps elsewhere to inspect this frame (e.g. source, timeline); COPY exports the
++// stack to the clipboard.
++export type ActionCategory = 'FOCUS' | 'FILTER' | 'DRILL' | 'COPY';
 +
 +const CATEGORY_LABELS: Record<ActionCategory, string> = {
 +  FOCUS: 'Focus',
 +  FILTER: 'Filter',
-+  OPEN: 'Open',
++  DRILL: 'Drill down',
++  COPY: 'Copy',
 +};
++
++const CATEGORY_ORDER: ReadonlyArray<ActionCategory> = [
++  'FOCUS',
++  'FILTER',
++  'DRILL',
++  'COPY',
++];
++
++// Left icon for each category's top-level dropdown button.
++const CATEGORY_ICONS: Record<ActionCategory, string> = {
++  FOCUS: 'center_focus_weak',
++  FILTER: 'filter_list',
++  DRILL: 'open_in_new',
++  COPY: 'content_copy',
++};
++
++// One entry in a node's tooltip action set. `label` is the plain-text name shown
++// as the menu item's first line. Every action lives under its category's
++// top-level dropdown.
++interface NodeAction {
++  readonly label: string;
++  readonly icon: string;
++  readonly description?: m.Children;
++  readonly category: ActionCategory;
++  execute(): void;
++}
 +
  // Context passed to a FlamegraphOptionalAction's execute callback.
  //
  // `properties` is the (reduced) kv map of the user-declared
-@@ -102,6 +121,11 @@ export interface FlamegraphOptionalAction {
+@@ -102,6 +149,11 @@ export interface FlamegraphOptionalAction {
    readonly name: string;
    execute?: (ctx: FlamegraphActionContext) => void;
    readonly subActions?: FlamegraphOptionalAction[];
 +  // Presentation metadata for the categorized node menu. Absent → the action
-+  // falls under OPEN with no icon and no description.
++  // falls under "Drill down" with no icon and no description.
 +  readonly icon?: string;
 +  readonly description?: m.Children;
 +  readonly category?: ActionCategory;
  }
  
  export interface FlamegraphOptionalMarker {
-@@ -177,17 +201,41 @@ export const FLAMEGRAPH_STATE_SCHEMA = z
+@@ -177,17 +229,41 @@ export const FLAMEGRAPH_STATE_SCHEMA = z
      selectedMetricName: z.string().readonly(),
      filters: z.array(FLAMEGRAPH_FILTER_SCHEMA),
      view: FLAMEGRAPH_VIEW_SCHEMA,
@@ -158,7 +248,7 @@ index b3e9e73f..29889102 100644
  }
  
  export interface FlamegraphAttrs {
-@@ -207,8 +255,15 @@ type FilterType =
+@@ -207,8 +283,15 @@ type FilterType =
  
  interface FilterTypeOption {
    readonly value: FilterType;
@@ -174,70 +264,88 @@ index b3e9e73f..29889102 100644
    readonly description: string;
  }
  
-@@ -216,42 +271,47 @@ const FILTER_TYPES: ReadonlyArray<FilterTypeOption> = [
+@@ -216,42 +299,52 @@ const FILTER_TYPES: ReadonlyArray<FilterTypeOption> = [
    {
      value: 'SHOW_STACK',
      label: 'Show Stack',
-+    friendlyLabel: 'Keep stacks through here',
++    friendlyLabel: 'Keep stacks matching name',
      shortLabel: 'SS',
--    description:
--      'Keep only samples whose stack contains a matching frame. ' +
--      'Non-matching samples are removed entirely.',
 +    icon: 'visibility',
 +    category: 'FILTER',
-+    description: 'Keep only samples whose stack passes through a matching frame.',
+     description:
+-      'Keep only samples whose stack contains a matching frame. ' +
+-      'Non-matching samples are removed entirely.',
++      'Keep only samples whose stack contains a frame whose name matches.',
    },
    {
      value: 'HIDE_STACK',
      label: 'Hide Stack',
-+    friendlyLabel: 'Drop stacks through here',
++    friendlyLabel: 'Hide stacks matching name',
      shortLabel: 'HS',
--    description:
--      'Remove samples whose stack contains a matching frame. ' +
--      'Also called "Drop function" in other profilers.',
 +    icon: 'visibility_off',
 +    category: 'FILTER',
-+    description: 'Remove samples whose stack passes through a matching frame.',
+     description:
+-      'Remove samples whose stack contains a matching frame. ' +
+-      'Also called "Drop function" in other profilers.',
++      'Remove samples whose stack contains a frame whose name matches.',
    },
    {
      value: 'SHOW_FROM_FRAME',
      label: 'Show From Frame',
-+    friendlyLabel: 'Focus on subtree',
++    friendlyLabel: 'Focus on matching subtrees',
      shortLabel: 'SFF',
--    description:
--      'Keep only matching frames and their descendants, removing ancestors. ' +
--      'Also called "Focus on subtree" in other profilers.',
 +    icon: 'center_focus_strong',
 +    category: 'FOCUS',
-+    description: 'Show only matching frames and what they call, dropping ancestors.',
+     description:
+-      'Keep only matching frames and their descendants, removing ancestors. ' +
+-      'Also called "Focus on subtree" in other profilers.',
++      'Show only frames whose name matches and their descendants, dropping ancestors.',
    },
    {
      value: 'HIDE_FRAME',
      label: 'Hide Frame',
-+    friendlyLabel: 'Merge into caller',
++    friendlyLabel: 'Merge matching frames into caller',
      shortLabel: 'HF',
--    description:
--      'Remove matching frames from all stacks, collapsing children into parent. ' +
--      'Also called "Merge function" in other profilers.',
 +    icon: 'call_merge',
 +    category: 'FILTER',
-+    description: 'Collapse matching frames, folding their time into the caller.',
+     description:
+-      'Remove matching frames from all stacks, collapsing children into parent. ' +
+-      'Also called "Merge function" in other profilers.',
++      'Remove frames whose name matches, merging their children into the caller.',
    },
    {
      value: 'PIVOT',
      label: 'Pivot',
-+    friendlyLabel: 'Pivot here',
++    friendlyLabel: 'Pivot on matching frames',
      shortLabel: 'P',
--    description:
--      'Re-root the flamegraph at matching frames. ' +
--      'Shows callers above and callees below the pivot point.',
 +    icon: 'account_tree',
 +    category: 'FOCUS',
-+    description: 'Re-root the flamegraph: callers above, callees below.',
+     description:
+-      'Re-root the flamegraph at matching frames. ' +
+-      'Shows callers above and callees below the pivot point.',
++      'Re-root the flamegraph at frames whose name matches: callers above, callees below.',
    },
  ];
  
-@@ -365,6 +425,12 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+@@ -288,7 +381,7 @@ class FilterBuilder implements m.ClassComponent<FilterBuilderAttrs> {
+             this.type = (e.target as HTMLSelectElement).value as FilterType;
+           },
+         },
+-        FILTER_TYPES.map((o) => m('option', {value: o.value}, o.label)),
++        FILTER_TYPES.map((o) => m('option', {value: o.value}, o.friendlyLabel)),
+       ),
+       opt && m('.pf-filter-builder__desc', opt.description),
+       m(FormLabel, 'Filter'),
+@@ -318,7 +411,7 @@ class FilterBuilder implements m.ClassComponent<FilterBuilderAttrs> {
+               m(
+                 '.pf-filter-builder__help-row',
+                 m('strong', `${o.shortLabel}:`),
+-                ` ${o.label}`,
++                ` ${o.friendlyLabel}`,
+               ),
+             ),
+             m('.pf-filter-builder__help-row', 'Example: SS: main HF: alloc.*'),
+@@ -365,6 +458,12 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
    private showFilterBuilder: boolean = false;
    private quickAddValue: string = '';
  
@@ -250,7 +358,7 @@ index b3e9e73f..29889102 100644
    private dataChangeMonitor = new Monitor([() => this.attrs.data]);
    private zoomRegion?: ZoomRegion;
    private canvasApi?: VirtualOverlayCanvasApi;
-@@ -644,6 +710,8 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+@@ -644,6 +743,8 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
      return {
        filters: state.filters,
        view: state.view,
@@ -259,7 +367,7 @@ index b3e9e73f..29889102 100644
        selectedMetricName: metricStillExists
          ? state.selectedMetricName
          : metrics[0].name,
-@@ -728,8 +796,17 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+@@ -728,8 +829,17 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
          name = '(merged)';
          colorScheme = getFlamegraphColorScheme(name, state === 'PARTIAL');
        } else {
@@ -279,7 +387,7 @@ index b3e9e73f..29889102 100644
        }
        const bgColor = hover ? colorScheme.variant : colorScheme.base;
        const textColor = hover ? colorScheme.textVariant : colorScheme.textBase;
-@@ -886,6 +963,7 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+@@ -886,6 +996,7 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
            className: 'pf-filter-builder',
          },
          m(FilterBuilder, {onAdd: addFilterFn, hasPivot}),
@@ -287,7 +395,7 @@ index b3e9e73f..29889102 100644
        ),
        m(CopyToClipboardButton(), {
          textToCopy: () => tags.join(' '),
-@@ -928,9 +1006,181 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+@@ -928,9 +1039,181 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
            m(RadioGroup.Button, {value: 'bottom-up'}, 'Bottom Up'),
          ],
        ),
@@ -409,9 +517,9 @@ index b3e9e73f..29889102 100644
 +      m('.pf-filter-builder__separator'),
 +      m('.pf-filter-builder__help-title', 'Show / hide by column'),
 +      m('.pf-flamegraph-column-visibility__row', selects),
-     );
-   }
- 
++    );
++  }
++
 +  // Distinct values of `key`, unioned with every value previously seen for this
 +  // (metric, column) so a hidden value stays listed even after it drops out of
 +  // the filtered data. Keyed by metric so switching metric starts fresh.
@@ -453,9 +561,9 @@ index b3e9e73f..29889102 100644
 +    const f = this.hideFilterFor(value);
 +    return this.attrs.state.filters.some(
 +      (x) => x.kind === 'HIDE_FRAME' && x.filter === f,
-+    );
-+  }
-+
+     );
+   }
+ 
 +  private toggleHiddenValue(value: string) {
 +    const f = this.hideFilterFor(value);
 +    const filters = this.isValueHidden(value)
@@ -469,7 +577,286 @@ index b3e9e73f..29889102 100644
    private renderTooltip() {
      if (this.tooltipPos === undefined) {
        return undefined;
-@@ -1562,6 +1812,20 @@ function addFilter(
+@@ -977,10 +1260,6 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+       properties,
+       marker,
+     } = nodes[queryIdx];
+-    const filterButtonClick = (state: FlamegraphState) => {
+-      this.attrs.onStateChange(state);
+-      this.tooltipPos = undefined;
+-    };
+ 
+     const percent = displayPercentage(
+       cumulativeValue,
+@@ -1039,71 +1318,190 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+         }
+         return null;
+       }),
+-      m(
+-        ButtonBar,
+-        {},
+-        m(Button, {
+-          label: 'Zoom',
+-          onclick: () => {
+-            this.zoomRegion = source;
+-          },
+-        }),
+-        m(Button, {
+-          label: 'Show Stack',
+-          onclick: () => {
+-            filterButtonClick(
+-              addFilter(this.attrs.state, {
+-                kind: 'SHOW_STACK',
+-                filter: `^${name}$`,
+-              }),
+-            );
+-          },
+-        }),
+-        m(Button, {
+-          label: 'Hide Stack',
+-          onclick: () => {
+-            filterButtonClick(
+-              addFilter(this.attrs.state, {
+-                kind: 'HIDE_STACK',
+-                filter: `^${name}$`,
+-              }),
+-            );
+-          },
+-        }),
+-        m(Button, {
+-          label: 'Hide Frame',
+-          onclick: () => {
+-            filterButtonClick(
+-              addFilter(this.attrs.state, {
+-                kind: 'HIDE_FRAME',
+-                filter: `^${name}$`,
+-              }),
+-            );
+-          },
+-        }),
+-        m(Button, {
+-          label: 'Show From Frame',
+-          onclick: () => {
+-            filterButtonClick(
+-              addFilter(this.attrs.state, {
+-                kind: 'SHOW_FROM_FRAME',
+-                filter: `^${name}$`,
+-              }),
+-            );
+-          },
+-        }),
+-        m(Button, {
+-          label: 'Pivot',
+-          onclick: () => {
+-            filterButtonClick({
+-              ...this.attrs.state,
+-              view: {kind: 'PIVOT', pivot: `^${name}$`},
+-            });
++      this.renderNodeActionBar(source, name, nodes[queryIdx], nodeActions),
++    );
++  }
++
++  // The action bar shown on a hovered/clicked frame: one top-level dropdown per
++  // category (Focus / Filter / Open), each listing its actions with an icon and a
++  // one-line description. Built-in operations come from `buildNodeActions`;
++  // embedder `nodeActions` slot into their declared category (default Open).
++  private renderNodeActionBar(
++    source: Source,
++    name: string,
++    node: FlamegraphNode,
++    nodeActions: ReadonlyArray<FlamegraphOptionalAction>,
++  ) {
++    const properties = node.properties;
++    const builtIn = this.buildNodeActions(source, name, node);
++
++    // Embedder actions: flat executable ones become NodeActions honouring their
++    // category; nested / disabled ones keep the existing renderMenuItem path and
++    // are appended under Open.
++    const isFlat = (a: FlamegraphOptionalAction) =>
++      a.execute !== undefined &&
++      (a.subActions === undefined || a.subActions.length === 0);
++    const embedderFlat: NodeAction[] = nodeActions
++      .filter(isFlat)
++      .map((a) => ({
++        label: a.name,
++        icon: a.icon ?? 'open_in_new',
++        description: a.description,
++        category: a.category ?? 'DRILL',
++        execute: () => {
++          a.execute!({
++            properties: this.createReducedProperties(properties),
++            node,
++          });
++          this.tooltipPos = undefined;
++        },
++      }));
++    const embedderComplex = nodeActions
++      .filter((a) => !isFlat(a))
++      .map((a) => this.renderMenuItem(a, properties, node));
++
++    const actions = [...builtIn, ...embedderFlat];
++    return m(
++      ButtonBar,
++      {className: 'pf-flamegraph-action-bar'},
++      CATEGORY_ORDER.map((cat) => {
++        const items = actions.filter((a) => a.category === cat);
++        const extra = cat === 'DRILL' ? embedderComplex : [];
++        if (items.length === 0 && extra.length === 0) return null;
++        return m(
++          PopupMenu,
++          {
++            trigger: m(Button, {
++              label: CATEGORY_LABELS[cat],
++              icon: CATEGORY_ICONS[cat],
++              // Right-side caret so the button reads as a dropdown, not an action.
++              rightIcon: 'arrow_drop_down',
++              compact: true,
++            }),
++            position: PopupPosition.Bottom,
++            className: 'pf-popup-menu pf-flamegraph-action-menu',
+           },
++          items.map((a) => this.renderNodeActionItem(a)),
++          extra,
++        );
++      }),
++    );
++  }
++
++  // Two-line menu item: friendly label on top, muted description beneath.
++  private renderNodeActionItem(a: NodeAction): m.Children {
++    return m(MenuItem, {
++      icon: a.icon,
++      label: m(
++        '.pf-flamegraph-action',
++        m('.pf-flamegraph-action__title', a.label),
++        a.description != null &&
++          m('.pf-flamegraph-action__desc', a.description),
++      ),
++      onclick: a.execute,
++    });
++  }
++
++  // Built-in node actions: the fixed filter/focus operations plus auto-generated
++  // hide/keep pairs for each unaggregatable column value on the clicked frame.
++  private buildNodeActions(
++    source: Source,
++    name: string,
++    node: FlamegraphNode,
++  ): NodeAction[] {
++    const applyState = (state: FlamegraphState) => {
++      this.attrs.onStateChange(state);
++      this.tooltipPos = undefined;
++    };
++    const addF = (kind: FlamegraphFilter['kind'], filter: string) =>
++      applyState(addFilter(this.attrs.state, {kind, filter}));
++    const ft = (v: FilterType) =>
++      assertExists(FILTER_TYPES.find((o) => o.value === v));
++    // Built from a FILTER_TYPES row: friendly label + icon + description, with
++    // the old name preserved as "(a.k.a. …)" for familiar users.
++    const filterAction = (v: FilterType, execute: () => void): NodeAction => {
++      const o = ft(v);
++      return {
++        label: o.friendlyLabel,
++        icon: o.icon,
++        category: o.category,
++        description: [
++          o.description,
++          ' ',
++          m('span.pf-flamegraph-action__aka', `(a.k.a. ${o.label})`),
++        ],
++        execute,
++      };
++    };
++
++    const actions: NodeAction[] = [
++      {
++        label: 'Zoom in',
++        icon: 'zoom_in',
++        category: 'FOCUS',
++        description: 'Enlarge this branch. Nothing is removed — zoom out anytime.',
++        execute: () => {
++          this.zoomRegion = source;
++        },
++      },
++      filterAction('SHOW_FROM_FRAME', () => addF('SHOW_FROM_FRAME', `^${name}$`)),
++      filterAction('PIVOT', () =>
++        applyState({
++          ...this.attrs.state,
++          view: {kind: 'PIVOT', pivot: `^${name}$`},
+         }),
+-        this.renderActionsMenu(nodeActions, properties, nodes[queryIdx]),
+       ),
++      filterAction('SHOW_STACK', () => addF('SHOW_STACK', `^${name}$`)),
++      filterAction('HIDE_STACK', () => addF('HIDE_STACK', `^${name}$`)),
++      filterAction('HIDE_FRAME', () => addF('HIDE_FRAME', `^${name}$`)),
++    ];
++
++    // Per-column hide/keep pairs, driven by this frame's own property values. The
++    // label stays generic ("Hide this mapping") so a long value (e.g. a full
++    // mapping path) never bloats the menu; the concrete value lives in the
++    // description, which wraps. Matches against the column out of the box (see
++    // query_flamegraph: every filter is matched against name + unagg columns).
++    for (const [, prop] of node.properties) {
++      if (prop.isAggregatable || prop.value === '') continue;
++      const {value, displayName} = prop;
++      const col = displayName.toLowerCase();
++      const f = `^${value}$`;
++      actions.push(
++        {
++          label: `Hide this ${col}`,
++          icon: 'layers_clear',
++          category: 'FILTER',
++          description: `Drop every frame with the same ${col} as this one.`,
++          execute: () => addF('HIDE_FRAME', f),
++        },
++        {
++          label: `Keep only this ${col}`,
++          icon: 'filter_alt',
++          category: 'FILTER',
++          description: `Keep only samples whose stack contains a frame with the same ${col} as this one.`,
++          execute: () => addF('SHOW_STACK', f),
++        },
++      );
++    }
++
++    actions.push(
++      {
++        label: 'Copy stack',
++        icon: Icons.Copy,
++        category: 'COPY',
++        description: 'Copy this stack as text.',
++        execute: () => copyToClipboard(this.buildStackString(node, false)),
++      },
++      {
++        label: 'Copy stack with details',
++        icon: Icons.Copy,
++        category: 'COPY',
++        description: 'Copy this stack with per-frame metrics and columns.',
++        execute: () => copyToClipboard(this.buildStackString(node, true)),
++      },
+     );
++
++    return actions;
+   }
+ 
+   private get selectedMetric() {
+@@ -1179,6 +1577,7 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+       MenuItem,
+       {
+         label: action.name,
++        icon: action.icon,
+         // No onclick handler for parent menu items
+       },
+       // Directly render sub-actions as children of the MenuItem
+@@ -1195,6 +1594,7 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+   ): m.Vnode<MenuItemAttrs> {
+     return m(MenuItem, {
+       label: action.name,
++      icon: action.icon,
+       onclick: () => {
+         action.execute!({
+           properties: this.createReducedProperties(properties),
+@@ -1562,6 +1962,20 @@ function addFilter(
    };
  }
  
