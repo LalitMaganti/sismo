@@ -20,10 +20,13 @@ Perfetto is checked out at third_party/src/perfetto/. The clone is shallow
 upstream SHA only requires editing the constant; on the next run the
 function fetches and checks out the new SHA.
 
-Patches in third_party/patches/perfetto/*.patch are applied on top via
-`git apply`. These are bridge patches for in-flight upstream PRs only;
-each patch is idempotent and gets deleted when the corresponding upstream
-PR merges.
+Patches in third_party/patches/perfetto/*.patch are `git format-patch`
+mailbox files applied on top as a commit series via `git am`, so the
+applied-patch state IS `git log PERFETTO_PIN..HEAD` — easy to inspect,
+split (git rebase -i), and re-capture (python/tools/capture_perfetto_patches.py
+runs git format-patch back into this directory). They are bridge patches
+for in-flight upstream PRs only; each gets deleted when its upstream PR
+merges.
 
 Overlays in third_party/overlays/perfetto/<perfetto-relative-path> are
 copied into the Perfetto checkout after patches apply. Overlays are
@@ -42,6 +45,7 @@ import argparse
 import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -389,6 +393,14 @@ def _git_head(repo: str) -> str | None:
     return result.stdout.strip()
 
 
+def _has_commit(repo: str, sha: str) -> bool:
+    """True if `sha` exists as a commit object in `repo`."""
+    return subprocess.run(
+        ["git", "-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"],
+        capture_output=True,
+    ).returncode == 0
+
+
 def _restore_mtimes_from_git(repo_dir: str) -> None:
     """Set every tracked file's mtime to the timestamp of the last commit that
     touched it.
@@ -449,7 +461,11 @@ def install_source_dep(dep: SourceDep) -> bool:
             return False
 
     current = _git_head(abs_dir)
-    if current != dep.pin:
+    # Fetch only when the pinned commit isn't already present. After the
+    # bridge patches apply (git am), HEAD sits at `pin + N commits`, so a
+    # `current != pin` gate would re-fetch on every run; gating on object
+    # presence avoids that while still fetching on first clone / pin bump.
+    if not _has_commit(abs_dir, dep.pin):
         if current:
             vprint(1, f"{dep.target_dir}: {current[:10]} -> {dep.pin[:10]}")
         else:
@@ -495,131 +511,137 @@ def install_source_dep(dep: SourceDep) -> bool:
     return True
 
 
-def _patch_modify_paths(patch_path: str) -> set[str]:
-    """Returns the set of repo-relative paths the patch modifies in place
-    (i.e. files present on both sides of the diff — neither created from
-    /dev/null nor deleted to /dev/null).
+# Stable committer identity + no GPG, so `git am` works headlessly (CI,
+# fresh clones) regardless of the user's git config. The author (and thus
+# the regenerated patch files) comes from each patch's own `From:` line, so
+# this never churns the patches.
+_AM_GIT_CONFIG: list[str] = [
+    "-c", "user.name=sismo-bridge",
+    "-c", "user.email=sismo-bridge@localhost",
+    "-c", "commit.gpgsign=false",
+]
 
-    Used by `apply_perfetto_patches` to detect "already applied" robustly:
-    overlays may have replaced patch-CREATED files with different content,
-    which breaks `git apply --reverse --check`. But the MODIFY portion of
-    each patch is the part we can reliably round-trip — if those tracked
-    files are dirty in the workdir, the patch is already applied.
-    """
-    paths: set[str] = set()
-    pending: str | None = None
-    is_create = False
-    is_delete = False
-    with open(patch_path) as f:
+
+def perfetto_pin() -> str | None:
+    """The pinned Perfetto SHA from SOURCE_DEPS (the base the patch series
+    is applied on top of)."""
+    for dep in SOURCE_DEPS:
+        if dep.name == "perfetto":
+            return dep.pin
+    return None
+
+
+def perfetto_patch_files() -> list[str]:
+    """Absolute paths of the bridge patch files, in apply (numeric) order."""
+    if not os.path.isdir(PERFETTO_PATCHES_DIR):
+        return []
+    return [
+        os.path.join(PERFETTO_PATCHES_DIR, p)
+        for p in sorted(os.listdir(PERFETTO_PATCHES_DIR))
+        if p.endswith(".patch")
+    ]
+
+
+def _mailbox_subject(patch_path: str) -> str:
+    """The `Subject:` of a mailbox-format patch, with any `[PATCH ...]`
+    prefix and RFC822 line-folding removed — i.e. exactly the commit subject
+    `git am` will produce. Used to compare patch files against applied
+    commits."""
+    subject = ""
+    in_subject = False
+    with open(patch_path, errors="replace") as f:
         for line in f:
-            if line.startswith("diff --git "):
-                if pending is not None and not is_create and not is_delete:
-                    paths.add(pending)
-                # Take the b/ side path. Format: "diff --git a/X b/Y".
-                tokens = line.rstrip("\n").split(" ")
-                if len(tokens) >= 4 and tokens[3].startswith("b/"):
-                    pending = tokens[3][2:]
+            if line.startswith("Subject:"):
+                subject = line[len("Subject:"):].strip()
+                in_subject = True
+            elif in_subject:
+                if line.startswith((" ", "\t")):  # folded continuation
+                    subject += " " + line.strip()
                 else:
-                    pending = None
-                is_create = False
-                is_delete = False
-            elif line.startswith("--- /dev/null"):
-                is_create = True
-            elif line.startswith("+++ /dev/null"):
-                is_delete = True
-    if pending is not None and not is_create and not is_delete:
-        paths.add(pending)
-    return paths
+                    break
+    return re.sub(r"^\[PATCH[^\]]*\]\s*", "", subject).strip()
+
+
+def _applied_patch_subjects(repo: str, base: str) -> list[str]:
+    """Subjects of the commits in `base..HEAD`, oldest first — the applied
+    patch stack."""
+    res = subprocess.run(
+        ["git", "-C", repo, "log", "--reverse", "--format=%s", f"{base}..HEAD"],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return []
+    return [s for s in res.stdout.splitlines() if s]
 
 
 def apply_perfetto_patches() -> bool:
-    """Applies *.patch files from third_party/patches/perfetto/ to the
-    Perfetto checkout. Idempotent: skips patches that are already applied.
-    """
-    if not os.path.isdir(PERFETTO_PATCHES_DIR):
-        return True
+    """Applies the bridge patch series to the Perfetto checkout as real
+    commits via `git am`, so the applied state is `git log PERFETTO_PIN..HEAD`.
 
+    Idempotent: when the applied commit subjects already match the patch
+    files, it's a no-op. Otherwise it resets to the pin and re-applies the
+    whole series cleanly (dropping stale patch commits and untracked overlay
+    symlinks, which the overlay step re-links; gitignored caches survive).
+    """
     if not _is_git_repo(PERFETTO_DIR):
         vprint(1, "Perfetto checkout missing; skipping patch apply.")
         vprint(1, "Run `tools/install-build-deps` first to clone it.")
         return True
 
-    patches = sorted(
-        p for p in os.listdir(PERFETTO_PATCHES_DIR) if p.endswith(".patch")
-    )
-    if not patches:
+    patch_paths = perfetto_patch_files()
+    if not patch_paths:
         return True
 
-    # One `git diff --name-only HEAD` call up front, shared across patches —
-    # used to detect "already applied" patches whose modify portions are
-    # present in the workdir even when overlay-managed paths block
-    # `git apply --reverse --check`.
-    dirty_proc = subprocess.run(
-        ["git", "-C", PERFETTO_DIR, "diff", "--name-only", "HEAD"],
+    pin = perfetto_pin()
+    if pin is None:
+        print("No perfetto SOURCE_DEP pin found.", file=sys.stderr)
+        return False
+    if not _has_commit(PERFETTO_DIR, pin):
+        print(
+            f"Perfetto pin {pin[:10]} not present in the checkout; run "
+            f"`tools/install-build-deps` to fetch it first.",
+            file=sys.stderr,
+        )
+        return False
+
+    desired = [_mailbox_subject(p) for p in patch_paths]
+    if _applied_patch_subjects(PERFETTO_DIR, pin) == desired:
+        vprint(2, f"all {len(patch_paths)} perfetto patch(es) already applied "
+                  f"as commits on {pin[:10]}")
+        return True
+
+    vprint(1, f"applying {len(patch_paths)} perfetto patch(es) onto "
+              f"{pin[:10]}")
+    reset = subprocess.run(
+        ["git", "-C", PERFETTO_DIR, "reset", "--hard", pin, "-q"]
+    )
+    if reset.returncode != 0:
+        print(f"reset to {pin[:10]} failed", file=sys.stderr)
+        return False
+    subprocess.run(["git", "-C", PERFETTO_DIR, "clean", "-fd", "-q"],
+                   check=False)
+
+    am = subprocess.run(
+        ["git", "-C", PERFETTO_DIR, *_AM_GIT_CONFIG, "am", "--keep-cr",
+         "--whitespace=nowarn", *patch_paths],
         capture_output=True,
     )
-    dirty_set: set[str] = (
-        set(dirty_proc.stdout.decode().splitlines())
-        if dirty_proc.returncode == 0 else set()
-    )
-
-    applied_count = 0
-    for name in patches:
-        patch_path = os.path.join(PERFETTO_PATCHES_DIR, name)
-
-        # Fast path: if every tracked file the patch modifies in place is
-        # already dirty in the workdir, treat the patch as applied. This
-        # holds up even after `install_perfetto_overlays` has replaced
-        # patch-created files with overlay symlinks (which is what breaks
-        # the `--reverse --check` test below).
-        modify_paths = _patch_modify_paths(patch_path)
-        if modify_paths and modify_paths.issubset(dirty_set):
-            vprint(2, f"  {name}: already applied (modifies present in workdir)")
-            continue
-
-        # Already applied? `git apply --reverse --check` succeeds iff the
-        # patch's post-state matches the working tree, i.e. it would apply
-        # cleanly if reversed. This is the strict check — used when the
-        # fast path can't decide (e.g. pure-create patches).
-        already = subprocess.run(
-            ["git", "-C", PERFETTO_DIR, "apply", "--reverse", "--check",
-             patch_path],
-            capture_output=True,
+    if am.returncode != 0:
+        print("git am failed applying perfetto bridge patches:",
+              file=sys.stderr)
+        print(am.stdout.decode(errors="replace"), file=sys.stderr)
+        print(am.stderr.decode(errors="replace"), file=sys.stderr)
+        subprocess.run(["git", "-C", PERFETTO_DIR, "am", "--abort"],
+                       check=False)
+        print(
+            "\nPERFETTO_PIN may have moved underneath these patches. Re-base "
+            "them with `python3 python/tools/uprev_perfetto.py`, or delete any "
+            "whose upstream PR has merged.",
+            file=sys.stderr,
         )
-        if already.returncode == 0:
-            vprint(2, f"  {name}: already applied")
-            continue
+        return False
 
-        # Not applied — but make sure it *would* apply before doing it, so
-        # we get a clean error rather than a half-applied state.
-        check = subprocess.run(
-            ["git", "-C", PERFETTO_DIR, "apply", "--check", patch_path],
-            capture_output=True,
-        )
-        if check.returncode != 0:
-            print(f"Patch {name} does not apply cleanly:", file=sys.stderr)
-            print(check.stderr.decode(), file=sys.stderr)
-            print(
-                f"\nPERFETTO_PIN may have moved underneath this patch. "
-                f"Either re-base the patch against the current pin, or "
-                f"delete it if the upstream PR has merged.",
-                file=sys.stderr,
-            )
-            return False
-
-        result = subprocess.run(
-            ["git", "-C", PERFETTO_DIR, "apply", patch_path],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            print(f"Failed to apply {name}:", file=sys.stderr)
-            print(result.stderr.decode(), file=sys.stderr)
-            return False
-        vprint(1, f"applied perfetto patch: {name}")
-        applied_count += 1
-
-    if applied_count == 0:
-        vprint(2, f"all {len(patches)} perfetto patch(es) already applied")
+    vprint(1, f"applied {len(patch_paths)} perfetto patch(es) as commits")
     return True
 
 

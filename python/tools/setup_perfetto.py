@@ -192,7 +192,8 @@ def ensure_perfetto_source_and_patches() -> None:
             continue
         if not install_source_dep(dep):
             sys.exit("perfetto source install failed")
-    print("==> applying sismo bridge patches (third_party/patches/perfetto/*.patch)")
+    print("==> applying sismo bridge patches as a git am commit series "
+          "(third_party/patches/perfetto/*.patch)")
     if not apply_perfetto_patches():
         sys.exit("perfetto patch apply failed")
     if not install_perfetto_overlays():

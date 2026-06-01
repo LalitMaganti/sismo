@@ -1,5 +1,15 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: nopr: vite dev serve bundled
+
+Serve bundled assets from the vite dev server. Sismo-local; no upstream PR yet.
+---
+ ui/build.mjs | 44 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 41 insertions(+), 3 deletions(-)
+
 diff --git a/ui/build.mjs b/ui/build.mjs
-index 09f1729..67e03e2 100644
+index 09f1729d..67e03e2a 100644
 --- a/ui/build.mjs
 +++ b/ui/build.mjs
 @@ -98,6 +98,7 @@ const cfg = {

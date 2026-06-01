@@ -1,3 +1,13 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: nopr: perf follower sample type
+
+Add a follower perf sample type for thread-scoped sampling. Sismo-local; no upstream PR yet.
+---
+ src/profiling/perf/event_config.cc | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
 diff --git a/src/profiling/perf/event_config.cc b/src/profiling/perf/event_config.cc
 index 490ac4a9..0f087299 100644
 --- a/src/profiling/perf/event_config.cc

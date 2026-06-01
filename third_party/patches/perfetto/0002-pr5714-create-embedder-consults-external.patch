@@ -1,5 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: pr5714: create embedder consults external
+
+create_embedder() consults the external embedder override before falling back to the default. Tracks google/perfetto#5714.
+---
+ ui/src/core/embedder/create_embedder.ts   | 12 ++++++---
+ ui/src/core/embedder/external_embedder.ts | 31 +++++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 3 deletions(-)
+ create mode 100644 ui/src/core/embedder/external_embedder.ts
+
 diff --git a/ui/src/core/embedder/create_embedder.ts b/ui/src/core/embedder/create_embedder.ts
-index 87621278ab..03557d81a2 100644
+index a30050be..640965d8 100644
 --- a/ui/src/core/embedder/create_embedder.ts
 +++ b/ui/src/core/embedder/create_embedder.ts
 @@ -15,13 +15,19 @@
@@ -27,7 +39,7 @@ index 87621278ab..03557d81a2 100644
      origin.endsWith('.perfetto.dev') ||
 diff --git a/ui/src/core/embedder/external_embedder.ts b/ui/src/core/embedder/external_embedder.ts
 new file mode 100644
-index 0000000000..c52d544d9e
+index 00000000..aa9aa156
 --- /dev/null
 +++ b/ui/src/core/embedder/external_embedder.ts
 @@ -0,0 +1,31 @@

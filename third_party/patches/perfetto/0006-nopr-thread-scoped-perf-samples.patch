@@ -1,3 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: nopr: thread scoped perf samples
+
+Thread-scoped perf samples (sample_scope=THREAD) with per-thread counters and kernel+user stacks. Sismo-local; no upstream PR yet.
+---
+ protos/perfetto/trace/perfetto_trace.proto    | 13 ++++
+ .../trace/profiling/profile_packet.proto      | 13 ++++
+ .../importers/common/tracks_common.h          | 13 ++++
+ .../importers/proto/perf_sample_tracker.cc    | 65 ++++++++++++-------
+ .../importers/proto/perf_sample_tracker.h     | 16 +++--
+ .../proto/perf_sample_tracker_unittest.cc     | 24 +++----
+ .../importers/proto/profile_module.cc         |  3 +-
+ 7 files changed, 106 insertions(+), 41 deletions(-)
+
 diff --git a/protos/perfetto/trace/perfetto_trace.proto b/protos/perfetto/trace/perfetto_trace.proto
 index 6b9b3bd7..6f314602 100644
 --- a/protos/perfetto/trace/perfetto_trace.proto

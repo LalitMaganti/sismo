@@ -1,3 +1,14 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: nopr: tab closable
+
+Allow detail tabs to be closable. Sismo-local; no upstream PR yet.
+---
+ ui/src/core_plugins/dev.perfetto.Timeline/tab_panel.ts | 2 +-
+ ui/src/public/tab.ts                                   | 3 +++
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
 diff --git a/ui/src/core_plugins/dev.perfetto.Timeline/tab_panel.ts b/ui/src/core_plugins/dev.perfetto.Timeline/tab_panel.ts
 index 1f13a1a2..9818ba70 100644
 --- a/ui/src/core_plugins/dev.perfetto.Timeline/tab_panel.ts

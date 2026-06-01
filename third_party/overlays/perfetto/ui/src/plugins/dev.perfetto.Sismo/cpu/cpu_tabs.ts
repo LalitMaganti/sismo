@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The CPU domain's tabbed shell: always-present fixed tabs (Overview · Where ·
-// Efficiency · Threads) plus dynamic, closeable entity tabs opened by drilling
-// into a function/thread/process. Modeled on com.android.HeapDumpExplorer. The
-// deep-dive tabs are stubs for now; Overview is the landing we built.
+// The CPU domain's tabbed shell: always-present fixed lens tabs (Overview ·
+// Where the time went · Efficiency · Where it ran) plus dynamic, closeable
+// entity tabs opened by drilling into a function/thread/process. Modeled on
+// com.android.HeapDumpExplorer. Efficiency and Where-it-ran are stubs for now;
+// Overview and Where are built.
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
@@ -50,7 +51,7 @@ const FIXED_TABS: ReadonlyArray<FixedTab> = [
   {key: OVERVIEW_TAB, title: 'Overview', icon: 'dashboard'},
   {key: 'where', title: 'Where the time went', icon: 'donut_large'},
   {key: 'efficiency', title: 'Efficiency', icon: 'speed'},
-  {key: 'threads', title: 'Threads over time', icon: 'timeline'},
+  {key: 'whereran', title: 'Where it ran', icon: 'developer_board'},
 ];
 
 const ENTITY_ICON: Record<EntityKind, string> = {

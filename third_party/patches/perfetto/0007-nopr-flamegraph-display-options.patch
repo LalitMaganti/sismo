@@ -1,3 +1,15 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: nopr: flamegraph display options
+
+Flamegraph display options: break-down-by dimension, color-by column, and show/hide-by-column filters. Sismo-local; no upstream PR yet.
+---
+ ui/src/components/query_flamegraph.ts |  10 +
+ ui/src/widgets/flamegraph.scss        |  85 +++-
+ ui/src/widgets/flamegraph.ts          | 574 ++++++++++++++++++++++----
+ 3 files changed, 586 insertions(+), 83 deletions(-)
+
 diff --git a/ui/src/components/query_flamegraph.ts b/ui/src/components/query_flamegraph.ts
 index e8911136..3b0f9d2d 100644
 --- a/ui/src/components/query_flamegraph.ts

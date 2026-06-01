@@ -19,7 +19,6 @@
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
-import {Button, ButtonVariant} from '../../../widgets/button';
 import {Callout} from '../../../widgets/callout';
 import {EmptyState} from '../../../widgets/empty_state';
 import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
@@ -40,6 +39,7 @@ import {
 import {fmtCount, fmtPercent} from '../format';
 import type {PrivilegedSet} from '../privileged_set';
 import {breakdownGrid, type BreakdownGridRow} from './grid';
+import {segmentedSwitcher} from './segmented';
 import {
   applyPrefs,
   loadFlamegraphPrefs,
@@ -154,20 +154,19 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
   }
 
   private renderModeBar(): m.Children {
-    const seg = (mode: Mode, label: string) =>
-      m(Button, {
-        label,
-        variant:
-          this.mode === mode ? ButtonVariant.Filled : ButtonVariant.Minimal,
-        onclick: () => {
-          this.mode = mode;
-        },
-      });
     return m(
       '.pf-sismo-tab__modebar',
-      seg('flamegraph', 'Flamegraph'),
-      seg('calltree', 'Call tree'),
-      seg('functions', 'Functions'),
+      segmentedSwitcher<Mode>(
+        [
+          {key: 'flamegraph', label: 'Flamegraph', icon: 'local_fire_department'},
+          {key: 'calltree', label: 'Call tree', icon: 'account_tree'},
+          {key: 'functions', label: 'Functions', icon: 'list'},
+        ],
+        this.mode,
+        (mode) => {
+          this.mode = mode;
+        },
+      ),
     );
   }
 
@@ -218,26 +217,16 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
     }
     const dirBar = m(
       '.pf-sismo-tab__modebar',
-      m(Button, {
-        label: 'Top-down',
-        variant:
-          this.ctDirection === 'top-down'
-            ? ButtonVariant.Filled
-            : ButtonVariant.Minimal,
-        onclick: () => {
-          this.ctDirection = 'top-down';
+      segmentedSwitcher<CallTreeDirection>(
+        [
+          {key: 'top-down', label: 'Top-down', icon: 'arrow_downward'},
+          {key: 'bottom-up', label: 'Bottom-up', icon: 'arrow_upward'},
+        ],
+        this.ctDirection,
+        (dir) => {
+          this.ctDirection = dir;
         },
-      }),
-      m(Button, {
-        label: 'Bottom-up',
-        variant:
-          this.ctDirection === 'bottom-up'
-            ? ButtonVariant.Filled
-            : ButtonVariant.Minimal,
-        onclick: () => {
-          this.ctDirection = 'bottom-up';
-        },
-      }),
+      ),
     );
     return m('', dirBar, m('.pf-sismo-tab__view', this.renderCalltreeGrid()));
   }

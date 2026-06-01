@@ -1,3 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: pr5712: ui embedder hooks
+
+Add embedder override hooks to the UI bootstrap so an external embedder can replace perfetto defaults. Tracks google/perfetto#5712.
+---
+ ui/build.mjs                                  | 110 +++++++++++++++++-
+ ui/src/assets/index.html                      |   6 +-
+ .../widgets/charts/chart_option_builder.ts    |  10 +-
+ ui/src/core/embedder/default_embedder.ts      |   2 +
+ ui/src/core/embedder/embedder.ts              |  23 ++++
+ ui/src/core/embedder/perfetto_ui_embedder.ts  |   2 +
+ ui/src/frontend/index.ts                      |   6 +-
+ ui/src/frontend/ui_main.ts                    |   2 +-
+ ui/src/frontend/views/sidebar.ts              |  10 +-
+ ui/vite.config.mjs                            |  72 ++++++++++++
+ 10 files changed, 230 insertions(+), 13 deletions(-)
+
 diff --git a/ui/build.mjs b/ui/build.mjs
 index 7d14885b..09f1729d 100644
 --- a/ui/build.mjs
