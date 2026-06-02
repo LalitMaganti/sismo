@@ -27,6 +27,7 @@ import {CpuLandingPage} from './landing';
 import {CpuWhereTab} from './where_tab';
 import {CpuEfficiencyTab} from './efficiency_tab';
 import {CpuScheduledTab} from './scheduled_tab';
+import {CpuDetailTab} from './detail_tab';
 import {
   CpuSession,
   OVERVIEW_TAB,
@@ -90,7 +91,9 @@ export class CpuTabsView implements m.ClassComponent<CpuTabsAttrs> {
       title: t.label,
       leftIcon: ENTITY_ICON[t.kind],
       closeButton: true,
-      content: this.visited.has(t.key) ? this.entityContent(t) : undefined,
+      content: this.visited.has(t.key)
+        ? this.entityContent(attrs, t, drill)
+        : undefined,
     }));
 
     return m(Tabs, {
@@ -105,13 +108,22 @@ export class CpuTabsView implements m.ClassComponent<CpuTabsAttrs> {
   private fixedContent(
     attrs: CpuTabsAttrs,
     tab: FixedTab,
-    _drill: Drill,
+    drill: Drill,
   ): m.Children {
     if (tab.key === OVERVIEW_TAB) {
-      return m(CpuLandingPage, {trace: attrs.trace, priv: attrs.priv});
+      return m(CpuLandingPage, {
+        trace: attrs.trace,
+        priv: attrs.priv,
+        onNavigate: (k) => this.session.setActive(k),
+        onDrill: drill,
+      });
     }
     if (tab.key === 'where') {
-      return m(CpuWhereTab, {trace: attrs.trace, priv: attrs.priv});
+      return m(CpuWhereTab, {
+        trace: attrs.trace,
+        priv: attrs.priv,
+        onDrill: drill,
+      });
     }
     if (tab.key === 'efficiency') {
       return m(CpuEfficiencyTab, {trace: attrs.trace, priv: attrs.priv});
@@ -126,11 +138,18 @@ export class CpuTabsView implements m.ClassComponent<CpuTabsAttrs> {
     });
   }
 
-  private entityContent(tab: EntityTab): m.Children {
-    return m(EmptyState, {
-      icon: 'construction',
-      title: tab.label,
-      description: 'Focused view coming soon.',
+  private entityContent(
+    attrs: CpuTabsAttrs,
+    tab: EntityTab,
+    drill: Drill,
+  ): m.Children {
+    return m(CpuDetailTab, {
+      trace: attrs.trace,
+      priv: attrs.priv,
+      kind: tab.kind,
+      id: tab.id,
+      label: tab.label,
+      onDrill: drill,
     });
   }
 }

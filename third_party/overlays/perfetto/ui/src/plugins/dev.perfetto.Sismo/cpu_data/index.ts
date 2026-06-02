@@ -81,17 +81,32 @@ export {
 } from './activity';
 
 
+export {
+  type EntitySplitRow,
+  type FunctionDetail,
+  type ThreadDetail,
+  SPLIT_LIMIT,
+  loadFunctionDetail,
+  loadThreadDetail,
+} from './entity_detail';
+
+export {
+  type Butterfly,
+  type ButterflyEdge,
+  loadButterfly,
+} from './butterfly';
+
+export {
+  type AnnInsn,
+  type AnnRow,
+  type SourceAsm,
+  loadSourceAsm,
+} from './annotation';
+
 export {type CpuTriage, loadCpuTriage} from './triage';
 
 export {
-  type DrillLens,
-  type Observation,
-  type ObservationDrill,
-  type ObservationKind,
-  loadObservations,
-} from './observations';
-
-export {
+  type FunctionMicroarch,
   type HotMappingRow,
   type HotSymbolRow,
   type MicroarchCounters,
@@ -104,6 +119,7 @@ export {
   type TmaBucket,
   type TmaModel,
   computeTma,
+  loadFunctionMicroarch,
   loadMicroarch,
   loadMicroarchByGroup,
   loadMicroarchCounters,

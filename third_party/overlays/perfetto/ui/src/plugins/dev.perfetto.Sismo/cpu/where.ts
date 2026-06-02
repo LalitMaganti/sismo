@@ -87,7 +87,10 @@ export async function loadWhereSummary(
   };
 }
 
-export function renderWhereBlock(s: WhereSummary): m.Children {
+export function renderWhereBlock(
+  s: WhereSummary,
+  onFunctionClick?: (name: string) => void,
+): m.Children {
   const cards: StatCard[] = [
     {label: 'CPU used', value: fmtDurationNs(s.cpuUsedNs)},
     {label: 'Wall window', value: fmtDurationNs(s.wallNs)},
@@ -108,6 +111,7 @@ export function renderWhereBlock(s: WhereSummary): m.Children {
         valueTitle: 'CPU time',
         formatValue: fmtDurationNs,
         rows: s.byFunction,
+        onNameClick: onFunctionClick,
       }),
     ),
     subSection(

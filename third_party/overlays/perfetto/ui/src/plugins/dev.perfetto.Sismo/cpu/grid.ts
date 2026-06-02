@@ -18,6 +18,7 @@
 // filtering for free; the rows arrive already ranked and capped from SQL.
 
 import m from 'mithril';
+import {Anchor} from '../../../widgets/anchor';
 import {DataGrid} from '../../../components/widgets/datagrid/datagrid';
 import type {
   ColumnSchema,
@@ -45,12 +46,22 @@ export interface BreakdownGridAttrs {
   readonly rows: ReadonlyArray<BreakdownGridRow>;
   // When set, a secondary text column (from row.group) is shown after the name.
   readonly groupTitle?: string;
+  // When set, the name cell becomes a link that opens that row's detail page.
+  readonly onNameClick?: (name: string) => void;
 }
 
 export function breakdownGrid(attrs: BreakdownGridAttrs): m.Children {
-  const {nameTitle, valueTitle, formatValue, rows, groupTitle} = attrs;
+  const {nameTitle, valueTitle, formatValue, rows, groupTitle, onNameClick} =
+    attrs;
   const columns: ColumnSchema = {
-    name: {title: nameTitle, columnType: 'text'},
+    name: {
+      title: nameTitle,
+      columnType: 'text',
+      cellRenderer:
+        onNameClick !== undefined
+          ? (v) => renderNameLink(String(v), onNameClick)
+          : undefined,
+    },
     value: {
       title: valueTitle,
       columnType: 'quantitative',
@@ -89,6 +100,24 @@ export function breakdownGrid(attrs: BreakdownGridAttrs): m.Children {
     enablePivotControls: false,
     showExportButton: false,
   });
+}
+
+function renderNameLink(
+  name: string,
+  onClick: (name: string) => void,
+): m.Children {
+  return m(
+    Anchor,
+    {
+      href: '#',
+      icon: 'open_in_new',
+      onclick: (e: Event) => {
+        e.preventDefault();
+        onClick(name);
+      },
+    },
+    name,
+  );
 }
 
 function renderShare(frac: number): m.Children {

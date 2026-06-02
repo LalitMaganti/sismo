@@ -17,6 +17,9 @@
 // are always present; drilling into an entity opens (or re-focuses) a closeable
 // tab scoped to it. State only; no queries.
 
+// A 'function' is a symbol aggregated across all its call sites (bottom-up) —
+// drilled from the flamegraph, call tree, and summary tables. thread/process are
+// the scheduler-scoped pages.
 export type EntityKind = 'function' | 'thread' | 'process';
 
 export interface EntityTab {

@@ -27,7 +27,7 @@ import type {Trace} from '../../../public/trace';
 import {QuerySlot, SerialTaskQueue} from '../../../base/query_slot';
 import {EmptyState} from '../../../widgets/empty_state';
 import type {PrivilegedSet} from '../privileged_set';
-import {actionLink} from '../page_common';
+import {ctaButton} from '../page_common';
 import {loadingBlock} from './block';
 import type {EntityKind} from './session';
 import {loadTriage, renderTriageBlock, type TriageSummary} from './triage';
@@ -90,13 +90,16 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
         key,
         () => loadWhereSummary(trace.engine, priv),
         'How much CPU did you use, and where did it go?',
-        renderWhereBlock,
+        (d) =>
+          renderWhereBlock(d, (name) =>
+            attrs.onDrill('function', name, name),
+          ),
         (d) => [
-          actionLink('See where the cycles went', 'arrow_forward', () =>
+          ctaButton('See where the cycles went', 'arrow_forward', () =>
             attrs.onNavigate('where'),
           ),
           d.byFunction.length > 0 &&
-            actionLink(
+            ctaButton(
               `Why is ${d.byFunction[0].name} slow?`,
               'help_outline',
               () =>
@@ -105,6 +108,7 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
                   d.byFunction[0].name,
                   d.byFunction[0].name,
                 ),
+              'secondary',
             ),
         ],
       ),
@@ -115,7 +119,7 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
         'Were your threads running in parallel, or serialized?',
         renderParallelBlock,
         () =>
-          actionLink('See how cycles were scheduled', 'arrow_forward', () =>
+          ctaButton('See how cycles were scheduled', 'arrow_forward', () =>
             attrs.onNavigate('whereran'),
           ),
       ),
@@ -133,7 +137,7 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
         'How efficiently did the CPU run?',
         renderEfficiencyBlock,
         () =>
-          actionLink('See how cycles were spent', 'arrow_forward', () =>
+          ctaButton('See how cycles were spent', 'arrow_forward', () =>
             attrs.onNavigate('efficiency'),
           ),
       ),

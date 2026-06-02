@@ -210,13 +210,34 @@ pub unsafe extern "C" fn sismo_symbolizer_add_module(
 /// into `out_utf8[..cap]`. Returns the number of bytes written (truncated
 /// to `cap` without a NUL terminator), or 0 if no match is found in any
 /// registered module.
+///
+/// Source line info (filename + line number) is written to the optional
+/// out-params when DWARF / debug info is available for the address; it is
+/// absent for symbol-table-only modules. `file_out`/`file_cap` receive the
+/// source file path (UTF-8, no NUL) with its length in `*file_len_out`, and
+/// `*line_out` receives the 1-based line number (0 = unknown). Pass null for
+/// any of `file_out`/`file_len_out`/`line_out` to skip it. The line info is
+/// taken from the outermost (non-inlined) frame, so it stays consistent with
+/// the function name reported above.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_symbolizer_resolve(
     s: *mut Symbolizer,
     avma: u64,
     out_utf8: *mut u8,
     cap: usize,
+    file_out: *mut u8,
+    file_cap: usize,
+    file_len_out: *mut usize,
+    line_out: *mut u32,
 ) -> usize {
+    // Initialize the optional line-info out-params to "unknown" up front, so
+    // every early return (no match, no debug info) leaves them well-defined.
+    if !file_len_out.is_null() {
+        unsafe { *file_len_out = 0 };
+    }
+    if !line_out.is_null() {
+        unsafe { *line_out = 0 };
+    }
     if s.is_null() || out_utf8.is_null() || cap == 0 {
         return 0;
     }
@@ -254,6 +275,30 @@ pub unsafe extern "C" fn sismo_symbolizer_resolve(
         Some(i) => i,
         None => return 0,
     };
+    // Source line info lives in `info.frames` (DWARF / inline records), not
+    // in `info.symbol` (which is symbol-table only). The vec runs innermost
+    // inlinee first, so the last entry is the outermost real function — the
+    // one whose name `info.symbol.name` reports. Use its file/line so the
+    // emitted name and source location describe the same frame.
+    if let Some(frame) = info.frames.as_ref().and_then(|f| f.last()) {
+        if let Some(line) = frame.line_number {
+            if !line_out.is_null() {
+                unsafe { *line_out = line };
+            }
+        }
+        if let Some(path) = frame.file_path.as_ref() {
+            if !file_out.is_null() && file_cap > 0 {
+                let raw = path.raw_path().as_bytes();
+                let fn_ = raw.len().min(file_cap);
+                let dst = unsafe { slice::from_raw_parts_mut(file_out, fn_) };
+                dst.copy_from_slice(&raw[..fn_]);
+                if !file_len_out.is_null() {
+                    unsafe { *file_len_out = fn_ };
+                }
+            }
+        }
+    }
+
     let offset = rel.saturating_sub(info.symbol.address);
     let formatted = format!("{} +{}", info.symbol.name, offset);
     let bytes = formatted.as_bytes();

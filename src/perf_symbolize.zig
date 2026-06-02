@@ -22,6 +22,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ProtoWriter = @import("proto_writer.zig").ProtoWriter;
 const symbolizer = @import("symbolizer.zig");
+const source_asm_sidecar = @import("source_asm_sidecar.zig");
+const disasm = @import("disasm.zig");
 
 // Field tags, inlined from protos/perfetto/trace/{trace_packet,profiling/
 // profile_common}.proto.
@@ -33,6 +35,8 @@ const MS_FIELD_ADDRESS_SYMBOLS: u32 = 3;
 const AS_FIELD_ADDRESS: u32 = 1;
 const AS_FIELD_LINES: u32 = 2;
 const LINE_FIELD_FUNCTION_NAME: u32 = 1;
+const LINE_FIELD_SOURCE_FILE_NAME: u32 = 2;
+const LINE_FIELD_LINE_NUMBER: u32 = 3;
 
 extern "c" fn sismo_trace_query_unsymbolized(
     trace_path: [*:0]const u8,
@@ -156,20 +160,42 @@ fn symbolizeTraceImpl(gpa: std.mem.Allocator, io: std.Io, trace_path: []const u8
     var stats: std.ArrayList(ModuleStat) = .empty;
     defer stats.deinit(gpa);
 
+    // Unique source-file paths referenced by sampled addresses (owned keys),
+    // collected during the resolve loop and bundled into the trace afterwards.
+    var src_set: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = src_set.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        src_set.deinit(gpa);
+    }
+
+    // Per-function disassembly listings to bundle (owned func + json; module and
+    // build_id borrow from the still-live Collector). Only on a supported arch.
+    var asm_records: std.ArrayList(source_asm_sidecar.AsmRecord) = .empty;
+    defer {
+        for (asm_records.items) |rec| {
+            gpa.free(rec.func);
+            gpa.free(rec.json);
+        }
+        asm_records.deinit(gpa);
+    }
+    const host_arch = disasm.currentArch();
+
     var n_funcs: usize = 0;
     var n_addrs: usize = 0;
 
     for (collector.modules.items) |*m| {
         if (m.rel_pcs.items.len == 0) continue;
         var stat: ModuleStat = .{ .name = m.name, .build_id_hex = m.build_id_hex };
-        const ms = try buildModuleSymbols(gpa, sym, m, &stat);
+        const ms = try buildModuleSymbols(gpa, sym, m, &stat, &src_set);
         defer gpa.free(ms);
         n_addrs += stat.n_addrs;
         n_funcs += stat.n_resolved;
         try stats.append(gpa, stat);
+        // Disassemble this module's hot functions while `sym` is scoped exactly
+        // as buildModuleSymbols saw it (line resolution reuses the same lookups).
+        if (host_arch) |arch| collectModuleDisasm(gpa, sym, m, arch, &asm_records) catch {};
         if (ms.len == 0) continue;
-        // Wrap the ModuleSymbols body in TracePacket.module_symbols (61),
-        // then the packet in Trace.packet (1).
         var tp = ProtoWriter.init(gpa);
         defer tp.deinit();
         try tp.writeMessage(TP_FIELD_MODULE_SYMBOLS, ms);
@@ -183,8 +209,178 @@ fn symbolizeTraceImpl(gpa: std.mem.Allocator, io: std.Io, trace_path: []const u8
         try file.writePositionalAll(io, out.bytes(), end);
     }
 
+    appendSourceAsmSidecar(gpa, io, trace_path, &src_set, asm_records.items);
+
     report(io, stats.items, n_addrs, n_funcs);
 }
+
+fn appendSourceAsmSidecar(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    trace_path: []const u8,
+    src_set: *std.StringHashMapUnmanaged(void),
+    asm_records: []const source_asm_sidecar.AsmRecord,
+) void {
+    if (src_set.count() == 0 and asm_records.len == 0) return;
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(gpa);
+    var it = src_set.keyIterator();
+    while (it.next()) |k| paths.append(gpa, k.*) catch return;
+    source_asm_sidecar.appendSidecar(gpa, io, trace_path, paths.items, asm_records) catch |err| {
+        std.debug.print("sismo record: source/asm bundling skipped ({s})\n", .{@errorName(err)});
+    };
+}
+
+// ==== BEGIN HACK: disassembly collection over the sidecar channel ====
+// Mirrors the source-bundling hack above; delete with sismo_privileged_marker.zig
+// when the real sidecar lands. The disasm bridge itself (disasm.zig / disasm.rs)
+// is reusable infra — only this trace-injection path is the hack.
+
+const DisasmInsn = struct { rel_pc: u64, bytes_hex: []u8, text: []u8 };
+
+const DisasmCtx = struct {
+    gpa: std.mem.Allocator,
+    funcs: std.AutoArrayHashMapUnmanaged(u64, std.ArrayList(DisasmInsn)) = .empty,
+    failed: bool = false,
+
+    fn deinit(self: *DisasmCtx) void {
+        var it = self.funcs.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.items) |insn| {
+                self.gpa.free(insn.bytes_hex);
+                self.gpa.free(insn.text);
+            }
+            e.value_ptr.deinit(self.gpa);
+        }
+        self.funcs.deinit(self.gpa);
+    }
+};
+
+fn onInsn(
+    ctx_opaque: ?*anyopaque,
+    func_start: u64,
+    insn_rel_pc: u64,
+    bytes_ptr: [*]const u8,
+    bytes_len: usize,
+    text_ptr: [*]const u8,
+    text_len: usize,
+) callconv(.c) void {
+    const ctx: *DisasmCtx = @ptrCast(@alignCast(ctx_opaque.?));
+    if (ctx.failed) return;
+    appendInsn(
+        ctx,
+        func_start,
+        insn_rel_pc,
+        bytes_ptr[0..bytes_len],
+        text_ptr[0..text_len],
+    ) catch {
+        ctx.failed = true;
+    };
+}
+
+fn appendInsn(
+    ctx: *DisasmCtx,
+    func_start: u64,
+    rel_pc: u64,
+    bytes: []const u8,
+    text: []const u8,
+) !void {
+    const gop = try ctx.funcs.getOrPut(ctx.gpa, func_start);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    const hex = try bytesToHex(ctx.gpa, bytes);
+    errdefer ctx.gpa.free(hex);
+    const txt = try ctx.gpa.dupe(u8, text);
+    try gop.value_ptr.append(ctx.gpa, .{ .rel_pc = rel_pc, .bytes_hex = hex, .text = txt });
+}
+
+fn collectModuleDisasm(
+    gpa: std.mem.Allocator,
+    sym: *symbolizer.Symbolizer,
+    m: *Module,
+    arch: disasm.Arch,
+    out: *std.ArrayList(source_asm_sidecar.AsmRecord),
+) !void {
+    var ctx: DisasmCtx = .{ .gpa = gpa };
+    defer ctx.deinit();
+    if (!disasm.disassembleModule(m.name, arch, m.rel_pcs.items, &onInsn, &ctx)) return;
+    if (ctx.failed) return;
+
+    var name_buf: [1024]u8 = undefined;
+    var file_buf: [1024]u8 = undefined;
+    var it = ctx.funcs.iterator();
+    while (it.next()) |e| {
+        const insns = e.value_ptr.items;
+        if (insns.len == 0) continue;
+        const r = symbolizer.resolve(sym, e.key_ptr.*, &name_buf, &file_buf);
+        if (r.name_len == 0) continue;
+        const fname = stripOffset(name_buf[0..r.name_len]);
+        if (fname.len == 0) continue;
+
+        var js: std.ArrayList(u8) = .empty;
+        errdefer js.deinit(gpa);
+        try js.append(gpa, '[');
+        for (insns, 0..) |insn, i| {
+            if (i > 0) try js.append(gpa, ',');
+            const lr = symbolizer.resolve(sym, insn.rel_pc, &name_buf, &file_buf);
+            try appendInsnJson(gpa, &js, insn, lr.line);
+        }
+        try js.append(gpa, ']');
+
+        const func_owned = try gpa.dupe(u8, fname);
+        errdefer gpa.free(func_owned);
+        try out.append(gpa, .{
+            .func = func_owned,
+            .module = m.name,
+            .build_id_hex = m.build_id_hex,
+            .json = try js.toOwnedSlice(gpa),
+        });
+    }
+}
+
+fn bytesToHex(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const digits = "0123456789abcdef";
+    const hex = try gpa.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |b, i| {
+        hex[i * 2] = digits[b >> 4];
+        hex[i * 2 + 1] = digits[b & 0xf];
+    }
+    return hex;
+}
+
+fn appendInsnJson(
+    gpa: std.mem.Allocator,
+    js: *std.ArrayList(u8),
+    insn: DisasmInsn,
+    line: u32,
+) !void {
+    var numbuf: [24]u8 = undefined;
+    try js.appendSlice(gpa, "{\"a\":\"");
+    try js.appendSlice(gpa, try std.fmt.bufPrint(&numbuf, "{d}", .{insn.rel_pc}));
+    try js.appendSlice(gpa, "\",\"b\":\"");
+    try js.appendSlice(gpa, insn.bytes_hex);
+    try js.appendSlice(gpa, "\",\"t\":\"");
+    try appendJsonEscaped(gpa, js, insn.text);
+    try js.appendSlice(gpa, "\"");
+    if (line > 0) {
+        try js.appendSlice(gpa, ",\"l\":");
+        try js.appendSlice(gpa, try std.fmt.bufPrint(&numbuf, "{d}", .{line}));
+    }
+    try js.append(gpa, '}');
+}
+
+fn appendJsonEscaped(gpa: std.mem.Allocator, js: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try js.appendSlice(gpa, "\\\""),
+            '\\' => try js.appendSlice(gpa, "\\\\"),
+            '\n' => try js.appendSlice(gpa, "\\n"),
+            '\t' => try js.appendSlice(gpa, "\\t"),
+            else => if (c >= 0x20) try js.append(gpa, c),
+        }
+    }
+}
+
+// ==== END HACK ====
 
 /// What happened when we tried to symbolize one module. Carries enough to
 /// tell a missing-symbols problem (actionable: install debug info) apart
@@ -339,6 +535,7 @@ fn buildModuleSymbols(
     sym: *symbolizer.Symbolizer,
     m: *Module,
     stat: *ModuleStat,
+    src_set: *std.StringHashMapUnmanaged(void),
 ) ![]u8 {
     // base_avma = load_bias makes the bridge's `rel = avma - base_avma`
     // equal `rel_pc - load_bias`, the module-relative address wholesym wants.
@@ -365,12 +562,13 @@ fn buildModuleSymbols(
     defer address_symbols.deinit();
 
     var name_buf: [1024]u8 = undefined;
+    var file_buf: [1024]u8 = undefined;
     var any = false;
     for (m.rel_pcs.items) |rel_pc| {
         stat.n_addrs += 1;
-        const n = symbolizer.resolve(sym, rel_pc, &name_buf);
-        if (n == 0) continue;
-        const func = stripOffset(name_buf[0..n]);
+        const r = symbolizer.resolve(sym, rel_pc, &name_buf, &file_buf);
+        if (r.name_len == 0) continue;
+        const func = stripOffset(name_buf[0..r.name_len]);
         if (func.len == 0) continue;
         stat.n_resolved += 1;
         any = true;
@@ -378,6 +576,16 @@ fn buildModuleSymbols(
         var line = ProtoWriter.init(gpa);
         defer line.deinit();
         try line.writeString(LINE_FIELD_FUNCTION_NAME, func);
+        // Source file + line come from DWARF; absent for symtab-only modules.
+        if (r.file_len > 0) {
+            const fpath = file_buf[0..r.file_len];
+            try line.writeString(LINE_FIELD_SOURCE_FILE_NAME, fpath);
+            // Remember the path so its text gets bundled (own the key — fpath
+            // points into the reused stack buffer).
+            const gop = try src_set.getOrPut(gpa, fpath);
+            if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, fpath);
+        }
+        if (r.line > 0) try line.writeUint32(LINE_FIELD_LINE_NUMBER, r.line);
 
         var as = ProtoWriter.init(gpa);
         defer as.deinit();

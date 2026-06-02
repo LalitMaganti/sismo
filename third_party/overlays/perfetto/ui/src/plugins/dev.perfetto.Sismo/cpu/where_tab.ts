@@ -32,6 +32,7 @@ import {
 import {
   Flamegraph,
   FlamegraphFilterBar,
+  type FlamegraphOptionalAction,
   type FlamegraphQueryData,
   type FlamegraphState,
 } from '../../../widgets/flamegraph';
@@ -42,9 +43,11 @@ import {
   type BreakdownKind,
 } from '../stack_timeline';
 import {fmtCount, fmtPercent} from '../format';
+import {actionLink} from '../page_common';
 import type {PrivilegedSet} from '../privileged_set';
 import {breakdownGrid, type BreakdownGridRow} from './grid';
 import {segmentedSwitcher} from './segmented';
+import type {EntityKind} from './session';
 import {
   applyPrefs,
   loadFlamegraphPrefs,
@@ -92,6 +95,9 @@ const CAPTION: Record<Mode, string> = {
 interface CpuWhereAttrs {
   readonly trace: Trace;
   readonly priv: PrivilegedSet;
+  // Open a detail tab: the flat Functions table drills a function (bottom-up),
+  // the flamegraph/call tree drill a stack (the top-down path at that frame).
+  readonly onDrill: (kind: EntityKind, id: string, label: string) => void;
 }
 
 export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
@@ -103,6 +109,8 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
   private fgState: FlamegraphState;
   private fgCounters?: ReadonlySet<string>;
   private fgBreakdown: BreakdownKind = 'none';
+  // "Open this stack" drilldown appended to every flamegraph node menu.
+  private readonly funcActions: ReadonlyArray<FlamegraphOptionalAction>;
   // Cross-trace view preferences, restored on construction (see ./prefs).
   private readonly prefs: FlamegraphPrefs;
 
@@ -118,13 +126,30 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
 
   constructor({attrs}: m.CVnode<CpuWhereAttrs>) {
     this.scope = sampleScopePredicates(attrs.priv);
+    this.funcActions = [
+      {
+        name: 'Why is this function slow?',
+        icon: 'open_in_new',
+        category: 'DRILL',
+        description: 'Open the function detail page for this frame.',
+        execute: (ctx) => {
+          const n = ctx.node?.name;
+          if (n !== undefined && n !== '') attrs.onDrill('function', n, n);
+        },
+      },
+    ];
     this.prefs = loadFlamegraphPrefs();
     // A persisted breakdown reshapes which metrics exist, so honour it before
     // building them.
     if (this.prefs.breakdownBy !== undefined) {
       this.fgBreakdown = this.prefs.breakdownBy as BreakdownKind;
     }
-    this.fgMetrics = buildSampleFlamegraphMetrics(this.scope, this.fgBreakdown);
+    this.fgMetrics = buildSampleFlamegraphMetrics(
+      this.scope,
+      this.fgBreakdown,
+      undefined,
+      this.funcActions,
+    );
     this.fgState = applyPrefs(
       Flamegraph.updateState(undefined, this.fgMetrics),
       this.prefs,
@@ -138,6 +163,7 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
           this.scope,
           this.fgBreakdown,
           counters,
+          this.funcActions,
         );
         // "Backend-bound slots" only appears once counters are confirmed; if the
         // saved metric was that and we fell back, restore it now (unless the user
@@ -246,6 +272,7 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
         this.scope,
         next,
         this.fgCounters,
+        this.funcActions,
       );
     }
   }
@@ -291,11 +318,14 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
             `Its callers (the upper half of the pivot) can only be shown in the ` +
             `flamegraph, not as a tree.`,
         ),
-      this.renderCalltreeGrid(built),
+      this.renderCalltreeGrid(attrs, built),
     );
   }
 
-  private renderCalltreeGrid(built: BuiltTree | undefined): m.Children {
+  private renderCalltreeGrid(
+    attrs: CpuWhereAttrs,
+    built: BuiltTree | undefined,
+  ): m.Children {
     if (built === undefined) {
       return m(EmptyState, {
         icon: 'hourglass_empty',
@@ -325,7 +355,11 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
             onChevronClick:
               kids.length > 0 ? () => this.toggle(built, node.id) : undefined,
           },
-          node.name,
+          // The name drills into that function's detail page; the chevron still
+          // expands the tree in place.
+          actionLink(node.name, 'open_in_new', () =>
+            attrs.onDrill('function', node.name, node.name),
+          ),
         ),
         m(GridCell, {align: 'right'}, fmtCount(node.total)),
         m(GridCell, {align: 'right'}, fmtPercent(node.total / total)),
@@ -379,6 +413,7 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
             valueTitle: 'Self cycles',
             formatValue: (n) => fmtCount(n),
             rows,
+            onNameClick: (name) => attrs.onDrill('function', name, name),
           });
     return m('.pf-sismo-tab__view', body);
   }

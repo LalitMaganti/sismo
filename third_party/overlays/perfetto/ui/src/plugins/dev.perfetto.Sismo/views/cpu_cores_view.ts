@@ -18,6 +18,7 @@
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
+import {QuerySlot, SerialTaskQueue} from '../../../base/query_slot';
 import {Section} from '../../../widgets/section';
 import {Card} from '../../../widgets/card';
 import {Anchor} from '../../../widgets/anchor';
@@ -56,15 +57,6 @@ interface CoreDrill {
   readonly onToggle: (cpu: number) => void;
 }
 
-// Whether utilisation (busy %, the bar, the sparkline) reflects only the
-// profiled set's work ('mine') or the whole machine ('system'). Defaults to
-// 'mine' when there's a profiled set; the toggle is offered only then.
-interface CoreScope {
-  readonly scope: 'mine' | 'system';
-  readonly hasPriv: boolean;
-  readonly onToggle: () => void;
-}
-
 // Class component wrapper: loads the per-core utilisation time-series (for the
 // inline sparklines) and the contention signals (threads sharing the core,
 // migrations onto it), re-rendering as each lands. The aggregate table renders
@@ -80,82 +72,107 @@ export interface CpuCoresViewAttrs {
 }
 
 export class CpuCoresView implements m.ClassComponent<CpuCoresViewAttrs> {
-  private seriesMine?: CoreSeries;
-  private seriesSystem?: CoreSeries;
-  private contention?: Map<number, CoreContentionRow>;
-  private coreThreads: Map<number, CoreThreadDetail> = new Map();
+  // Each signal is its own QuerySlot, re-keyed on {upids, focus window}: change
+  // the focus and they all re-fetch, with stale results dropped by the slot. The
+  // aggregate table renders as soon as perCore lands; the sparkline / contention
+  // / drill columns fill in as their slots resolve (each .data is undefined until
+  // then). Replaces the old oninit + five hand-cancelled .then() loads.
+  private readonly queue = new SerialTaskQueue();
+  private readonly perCoreSlot = new QuerySlot<CpuCoreRow[]>(this.queue);
+  private readonly seriesSystemSlot = new QuerySlot<CoreSeries>(this.queue);
+  private readonly seriesMineSlot = new QuerySlot<CoreSeries>(this.queue);
+  private readonly contentionSlot = new QuerySlot<
+    Map<number, CoreContentionRow>
+  >(this.queue);
+  private readonly coreThreadsSlot = new QuerySlot<
+    Map<number, CoreThreadDetail>
+  >(this.queue);
   private expandedCpu: number | null = null;
-  private scope: 'mine' | 'system' = 'system';
-  // Per-core runtimes: the preloaded whole-trace rows, or a windowed reload.
-  private perCore?: CpuCoreRow[];
+  // Utilisation basis. Defaults to your work when there's a profiled set; set
+  // once on first render (there's no in-view toggle).
+  private scope?: 'mine' | 'system';
 
-  oninit({attrs}: m.CVnode<CpuCoresViewAttrs>): void {
-    const {trace, priv, focus} = attrs;
-    const hasPriv = priv.upids.length > 0;
-    this.scope = hasPriv ? 'mine' : 'system';
-    if (focus === undefined) {
-      this.perCore = attrs.perCore;
-    } else {
-      loadPerCore(trace.engine, priv, focus)
-        .then((rows) => {
-          this.perCore = rows;
-          m.redraw();
-        })
-        .catch(() => {
-          this.perCore = [];
-          m.redraw();
-        });
-    }
-    loadCoreSeries(trace.engine, undefined, undefined, focus)
-      .then((s) => {
-        this.seriesSystem = s;
-        m.redraw();
-      })
-      .catch(() => {
-        this.seriesSystem = {numBuckets: 0, byCpu: new Map()};
-        m.redraw();
-      });
-    if (hasPriv) {
-      loadCoreSeries(trace.engine, priv, undefined, focus)
-        .then((s) => {
-          this.seriesMine = s;
-          m.redraw();
-        })
-        .catch(() => {});
-    }
-    loadCoreContention(trace.engine, focus)
-      .then((c) => {
-        this.contention = c;
-        m.redraw();
-      })
-      .catch(() => {});
-    loadCoreThreads(trace.engine, priv, undefined, focus)
-      .then((t) => {
-        this.coreThreads = t;
-        m.redraw();
-      })
-      .catch(() => {});
+  onremove(): void {
+    this.perCoreSlot.dispose();
+    this.seriesSystemSlot.dispose();
+    this.seriesMineSlot.dispose();
+    this.contentionSlot.dispose();
+    this.coreThreadsSlot.dispose();
   }
 
   view({attrs}: m.CVnode<CpuCoresViewAttrs>): m.Children {
+    const {trace, priv, focus} = attrs;
+    const hasPriv = priv.upids.length > 0;
+    this.scope ??= hasPriv ? 'mine' : 'system';
+    const upids = [...priv.upids];
+
+    // Per-core runtimes: the preloaded whole-trace rows when unfocused, else a
+    // windowed reload keyed on the focus.
+    let perCore: CpuCoreRow[] | undefined;
+    if (focus === undefined) {
+      perCore = attrs.perCore;
+    } else {
+      try {
+        perCore = this.perCoreSlot.use({
+          key: {upids, focus},
+          queryFn: () => loadPerCore(trace.engine, priv, focus),
+        }).data;
+      } catch {
+        perCore = [];
+      }
+    }
+
+    let seriesSystem: CoreSeries | undefined;
+    try {
+      seriesSystem = this.seriesSystemSlot.use({
+        key: {focus: focus ?? null},
+        queryFn: () => loadCoreSeries(trace.engine, undefined, undefined, focus),
+      }).data;
+    } catch {
+      seriesSystem = {numBuckets: 0, byCpu: new Map()};
+    }
+
+    let seriesMine: CoreSeries | undefined;
+    if (hasPriv) {
+      try {
+        seriesMine = this.seriesMineSlot.use({
+          key: {upids, focus: focus ?? null},
+          queryFn: () => loadCoreSeries(trace.engine, priv, undefined, focus),
+        }).data;
+      } catch {
+        seriesMine = undefined;
+      }
+    }
+
+    let contention: Map<number, CoreContentionRow> | undefined;
+    try {
+      contention = this.contentionSlot.use({
+        key: {focus: focus ?? null},
+        queryFn: () => loadCoreContention(trace.engine, focus),
+      }).data;
+    } catch {
+      contention = undefined;
+    }
+
+    let coreThreads: Map<number, CoreThreadDetail> | undefined;
+    try {
+      coreThreads = this.coreThreadsSlot.use({
+        key: {upids, focus: focus ?? null},
+        queryFn: () => loadCoreThreads(trace.engine, priv, undefined, focus),
+      }).data;
+    } catch {
+      coreThreads = undefined;
+    }
+
     const drill: CoreDrill = {
-      threads: this.coreThreads,
+      threads: coreThreads ?? new Map(),
       expandedCpu: this.expandedCpu,
       onToggle: (cpu) => {
         this.expandedCpu = this.expandedCpu === cpu ? null : cpu;
         m.redraw();
       },
     };
-    const scopeCtl: CoreScope = {
-      scope: this.scope,
-      hasPriv: attrs.priv.upids.length > 0,
-      onToggle: () => {
-        this.scope = this.scope === 'mine' ? 'system' : 'mine';
-        m.redraw();
-      },
-    };
-    const series = this.scope === 'mine' ? this.seriesMine : this.seriesSystem;
-    const perCore = this.perCore;
+    const series = this.scope === 'mine' ? seriesMine : seriesSystem;
     if (perCore === undefined) {
       return m(
         Section,
@@ -174,9 +191,9 @@ export class CpuCoresView implements m.ClassComponent<CpuCoresViewAttrs> {
       summary,
       perCore,
       series,
-      this.contention,
+      contention,
       drill,
-      scopeCtl,
+      this.scope === 'mine',
     );
   }
 }
@@ -188,7 +205,10 @@ export function renderCpuCores(
   series?: CoreSeries,
   contention?: Map<number, CoreContentionRow>,
   drill?: CoreDrill,
-  scopeCtl?: CoreScope,
+  // Utilisation basis: your work only ('mine') vs the whole machine. Fixed per
+  // trace (your-work when there's a profiled set, else machine-wide) — there is
+  // no in-view toggle.
+  mineScope = false,
 ): m.Children {
   if (rows.length === 0) {
     return m(
@@ -203,8 +223,6 @@ export function renderCpuCores(
   const walltime = summary.walltimeNs !== null ? Number(summary.walltimeNs) : 0;
   const hasPriv = rows.some((r) => r.privilegedRuntimeNs !== null);
   const clusters = groupCoresByCluster(rows);
-  // Utilisation basis: your work only ('mine') vs the whole machine ('system').
-  const mineScope = scopeCtl?.scope === 'mine';
   const coreBusyNs = (r: CpuCoreRow): bigint =>
     (mineScope ? r.privilegedRuntimeNs : r.runtimeNs) ?? 0n;
 
@@ -250,7 +268,6 @@ export function renderCpuCores(
   return m(
     Section,
     {title: 'Per-core breakdown', subtitle},
-    scopeCtl?.hasPriv === true && renderScopeToggle(scopeCtl),
     m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
     clusters.map((cl) =>
       m(
@@ -275,28 +292,6 @@ export function renderCpuCores(
         drill?.threads.get(expanded),
         busyNsOf(expanded),
       ),
-  );
-}
-
-// "Your work | Full system" toggle for the utilisation basis. Two inline
-// buttons; the active one is highlighted.
-function renderScopeToggle(ctl: CoreScope): m.Children {
-  const opt = (key: 'mine' | 'system', label: string): m.Children =>
-    m(
-      'button.pf-sismo-page__seg' +
-        (ctl.scope === key ? '.pf-sismo-page__seg--active' : ''),
-      {
-        onclick: () => {
-          if (ctl.scope !== key) ctl.onToggle();
-        },
-      },
-      label,
-    );
-  return m(
-    '.pf-sismo-page__seg-row',
-    m('span.pf-sismo-page__muted', 'Utilisation:'),
-    opt('mine', 'Your work'),
-    opt('system', 'Full system'),
   );
 }
 

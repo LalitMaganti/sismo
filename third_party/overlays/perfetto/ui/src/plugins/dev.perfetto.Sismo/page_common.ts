@@ -17,9 +17,13 @@
 import m from 'mithril';
 import type {Trace} from '../../public/trace';
 import {Anchor} from '../../widgets/anchor';
+import {Button, ButtonVariant} from '../../widgets/button';
 import {Card} from '../../widgets/card';
+import {EmptyState} from '../../widgets/empty_state';
 import {Icon} from '../../widgets/icon';
+import {Intent} from '../../widgets/common';
 import {Section} from '../../widgets/section';
+import {Spinner} from '../../widgets/spinner';
 import {Tooltip} from '../../widgets/tooltip';
 import {Time} from '../../base/time';
 import {LONG_NULL} from '../../trace_processor/query_result';
@@ -190,6 +194,25 @@ export function actionLink(
   );
 }
 
+// A prominent call-to-action button for navigating between pages — the loud
+// version of actionLink, for footers that send the user to a whole other view.
+// `primary` is the filled accent button; `secondary` is outlined.
+export function ctaButton(
+  label: string,
+  icon: string,
+  onclick: () => void,
+  variant: 'primary' | 'secondary' = 'primary',
+): m.Children {
+  return m(Button, {
+    label,
+    icon,
+    variant:
+      variant === 'primary' ? ButtonVariant.Filled : ButtonVariant.Outlined,
+    intent: variant === 'primary' ? Intent.Primary : Intent.None,
+    onclick,
+  });
+}
+
 // "See all →" footer link into a lens tab.
 export function renderSeeAllLink(
   trace: Trace,
@@ -272,6 +295,30 @@ export function renderThreadLink(
     },
     threadName,
     tid !== null && m('span.pf-sismo-page__muted', ` (tid ${tid})`),
+  );
+}
+
+// A 0..1 proportion bar reusing the breakdown cell-bar styles, with an optional
+// trailing label. Shared by the detail-page tables (splits, butterfly edges).
+export function renderBar(frac: number, label?: string): m.Children {
+  return m(
+    '.pf-sismo-cellbar',
+    m(
+      '.pf-sismo-cellbar__track',
+      m('.pf-sismo-cellbar__fill', {
+        style: `width:${Math.min(100, Math.max(0, frac) * 100).toFixed(1)}%`,
+      }),
+    ),
+    label !== undefined && m('span.pf-sismo-cellbar__pct', label),
+  );
+}
+
+// A spinner-over-EmptyState placeholder used while a detail pane's query runs.
+export function loadingBody(title: string): m.Children {
+  return m(
+    EmptyState,
+    {icon: 'hourglass_empty', title},
+    m(Spinner, {easing: true}),
   );
 }
 

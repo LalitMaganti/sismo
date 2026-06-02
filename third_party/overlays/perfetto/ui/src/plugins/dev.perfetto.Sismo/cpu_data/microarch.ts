@@ -382,19 +382,19 @@ export async function loadMicroarchCounters(
       ${frameNameExpr('spf')} AS name,
       spm.name AS mapping_name,
       count(DISTINCT d.sample_id) AS samples,
-      sum(CASE WHEN cname = 'cpu-cycles' THEN dv END) AS cycles,
-      sum(CASE WHEN cname = 'instructions' THEN dv END) AS instructions,
-      sum(CASE WHEN cname = 'cache-misses' THEN dv END) AS cache_miss,
-      sum(CASE WHEN cname = 'branch-misses' THEN dv END) AS branch_miss,
-      sum(CASE WHEN cname = 'stalled-cycles-frontend' THEN dv END) AS stall_fe,
-      sum(CASE WHEN cname = 'stalled-cycles-backend' THEN dv END) AS stall_be,
-      sum(CASE WHEN cname = 'op-retired' THEN dv END) AS arm_retired,
-      sum(CASE WHEN cname = 'op-spec' THEN dv END) AS arm_spec,
-      sum(CASE WHEN cname = 'stall-slot-frontend' THEN dv END) AS arm_fe,
-      sum(CASE WHEN cname = 'stall-slot-backend' THEN dv END) AS arm_be,
-      sum(CASE WHEN cname = 'slots' THEN dv END) AS intel_slots,
-      sum(CASE WHEN cname = 'topdown-slots-retired' THEN dv END) AS intel_retired,
-      sum(CASE WHEN cname = 'topdown-fetch-bubbles' THEN dv END) AS intel_fe
+      sum(CASE WHEN cname = 'cpu-cycles' AND dv > 0 THEN dv END) AS cycles,
+      sum(CASE WHEN cname = 'instructions' AND dv > 0 THEN dv END) AS instructions,
+      sum(CASE WHEN cname = 'cache-misses' AND dv > 0 THEN dv END) AS cache_miss,
+      sum(CASE WHEN cname = 'branch-misses' AND dv > 0 THEN dv END) AS branch_miss,
+      sum(CASE WHEN cname = 'stalled-cycles-frontend' AND dv > 0 THEN dv END) AS stall_fe,
+      sum(CASE WHEN cname = 'stalled-cycles-backend' AND dv > 0 THEN dv END) AS stall_be,
+      sum(CASE WHEN cname = 'op-retired' AND dv > 0 THEN dv END) AS arm_retired,
+      sum(CASE WHEN cname = 'op-spec' AND dv > 0 THEN dv END) AS arm_spec,
+      sum(CASE WHEN cname = 'stall-slot-frontend' AND dv > 0 THEN dv END) AS arm_fe,
+      sum(CASE WHEN cname = 'stall-slot-backend' AND dv > 0 THEN dv END) AS arm_be,
+      sum(CASE WHEN cname = 'slots' AND dv > 0 THEN dv END) AS intel_slots,
+      sum(CASE WHEN cname = 'topdown-slots-retired' AND dv > 0 THEN dv END) AS intel_retired,
+      sum(CASE WHEN cname = 'topdown-fetch-bubbles' AND dv > 0 THEN dv END) AS intel_fe
     FROM d
     JOIN stack_profile_callsite c ON c.id = d.callsite_id
     JOIN stack_profile_frame spf ON spf.id = c.frame_id
@@ -457,22 +457,133 @@ export async function loadMicroarchCounters(
   return {state: 'ok', totalSamples, roles: roleMap, perFunc};
 }
 
-// Counter-delta sums by role, shared by every grouping of loadMicroarchByGroup.
-// `dv` is the consecutive-sample delta from the `d` CTE (see loadMicroarchByGroup).
+// One function's microarchitecture, set against the workload it ran in. The
+// per-function side is leaf-attributed and APPROXIMATE (timer-sampled, no PEBS):
+// the counter delta over each sample interval is credited to whatever stack was
+// caught at the interval's end. So treat `self` as the shape of this function's
+// execution, not a precise per-instruction measurement — its value is the
+// CONTRAST with `baseline` (the whole profiled set), which tells you whether
+// this function runs hotter/stallier than the workload average.
+export interface FunctionMicroarch {
+  state: MicroarchState;
+  // Samples (delta intervals) attributed to this function's leaf.
+  samples: number;
+  // null when counters are absent/zero or the function has too few samples for
+  // a stable derivation (we don't print a precise-looking number from noise).
+  self: TmaModel | null;
+  baseline: TmaModel | null;
+}
+
+export async function loadFunctionMicroarch(
+  engine: Engine,
+  priv: PrivilegedSet,
+  name: string,
+): Promise<FunctionMicroarch> {
+  await engine.query('INCLUDE PERFETTO MODULE linux.perf.counters;');
+  const scope = sampleScopePredicate(priv);
+  const esc = name.replace(/'/g, "''");
+  const nameExpr = frameNameExpr('spf', null);
+
+  // Baseline = whole-scope role totals: per-thread max (cumulative counters),
+  // summed over threads — the same accounting the headline TMA bar uses.
+  const baseRes = await engine.query(`
+    WITH pt AS (
+      SELECT s.utid AS utid, t.name AS cname, max(s.counter_value) AS v
+      FROM linux_perf_sample_with_counters s
+      JOIN track t ON t.id = s.track_id
+      WHERE s.callsite_id IS NOT NULL ${scope}
+      GROUP BY s.utid, t.name
+    )
+    SELECT cname, sum(v) AS total FROM pt GROUP BY cname
+  `);
+  const baseRoles = new Map<CounterRole, number>();
+  for (
+    const it = baseRes.iter({cname: STR_NULL, total: NUM_NULL});
+    it.valid();
+    it.next()
+  ) {
+    const role = it.cname !== null ? COUNTER_ROLES.get(it.cname) : undefined;
+    if (role !== undefined && it.total !== null) baseRoles.set(role, it.total);
+  }
+  if (baseRoles.size === 0) {
+    return {state: 'no-counters', samples: 0, self: null, baseline: null};
+  }
+  if (
+    (baseRoles.get('cycles') ?? 0) === 0 &&
+    (baseRoles.get('instructions') ?? 0) === 0
+  ) {
+    return {state: 'all-zero', samples: 0, self: null, baseline: null};
+  }
+
+  // Self = per-function role sums via the consecutive-sample delta, restricted
+  // to samples whose leaf frame is this function (same method as the per-row
+  // breakdown in loadMicroarchCounters, filtered to one name and unlimited).
+  const selfRes = await engine.query(`
+    WITH d AS (
+      SELECT
+        s.callsite_id AS callsite_id,
+        s.sample_id AS sample_id,
+        t.name AS cname,
+        s.counter_value - lag(s.counter_value) OVER (
+          PARTITION BY s.utid, s.track_id ORDER BY s.ts
+        ) AS dv
+      FROM linux_perf_sample_with_counters s
+      JOIN track t ON t.id = s.track_id
+      WHERE s.callsite_id IS NOT NULL ${scope}
+    )
+    SELECT count(DISTINCT d.sample_id) AS samples, ${ROLE_SUMS}
+    FROM d
+    JOIN stack_profile_callsite c ON c.id = d.callsite_id
+    JOIN stack_profile_frame spf ON spf.id = c.frame_id
+    WHERE ${nameExpr} = '${esc}'
+  `);
+  const sr = selfRes.firstRow({
+    samples: NUM,
+    cycles: NUM_NULL,
+    instructions: NUM_NULL,
+    cache_miss: NUM_NULL,
+    branch_miss: NUM_NULL,
+    stall_fe: NUM_NULL,
+    stall_be: NUM_NULL,
+    arm_retired: NUM_NULL,
+    arm_spec: NUM_NULL,
+    arm_fe: NUM_NULL,
+    arm_be: NUM_NULL,
+    intel_slots: NUM_NULL,
+    intel_retired: NUM_NULL,
+    intel_fe: NUM_NULL,
+  });
+  const self =
+    sr.samples >= FUNC_TMA_MIN_SAMPLES ? computeTma(rowRoles(sr)) : null;
+  return {
+    state: 'ok',
+    samples: sr.samples,
+    self,
+    baseline: computeTma(baseRoles),
+  };
+}
+
+// Counter-delta sums by role, shared by every grouping of loadMicroarchByGroup
+// AND by the per-function self totals in loadFunctionMicroarch. `dv` is the
+// consecutive-sample delta from the `d` CTE. Cumulative counters can step
+// backwards across a counter reset or a cross-CPU migration mid-series (lag is
+// partitioned by utid+track, not CPU), so a `dv > 0` guard drops those negative
+// artifacts — matching the windowed totals and loadRealCycles, which clamp the
+// same way. Without it a single backward step silently subtracts real work.
 const ROLE_SUMS = `
-  sum(CASE WHEN cname = 'cpu-cycles' THEN dv END) AS cycles,
-  sum(CASE WHEN cname = 'instructions' THEN dv END) AS instructions,
-  sum(CASE WHEN cname = 'cache-misses' THEN dv END) AS cache_miss,
-  sum(CASE WHEN cname = 'branch-misses' THEN dv END) AS branch_miss,
-  sum(CASE WHEN cname = 'stalled-cycles-frontend' THEN dv END) AS stall_fe,
-  sum(CASE WHEN cname = 'stalled-cycles-backend' THEN dv END) AS stall_be,
-  sum(CASE WHEN cname = 'op-retired' THEN dv END) AS arm_retired,
-  sum(CASE WHEN cname = 'op-spec' THEN dv END) AS arm_spec,
-  sum(CASE WHEN cname = 'stall-slot-frontend' THEN dv END) AS arm_fe,
-  sum(CASE WHEN cname = 'stall-slot-backend' THEN dv END) AS arm_be,
-  sum(CASE WHEN cname = 'slots' THEN dv END) AS intel_slots,
-  sum(CASE WHEN cname = 'topdown-slots-retired' THEN dv END) AS intel_retired,
-  sum(CASE WHEN cname = 'topdown-fetch-bubbles' THEN dv END) AS intel_fe`;
+  sum(CASE WHEN cname = 'cpu-cycles' AND dv > 0 THEN dv END) AS cycles,
+  sum(CASE WHEN cname = 'instructions' AND dv > 0 THEN dv END) AS instructions,
+  sum(CASE WHEN cname = 'cache-misses' AND dv > 0 THEN dv END) AS cache_miss,
+  sum(CASE WHEN cname = 'branch-misses' AND dv > 0 THEN dv END) AS branch_miss,
+  sum(CASE WHEN cname = 'stalled-cycles-frontend' AND dv > 0 THEN dv END) AS stall_fe,
+  sum(CASE WHEN cname = 'stalled-cycles-backend' AND dv > 0 THEN dv END) AS stall_be,
+  sum(CASE WHEN cname = 'op-retired' AND dv > 0 THEN dv END) AS arm_retired,
+  sum(CASE WHEN cname = 'op-spec' AND dv > 0 THEN dv END) AS arm_spec,
+  sum(CASE WHEN cname = 'stall-slot-frontend' AND dv > 0 THEN dv END) AS arm_fe,
+  sum(CASE WHEN cname = 'stall-slot-backend' AND dv > 0 THEN dv END) AS arm_be,
+  sum(CASE WHEN cname = 'slots' AND dv > 0 THEN dv END) AS intel_slots,
+  sum(CASE WHEN cname = 'topdown-slots-retired' AND dv > 0 THEN dv END) AS intel_retired,
+  sum(CASE WHEN cname = 'topdown-fetch-bubbles' AND dv > 0 THEN dv END) AS intel_fe`;
 
 function rowRoles(it: {
   cycles: number | null;

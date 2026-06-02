@@ -41,7 +41,11 @@ import type {VerticalBounds} from '../../base/geom';
 import type {SourceDataset as SourceDatasetType} from '../../trace_processor/dataset';
 import {FlamegraphPanel} from '../../components/flamegraph_panel';
 import type {QueryFlamegraphMetric} from '../../components/query_flamegraph';
-import {Flamegraph, type FlamegraphState} from '../../widgets/flamegraph';
+import {
+  Flamegraph,
+  type FlamegraphOptionalAction,
+  type FlamegraphState,
+} from '../../widgets/flamegraph';
 import type {PrivilegedSet} from './privileged_set';
 
 const STACK_TABLE = 'sismo_priv_stack_slices';
@@ -847,6 +851,9 @@ export function buildSampleFlamegraphMetrics(
   // and the backend-bound view — which needs the optional Top-Down counters — is
   // withheld, so it never shows for a trace that can't support it.
   availableCounters?: ReadonlySet<string>,
+  // Embedder node actions appended to every metric's node menu (e.g. a Sismo
+  // "open this stack" drilldown). Each receives the clicked node via its ctx.
+  nodeActions?: ReadonlyArray<FlamegraphOptionalAction>,
 ): QueryFlamegraphMetric[] {
   const where = ['p.callsite_id is not null', ...wherePredicates].join(
     '\n            and ',
@@ -939,6 +946,9 @@ export function buildSampleFlamegraphMetrics(
       unaggregatableProperties,
       aggregatableProperties,
     });
+  }
+  if (nodeActions !== undefined && nodeActions.length > 0) {
+    return metrics.map((mt) => ({...mt, optionalNodeActions: nodeActions}));
   }
   return metrics;
 }

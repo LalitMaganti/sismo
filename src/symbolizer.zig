@@ -9,9 +9,10 @@
 //!     const s = try symbolizer.create();
 //!     defer symbolizer.destroy(s);
 //!     try symbolizer.addModule(s, base_avma, end_avma, path);
-//!     var buf: [256]u8 = undefined;
-//!     const n = symbolizer.resolve(s, pc, &buf);
-//!     if (n > 0) std.debug.print("{s}\n", .{buf[0..n]});
+//!     var name_buf: [256]u8 = undefined;
+//!     var file_buf: [512]u8 = undefined;
+//!     const r = symbolizer.resolve(s, pc, &name_buf, &file_buf);
+//!     if (r.name_len > 0) std.debug.print("{s}\n", .{name_buf[0..r.name_len]});
 
 const std = @import("std");
 
@@ -61,7 +62,21 @@ extern "c" fn sismo_symbolizer_resolve(
     avma: u64,
     out_utf8: [*]u8,
     cap: usize,
+    file_out: [*]u8,
+    file_cap: usize,
+    file_len_out: *usize,
+    line_out: *u32,
 ) usize;
+
+/// Result of `resolve`: lengths of the bytes written into the caller's name
+/// and file buffers, plus the 1-based source line (0 if unavailable). A
+/// `name_len` of 0 means no symbol matched. `file_len`/`line` are populated
+/// only when the module had DWARF / debug info for the address.
+pub const Resolved = struct {
+    name_len: usize = 0,
+    file_len: usize = 0,
+    line: u32 = 0,
+};
 
 pub fn create() Error!*Symbolizer {
     return sismo_symbolizer_create() orelse error.OutOfMemory;
@@ -117,9 +132,23 @@ pub fn addModule(
     };
 }
 
-/// Resolve `avma` into `out` as UTF-8 (no NUL). Returns the byte count
-/// written (0 if no match). Caller slices the buffer accordingly.
-pub fn resolve(s: *Symbolizer, avma: u64, out: []u8) usize {
-    if (out.len == 0) return 0;
-    return sismo_symbolizer_resolve(s, avma, out.ptr, out.len);
+/// Resolve `avma`, writing the demangled `<name> +<offset>` into `name` and
+/// (when debug info is available) the source file path into `file`. Both are
+/// UTF-8, no NUL; the returned `Resolved` carries the byte counts and the
+/// source line number. Caller slices the buffers accordingly.
+pub fn resolve(s: *Symbolizer, avma: u64, name: []u8, file: []u8) Resolved {
+    if (name.len == 0) return .{};
+    var file_len: usize = 0;
+    var line: u32 = 0;
+    const n = sismo_symbolizer_resolve(
+        s,
+        avma,
+        name.ptr,
+        name.len,
+        file.ptr,
+        file.len,
+        &file_len,
+        &line,
+    );
+    return .{ .name_len = n, .file_len = file_len, .line = line };
 }

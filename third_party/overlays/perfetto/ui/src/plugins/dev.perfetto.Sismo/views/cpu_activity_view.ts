@@ -21,6 +21,7 @@
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
+import {QuerySlot, SerialTaskQueue} from '../../../base/query_slot';
 import {Section} from '../../../widgets/section';
 import {Card} from '../../../widgets/card';
 import {Anchor} from '../../../widgets/anchor';
@@ -60,10 +61,13 @@ interface Lane {
 }
 
 export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
-  private board?: ActivityBoard;
-  private trace?: Trace;
-  // Stored so the window-consumers drill can scope to the profiled set.
-  private priv?: PrivilegedSet;
+  // The board and the window-consumers drill both load through QuerySlot: the
+  // board is keyed on the profiled set, the drill on the brushed time window. A
+  // changed key re-fetches and the slot drops stale in-flight results, so the
+  // old hand-rolled loadSeq token is gone.
+  private readonly queue = new SerialTaskQueue();
+  private readonly boardSlot = new QuerySlot<ActivityBoard>(this.queue);
+  private readonly windowSlot = new QuerySlot<WindowThreadRow[]>(this.queue);
   // The committed selection: an inclusive range of bucket indices. A plain
   // click is a one-bucket range; dragging brushes a wider window.
   private selStart?: number;
@@ -71,21 +75,15 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
   // The committed range when it is exactly one column — lets a repeat click on
   // that same column toggle the selection off.
   private committedSingle?: number;
-  private windowRows?: WindowThreadRow[];
   // Live brush state while the mouse is held down.
   private brushAnchor?: number;
   private brushing = false;
-  // Monotonic token so a stale window-consumers query can't overwrite a newer
-  // selection's result.
-  private loadSeq = 0;
   private readonly onWindowUp = () => this.endBrush();
-
-  constructor({attrs}: m.CVnode<CpuActivityViewAttrs>) {
-    this.load(attrs.trace, attrs.priv);
-  }
 
   onremove(): void {
     window.removeEventListener('mouseup', this.onWindowUp);
+    this.boardSlot.dispose();
+    this.windowSlot.dispose();
   }
 
   private inSelection(i: number): boolean {
@@ -116,7 +114,8 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
   }
 
   // Pointer released: finalise the range. A no-drag click on the already-
-  // selected single column clears the selection; otherwise load its consumers.
+  // selected single column clears the selection; otherwise the new range's key
+  // drives the window-consumers slot on the next render.
   private endBrush(): void {
     window.removeEventListener('mouseup', this.onWindowUp);
     if (!this.brushing) return;
@@ -131,7 +130,6 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
       return;
     }
     this.committedSingle = a === b ? a : undefined;
-    this.loadWindow(a, b);
     m.redraw();
   }
 
@@ -139,32 +137,6 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
     this.selStart = undefined;
     this.selEnd = undefined;
     this.committedSingle = undefined;
-    this.windowRows = undefined;
-  }
-
-  // Load the threads busy across the selected bucket range [a, b].
-  private loadWindow(a: number, b: number): void {
-    const board = this.board;
-    const trace = this.trace;
-    if (board === undefined || trace === undefined) return;
-    const lo = board.buckets[a]?.startTs;
-    const hi = board.buckets[b]?.endTs;
-    if (lo === undefined || hi === undefined) return;
-    this.windowRows = undefined;
-    const seq = ++this.loadSeq;
-    loadWindowConsumers(trace.engine, lo, hi, this.priv)
-      .then((rows) => {
-        if (this.loadSeq === seq) {
-          this.windowRows = rows;
-          m.redraw();
-        }
-      })
-      .catch(() => {
-        if (this.loadSeq === seq) {
-          this.windowRows = [];
-          m.redraw();
-        }
-      });
   }
 
   view({attrs}: m.CVnode<CpuActivityViewAttrs>): m.Children {
@@ -174,7 +146,15 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
       'axis, so you can line churn up against concurrency and load. Click a ' +
       'column — or drag across several — to see who was busy in that window, ' +
       'then jump to the timeline framed on it.';
-    const board = this.board;
+    let board: ActivityBoard | undefined;
+    try {
+      board = this.boardSlot.use({
+        key: {upids: [...attrs.priv.upids]},
+        queryFn: () => loadActivityBoard(attrs.trace.engine, attrs.priv),
+      }).data;
+    } catch {
+      board = {hasData: false, numCpus: 0, bucketWidthNs: 0n, buckets: []};
+    }
     if (board === undefined) {
       return m(
         Section,
@@ -274,7 +254,7 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
           m('span', fmtDuration(attrs.trace, span)),
         ),
       ),
-      this.renderSliceDetail(attrs.trace, board, originTs),
+      this.renderSliceDetail(attrs, board, originTs),
     );
   }
 
@@ -282,10 +262,11 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
   // bucket range, yours starred, with a jump that frames the whole window in
   // the timeline. A single column reads as a slice; a brushed range as a span.
   private renderSliceDetail(
-    trace: Trace,
+    attrs: CpuActivityViewAttrs,
     board: ActivityBoard,
     originTs: bigint,
   ): m.Children {
+    const trace = attrs.trace;
     const a = this.selStart;
     const z = this.selEnd;
     if (a === undefined || z === undefined) return undefined;
@@ -298,7 +279,18 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
       `t+${fmtDuration(trace, start - originTs)} – ` +
       `t+${fmtDuration(trace, end - originTs)}`;
     const span = a === z ? 'slice' : `${z - a + 1} slices`;
-    const rows = this.windowRows;
+    // The brushed window is the slot's key: a new selection re-fetches, an
+    // unchanged one is served from cache.
+    let rows: WindowThreadRow[] | undefined;
+    try {
+      rows = this.windowSlot.use({
+        key: {lo: start, hi: end, upids: [...attrs.priv.upids]},
+        queryFn: () =>
+          loadWindowConsumers(trace.engine, start, end, attrs.priv),
+      }).data;
+    } catch {
+      rows = [];
+    }
     return m(
       '.pf-sismo-page__tab-pane',
       m('.pf-sismo-page__tab-pane-label', `Busiest in ${label} (${span})`),
@@ -374,17 +366,6 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
         ),
       ),
     );
-  }
-
-  private async load(trace: Trace, priv: PrivilegedSet): Promise<void> {
-    this.trace = trace;
-    this.priv = priv;
-    try {
-      this.board = await loadActivityBoard(trace.engine, priv);
-    } catch {
-      this.board = {hasData: false, numCpus: 0, bucketWidthNs: 0n, buckets: []};
-    }
-    m.redraw();
   }
 }
 

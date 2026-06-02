@@ -284,6 +284,15 @@
     letter-spacing: -0.005em;
   }
 
+  // A lighter heading for a sub-block inside a tab-pane (e.g. the Top-Down split
+  // under "How efficiently it ran").
+  &__tab-pane-sublabel {
+    font-size: var(--pf-font-size-s);
+    font-weight: 600;
+    color: var(--pf-color-text-muted);
+    margin-top: 8px;
+  }
+
   &__headline {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -552,6 +561,66 @@
   height: 100%;
   overflow: hidden;
 
+  // Neutral inline flag on a Top-Down bucket row ("← largest") — deliberately
+  // muted, not a red/green verdict colour.
+  &__tag {
+    color: var(--pf-color-text-muted);
+    font-weight: 600;
+    font-size: var(--pf-font-size-s);
+  }
+
+  // Entity header above the sub-tab switcher: the name + a one-line orientation.
+  &__head {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  &__head-title {
+    font-size: var(--pf-font-size-l);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    word-break: break-word;
+  }
+
+  &__head-sub {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+
+  // A sub-tab body: vertical stack of its blocks.
+  &__pane {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  // "What stands out" facts on an Overview.
+  &__facts {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  &__fact {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 10px 12px;
+    border: 1px solid var(--pf-color-border);
+    border-radius: 6px;
+  }
+
+  &__fact-icon {
+    color: var(--pf-color-text-muted);
+    flex: 0 0 auto;
+  }
+
+  &__fact-text {
+    flex: 1 1 200px;
+  }
+
   &__toolbar {
     display: flex;
     align-items: center;
@@ -612,47 +681,201 @@
   }
 }
 
-// Top-Down (TMA) Level-1 bar: pipeline slots split into Retiring / Bad-Spec /
-// Frontend / Backend (or the coarse Not-stalled / Frontend / Backend). Semantic
-// colours: green = useful work, red = wasted speculation, amber = frontend,
-// blue = backend.
+// The function-detail "How efficiently it ran" pane: a bordered card holding a
+// cycle headline, the IPC / miss-rate vitals (this fn vs workload), the Top-Down
+// split bar, the pointer callout and the reweight row.
+.pf-sismo-eff {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  margin-top: 4px;
+  border: 1px solid var(--pf-color-border);
+  border-radius: 8px;
+
+  &__title {
+    font-size: var(--pf-font-size-m);
+    font-weight: 600;
+    letter-spacing: -0.005em;
+  }
+
+  &__sublabel {
+    font-size: var(--pf-font-size-s);
+    font-weight: 600;
+    color: var(--pf-color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  &__note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+
+  &__caveat {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    line-height: 1.45;
+  }
+
+  &__headline {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+
+  &__cyc {
+    font-size: 22px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__cyc-share {
+    color: var(--pf-color-text-muted);
+    font-size: var(--pf-font-size-m);
+  }
+
+  // Pointer callout body: evidence text on the left, the reweight buttons
+  // pushed to the right edge of the card.
+  &__pointer {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  &__pointer-text {
+    flex: 1 1 220px;
+  }
+
+  &__look {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+
+  &__look-label {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+}
+
+// IPC / miss-rate rows: value, a bar scaled to the larger of this-fn and
+// workload, and a tick marking the workload's position.
+.pf-sismo-vitals {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.pf-sismo-vital {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  &__head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  &__label {
+    font-weight: 600;
+  }
+
+  &__sub {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+
+  &__row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  &__self {
+    flex: 0 0 auto;
+    min-width: 60px;
+    text-align: right;
+    font-weight: 700;
+    font-size: var(--pf-font-size-m);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__track {
+    position: relative;
+    flex: 1 1 auto;
+    height: 10px;
+    background: var(--pf-color-background);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+
+  &__fill {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    background: #3478f6;
+  }
+
+  // Workload reference tick: a full-height line at the workload's value.
+  &__mark {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    transform: translateX(-1px);
+    background: var(--pf-color-text);
+    opacity: 0.65;
+  }
+
+  &__base {
+    flex: 0 0 auto;
+    min-width: 70px;
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+// Top-Down split as one stacked bar + legend. Bucket colours are CATEGORICAL and
+// deliberately muted — they identify the bucket, they are NOT a green=good /
+// red=bad stoplight (that would pre-judge the diagnosis).
 .pf-sismo-tma {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+
   &__bar {
     display: flex;
-    height: 16px;
-    border-radius: 4px;
+    height: 18px;
+    border-radius: 5px;
     overflow: hidden;
     border: 1px solid var(--pf-color-border);
   }
 
-  &__fill {
+  &__seg {
     height: 100%;
-
-    &--retiring,
-    &--not-stalled {
-      background: #34a853;
-    }
-    &--bad-spec {
-      background: #ea4335;
-    }
-    &--frontend {
-      background: #fbbc04;
-    }
-    &--backend {
-      background: #4285f4;
-    }
+    min-width: 2px;
   }
 
   &__legend {
     display: flex;
     flex-wrap: wrap;
-    gap: 16px;
-    margin-top: 8px;
+    gap: 14px;
     font-size: var(--pf-font-size-s);
-    color: var(--pf-color-text-muted);
   }
 
-  &__legend-item {
+  &__key {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -663,6 +886,214 @@
     height: 10px;
     border-radius: 2px;
     display: inline-block;
+  }
+
+  &__key-pct {
+    color: var(--pf-color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__key-tag {
+    font-size: var(--pf-font-size-s);
+    font-weight: 600;
+    color: var(--pf-color-text-muted);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 3px;
+    padding: 0 4px;
+  }
+
+  &__seg--retiring,
+  &__seg--not-stalled {
+    background: #4f8a8b;
+  }
+  &__seg--frontend {
+    background: #b58a4a;
+  }
+  &__seg--backend {
+    background: #5a78a8;
+  }
+  &__seg--bad-spec {
+    background: #a06a8c;
+  }
+}
+
+// The Top-Down bar shown inline on a function Summary, set off from the cards.
+.pf-sismo-detail__pane-inset {
+  padding-top: 4px;
+}
+
+// Caller/Callee butterfly: two columns either side of the focus chip.
+.pf-sismo-butterfly {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+
+  &__col {
+    flex: 1 1 320px;
+    min-width: 280px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  &__col-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  &__col-title {
+    font-weight: 600;
+  }
+
+  &__col-sub {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+
+  // The focus function, centred between the two columns.
+  &__focus {
+    flex: 0 0 auto;
+    align-self: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 8px 12px;
+    border: 1px solid var(--pf-color-border);
+    border-radius: 6px;
+    background: var(--pf-color-background-secondary);
+  }
+
+  &__focus-name {
+    font-weight: 700;
+    word-break: break-word;
+    text-align: center;
+  }
+
+  &__focus-sub {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+}
+
+// Source/Assembly: a monospace listing, one row per source line (or
+// instruction), with a sample count + a muted intensity bar in the gutter. The
+// bar is a sparkline, NOT a stoplight — single hue, opacity ∝ the hottest line.
+.pf-sismo-srcasm {
+  font-family: var(
+    --pf-font-family-code,
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    monospace
+  );
+  font-size: var(--pf-font-size-s);
+  border: 1px solid var(--pf-color-border);
+  border-radius: 6px;
+  overflow: auto;
+  max-height: 70vh;
+  background: var(--pf-color-background);
+
+  &__toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
+  &__file {
+    font-family: var(
+      --pf-font-family-code,
+      ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      Consolas,
+      monospace
+    );
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    word-break: break-all;
+  }
+
+  &__row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 8px;
+    line-height: 1.5;
+    white-space: nowrap;
+
+    &--sampled {
+      background: var(--pf-color-background-secondary);
+    }
+
+    &--insn {
+      color: var(--pf-color-text-muted);
+    }
+
+    &--indent {
+      padding-left: 28px;
+    }
+  }
+
+  &__count {
+    flex: 0 0 auto;
+    width: 52px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--pf-color-text-muted);
+  }
+
+  &__heat {
+    flex: 0 0 auto;
+    width: 56px;
+    height: 8px;
+    background: var(--pf-color-background);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  &__heat-fill {
+    height: 100%;
+    background: #3478f6;
+  }
+
+  &__lineno {
+    flex: 0 0 auto;
+    width: 44px;
+    text-align: right;
+    color: var(--pf-color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__addr {
+    flex: 0 0 auto;
+    width: 96px;
+    color: var(--pf-color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__code {
+    flex: 1 1 auto;
+    white-space: pre;
+    overflow-x: auto;
+  }
+
+  &__tag {
+    margin-left: 10px;
+    font-size: var(--pf-font-size-s);
+    font-weight: 600;
+    color: var(--pf-color-text-muted);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 3px;
+    padding: 0 4px;
+    white-space: nowrap;
   }
 }
 

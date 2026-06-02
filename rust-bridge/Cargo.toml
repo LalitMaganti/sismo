@@ -17,7 +17,12 @@ codegen-units = 1
 
 [dependencies]
 framehop = { version = "0.16.0", default-features = false, features = ["macho"] }
-object = { version = "0.39.1", default-features = false, features = ["std", "read", "macho"] }
+object = { version = "0.39.1", default-features = false, features = ["std", "read", "macho", "elf"] }
 tokio = { version = "1.52.1", features = ["rt"] }
 uuid = "1.23.1"
 wholesym = "0.8.1"
+# Disassembly for the source/asm view. Pure-Rust decoders so they link into the
+# staticlib with no C dependency (capstone would need extra link wiring).
+yaxpeax-arch = "0.3"
+yaxpeax-x86 = "2"
+yaxpeax-arm = "0.3"
