@@ -14,7 +14,6 @@
 
 import type {Engine} from '../../../trace_processor/engine';
 import {
-  LONG_NULL,
   NUM,
   NUM_NULL,
   STR_NULL,
@@ -563,13 +562,13 @@ export async function loadFunctionMicroarch(
   };
 }
 
-// Counter-delta sums by role, shared by every grouping of loadMicroarchByGroup
-// AND by the per-function self totals in loadFunctionMicroarch. `dv` is the
+// Counter-delta sums by role, shared by the per-function breakdown in
+// loadMicroarchCounters and the self totals in loadFunctionMicroarch. `dv` is the
 // consecutive-sample delta from the `d` CTE. Cumulative counters can step
 // backwards across a counter reset or a cross-CPU migration mid-series (lag is
 // partitioned by utid+track, not CPU), so a `dv > 0` guard drops those negative
-// artifacts — matching the windowed totals and loadRealCycles, which clamp the
-// same way. Without it a single backward step silently subtracts real work.
+// artifacts — matching the windowed totals, which clamp the same way. Without it
+// a single backward step silently subtracts real work.
 const ROLE_SUMS = `
   sum(CASE WHEN cname = 'cpu-cycles' AND dv > 0 THEN dv END) AS cycles,
   sum(CASE WHEN cname = 'instructions' AND dv > 0 THEN dv END) AS instructions,
@@ -618,175 +617,6 @@ function rowRoles(it: {
   put('intel-retired', it.intel_retired);
   put('intel-fetch-bubbles', it.intel_fe);
   return roles;
-}
-
-// How to split the trace's cycles into heatmap rows. The columns are always the
-// TMA sections; the grouping picks what each row aggregates over. All three are
-// honest because counters are thread-scoped, so a row's role totals are a real
-// sum, not a per-function attribution.
-export type MicroarchGrouping = 'thread' | 'module' | 'privilege';
-
-export interface MicroarchGroupRow {
-  // Stable identity + a label for display.
-  key: string;
-  label: string;
-  // Set for 'thread' rows so the UI can bridge to the thread's timeline track;
-  // null for module / privilege rows.
-  utid: number | null;
-  upid: number | null;
-  tid: number | null;
-  // Set for 'module' rows (the mapping name).
-  mapping: string | null;
-  samples: number;
-  // Cycles in this row (the "relative dominance" denominator is their sum).
-  cycles: number | null;
-  tma: TmaModel | null;
-}
-
-export interface MicroarchGroups {
-  state: MicroarchState;
-  // Sum of per-row cycles, so each row's cycle share (its dominance) is
-  // row.cycles / totalCycles.
-  totalCycles: number;
-  rows: MicroarchGroupRow[];
-}
-
-// Below this many samples a group's counter sums are too noisy for a stable
-// TMA/IPC, so we leave `tma` null (the row still shows its cycle share).
-const GROUP_TMA_MIN_SAMPLES = 30;
-
-// Per-group role totals → computeTma per group. Rows are the chosen grouping
-// (threads, modules, or profiled-vs-context); columns (TMA sections) come from
-// each row's TmaModel. 'privilege' deliberately drops the privileged scope so
-// the context side is visible; the others restrict to the profiled set.
-export async function loadMicroarchByGroup(
-  engine: Engine,
-  priv: PrivilegedSet,
-  grouping: MicroarchGrouping,
-  limit = 16,
-  window?: FocusWindow,
-): Promise<MicroarchGroups> {
-  await engine.query('INCLUDE PERFETTO MODULE linux.perf.counters;');
-  // privilege needs both sides, so it runs unscoped; thread/module stay scoped.
-  const scope = grouping === 'privilege' ? '' : sampleScopePredicate(priv);
-  const win = tsRangeClause(window, 'd.ts');
-
-  const dCte = `
-    WITH d AS (
-      SELECT
-        s.utid AS utid,
-        s.callsite_id AS callsite_id,
-        s.sample_id AS sample_id,
-        s.ts AS ts,
-        t.name AS cname,
-        s.counter_value - lag(s.counter_value) OVER (
-          PARTITION BY s.utid, s.track_id ORDER BY s.ts
-        ) AS dv
-      FROM linux_perf_sample_with_counters s
-      JOIN track t ON t.id = s.track_id
-      WHERE s.callsite_id IS NOT NULL ${scope}
-    )`;
-
-  let sql: string;
-  if (grouping === 'thread') {
-    sql = `${dCte}
-      SELECT
-        th.utid AS utid, th.upid AS upid, th.tid AS tid,
-        coalesce(nullif(th.name, ''), 'tid ' || th.tid) AS label,
-        NULL AS mapping,
-        count(DISTINCT d.sample_id) AS samples,
-        ${ROLE_SUMS}
-      FROM d JOIN thread th ON th.utid = d.utid
-      WHERE 1${win}
-      GROUP BY th.utid
-      ORDER BY cycles IS NULL, cycles DESC
-      LIMIT ${limit}`;
-  } else if (grouping === 'module') {
-    sql = `${dCte}
-      SELECT
-        NULL AS utid, NULL AS upid, NULL AS tid,
-        coalesce(spm.name, '[unknown]') AS label,
-        spm.name AS mapping,
-        count(DISTINCT d.sample_id) AS samples,
-        ${ROLE_SUMS}
-      FROM d
-      JOIN stack_profile_callsite c ON c.id = d.callsite_id
-      JOIN stack_profile_frame spf ON spf.id = c.frame_id
-      LEFT JOIN stack_profile_mapping spm ON spm.id = spf.mapping
-      WHERE 1${win}
-      GROUP BY spm.name
-      ORDER BY cycles IS NULL, cycles DESC
-      LIMIT ${limit}`;
-  } else {
-    // privilege: two rows, profiled set vs everything else that was sampled.
-    const member =
-      priv.upids.length > 0
-        ? `th.upid IN (${priv.upids.join(',')})`
-        : '0';
-    sql = `${dCte}
-      SELECT
-        NULL AS utid, NULL AS upid, NULL AS tid,
-        CASE WHEN ${member} THEN 'Profiled' ELSE 'Context' END AS label,
-        CASE WHEN ${member} THEN 'priv' ELSE 'ctx' END AS mapping,
-        count(DISTINCT d.sample_id) AS samples,
-        ${ROLE_SUMS}
-      FROM d JOIN thread th ON th.utid = d.utid
-      WHERE 1${win}
-      GROUP BY label
-      ORDER BY label`;
-  }
-
-  const res = await engine.query(sql);
-  const rows: MicroarchGroupRow[] = [];
-  let totalCycles = 0;
-  for (
-    const it = res.iter({
-      utid: NUM_NULL,
-      upid: NUM_NULL,
-      tid: NUM_NULL,
-      label: STR_NULL,
-      mapping: STR_NULL,
-      samples: NUM,
-      cycles: NUM_NULL,
-      instructions: NUM_NULL,
-      cache_miss: NUM_NULL,
-      branch_miss: NUM_NULL,
-      stall_fe: NUM_NULL,
-      stall_be: NUM_NULL,
-      arm_retired: NUM_NULL,
-      arm_spec: NUM_NULL,
-      arm_fe: NUM_NULL,
-      arm_be: NUM_NULL,
-      intel_slots: NUM_NULL,
-      intel_retired: NUM_NULL,
-      intel_fe: NUM_NULL,
-    });
-    it.valid();
-    it.next()
-  ) {
-    const roles = rowRoles(it);
-    const label = it.label ?? '[unknown]';
-    if (it.cycles !== null) totalCycles += it.cycles;
-    rows.push({
-      key:
-        grouping === 'thread'
-          ? `utid:${it.utid}`
-          : grouping === 'module'
-            ? `mod:${it.mapping ?? label}`
-            : `priv:${it.mapping ?? label}`,
-      label,
-      utid: it.utid,
-      upid: it.upid,
-      tid: it.tid,
-      mapping: it.mapping,
-      samples: it.samples,
-      cycles: it.cycles,
-      tma: it.samples >= GROUP_TMA_MIN_SAMPLES ? computeTma(roles) : null,
-    });
-  }
-  const state: MicroarchState =
-    rows.length === 0 ? 'no-counters' : totalCycles === 0 ? 'all-zero' : 'ok';
-  return {state, totalCycles, rows};
 }
 
 // ---- Top-Down (TMA) model -------------------------------------------------
@@ -957,105 +787,3 @@ export function computeTma(roles: RoleTotals): TmaModel | null {
   };
 }
 
-// Real cycles and instructions delivered, per thread and per process, from the
-// eBPF cpu-cycles / instructions counters. Each counter is cumulative per
-// thread, so a thread's total is its max reading; processes sum their threads.
-// `byUtid`/`byUpid` are cycles (the cpufreq-free replacement for the cpu_cycles
-// megacycles); `instrByUtid`/`instrByUpid` drive per-entity IPC. Empty on
-// traces without perf counters.
-export interface RealCycles {
-  byUtid: Map<number, bigint>;
-  byUpid: Map<number, bigint>;
-  instrByUtid: Map<number, bigint>;
-  instrByUpid: Map<number, bigint>;
-}
-
-export async function loadRealCycles(
-  engine: Engine,
-  window?: FocusWindow,
-): Promise<RealCycles> {
-  const empty: RealCycles = {
-    byUtid: new Map(),
-    byUpid: new Map(),
-    instrByUtid: new Map(),
-    instrByUpid: new Map(),
-  };
-  const has = await engine
-    .query(`SELECT name FROM sqlite_master WHERE name = 'perf_sample' LIMIT 1`)
-    .catch(() => undefined);
-  if (has === undefined || has.numRows() === 0) return empty;
-  try {
-    await engine.query('INCLUDE PERFETTO MODULE linux.perf.counters;');
-    // Whole-trace: a thread's cumulative counter total is just its max reading.
-    // Windowed: the counters are cumulative, so the work inside the window is
-    // the sum of positive consecutive-sample deltas whose sample falls in it —
-    // the same delta accounting the Activity board uses per bucket.
-    const ptCte =
-      window === undefined
-        ? `pt AS (
-        SELECT s.utid AS utid, t.name AS cname, max(s.counter_value) AS v
-        FROM linux_perf_sample_with_counters s
-        JOIN track t ON t.id = s.track_id
-        WHERE t.name IN ('cpu-cycles', 'instructions')
-          AND s.callsite_id IS NOT NULL
-        GROUP BY s.utid, t.name
-      )`
-        : `deltas AS (
-        SELECT
-          s.utid AS utid,
-          t.name AS cname,
-          s.ts AS ts,
-          s.counter_value - lag(s.counter_value)
-            OVER (PARTITION BY s.utid, s.track_id ORDER BY s.ts) AS delta
-        FROM linux_perf_sample_with_counters s
-        JOIN track t ON t.id = s.track_id
-        WHERE t.name IN ('cpu-cycles', 'instructions')
-          AND s.callsite_id IS NOT NULL
-      ),
-      pt AS (
-        SELECT utid, cname, sum(CASE WHEN delta > 0 THEN delta ELSE 0 END) AS v
-        FROM deltas
-        WHERE 1${tsRangeClause(window, 'ts')}
-        GROUP BY utid, cname
-      )`;
-    const res = await engine.query(`
-      WITH ${ptCte}
-      SELECT
-        pt.utid AS utid,
-        th.upid AS upid,
-        sum(CASE WHEN cname = 'cpu-cycles' THEN v ELSE 0 END) AS cyc,
-        sum(CASE WHEN cname = 'instructions' THEN v ELSE 0 END) AS instr
-      FROM pt
-      JOIN thread th USING (utid)
-      GROUP BY pt.utid
-    `);
-    const byUtid = new Map<number, bigint>();
-    const byUpid = new Map<number, bigint>();
-    const instrByUtid = new Map<number, bigint>();
-    const instrByUpid = new Map<number, bigint>();
-    const add = (m: Map<number, bigint>, k: number, v: bigint) =>
-      m.set(k, (m.get(k) ?? 0n) + v);
-    for (
-      const it = res.iter({
-        utid: NUM,
-        upid: NUM_NULL,
-        cyc: LONG_NULL,
-        instr: LONG_NULL,
-      });
-      it.valid();
-      it.next()
-    ) {
-      const cyc = it.cyc ?? 0n;
-      const instr = it.instr ?? 0n;
-      byUtid.set(it.utid, cyc);
-      instrByUtid.set(it.utid, instr);
-      if (it.upid !== null) {
-        add(byUpid, it.upid, cyc);
-        add(instrByUpid, it.upid, instr);
-      }
-    }
-    return {byUtid, byUpid, instrByUtid, instrByUpid};
-  } catch {
-    return empty;
-  }
-}

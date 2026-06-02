@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Data for the entity detail tabs (a function / thread / process drilled out of
-// the CPU views). Everything here is LEAF-BASED self time — the function the
-// sample was actually executing — which is the honest number a timer-sampled
-// profile can report (no PEBS, so we don't pretend to attribute counters to a
-// single function). The call-shape evidence (who calls whom) is left to the
-// flamegraph the detail tab renders alongside these splits.
+// Data for the function detail tab. Everything here is LEAF-BASED self time —
+// the function the sample was actually executing — which is the honest number a
+// timer-sampled profile can report (no PEBS, so we don't pretend to attribute
+// counters to a single function).
 
 import type {Engine} from '../../../trace_processor/engine';
-import {LONG, NUM, NUM_NULL, STR_NULL} from '../../../trace_processor/query_result';
+import {NUM, NUM_NULL, STR_NULL} from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
 import {frameNameExpr, sampleScopePredicate} from './sql';
 
@@ -177,101 +175,4 @@ export async function loadFunctionDetail(
   }
 
   return {name, selfSamples, inclusiveSamples, scopeSamples, byThread, byModule};
-}
-
-// What "why is this THREAD slow" shows beyond the flamegraph: its on-CPU sample
-// count and share of the profiled set, the wall time it actually ran, and the
-// functions it spent that time in.
-export interface ThreadDetail {
-  readonly utid: number;
-  readonly tid: number | null;
-  readonly threadName: string;
-  readonly process?: string;
-  readonly upid?: number;
-  // Samples whose thread is this one (on-CPU at the tick).
-  readonly samples: number;
-  // All in-scope samples — denominator for the headline share.
-  readonly scopeSamples: number;
-  // Wall time the thread was actually scheduled on a CPU.
-  readonly onCpuNs: bigint;
-  readonly byFunction: ReadonlyArray<EntitySplitRow>;
-}
-
-export async function loadThreadDetail(
-  engine: Engine,
-  priv: PrivilegedSet,
-  utid: number,
-): Promise<ThreadDetail> {
-  const scope = sampleScopePredicate(priv);
-  const nameExpr = frameNameExpr('spf');
-
-  const head = await engine.query(`
-    SELECT
-      th.tid AS tid,
-      th.name AS thread_name,
-      th.upid AS upid,
-      pr.name AS process
-    FROM thread th
-    LEFT JOIN process pr ON pr.upid = th.upid
-    WHERE th.utid = ${utid}
-  `);
-  const hr = head.firstRow({
-    tid: NUM_NULL,
-    thread_name: STR_NULL,
-    upid: NUM_NULL,
-    process: STR_NULL,
-  });
-
-  const counts = await engine.query(`
-    SELECT
-      (SELECT count(*) FROM perf_sample s
-        WHERE s.callsite_id IS NOT NULL ${scope}) AS scope_samples,
-      (SELECT count(*) FROM perf_sample s
-        WHERE s.callsite_id IS NOT NULL AND s.utid = ${utid}) AS samples,
-      (SELECT coalesce(sum(dur), 0) FROM sched
-        WHERE utid = ${utid} AND dur > 0) AS on_cpu_ns
-  `);
-  const cr = counts.firstRow({
-    scope_samples: NUM,
-    samples: NUM,
-    on_cpu_ns: LONG,
-  });
-  const denom = cr.samples > 0 ? cr.samples : 1;
-
-  const byFunction: EntitySplitRow[] = [];
-  if (cr.samples > 0) {
-    const res = await engine.query(`
-      SELECT ${nameExpr} AS name, count(*) AS samples
-      FROM perf_sample s
-      JOIN stack_profile_callsite c ON c.id = s.callsite_id
-      JOIN stack_profile_frame spf ON spf.id = c.frame_id
-      WHERE s.callsite_id IS NOT NULL AND s.utid = ${utid}
-      GROUP BY 1
-      ORDER BY samples DESC
-      LIMIT ${SPLIT_LIMIT}
-    `);
-    for (
-      const it = res.iter({name: STR_NULL, samples: NUM});
-      it.valid();
-      it.next()
-    ) {
-      byFunction.push({
-        name: it.name ?? '[unsymbolised]',
-        samples: it.samples,
-        share: it.samples / denom,
-      });
-    }
-  }
-
-  return {
-    utid,
-    tid: hr.tid,
-    threadName: hr.thread_name ?? `utid ${utid}`,
-    process: hr.process ?? undefined,
-    upid: hr.upid ?? undefined,
-    samples: cr.samples,
-    scopeSamples: cr.scope_samples,
-    onCpuNs: cr.on_cpu_ns,
-    byFunction,
-  };
 }

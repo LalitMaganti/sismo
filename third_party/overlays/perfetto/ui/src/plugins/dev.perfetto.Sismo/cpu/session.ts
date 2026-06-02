@@ -18,9 +18,10 @@
 // tab scoped to it. State only; no queries.
 
 // A 'function' is a symbol aggregated across all its call sites (bottom-up) —
-// drilled from the flamegraph, call tree, and summary tables. thread/process are
-// the scheduler-scoped pages.
-export type EntityKind = 'function' | 'thread' | 'process';
+// drilled from the flamegraph, call tree, and summary tables. It's the only
+// entity with a detail page; threads/processes are explored on the timeline and
+// the "How cycles were scheduled" tab.
+export type EntityKind = 'function';
 
 export interface EntityTab {
   // Stable, unique key, e.g. 'function:parse' — also the dedup identity.

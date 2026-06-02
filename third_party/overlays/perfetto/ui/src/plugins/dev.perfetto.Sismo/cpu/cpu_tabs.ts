@@ -14,7 +14,7 @@
 
 // The CPU domain's tabbed shell: always-present fixed lens tabs (Overview ·
 // Where the cycles went · How were cycles spent · Where it ran) plus dynamic,
-// closeable entity tabs opened by drilling into a function/thread/process.
+// closeable function detail tabs opened by drilling into a function.
 // Modeled on com.android.HeapDumpExplorer. Where-it-ran is a stub for now; the
 // rest are built.
 
@@ -35,8 +35,8 @@ import {
   type EntityTab,
 } from './session';
 
-// Opens (or re-focuses) a dynamic entity tab. Passed down into the views so a
-// click on a function/thread/process anywhere spawns its tab.
+// Opens (or re-focuses) a function detail tab. Passed down into the views so a
+// click on a function anywhere spawns its tab.
 export type Drill = (kind: EntityKind, id: string, label: string) => void;
 
 interface CpuTabsAttrs {
@@ -59,8 +59,6 @@ const FIXED_TABS: ReadonlyArray<FixedTab> = [
 
 const ENTITY_ICON: Record<EntityKind, string> = {
   function: 'code',
-  thread: 'lan',
-  process: 'memory',
 };
 
 export class CpuTabsView implements m.ClassComponent<CpuTabsAttrs> {

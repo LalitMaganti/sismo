@@ -25,13 +25,9 @@ export {
 } from './focus_window';
 
 export {
-  type CallTree,
-  type CallTreeNode,
-  type CallTreeDirection,
   type HeaviestFunctionRow,
   type RepresentativeSample,
   type SampleListRow,
-  loadCallTree,
   loadHeaviestFunctions,
   loadRepresentativeSample,
   loadSampleList,
@@ -84,10 +80,8 @@ export {
 export {
   type EntitySplitRow,
   type FunctionDetail,
-  type ThreadDetail,
   SPLIT_LIMIT,
   loadFunctionDetail,
-  loadThreadDetail,
 } from './entity_detail';
 
 export {
@@ -112,16 +106,10 @@ export {
   type MicroarchCounters,
   type MicroarchData,
   type MicroarchFuncRow,
-  type MicroarchGrouping,
-  type MicroarchGroupRow,
-  type MicroarchGroups,
-  type RealCycles,
   type TmaBucket,
   type TmaModel,
   computeTma,
   loadFunctionMicroarch,
   loadMicroarch,
-  loadMicroarchByGroup,
   loadMicroarchCounters,
-  loadRealCycles,
 } from './microarch';
