@@ -17,12 +17,12 @@
 // sharing it, migrations onto it), grouped by cluster on big/little SoCs.
 
 import m from 'mithril';
-import type {Trace} from '../../../../public/trace';
-import {Section} from '../../../../widgets/section';
-import {Card} from '../../../../widgets/card';
-import {Anchor} from '../../../../widgets/anchor';
-import {Grid, GridCell, GridHeaderCell} from '../../../../widgets/grid';
-import {EmptyState} from '../../../../widgets/empty_state';
+import type {Trace} from '../../../public/trace';
+import {Section} from '../../../widgets/section';
+import {Card} from '../../../widgets/card';
+import {Anchor} from '../../../widgets/anchor';
+import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
+import {EmptyState} from '../../../widgets/empty_state';
 import type {
   CoreContentionRow,
   CoreSeries,
@@ -30,22 +30,22 @@ import type {
   CpuCoreRow,
   CpuSummary,
   FocusWindow,
-} from '../../cpu_data';
+} from '../cpu_data';
 import {
   loadCoreContention,
   loadCoreSeries,
   loadCoreThreads,
   loadPerCore,
-} from '../../cpu_data';
-import type {PrivilegedSet} from '../../privileged_set';
-import {MeterBar} from '../../../dev.perfetto.SismoWidgets/meter';
+} from '../cpu_data';
+import type {PrivilegedSet} from '../privileged_set';
+import {MeterBar} from '../../dev.perfetto.SismoWidgets/meter';
 import {
   renderStatCard,
   renderThreadLink,
   revealInTimeline,
   type StatCard,
-} from '../../page_common';
-import {fmtCount, fmtDuration, fmtPercent} from '../../format';
+} from '../page_common';
+import {fmtCount, fmtDuration, fmtPercent} from '../format';
 
 // Per-core drill state threaded into the render: which core's "what ran here"
 // detail is open, the loaded per-core threads (your set + an "others" total),

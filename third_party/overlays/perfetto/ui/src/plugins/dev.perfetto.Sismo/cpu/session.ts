@@ -34,7 +34,10 @@ export const OVERVIEW_TAB = 'overview';
 
 export class CpuSession {
   private readonly _tabs: EntityTab[] = [];
-  private _active = OVERVIEW_TAB;
+  // The active tab lives only for the lifetime of this session (one trace). It
+  // is deliberately NOT persisted across traces, so every freshly-loaded trace
+  // opens on the overview.
+  private _active: string = OVERVIEW_TAB;
 
   get tabs(): ReadonlyArray<EntityTab> {
     return this._tabs;

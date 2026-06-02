@@ -13,10 +13,10 @@
 // limitations under the License.
 
 // The CPU domain's tabbed shell: always-present fixed lens tabs (Overview ·
-// Where the time went · Efficiency · Where it ran) plus dynamic, closeable
-// entity tabs opened by drilling into a function/thread/process. Modeled on
-// com.android.HeapDumpExplorer. Efficiency and Where-it-ran are stubs for now;
-// Overview and Where are built.
+// Where the cycles went · How were cycles spent · Where it ran) plus dynamic,
+// closeable entity tabs opened by drilling into a function/thread/process.
+// Modeled on com.android.HeapDumpExplorer. Where-it-ran is a stub for now; the
+// rest are built.
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
@@ -25,6 +25,8 @@ import {Tabs, type TabsTab} from '../../../widgets/tabs';
 import type {PrivilegedSet} from '../privileged_set';
 import {CpuLandingPage} from './landing';
 import {CpuWhereTab} from './where_tab';
+import {CpuEfficiencyTab} from './efficiency_tab';
+import {CpuScheduledTab} from './scheduled_tab';
 import {
   CpuSession,
   OVERVIEW_TAB,
@@ -48,10 +50,10 @@ interface FixedTab {
 }
 
 const FIXED_TABS: ReadonlyArray<FixedTab> = [
-  {key: OVERVIEW_TAB, title: 'Overview', icon: 'dashboard'},
-  {key: 'where', title: 'Where the time went', icon: 'donut_large'},
-  {key: 'efficiency', title: 'Efficiency', icon: 'speed'},
-  {key: 'whereran', title: 'Where it ran', icon: 'developer_board'},
+  {key: OVERVIEW_TAB, title: 'Summary', icon: 'dashboard'},
+  {key: 'where', title: 'Where the cycles went', icon: 'donut_large'},
+  {key: 'efficiency', title: 'How were cycles spent', icon: 'speed'},
+  {key: 'whereran', title: 'How cycles were scheduled', icon: 'developer_board'},
 ];
 
 const ENTITY_ICON: Record<EntityKind, string> = {
@@ -110,6 +112,12 @@ export class CpuTabsView implements m.ClassComponent<CpuTabsAttrs> {
     }
     if (tab.key === 'where') {
       return m(CpuWhereTab, {trace: attrs.trace, priv: attrs.priv});
+    }
+    if (tab.key === 'efficiency') {
+      return m(CpuEfficiencyTab, {trace: attrs.trace, priv: attrs.priv});
+    }
+    if (tab.key === 'whereran') {
+      return m(CpuScheduledTab, {trace: attrs.trace, priv: attrs.priv});
     }
     return m(EmptyState, {
       icon: 'construction',

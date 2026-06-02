@@ -302,6 +302,12 @@
     align-content: start;
   }
 
+  // Breathing room when a meter sits directly under a row of scorecards (the
+  // question blocks on the landing page).
+  &__stat-row + .pf-sismo-meter {
+    margin-top: 12px;
+  }
+
   // "Your work | Full system" segmented toggle (Cores utilisation basis).
   &__seg-row {
     display: flex;
@@ -708,7 +714,9 @@
     display: flex;
     flex-direction: column;
     justify-content: flex-end;
-    cursor: pointer;
+    // Horizontal-drag cursor (↔) signals "drag across to brush a range", not
+    // just "click" — the affordance without adding any explanatory text.
+    cursor: ew-resize;
 
     &:hover {
       background: rgba(128, 128, 128, 0.15);

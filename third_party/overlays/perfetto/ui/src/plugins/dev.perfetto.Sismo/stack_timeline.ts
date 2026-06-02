@@ -433,9 +433,10 @@ export function registerSismoFlamegraphTab(trace: Trace): void {
 }
 
 // How the flamegraph's top level is split. 'none' is the plain call tree;
-// 'thread'/'process' insert a synthetic root per thread/process above the call
-// tree (the "breakdown dimension").
-export type BreakdownKind = 'none' | 'thread' | 'process';
+// 'thread'/'process' insert one synthetic root per thread/process above the call
+// tree; 'process_thread' nests both — a process root, its threads beneath it,
+// then each thread's call tree (the "breakdown dimension").
+export type BreakdownKind = 'none' | 'thread' | 'process' | 'process_thread';
 
 // `mapping_name LIKE` test for the kernel mapping. trace_processor renders the
 // kernel mapping as `/[kernel.kallsyms]` (it prepends '/' per path component),
@@ -464,70 +465,206 @@ function flatStatement(where: string): string {
   `;
 }
 
-// The call tree split by thread/process: one synthetic root per group, with
-// that group's callsite subtree hung beneath it. Built by hand (rather than the
-// stdlib macro) because self counts must be per-group; the group's root
-// callsites are reparented onto the synthetic root. Inlined frames collapse to
-// their callsite frame here (the macro's inline expansion isn't available
-// per-group) — an accepted fidelity trade for the breakdown view.
+// The SQL that identifies a breakdown group and labels it. `grp` is the integer
+// the call tree is split on (utid / upid) and `label` names its synthetic root.
+// `pgrp`/`plabel` are an optional PARENT group nested above it (process above
+// thread); they are SQL `null` literals when the breakdown is single-level.
+// `joins` brings in the thread (and, when a process is involved, process) rows
+// the expressions need. `p` is the per-sample relation the stream selects from.
+interface BreakdownGroup {
+  readonly grp: string;
+  readonly label: string;
+  readonly pgrp: string;
+  readonly plabel: string;
+  readonly joins: string;
+}
+
+const THREAD_LABEL = `coalesce(th.name, 'utid ' || th.utid) || ' (tid ' || th.tid || ')'`;
+const PROCESS_LABEL = `coalesce(pr.name, 'upid ' || th.upid) || ' (pid ' || pr.pid || ')'`;
+const THREAD_JOIN = 'join thread th on th.utid = p.utid';
+const PROCESS_JOIN =
+  'join thread th on th.utid = p.utid\n' +
+  '      join process pr on pr.upid = th.upid';
+const NO_PARENT = {pgrp: 'cast(null as int)', plabel: 'cast(null as text)'};
+
+function breakdownGroupCols(
+  kind: 'thread' | 'process' | 'process_thread',
+): BreakdownGroup {
+  if (kind === 'thread') {
+    return {grp: 'th.utid', label: THREAD_LABEL, ...NO_PARENT, joins: THREAD_JOIN};
+  }
+  if (kind === 'process') {
+    return {
+      grp: 'th.upid',
+      label: PROCESS_LABEL,
+      ...NO_PARENT,
+      joins: PROCESS_JOIN,
+    };
+  }
+  // process_thread: each thread's call tree nested under its process.
+  return {
+    grp: 'th.utid',
+    label: THREAD_LABEL,
+    pgrp: 'th.upid',
+    plabel: PROCESS_LABEL,
+    joins: PROCESS_JOIN,
+  };
+}
+
+// A "sample stream" yields one row per sample as (grp, label, pgrp, plabel, cs,
+// w): which breakdown group it belongs to, that group's label, its optional
+// parent group + label, the leaf callsite, and the self-weight to credit. This is
+// the only metric-specific part of a breakdown — breakdownTreeStatement turns any
+// such stream into the per-group call tree.
+
+// Plain sample count: every sample weighs 1.
+function sampleCountStream(where: string, g: BreakdownGroup): string {
+  return `
+    select ${g.grp} as grp, ${g.label} as label,
+      ${g.pgrp} as pgrp, ${g.plabel} as plabel,
+      p.callsite_id as cs, 1 as w
+    from perf_sample p
+    ${g.joins}
+    where ${where}
+  `;
+}
+
+// Counter-weighted: credit each sample the per-interval delta of a hardware
+// counter (its reading minus the prior sample on the same thread+track), clamped
+// at 0. Same approximate sampling attribution as counterWeightedStatement.
+function counterStream(
+  where: string,
+  g: BreakdownGroup,
+  counterName: string,
+): string {
+  return `
+    select grp, label, pgrp, plabel, cs,
+      case when dv > 0 then dv else 0 end as w
+    from (
+      select ${g.grp} as grp, ${g.label} as label,
+        ${g.pgrp} as pgrp, ${g.plabel} as plabel,
+        p.callsite_id as cs,
+        p.counter_value - lag(p.counter_value) over (
+          partition by p.utid, p.track_id order by p.ts
+        ) as dv
+      from linux_perf_sample_with_counters p
+      ${g.joins}
+      join track t on t.id = p.track_id
+      where ${where}
+        and t.name = '${counterName}'
+    )
+  `;
+}
+
+// Backend-bound slots: weigh by slots − retired − frontend per sample (the L1
+// Backend numerator), clamped at 0. Pivots the three Top-Down slot counters per
+// sample, same as backendSlotsStatement.
+function backendSlotsStream(where: string, g: BreakdownGroup): string {
+  return `
+    select grp, label, cs,
+      case
+        when slots is not null and retired is not null and fetch_bubbles is not null
+          and slots - retired - fetch_bubbles > 0
+        then slots - retired - fetch_bubbles
+        else 0
+      end as w
+    from (
+      select grp, label, pgrp, plabel, max(callsite_id) as cs,
+        max(case when cname = 'slots' then dv end) as slots,
+        max(case when cname = 'topdown-slots-retired' then dv end) as retired,
+        max(case when cname = 'topdown-fetch-bubbles' then dv end) as fetch_bubbles
+      from (
+        select ${g.grp} as grp, ${g.label} as label,
+          ${g.pgrp} as pgrp, ${g.plabel} as plabel,
+          p.sample_id as sample_id,
+          p.callsite_id as callsite_id, t.name as cname,
+          p.counter_value - lag(p.counter_value) over (
+            partition by p.utid, p.track_id order by p.ts
+          ) as dv
+        from linux_perf_sample_with_counters p
+        ${g.joins}
+        join track t on t.id = p.track_id
+        where ${where}
+          and t.name in ('slots', 'topdown-slots-retired', 'topdown-fetch-bubbles')
+      )
+      group by grp, sample_id, callsite_id
+    )
+  `;
+}
+
+// The call tree split by group: one synthetic root per group, with that group's
+// callsite subtree hung beneath it, self-value = the stream's summed weight per
+// (group, callsite). When the stream carries a parent group (process above
+// thread), a second tier of roots is inserted above the group roots. Built by
+// hand (rather than the stdlib macro) because weights must be per-group; the
+// group's root callsites are reparented onto the synthetic root. Inlined frames
+// collapse to their callsite frame here (the macro's inline expansion isn't
+// available per-group) — an accepted fidelity trade for the breakdown view.
 //
 // Ids must be DENSE and non-negative: the flamegraph's graph aggregation
 // (__intrinsic_graph_agg / NodeAgg) casts each id to uint32 and `resize`s a
 // vector to max_id+1, indexing by id. A negative id wraps to ~4e9 (OOM crash)
-// and sparse ids (group_index * BIG + callsite_id) inflate that vector. So
-// assign every reachable (group, callsite) a dense row_number, and place the
-// synthetic roots in the slots just above them.
-function breakdownStatement(where: string, kind: 'thread' | 'process'): string {
-  const groupExpr = kind === 'thread' ? 'th.utid' : 'th.upid';
-  const labelExpr =
-    kind === 'thread'
-      ? `coalesce(th.name, 'utid ' || th.utid) || ' (tid ' || th.tid || ')'`
-      : `coalesce(pr.name, 'upid ' || th.upid) || ' (pid ' || pr.pid || ')'`;
-  const procJoin = kind === 'process' ? 'join process pr on pr.upid = th.upid' : '';
+// and sparse ids (group_index * BIG + callsite_id) inflate that vector. So pack
+// the ids into three dense contiguous ranges: callsite nodes 1..N, then group
+// roots N+1..N+T, then parent roots N+T+1..N+T+P.
+function breakdownTreeStatement(stream: string): string {
   return `
     with recursive
-      samples as (
-        select p.callsite_id as cs, ${groupExpr} as grp
-        from perf_sample p
-        join thread th on th.utid = p.utid
-        ${procJoin}
-        where ${where}
-      ),
+      base as (${stream}),
+      -- Inner groups (e.g. threads), each carrying its optional parent group.
       grp_idx as (
-        select grp, row_number() over (order by grp) as gidx, label
-        from (
-          select distinct ${groupExpr} as grp, ${labelExpr} as label
-          from perf_sample p
-          join thread th on th.utid = p.utid
-          ${procJoin}
-          where ${where}
-        )
+        select grp, row_number() over (order by grp) as gidx, label, pgrp
+        from (select distinct grp, label, pgrp from base)
       ),
-      self_counts as (select grp, cs, count() as n from samples group by grp, cs),
-      walk(grp, cur, n) as (
-        select grp, cs, n from self_counts
+      -- Parent groups (e.g. processes); empty for a single-level breakdown.
+      pgrp_idx as (
+        select pgrp, row_number() over (order by pgrp) as pidx, plabel
+        from (select distinct pgrp, plabel from base where pgrp is not null)
+      ),
+      self_counts as (select grp, cs, sum(w) as n from base group by grp, cs),
+      walk(grp, cur) as (
+        select grp, cs from self_counts
         union all
-        select w.grp, c.parent_id, w.n
+        select w.grp, c.parent_id
         from walk w
         join stack_profile_callsite c on c.id = w.cur
         where c.parent_id is not null
       ),
       reach as (select distinct grp, cur as cs from walk),
-      -- Dense 1..N id per reachable (group, callsite); roots take N+1..N+R.
+      -- Dense 1..N id per reachable (group, callsite).
       node_ids as (
         select grp, cs, row_number() over (order by grp, cs) as nid from reach
       ),
-      node_count as (select count(*) as n from node_ids)
+      node_count as (select count(*) as n from node_ids),
+      grp_count as (select count(*) as n from grp_idx)
+    -- Parent (process) roots: ids N+T+1..N+T+P, no parent.
+    select
+      (select n from node_count) + (select n from grp_count) + pi.pidx as id,
+      cast(null as int) as parentId,
+      pi.plabel as name,
+      cast(null as text) as mapping_name,
+      cast(null as text) as code_type,
+      cast(null as text) as source_location,
+      0 as value
+    from pgrp_idx pi
+    union all
+    -- Group (thread) roots: ids N+1..N+T, parented to their parent root (or no
+    -- parent for a single-level breakdown).
     select
       (select n from node_count) + gi.gidx as id,
-      cast(null as int) as parentId,
+      case
+        when gi.pgrp is null then cast(null as int)
+        else (select n from node_count) + (select n from grp_count) + pi.pidx
+      end as parentId,
       gi.label as name,
       cast(null as text) as mapping_name,
       cast(null as text) as code_type,
       cast(null as text) as source_location,
       0 as value
     from grp_idx gi
+    left join pgrp_idx pi on pi.pgrp = gi.pgrp
     union all
+    -- Call-tree nodes, root callsites reparented onto their group root.
     select
       ni.nid as id,
       case
@@ -685,11 +822,23 @@ export async function loadPerfCounterNames(
   return out;
 }
 
-// Builds the sismo sample flamegraph metric. `wherePredicates` are extra SQL
+// perf_sample (alias `p`) predicates scoping the sample flamegraph metrics to
+// the profiled set. Empty when there's no privileged set, so the views show the
+// whole workload rather than nothing. The metric SQL aliases perf_sample as `p`.
+export function sampleScopePredicates(priv: PrivilegedSet): string[] {
+  if (priv.upids.length === 0) return [];
+  return [
+    `p.utid in (SELECT utid FROM thread WHERE upid IN ` +
+      `(${priv.upids.join(',')}))`,
+  ];
+}
+
+// Builds the sismo sample flamegraph metrics. `wherePredicates` are extra SQL
 // fragments ANDed onto the perf_sample selection (utid/time scoping); the
-// `callsite_id IS NOT NULL` guard is always applied. Pass `breakdownBy` to
-// enable the breakdown dimension (declares the "Break down by" control and
-// reshapes the statement); omit it for a flat tree with no control.
+// `callsite_id IS NOT NULL` guard is always applied. Pass `breakdownBy` (even
+// 'none') to declare the "Break down by" control; 'thread'/'process' reshape
+// EVERY metric — sample count and each counter weighting — into the per-group
+// tree. Omit it for plain flat trees with no control.
 export function buildSampleFlamegraphMetrics(
   wherePredicates: ReadonlyArray<string>,
   breakdownBy?: BreakdownKind,
@@ -702,10 +851,23 @@ export function buildSampleFlamegraphMetrics(
   const where = ['p.callsite_id is not null', ...wherePredicates].join(
     '\n            and ',
   );
-  const flat = breakdownBy === undefined || breakdownBy === 'none';
-  const statement = flat
-    ? flatStatement(where)
-    : breakdownStatement(where, breakdownBy);
+  // `broken` reshapes every metric into the per-group tree; `g` carries the
+  // group/label SQL. When breakdownBy is supplied at all (even 'none') the metrics
+  // declare the "Break down by" control, so the user can switch into a breakdown.
+  const broken =
+    breakdownBy === 'thread' ||
+    breakdownBy === 'process' ||
+    breakdownBy === 'process_thread';
+  const g = broken ? breakdownGroupCols(breakdownBy) : undefined;
+  const breakdownDimensions =
+    breakdownBy === undefined
+      ? undefined
+      : [
+          {key: 'none', label: 'None'},
+          {key: 'thread', label: 'Thread'},
+          {key: 'process', label: 'Process'},
+          {key: 'process_thread', label: 'Process › Thread'},
+        ];
   // Shared across all metrics (sample count + counter-weighted).
   const unaggregatableProperties = [
     {name: 'mapping_name', displayName: 'Mapping'},
@@ -727,57 +889,56 @@ export function buildSampleFlamegraphMetrics(
       unit: '',
       nameColumnLabel: 'Symbol',
       dependencySql: 'include perfetto module linux.perf.samples;',
-      statement,
-      breakdownDimensions:
-        breakdownBy === undefined
-          ? undefined
-          : [
-              {key: 'none', label: 'None'},
-              {key: 'thread', label: 'Thread'},
-              {key: 'process', label: 'Process'},
-            ],
+      statement: broken
+        ? breakdownTreeStatement(sampleCountStream(where, g!))
+        : flatStatement(where),
+      breakdownDimensions,
       unaggregatableProperties,
       aggregatableProperties,
     },
   ];
   // Counter-weighted views weight the same tree by a hardware counter instead of
-  // sample count. Flat-only: the breakdown statement is built for sample counts,
-  // so we offer these only when not breaking down. A counter missing from the
-  // trace just yields an empty tree for that metric.
-  if (flat) {
-    const present = (n: string) =>
-      availableCounters === undefined || availableCounters.has(n);
-    const counterDeps =
-      'include perfetto module linux.perf.samples;\n' +
-      'include perfetto module linux.perf.counters;';
-    for (const w of COUNTER_WEIGHTS) {
-      if (!present(w.counter)) continue;
-      metrics.push({
-        name: w.label,
-        unit: '',
-        nameColumnLabel: 'Symbol',
-        dependencySql: counterDeps,
-        statement: counterWeightedStatement(where, w.counter),
-        unaggregatableProperties,
-        aggregatableProperties,
-      });
-    }
-    // Backend-bound slots only when we've confirmed all three Top-Down counters
-    // are present (withheld under the undefined "unknown" case).
-    if (
-      availableCounters !== undefined &&
-      BACKEND_SLOT_COUNTERS.every((c) => availableCounters.has(c))
-    ) {
-      metrics.push({
-        name: 'Backend-bound slots (approx)',
-        unit: '',
-        nameColumnLabel: 'Symbol',
-        dependencySql: counterDeps,
-        statement: backendSlotsStatement(where),
-        unaggregatableProperties,
-        aggregatableProperties,
-      });
-    }
+  // sample count — including under a breakdown, where each group's subtree carries
+  // its own counter weights. A counter missing from the trace just yields an empty
+  // tree for that metric.
+  const present = (n: string) =>
+    availableCounters === undefined || availableCounters.has(n);
+  const counterDeps =
+    'include perfetto module linux.perf.samples;\n' +
+    'include perfetto module linux.perf.counters;';
+  for (const w of COUNTER_WEIGHTS) {
+    if (!present(w.counter)) continue;
+    metrics.push({
+      name: w.label,
+      unit: '',
+      nameColumnLabel: 'Symbol',
+      dependencySql: counterDeps,
+      statement: broken
+        ? breakdownTreeStatement(counterStream(where, g!, w.counter))
+        : counterWeightedStatement(where, w.counter),
+      breakdownDimensions,
+      unaggregatableProperties,
+      aggregatableProperties,
+    });
+  }
+  // Backend-bound slots only when we've confirmed all three Top-Down counters
+  // are present (withheld under the undefined "unknown" case).
+  if (
+    availableCounters !== undefined &&
+    BACKEND_SLOT_COUNTERS.every((c) => availableCounters.has(c))
+  ) {
+    metrics.push({
+      name: 'Backend-bound slots (approx)',
+      unit: '',
+      nameColumnLabel: 'Symbol',
+      dependencySql: counterDeps,
+      statement: broken
+        ? breakdownTreeStatement(backendSlotsStream(where, g!))
+        : backendSlotsStatement(where),
+      breakdownDimensions,
+      unaggregatableProperties,
+      aggregatableProperties,
+    });
   }
   return metrics;
 }

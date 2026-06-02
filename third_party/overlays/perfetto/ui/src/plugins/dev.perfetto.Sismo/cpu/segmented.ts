@@ -20,7 +20,6 @@
 
 import m from 'mithril';
 import {RadioGroup} from '../../../widgets/radio_group';
-import {Intent} from '../../../widgets/common';
 
 export interface Segment<K extends string> {
   readonly key: K;
@@ -28,6 +27,8 @@ export interface Segment<K extends string> {
   readonly icon?: string;
 }
 
+// Neutral (no `intent`) to match the flamegraph's Top-Down/Bottom-Up toggle —
+// the selected segment reads via the default active styling, not a coloured fill.
 export function segmentedSwitcher<K extends string>(
   segments: ReadonlyArray<Segment<K>>,
   active: K,
@@ -38,10 +39,10 @@ export function segmentedSwitcher<K extends string>(
     {
       selectedValue: active,
       onValueChange: (v: string) => onChange(v as K),
-      intent: Intent.Primary,
     },
     segments.map((s) =>
       m(RadioGroup.Button, {value: s.key, icon: s.icon}, s.label),
     ),
   );
 }
+

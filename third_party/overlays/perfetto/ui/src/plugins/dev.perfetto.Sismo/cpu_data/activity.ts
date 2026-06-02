@@ -20,7 +20,7 @@ import {
   STR_NULL,
 } from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
-import {sampleScopePredicate} from './sql';
+import {privInClause, sampleScopePredicate} from './sql';
 
 // One time-bucket of the Activity board. Slices are bucketed by their start ts
 // — for a coarse board (~hundreds of buckets, each far wider than a sched
@@ -101,24 +101,47 @@ export async function loadActivityBoard(
   }
 
   // Busy / scoped-busy time per bucket (utilisation + concurrency), from sched.
+  // A slice is DISTRIBUTED across every bucket it overlaps, crediting each bucket
+  // only the portion of the slice inside it — not dumped whole into its start
+  // bucket. Without this, one long run (common for CPU-bound work) lands all its
+  // time in a single slice and the "avg cores busy" reads far above the core
+  // count there and zero around it. Each slice spans buckets [b0, b1]; the join
+  // limits it to those, so the busy sum per bucket is bounded by width × cores.
   const sched = await engine.query(`
-    WITH s AS (
+    WITH RECURSIVE bkt(b) AS (
+      SELECT 0
+      UNION ALL
+      SELECT b + 1 FROM bkt WHERE b + 1 < ${numBuckets}
+    ),
+    ps AS (
       SELECT
-        CAST((sched.ts - ${lo}) / ${width} AS INT) AS bucket,
-        sched.dur AS dur,
-        (CASE WHEN ${privExpr} THEN 1 ELSE 0 END) AS is_priv
+        sched.ts AS ts,
+        sched.ts + sched.dur AS te,
+        (CASE WHEN ${privExpr} THEN 1 ELSE 0 END) AS is_priv,
+        max(0, CAST((sched.ts - ${lo}) / ${width} AS INT)) AS b0,
+        min(
+          ${numBuckets} - 1,
+          CAST((sched.ts + sched.dur - 1 - ${lo}) / ${width} AS INT)
+        ) AS b1
       FROM sched
       JOIN thread USING (utid)
       WHERE sched.dur > 0
         AND NOT (sched.utid IN (SELECT utid FROM thread WHERE is_idle))
+        AND sched.ts < ${hi} AND sched.ts + sched.dur > ${lo}
     )
     SELECT
-      bucket,
-      sum(dur) AS busy,
-      sum(CASE WHEN is_priv = 1 THEN dur ELSE 0 END) AS priv_busy
-    FROM s
-    WHERE bucket >= 0 AND bucket < ${numBuckets}
-    GROUP BY bucket
+      bkt.b AS bucket,
+      sum(
+        min(ps.te, ${lo} + (bkt.b + 1) * ${width}) -
+        max(ps.ts, ${lo} + bkt.b * ${width})
+      ) AS busy,
+      sum(CASE WHEN ps.is_priv = 1 THEN
+        min(ps.te, ${lo} + (bkt.b + 1) * ${width}) -
+        max(ps.ts, ${lo} + bkt.b * ${width})
+      ELSE 0 END) AS priv_busy
+    FROM ps
+    JOIN bkt ON bkt.b BETWEEN ps.b0 AND ps.b1
+    GROUP BY bkt.b
   `);
   let hasData = false;
   for (
@@ -233,8 +256,15 @@ export async function loadWindowConsumers(
   engine: Engine,
   loTs: bigint,
   hiTs: bigint,
+  // When given, restrict to the profiled set's threads — this tab is about your
+  // work's scheduling, not the whole machine's.
+  priv?: PrivilegedSet,
   limit = 10,
 ): Promise<WindowThreadRow[]> {
+  const privFilter =
+    priv !== undefined && priv.upids.length > 0
+      ? `AND th.upid ${privInClause(priv)}`
+      : '';
   const res = await engine.query(`
     SELECT
       th.utid AS utid,
@@ -250,6 +280,7 @@ export async function loadWindowConsumers(
       AND sched.ts < ${hiTs}
       AND sched.ts + sched.dur > ${loTs}
       AND NOT (th.utid IN (SELECT utid FROM thread WHERE is_idle))
+      ${privFilter}
     GROUP BY th.utid
     ORDER BY rt DESC
     LIMIT ${limit}

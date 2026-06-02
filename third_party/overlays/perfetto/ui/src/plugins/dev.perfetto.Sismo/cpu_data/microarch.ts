@@ -457,6 +457,227 @@ export async function loadMicroarchCounters(
   return {state: 'ok', totalSamples, roles: roleMap, perFunc};
 }
 
+// Counter-delta sums by role, shared by every grouping of loadMicroarchByGroup.
+// `dv` is the consecutive-sample delta from the `d` CTE (see loadMicroarchByGroup).
+const ROLE_SUMS = `
+  sum(CASE WHEN cname = 'cpu-cycles' THEN dv END) AS cycles,
+  sum(CASE WHEN cname = 'instructions' THEN dv END) AS instructions,
+  sum(CASE WHEN cname = 'cache-misses' THEN dv END) AS cache_miss,
+  sum(CASE WHEN cname = 'branch-misses' THEN dv END) AS branch_miss,
+  sum(CASE WHEN cname = 'stalled-cycles-frontend' THEN dv END) AS stall_fe,
+  sum(CASE WHEN cname = 'stalled-cycles-backend' THEN dv END) AS stall_be,
+  sum(CASE WHEN cname = 'op-retired' THEN dv END) AS arm_retired,
+  sum(CASE WHEN cname = 'op-spec' THEN dv END) AS arm_spec,
+  sum(CASE WHEN cname = 'stall-slot-frontend' THEN dv END) AS arm_fe,
+  sum(CASE WHEN cname = 'stall-slot-backend' THEN dv END) AS arm_be,
+  sum(CASE WHEN cname = 'slots' THEN dv END) AS intel_slots,
+  sum(CASE WHEN cname = 'topdown-slots-retired' THEN dv END) AS intel_retired,
+  sum(CASE WHEN cname = 'topdown-fetch-bubbles' THEN dv END) AS intel_fe`;
+
+function rowRoles(it: {
+  cycles: number | null;
+  instructions: number | null;
+  cache_miss: number | null;
+  branch_miss: number | null;
+  stall_fe: number | null;
+  stall_be: number | null;
+  arm_retired: number | null;
+  arm_spec: number | null;
+  arm_fe: number | null;
+  arm_be: number | null;
+  intel_slots: number | null;
+  intel_retired: number | null;
+  intel_fe: number | null;
+}): Map<CounterRole, number> {
+  const roles = new Map<CounterRole, number>();
+  const put = (role: CounterRole, v: number | null) => {
+    if (v !== null) roles.set(role, v);
+  };
+  put('cycles', it.cycles);
+  put('instructions', it.instructions);
+  put('cache-miss', it.cache_miss);
+  put('branch-miss', it.branch_miss);
+  put('stall-frontend', it.stall_fe);
+  put('stall-backend', it.stall_be);
+  put('arm-retired', it.arm_retired);
+  put('arm-spec', it.arm_spec);
+  put('arm-slot-frontend', it.arm_fe);
+  put('arm-slot-backend', it.arm_be);
+  put('intel-slots', it.intel_slots);
+  put('intel-retired', it.intel_retired);
+  put('intel-fetch-bubbles', it.intel_fe);
+  return roles;
+}
+
+// How to split the trace's cycles into heatmap rows. The columns are always the
+// TMA sections; the grouping picks what each row aggregates over. All three are
+// honest because counters are thread-scoped, so a row's role totals are a real
+// sum, not a per-function attribution.
+export type MicroarchGrouping = 'thread' | 'module' | 'privilege';
+
+export interface MicroarchGroupRow {
+  // Stable identity + a label for display.
+  key: string;
+  label: string;
+  // Set for 'thread' rows so the UI can bridge to the thread's timeline track;
+  // null for module / privilege rows.
+  utid: number | null;
+  upid: number | null;
+  tid: number | null;
+  // Set for 'module' rows (the mapping name).
+  mapping: string | null;
+  samples: number;
+  // Cycles in this row (the "relative dominance" denominator is their sum).
+  cycles: number | null;
+  tma: TmaModel | null;
+}
+
+export interface MicroarchGroups {
+  state: MicroarchState;
+  // Sum of per-row cycles, so each row's cycle share (its dominance) is
+  // row.cycles / totalCycles.
+  totalCycles: number;
+  rows: MicroarchGroupRow[];
+}
+
+// Below this many samples a group's counter sums are too noisy for a stable
+// TMA/IPC, so we leave `tma` null (the row still shows its cycle share).
+const GROUP_TMA_MIN_SAMPLES = 30;
+
+// Per-group role totals → computeTma per group. Rows are the chosen grouping
+// (threads, modules, or profiled-vs-context); columns (TMA sections) come from
+// each row's TmaModel. 'privilege' deliberately drops the privileged scope so
+// the context side is visible; the others restrict to the profiled set.
+export async function loadMicroarchByGroup(
+  engine: Engine,
+  priv: PrivilegedSet,
+  grouping: MicroarchGrouping,
+  limit = 16,
+  window?: FocusWindow,
+): Promise<MicroarchGroups> {
+  await engine.query('INCLUDE PERFETTO MODULE linux.perf.counters;');
+  // privilege needs both sides, so it runs unscoped; thread/module stay scoped.
+  const scope = grouping === 'privilege' ? '' : sampleScopePredicate(priv);
+  const win = tsRangeClause(window, 'd.ts');
+
+  const dCte = `
+    WITH d AS (
+      SELECT
+        s.utid AS utid,
+        s.callsite_id AS callsite_id,
+        s.sample_id AS sample_id,
+        s.ts AS ts,
+        t.name AS cname,
+        s.counter_value - lag(s.counter_value) OVER (
+          PARTITION BY s.utid, s.track_id ORDER BY s.ts
+        ) AS dv
+      FROM linux_perf_sample_with_counters s
+      JOIN track t ON t.id = s.track_id
+      WHERE s.callsite_id IS NOT NULL ${scope}
+    )`;
+
+  let sql: string;
+  if (grouping === 'thread') {
+    sql = `${dCte}
+      SELECT
+        th.utid AS utid, th.upid AS upid, th.tid AS tid,
+        coalesce(nullif(th.name, ''), 'tid ' || th.tid) AS label,
+        NULL AS mapping,
+        count(DISTINCT d.sample_id) AS samples,
+        ${ROLE_SUMS}
+      FROM d JOIN thread th ON th.utid = d.utid
+      WHERE 1${win}
+      GROUP BY th.utid
+      ORDER BY cycles IS NULL, cycles DESC
+      LIMIT ${limit}`;
+  } else if (grouping === 'module') {
+    sql = `${dCte}
+      SELECT
+        NULL AS utid, NULL AS upid, NULL AS tid,
+        coalesce(spm.name, '[unknown]') AS label,
+        spm.name AS mapping,
+        count(DISTINCT d.sample_id) AS samples,
+        ${ROLE_SUMS}
+      FROM d
+      JOIN stack_profile_callsite c ON c.id = d.callsite_id
+      JOIN stack_profile_frame spf ON spf.id = c.frame_id
+      LEFT JOIN stack_profile_mapping spm ON spm.id = spf.mapping
+      WHERE 1${win}
+      GROUP BY spm.name
+      ORDER BY cycles IS NULL, cycles DESC
+      LIMIT ${limit}`;
+  } else {
+    // privilege: two rows, profiled set vs everything else that was sampled.
+    const member =
+      priv.upids.length > 0
+        ? `th.upid IN (${priv.upids.join(',')})`
+        : '0';
+    sql = `${dCte}
+      SELECT
+        NULL AS utid, NULL AS upid, NULL AS tid,
+        CASE WHEN ${member} THEN 'Profiled' ELSE 'Context' END AS label,
+        CASE WHEN ${member} THEN 'priv' ELSE 'ctx' END AS mapping,
+        count(DISTINCT d.sample_id) AS samples,
+        ${ROLE_SUMS}
+      FROM d JOIN thread th ON th.utid = d.utid
+      WHERE 1${win}
+      GROUP BY label
+      ORDER BY label`;
+  }
+
+  const res = await engine.query(sql);
+  const rows: MicroarchGroupRow[] = [];
+  let totalCycles = 0;
+  for (
+    const it = res.iter({
+      utid: NUM_NULL,
+      upid: NUM_NULL,
+      tid: NUM_NULL,
+      label: STR_NULL,
+      mapping: STR_NULL,
+      samples: NUM,
+      cycles: NUM_NULL,
+      instructions: NUM_NULL,
+      cache_miss: NUM_NULL,
+      branch_miss: NUM_NULL,
+      stall_fe: NUM_NULL,
+      stall_be: NUM_NULL,
+      arm_retired: NUM_NULL,
+      arm_spec: NUM_NULL,
+      arm_fe: NUM_NULL,
+      arm_be: NUM_NULL,
+      intel_slots: NUM_NULL,
+      intel_retired: NUM_NULL,
+      intel_fe: NUM_NULL,
+    });
+    it.valid();
+    it.next()
+  ) {
+    const roles = rowRoles(it);
+    const label = it.label ?? '[unknown]';
+    if (it.cycles !== null) totalCycles += it.cycles;
+    rows.push({
+      key:
+        grouping === 'thread'
+          ? `utid:${it.utid}`
+          : grouping === 'module'
+            ? `mod:${it.mapping ?? label}`
+            : `priv:${it.mapping ?? label}`,
+      label,
+      utid: it.utid,
+      upid: it.upid,
+      tid: it.tid,
+      mapping: it.mapping,
+      samples: it.samples,
+      cycles: it.cycles,
+      tma: it.samples >= GROUP_TMA_MIN_SAMPLES ? computeTma(roles) : null,
+    });
+  }
+  const state: MicroarchState =
+    rows.length === 0 ? 'no-counters' : totalCycles === 0 ? 'all-zero' : 'ok';
+  return {state, totalCycles, rows};
+}
+
 // ---- Top-Down (TMA) model -------------------------------------------------
 //
 // Built from the role totals by an ordered list of L1 *strategies*, most precise

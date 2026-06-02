@@ -117,7 +117,7 @@ const EMPTY_BURSTS: BurstShape = {
   shortBurstNs: 0n,
 };
 
-async function loadCpuSummary(
+export async function loadCpuSummary(
   engine: Engine,
   priv: PrivilegedSet,
 ): Promise<CpuSummary> {

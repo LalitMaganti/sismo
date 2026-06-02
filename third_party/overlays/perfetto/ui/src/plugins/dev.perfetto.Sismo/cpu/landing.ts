@@ -27,7 +27,9 @@ import type {Trace} from '../../../public/trace';
 import {QuerySlot, SerialTaskQueue} from '../../../base/query_slot';
 import {EmptyState} from '../../../widgets/empty_state';
 import type {PrivilegedSet} from '../privileged_set';
+import {actionLink} from '../page_common';
 import {loadingBlock} from './block';
+import type {EntityKind} from './session';
 import {loadTriage, renderTriageBlock, type TriageSummary} from './triage';
 import {loadWhereSummary, renderWhereBlock, type WhereSummary} from './where';
 import {
@@ -49,6 +51,10 @@ import {
 interface CpuLandingAttrs {
   readonly trace: Trace;
   readonly priv: PrivilegedSet;
+  // Switch to a fixed lens tab (e.g. 'where', 'efficiency', 'whereran').
+  readonly onNavigate: (tabKey: string) => void;
+  // Open (or focus) a detail tab for a function/thread/process.
+  readonly onDrill: (kind: EntityKind, id: string, label: string) => void;
 }
 
 export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
@@ -85,6 +91,22 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
         () => loadWhereSummary(trace.engine, priv),
         'How much CPU did you use, and where did it go?',
         renderWhereBlock,
+        (d) => [
+          actionLink('See where the cycles went', 'arrow_forward', () =>
+            attrs.onNavigate('where'),
+          ),
+          d.byFunction.length > 0 &&
+            actionLink(
+              `Why is ${d.byFunction[0].name} slow?`,
+              'help_outline',
+              () =>
+                attrs.onDrill(
+                  'function',
+                  d.byFunction[0].name,
+                  d.byFunction[0].name,
+                ),
+            ),
+        ],
       ),
       this.block(
         this.parallelSlot,
@@ -92,6 +114,10 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
         () => loadParallelSummary(trace.engine, priv),
         'Were your threads running in parallel, or serialized?',
         renderParallelBlock,
+        () =>
+          actionLink('See how cycles were scheduled', 'arrow_forward', () =>
+            attrs.onNavigate('whereran'),
+          ),
       ),
       this.block(
         this.burstSlot,
@@ -106,6 +132,10 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
         () => loadEfficiencySummary(trace.engine, priv),
         'How efficiently did the CPU run?',
         renderEfficiencyBlock,
+        () =>
+          actionLink('See how cycles were spent', 'arrow_forward', () =>
+            attrs.onNavigate('efficiency'),
+          ),
       ),
     );
   }
@@ -127,6 +157,9 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
     queryFn: () => Promise<T>,
     question: string,
     render: (data: T) => m.Children,
+    // Action-button footer (link-styled buttons that fire onNavigate / onDrill),
+    // built from the loaded data so it can reference specific entities.
+    footer?: (data: T) => m.Children,
   ): m.Children {
     let data: T | undefined;
     try {
@@ -134,7 +167,14 @@ export class CpuLandingPage implements m.ClassComponent<CpuLandingAttrs> {
     } catch {
       data = undefined;
     }
-    return data !== undefined ? render(data) : loadingBlock(question);
+    if (data === undefined) return loadingBlock(question);
+    const content = render(data);
+    if (footer === undefined) return content;
+    return m(
+      '.pf-sismo-landing__block',
+      content,
+      m('.pf-sismo-page__question-footer', footer(data)),
+    );
   }
 
   private renderTriage(

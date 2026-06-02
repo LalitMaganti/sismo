@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Cross-trace view preferences for the CPU flamegraph. The flamegraph widget is
-// stateless across traces by design; carrying a user's metric / colouring /
-// breakdown / direction / filters from one trace to the next is a Sismo concern,
-// so it lives here (localStorage) rather than in the shared widget.
+// Cross-trace view preferences for the CPU flamegraph: the user's metric /
+// colouring / breakdown / direction / filters, carried from one trace to the
+// next. Persisted through the shared Sismo settings store (../settings).
 
 import type {FlamegraphState, FlamegraphView} from '../../../widgets/flamegraph';
-
-const STORAGE_KEY = 'dev.perfetto.Sismo.cpu.flamegraph.prefs.v1';
+import {Setting, str} from '../settings';
 
 // Mirror of the widget's filter kinds. Persisted filters are validated against
 // this on load so a hand-edited or stale entry can't poison the state.
@@ -48,35 +46,34 @@ export interface FlamegraphPrefs {
   filters?: ReadonlyArray<{kind: FilterKind; filter: string}>;
 }
 
+const flamegraphPrefs = new Setting<FlamegraphPrefs>(
+  'cpu.flamegraph.prefs',
+  {},
+  parsePrefs,
+);
+
 export function loadFlamegraphPrefs(): FlamegraphPrefs {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw === null) return {};
-    const parsed = JSON.parse(raw) as unknown;
-    if (typeof parsed !== 'object' || parsed === null) return {};
-    const o = parsed as Record<string, unknown>;
-    const direction =
-      o.direction === 'BOTTOM_UP' || o.direction === 'TOP_DOWN'
-        ? o.direction
-        : undefined;
-    return {
-      selectedMetricName: str(o.selectedMetricName),
-      colorBy: str(o.colorBy),
-      breakdownBy: str(o.breakdownBy),
-      direction,
-      filters: parseFilters(o.filters),
-    };
-  } catch {
-    return {};
-  }
+  return flamegraphPrefs.get();
 }
 
 export function saveFlamegraphPrefs(prefs: FlamegraphPrefs): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
-  } catch {
-    // Storage unavailable or over quota — preferences are best-effort.
-  }
+  flamegraphPrefs.set(prefs);
+}
+
+function parsePrefs(raw: unknown): FlamegraphPrefs | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const o = raw as Record<string, unknown>;
+  const direction =
+    o.direction === 'BOTTOM_UP' || o.direction === 'TOP_DOWN'
+      ? o.direction
+      : undefined;
+  return {
+    selectedMetricName: str(o.selectedMetricName),
+    colorBy: str(o.colorBy),
+    breakdownBy: str(o.breakdownBy),
+    direction,
+    filters: parseFilters(o.filters),
+  };
 }
 
 // Derive the persistable subset from a full FlamegraphState.
@@ -118,10 +115,6 @@ export function applyPrefs(
     view,
     filters: prefs.filters !== undefined ? [...prefs.filters] : state.filters,
   };
-}
-
-function str(v: unknown): string | undefined {
-  return typeof v === 'string' ? v : undefined;
 }
 
 function parseFilters(

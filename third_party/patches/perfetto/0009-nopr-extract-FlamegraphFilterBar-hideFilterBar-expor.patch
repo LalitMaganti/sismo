@@ -1,0 +1,1745 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: nopr: extract FlamegraphFilterBar + hideFilterBar + export
+ computeFlamegraphTree
+
+Expose the flamegraph's machinery so an embedder can build a shared UI around it:
+- Split the filter / display bar into a standalone exported FlamegraphFilterBar,
+  with hideFilterBar to suppress the widget's built-in copy and
+  showViewControls / showDisplayOptions to tailor which controls a shared bar
+  shows for non-flamegraph views.
+- Export computeFlamegraphTree so a call tree or a flat functions list can run on
+  the exact same filtering / pivoting pipeline (and metric) as the flamegraph.
+- Move the .filter-bar styles to the top level so the bar renders correctly when
+  detached from .pf-flamegraph.
+Sismo-local; no upstream PR yet.
+---
+ ui/src/components/flamegraph_panel.ts |    5 +
+ ui/src/components/query_flamegraph.ts |   14 +-
+ ui/src/widgets/flamegraph.scss        |  102 +-
+ ui/src/widgets/flamegraph.ts          | 1437 +++++++++++++------------
+ 4 files changed, 820 insertions(+), 738 deletions(-)
+
+diff --git a/ui/src/components/flamegraph_panel.ts b/ui/src/components/flamegraph_panel.ts
+index 9d8e0244..d2717212 100644
+--- a/ui/src/components/flamegraph_panel.ts
++++ b/ui/src/components/flamegraph_panel.ts
+@@ -37,6 +37,10 @@ export interface FlamegraphPanelAttrs {
+ 
+   // Hide the metric-picker dropdown (the embedder drives the metric itself).
+   readonly hideMetricSelector?: boolean;
++
++  // Hide the inner flamegraph's filter bar entirely (the embedder renders a
++  // shared `FlamegraphFilterBar` instead).
++  readonly hideFilterBar?: boolean;
+ }
+ 
+ // Mithril wrapper around `QueryFlamegraph` that owns the inner instance's
+@@ -65,6 +69,7 @@ export class FlamegraphPanel implements m.ClassComponent<FlamegraphPanelAttrs> {
+       state: attrs.state,
+       onStateChange: attrs.onStateChange,
+       hideMetricSelector: attrs.hideMetricSelector,
++      hideFilterBar: attrs.hideFilterBar,
+     });
+   }
+ 
+diff --git a/ui/src/components/query_flamegraph.ts b/ui/src/components/query_flamegraph.ts
+index 84768fbb..25b719c0 100644
+--- a/ui/src/components/query_flamegraph.ts
++++ b/ui/src/components/query_flamegraph.ts
+@@ -187,6 +187,10 @@ interface QueryFlamegraphAttrs {
+ 
+   // Hide the metric-picker dropdown (the embedder drives the metric itself).
+   readonly hideMetricSelector?: boolean;
++
++  // Hide the inner flamegraph's filter bar entirely (the embedder renders a
++  // shared `FlamegraphFilterBar` instead).
++  readonly hideFilterBar?: boolean;
+ }
+ 
+ // A Perfetto UI component which wraps the `Flamegraph` widget and fetches the
+@@ -217,7 +221,8 @@ export class QueryFlamegraph implements AsyncDisposable {
+   }
+ 
+   render(attrs: QueryFlamegraphAttrs) {
+-    const {metrics, state, onStateChange, hideMetricSelector} = attrs;
++    const {metrics, state, onStateChange, hideMetricSelector, hideFilterBar} =
++      attrs;
+     this.lastAttrs = attrs;
+     if (this.monitor.ifStateChanged()) {
+       this.data = undefined;
+@@ -235,6 +240,7 @@ export class QueryFlamegraph implements AsyncDisposable {
+       },
+       onStateChange,
+       hideMetricSelector,
++      hideFilterBar,
+     });
+   }
+ 
+@@ -267,7 +273,11 @@ export class QueryFlamegraph implements AsyncDisposable {
+   }
+ }
+ 
+-async function computeFlamegraphTree(
++// Runs a metric's SQL, applies the `filters` and `view` from `state`, and
++// returns the laid-out flamegraph tree. Exported so an embedder can drive other
++// views (e.g. a call-tree table or a flat functions list) off the exact same
++// filtering / pivoting pipeline as the flamegraph, instead of reimplementing it.
++export async function computeFlamegraphTree(
+   engine: Engine,
+   {
+     dependencySql,
+diff --git a/ui/src/widgets/flamegraph.scss b/ui/src/widgets/flamegraph.scss
+index 82a8a6cc..e088d7af 100644
+--- a/ui/src/widgets/flamegraph.scss
++++ b/ui/src/widgets/flamegraph.scss
+@@ -24,27 +24,47 @@
+     height: 100%;
+   }
+ 
+-  .filter-bar {
+-    // Seat as a toolbar with inner padding (not outer margin) so the left and
+-    // right insets are symmetric and read as deliberate, like the DataGrid
+-    // toolbar — outer margin previously left the bar misaligned against the
+-    // full-bleed canvas below it.
+-    margin: 0;
+-    padding: 6px 8px;
+-    border-bottom: 1px solid var(--pf-color-border);
+-    background: var(--pf-color-background);
+-    display: flex;
+-    flex-wrap: wrap;
+-    gap: 8px;
+-    align-items: center;
++  .popup-anchor {
++    width: 0px;
++    height: 0px;
++    position: absolute;
++  }
+ 
+-    .pf-tag-input {
+-      flex-grow: 1;
+-    }
++  canvas {
++    user-select: none;
++  }
+ 
+-    .pf-select {
+-      flex-shrink: 0;
+-    }
++  .canvas-container {
++    height: 100%;
++    position: relative;
++    overflow-y: auto;
++  }
++
++  .pf-virtual-canvas {
++    height: 100%;
++  }
++}
++
++// The filter bar (FlamegraphFilterBar). Kept at the top level rather than
++// nested under .pf-flamegraph so it styles correctly both inside the flamegraph
++// and when an embedder renders it standalone as a shared bar above several
++// views.
++.filter-bar {
++  // Seat as a toolbar with inner padding (not outer margin) so the left and
++  // right insets are symmetric and read as deliberate, like the DataGrid
++  // toolbar — outer margin previously left the bar misaligned against the
++  // full-bleed canvas below it.
++  margin: 0;
++  padding: 6px 8px;
++  border-bottom: 1px solid var(--pf-color-border);
++  background: var(--pf-color-background);
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++  align-items: center;
++
++  .pf-select {
++    flex-shrink: 0;
+   }
+ 
+   .pf-tag-input {
+@@ -70,40 +90,20 @@
+       min-width: 80px;
+     }
+   }
++}
+ 
+-  .pf-flamegraph-filter-bar-separator {
+-    width: 1px;
+-    height: 24px;
+-    background: var(--pf-color-border);
+-    flex-shrink: 0;
+-    margin: 0 4px;
+-    align-self: center;
+-  }
+-
+-  .pf-flamegraph-filter-label {
+-    font-weight: 500;
+-    flex-shrink: 0;
+-  }
+-
+-  .popup-anchor {
+-    width: 0px;
+-    height: 0px;
+-    position: absolute;
+-  }
+-
+-  canvas {
+-    user-select: none;
+-  }
+-
+-  .canvas-container {
+-    height: 100%;
+-    position: relative;
+-    overflow-y: auto;
+-  }
++.pf-flamegraph-filter-bar-separator {
++  width: 1px;
++  height: 24px;
++  background: var(--pf-color-border);
++  flex-shrink: 0;
++  margin: 0 4px;
++  align-self: center;
++}
+ 
+-  .pf-virtual-canvas {
+-    height: 100%;
+-  }
++.pf-flamegraph-filter-label {
++  font-weight: 500;
++  flex-shrink: 0;
+ }
+ 
+ .pf-flamegraph-tooltip-popup {
+diff --git a/ui/src/widgets/flamegraph.ts b/ui/src/widgets/flamegraph.ts
+index 02c594c6..7d74e8d3 100644
+--- a/ui/src/widgets/flamegraph.ts
++++ b/ui/src/widgets/flamegraph.ts
+@@ -277,6 +277,12 @@ export interface FlamegraphAttrs {
+   // drives the selected metric itself (e.g. its own tabs) so the choice isn't
+   // offered twice.
+   readonly hideMetricSelector?: boolean;
++
++  // When true the widget does not render its own filter bar at all. Use this
++  // when an embedding view renders a shared `FlamegraphFilterBar` above several
++  // panes (e.g. a flamegraph, a call tree and a functions table) so they share
++  // one set of filters.
++  readonly hideFilterBar?: boolean;
+ }
+ 
+ type FilterType =
+@@ -457,8 +463,40 @@ class FilterBuilder implements m.ClassComponent<FilterBuilderAttrs> {
+  * });
+  * ```
+  */
+-export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+-  private attrs: FlamegraphAttrs;
++export interface FlamegraphFilterBarAttrs {
++  readonly metrics: ReadonlyArray<FlamegraphMetric>;
++  readonly state: FlamegraphState;
++  readonly onStateChange: (state: FlamegraphState) => void;
++
++  // The flamegraph's query result, when available. Only the "show / hide by
++  // column" control needs it (it lists the column values present in the data).
++  // A standalone embedder that renders this bar above non-flamegraph views can
++  // omit it; that control is then hidden.
++  readonly data?: FlamegraphQueryData;
++
++  // Hide the metric-picker dropdown (the embedder drives the metric itself).
++  readonly hideMetricSelector?: boolean;
++
++  // Whether to show the Top Down / Bottom Up view toggle. Defaults to true. The
++  // toggle drives `state.view`, so a shared bar can keep it for views that have
++  // a direction (a flamegraph or a call tree) and hide it for those that don't
++  // (a flat functions table).
++  readonly showViewControls?: boolean;
++
++  // Whether to show the "Display" options menu (break-down-by, colour-by).
++  // Defaults to true. These only affect the flamegraph, so a shared bar hides
++  // them outside flamegraph mode.
++  readonly showDisplayOptions?: boolean;
++}
++
++// The flamegraph's filter / display bar, split out so it can be rendered either
++// inside the `Flamegraph` widget (the default) or standalone by an embedder
++// that wants one shared bar driving several views. Pass `hideFilterBar` to the
++// `Flamegraph` / `FlamegraphPanel` to suppress the built-in copy when doing so.
++export class FlamegraphFilterBar
++  implements m.ClassComponent<FlamegraphFilterBarAttrs>
++{
++  private attrs!: FlamegraphFilterBarAttrs;
+ 
+   private showFilterBuilder: boolean = false;
+   private quickAddValue: string = '';
+@@ -469,756 +507,785 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+   // vanish from the "Hide" menu and could never be un-hidden.
+   private seenPropertyValues = new Map<string, Set<string>>();
+ 
+-  private dataChangeMonitor = new Monitor([() => this.attrs.data]);
+-  private zoomRegion?: ZoomRegion;
+-  private canvasApi?: VirtualOverlayCanvasApi;
+-  private pendingScrollToY?: number;
+-
+-  private renderNodesMonitor = new Monitor([
+-    () => this.attrs.data,
+-    () => this.canvasWidth,
+-    () => this.zoomRegion,
+-  ]);
+-  private renderNodes?: ReadonlyArray<RenderNode>;
+-
+-  private tooltipPos?: {
+-    x: number;
+-    y: number;
+-    source: Source;
+-    state: 'HOVER' | 'CLICK' | 'DECLICK';
+-  };
+-  private lastClickedNode?: RenderNode;
+-
+-  // Track hovered node by index to avoid redraws when mouse moves within same node.
+-  // We also keep hoveredX/Y so we can re-find the node after render nodes change.
+-  private hoveredNodeIdx?: number;
+-  private hoveredX?: number;
+-  private hoveredY?: number;
+-
+-  private canvasWidth = 0;
+-  private labelCharWidth = 0;
+-  private viewportRect?: Rect2D;
+-  private lastPopupVisible = false;
+-
+-  constructor({attrs}: m.Vnode<FlamegraphAttrs, {}>) {
++  view({attrs}: m.CVnode<FlamegraphFilterBarAttrs>): m.Children {
+     this.attrs = attrs;
+-  }
+-
+-  oncreate() {
+-    this.flushPendingScroll();
+-  }
+-
+-  onupdate() {
+-    this.flushPendingScroll();
+-  }
++    const tags = toTags(this.attrs.state);
++    const hasPivot = this.attrs.state.view.kind === 'PIVOT';
++    const hasFilters = tags.length > 0;
+ 
+-  private flushPendingScroll() {
+-    if (this.pendingScrollToY === undefined || this.canvasApi === undefined) {
+-      return;
+-    }
+-    this.canvasApi.scrollTo({y: this.pendingScrollToY});
+-    this.pendingScrollToY = undefined;
+-  }
++    const removeTag = (i: number) => {
++      if (i === this.attrs.state.filters.length) {
++        this.attrs.onStateChange({
++          ...this.attrs.state,
++          view: {kind: 'TOP_DOWN'},
++        });
++      } else {
++        const filters = this.attrs.state.filters.filter((_, j) => j !== i);
++        this.attrs.onStateChange({...this.attrs.state, filters});
++      }
++    };
+ 
+-  view({attrs}: m.Vnode<FlamegraphAttrs, this>): void | m.Children {
+-    this.attrs = attrs;
+-    if (this.dataChangeMonitor.ifStateChanged()) {
+-      this.zoomRegion = undefined;
+-      this.lastClickedNode = undefined;
+-      this.tooltipPos = undefined;
+-      // Auto-scroll so the root (depth 0) is visible. In TOP_DOWN the root
+-      // sits at the top of the canvas; in BOTTOM_UP it sits near the bottom
+-      // (only callers/leaves above it); in PIVOT it sits somewhere in the
+-      // middle with callers above and callees below.
+-      if (attrs.data !== undefined) {
+-        if (attrs.state.view.kind === 'BOTTOM_UP') {
+-          // Large value — the browser clamps to scrollHeight - clientHeight.
+-          this.pendingScrollToY = Number.MAX_SAFE_INTEGER;
++    const addFilterFn = (filters: Array<{type: FilterType; value: string}>) => {
++      let newState = this.attrs.state;
++      for (const {type, value} of filters) {
++        if (type === 'PIVOT') {
++          newState = {...newState, view: {kind: 'PIVOT', pivot: value}};
+         } else {
+-          const rootY = -attrs.data.minDepth * NODE_HEIGHT;
+-          this.pendingScrollToY = Math.max(0, rootY - NODE_HEIGHT);
++          newState = addFilter(newState, {kind: type, filter: value});
+         }
+       }
+-    }
+-    if (attrs.data === undefined) {
+-      return m(
+-        '.pf-flamegraph',
+-        this.renderFilterBar(attrs),
++      this.attrs.onStateChange(newState);
++    };
++
++    return m(
++      '.filter-bar',
++      !attrs.hideMetricSelector && [
+         m(
+-          '.loading-container',
+-          m(
+-            EmptyState,
+-            {
+-              icon: 'bar_chart',
+-              title: 'Computing graph ...',
+-              className: 'flamegraph-loading',
++          Select,
++          {
++            value: attrs.state.selectedMetricName,
++            onchange: (e: Event) => {
++              const el = e.target as HTMLSelectElement;
++              attrs.onStateChange({
++                ...this.attrs.state,
++                selectedMetricName: el.value,
++              });
+             },
+-            m(Spinner, {easing: true}),
+-          ),
++          },
++          attrs.metrics.map((x) => {
++            return m('option', {value: x.name}, x.name);
++          }),
+         ),
+-      );
+-    }
+-    const {minDepth, maxDepth} = attrs.data;
+-    const canvasHeight =
+-      Math.max(maxDepth - minDepth + PADDING_NODE_COUNT, PADDING_NODE_COUNT) *
+-      NODE_HEIGHT;
+-    const hoveredNode =
+-      this.hoveredNodeIdx !== undefined
+-        ? this.renderNodes?.[this.hoveredNodeIdx]
+-        : undefined;
+-    return m(
+-      '.pf-flamegraph',
+-      this.renderFilterBar(attrs),
++        m('.pf-flamegraph-filter-bar-separator'),
++      ],
++      m('span.pf-flamegraph-filter-label', 'Filters:'),
++      // Tag input: chips + text input combined
++      m(TagInput, {
++        tags,
++        value: this.quickAddValue,
++        onChange: (text) => {
++          this.quickAddValue = text;
++        },
++        onTagAdd: (text) => {
++          const filters = splitFilters(text).map((part) => parseFilter(part));
++          if (filters.length > 0) {
++            addFilterFn(filters);
++            this.quickAddValue = '';
++          }
++        },
++        onTagRemove: removeTag,
++        placeholder: hasFilters ? '' : 'e.g. SS: main HF: alloc.*',
++        renderTag: (text, onRemove) =>
++          m(Chip, {
++            ondblclick: () => {
++              this.quickAddValue = text;
++              onRemove();
++            },
++            label: m(MiddleEllipsis, {text}),
++            removable: true,
++            compact: true,
++            intent: Intent.Primary,
++            onRemove,
++          }),
++      }),
++      // [+] button opens guided form dialog
+       m(
+-        VirtualOverlayCanvas,
++        Popup,
+         {
+-          className: 'pf-virtual-canvas',
+-          overflowX: 'hidden',
+-          overflowY: 'auto',
+-          onMount: (api) => {
+-            this.canvasApi = api;
+-          },
+-          onscroll: (e: MithrilEvent<Event>) => {
+-            // Only redraw if popup visibility would change
+-            if (!this.tooltipPos) {
+-              e.redraw = false;
+-              return;
+-            }
+-            const target = e.target as HTMLElement;
+-            const scrollTop = target.scrollTop;
+-            const clientHeight = target.clientHeight;
+-            const tooltipY = this.tooltipPos.y;
+-            const nowVisible =
+-              tooltipY >= scrollTop && tooltipY <= scrollTop + clientHeight;
+-            if (nowVisible === this.lastPopupVisible) {
+-              e.redraw = false;
+-            }
+-          },
+-          onCanvasRedraw: ({
+-            ctx,
+-            virtualCanvasSize,
+-            canvasRect,
+-            viewportRect,
+-          }) => {
+-            this.drawCanvas(ctx, virtualCanvasSize, canvasRect, viewportRect);
++          trigger: m(Button, {
++            icon: Icons.Add,
++            compact: true,
++            active: this.showFilterBuilder,
++            onclick: () => {
++              this.showFilterBuilder = !this.showFilterBuilder;
++            },
++          }),
++          isOpen: this.showFilterBuilder,
++          onChange: (shouldOpen: boolean) => {
++            this.showFilterBuilder = shouldOpen;
+           },
++          position: PopupPosition.RightStart,
++          closeOnOutsideClick: true,
++          closeOnEscape: true,
++          className: 'pf-filter-builder',
++        },
++        m(FilterBuilder, {onAdd: addFilterFn, hasPivot}),
++        this.renderColumnVisibility(),
++      ),
++      m(CopyToClipboardButton(), {
++        textToCopy: () => tags.join(' '),
++        compact: true,
++        disabled: !hasFilters,
++      }),
++      m(Button, {
++        icon: 'delete',
++        compact: true,
++        disabled: !hasFilters,
++        onclick: () => {
++          attrs.onStateChange({
++            ...this.attrs.state,
++            filters: [],
++            view:
++              this.attrs.state.view.kind === 'PIVOT'
++                ? {kind: 'TOP_DOWN'}
++                : this.attrs.state.view,
++          });
+         },
++      }),
++      // The view toggle drives state.view, so a shared bar keeps it for any view
++      // with a direction (flamegraph or call tree); the display options only
++      // affect the flamegraph, so they're gated separately.
++      (this.attrs.showViewControls ?? true) && [
++        m('.pf-flamegraph-filter-bar-separator'),
+         m(
+-          'div',
++          RadioGroup,
+           {
+-            style: {
+-              height: `${canvasHeight}px`,
+-              cursor: hoveredNode === undefined ? 'default' : 'pointer',
+-            },
+-            onmousemove: (e: MithrilEvent<MouseEvent>) => {
+-              const {offsetX, offsetY} = e;
+-              this.hoveredX = offsetX;
+-              this.hoveredY = offsetY;
+-
+-              const nodeIdx = this.renderNodes?.findIndex((n) =>
+-                isIntersecting(offsetX, offsetY, n),
+-              );
+-              const newHoveredIdx =
+-                nodeIdx !== undefined && nodeIdx !== -1 ? nodeIdx : undefined;
+-
+-              if (newHoveredIdx === this.hoveredNodeIdx) {
+-                e.redraw = false;
+-                return;
+-              }
+-              this.hoveredNodeIdx = newHoveredIdx;
+-
+-              if (this.tooltipPos?.state === 'CLICK') {
+-                return;
+-              }
+-              if (newHoveredIdx === undefined) {
+-                this.tooltipPos = undefined;
+-                return;
+-              }
+-              const renderNode = this.renderNodes![newHoveredIdx];
+-              this.tooltipPos = {
+-                x: offsetX,
+-                y: renderNode.y,
+-                source: renderNode.source,
+-                state: 'HOVER',
+-              };
+-            },
+-            onmouseout: () => {
+-              this.hoveredNodeIdx = undefined;
+-              this.hoveredX = undefined;
+-              this.hoveredY = undefined;
+-              if (
+-                this.tooltipPos?.state === 'HOVER' ||
+-                this.tooltipPos?.state === 'DECLICK'
+-              ) {
+-                this.tooltipPos = undefined;
+-              }
+-            },
+-            onclick: ({offsetX, offsetY}: MouseEvent) => {
+-              const renderNode = this.renderNodes?.find((n) =>
+-                isIntersecting(offsetX, offsetY, n),
+-              );
+-              this.lastClickedNode = renderNode;
+-              if (renderNode === undefined) {
+-                this.tooltipPos = undefined;
+-              } else if (
+-                isIntersecting(
+-                  this.tooltipPos?.x,
+-                  this.tooltipPos?.y,
+-                  renderNode,
+-                )
+-              ) {
+-                this.tooltipPos!.state =
+-                  this.tooltipPos?.state === 'CLICK' ? 'DECLICK' : 'CLICK';
+-              } else {
+-                this.tooltipPos = {
+-                  x: offsetX,
+-                  y: renderNode.y,
+-                  source: renderNode.source,
+-                  state: 'CLICK',
+-                };
+-              }
+-            },
+-            ondblclick: ({offsetX, offsetY}: MouseEvent) => {
+-              const renderNode = this.renderNodes?.find((n) =>
+-                isIntersecting(offsetX, offsetY, n),
+-              );
+-              if (renderNode?.source.kind === 'MERGED') {
+-                return;
+-              }
+-              this.zoomRegion = renderNode?.source;
++            selectedValue:
++              this.attrs.state.view.kind === 'TOP_DOWN'
++                ? 'top-down'
++                : 'bottom-up',
++            onValueChange: (value) => {
++              this.attrs.onStateChange({
++                ...this.attrs.state,
++                view: {kind: value === 'top-down' ? 'TOP_DOWN' : 'BOTTOM_UP'},
++              });
+             },
++            disabled: this.attrs.state.view.kind === 'PIVOT',
+           },
+-          (() => {
+-            const popupVisible =
+-              this.isPopupAnchorVisible() &&
+-              (this.tooltipPos?.state === 'HOVER' ||
+-                this.tooltipPos?.state === 'CLICK');
+-            this.lastPopupVisible = popupVisible;
+-            return m(
+-              Popup,
+-              {
+-                trigger: m('.popup-anchor', {
+-                  style: {
+-                    left: this.tooltipPos?.x + 'px',
+-                    top: this.tooltipPos?.y + 'px',
+-                  },
+-                }),
+-                fitContent: true,
+-                position: PopupPosition.Right,
+-                isOpen: popupVisible,
+-                className: 'pf-flamegraph-tooltip-popup',
+-                offset: NODE_HEIGHT,
+-              },
+-              this.renderTooltip(),
+-            );
+-          })(),
++          [
++            m(RadioGroup.Button, {value: 'top-down'}, 'Top Down'),
++            m(RadioGroup.Button, {value: 'bottom-up'}, 'Bottom Up'),
++          ],
+         ),
+-      ),
++      ],
++      (this.attrs.showDisplayOptions ?? true) && this.renderDisplayOptions(),
+     );
+   }
+ 
+-  static createDefaultState(
+-    metrics: ReadonlyArray<FlamegraphMetric>,
+-  ): FlamegraphState {
+-    return {
+-      selectedMetricName: metrics[0].name,
+-      filters: [],
+-      view: {kind: 'TOP_DOWN'},
+-    };
+-  }
+-
+-  /**
+-   * Updates a FlamegraphState with new metrics, preserving filters where possible.
+-   *
+-   * If the current state has no metric selected (empty string), this will
+-   * initialize it with the first metric. Otherwise, it preserves the selected
+-   * metric if it still exists in the new metrics array, or falls back to the
+-   * first metric if it doesn't.
+-   */
+-  static updateState(
+-    state: FlamegraphState | undefined,
+-    metrics: ReadonlyArray<FlamegraphMetric>,
+-  ): FlamegraphState {
+-    if (state === undefined) {
+-      return Flamegraph.createDefaultState(metrics);
++  // "Display" menu: a single settings button gathering everything that governs
++  // how the flamegraph is presented — how the tree is broken down, how frames
++  // are coloured, and which frames are hidden. Modelled on the workspace
++  // switcher: one PopupMenu of flat MenuTitle sections rather than a button per
++  // control. Hidden entirely when the metric declares no presentation options.
++  private renderDisplayOptions() {
++    const dims = this.selectedMetric?.breakdownDimensions ?? [];
++    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
++    if (dims.length === 0 && columns.length === 0) {
++      return undefined;
+     }
+-    const metricStillExists = metrics.some(
+-      (m) => m.name === state.selectedMetricName,
+-    );
+-    return {
+-      filters: state.filters,
+-      view: state.view,
+-      colorBy: state.colorBy,
+-      breakdownBy: state.breakdownBy,
+-      selectedMetricName: metricStillExists
+-        ? state.selectedMetricName
+-        : metrics[0].name,
+-    };
+-  }
+-
+-  private drawCanvas(
+-    ctx: CanvasRenderingContext2D,
+-    size: Size2D,
+-    canvasRect: Rect2D,
+-    viewportRect: Rect2D,
+-  ) {
+-    this.viewportRect = viewportRect;
+-    this.canvasWidth = size.width;
++    const items: m.Children[] = [];
+ 
+-    if (this.renderNodesMonitor.ifStateChanged()) {
+-      if (this.attrs.data === undefined) {
+-        this.renderNodes = undefined;
+-        this.lastClickedNode = undefined;
+-      } else {
+-        this.renderNodes = computeRenderNodes(
+-          this.attrs.data,
+-          this.zoomRegion ?? {
+-            queryXStart: 0,
+-            queryXEnd: this.attrs.data.allRootsCumulativeValue,
+-            type: 'ROOT',
+-          },
+-          size.width,
+-        );
+-        this.lastClickedNode = this.renderNodes?.find((n) =>
+-          isIntersecting(this.lastClickedNode?.x, this.lastClickedNode?.y, n),
+-        );
+-      }
+-      this.tooltipPos = undefined;
+-      // Re-find hovered node using stored coordinates
+-      const nodeIdx = this.renderNodes?.findIndex((n) =>
+-        isIntersecting(this.hoveredX, this.hoveredY, n),
++    // "Break down by": splits the flamegraph's top level along a metric-declared
++    // dimension (e.g. thread, process). The widget only records the choice in
++    // state.breakdownBy; the embedder rebuilds the tree to match.
++    if (dims.length > 0) {
++      const selected = this.attrs.state.breakdownBy ?? dims[0].key;
++      items.push(
++        m(MenuTitle, {label: 'Break down'}),
++        dims.map((d) =>
++          this.radioItem(d.label, d.key === selected, () =>
++            this.attrs.onStateChange({...this.attrs.state, breakdownBy: d.key}),
++          ),
++        ),
+       );
+-      this.hoveredNodeIdx =
+-        nodeIdx !== undefined && nodeIdx !== -1 ? nodeIdx : undefined;
+-    }
+-    if (this.attrs.data === undefined || this.renderNodes === undefined) {
+-      return;
+     }
+ 
+-    const yStart = canvasRect.top;
+-    const yEnd = canvasRect.bottom;
+-
+-    const {allRootsCumulativeValue, unfilteredCumulativeValue, nodes} =
+-      this.attrs.data;
+-    const unit = assertExists(this.selectedMetric).unit;
+-
+-    ctx.font = LABEL_FONT_STYLE;
+-    ctx.textBaseline = 'middle';
+-
+-    ctx.strokeStyle = 'white';
+-    ctx.lineWidth = 0.5;
+-
+-    if (this.labelCharWidth === 0) {
+-      this.labelCharWidth = ctx.measureText('_').width;
++    // "Color by": frame name (default) or any unaggregatable property the metric
++    // declares (e.g. mapping, code type).
++    if (columns.length > 0) {
++      if (items.length > 0) items.push(m(MenuDivider));
++      const nameLabel = this.selectedMetric?.nameColumnLabel ?? 'Name';
++      const selected = this.attrs.state.colorBy ?? COLOR_BY_NAME;
++      const options = [
++        {value: COLOR_BY_NAME, label: nameLabel},
++        ...columns.map((c) => ({value: c.name, label: c.displayName})),
++      ];
++      items.push(
++        m(MenuTitle, {label: 'Color'}),
++        options.map((o) =>
++          this.radioItem(o.label, o.value === selected, () =>
++            this.attrs.onStateChange({...this.attrs.state, colorBy: o.value}),
++          ),
++        ),
++      );
+     }
+ 
+-    for (let i = 0; i < this.renderNodes.length; i++) {
+-      const node = this.renderNodes[i];
+-      const {x, y, width: width, source, state} = node;
+-      if (y + NODE_HEIGHT <= yStart || y >= yEnd) {
+-        continue;
+-      }
++    // Show/hide by column lives in the filter panel (renderColumnVisibility),
++    // not here — it produces HIDE_FRAME filters, so it belongs with the filters.
+ 
+-      const hover = isIntersecting(this.hoveredX, this.hoveredY, node);
+-      let name: string;
+-      let colorScheme;
+-      if (source.kind === 'ROOT') {
+-        const val = displaySize(allRootsCumulativeValue, unit);
+-        const percent = displayPercentage(
+-          allRootsCumulativeValue,
+-          unfilteredCumulativeValue,
+-        );
+-        name = `root: ${val} (${percent})`;
+-        colorScheme = getFlamegraphColorScheme('root', state === 'PARTIAL');
+-      } else if (source.kind === 'MERGED') {
+-        name = '(merged)';
+-        colorScheme = getFlamegraphColorScheme(name, state === 'PARTIAL');
+-      } else {
+-        const node = nodes[source.queryIdx];
+-        name = node.name;
+-        // The label is always the frame name; only the colour key varies. When
+-        // colouring by a property, frames sharing that property value (e.g. all
+-        // frames from one mapping, or all kernel frames) get the same hue.
+-        const colorBy = this.attrs.state.colorBy ?? COLOR_BY_NAME;
+-        const colorKey =
+-          colorBy === COLOR_BY_NAME
+-            ? name
+-            : (node.properties.get(colorBy)?.value ?? name);
+-        colorScheme = getFlamegraphColorScheme(colorKey, state === 'PARTIAL');
+-      }
+-      const bgColor = hover ? colorScheme.variant : colorScheme.base;
+-      const textColor = hover ? colorScheme.textVariant : colorScheme.textBase;
+-      ctx.fillStyle = bgColor.cssString;
+-      ctx.fillRect(x, y, width - 1, NODE_HEIGHT - 1);
+-
+-      // Render marker
+-      const MARKER_SIZE = 3;
+-      const MARKER_LEFT_MARGIN = 2;
+-      const MIN_WIDTH_FOR_MARKER = 15; // Don't show marker on very small nodes
+-      const hasMarker =
+-        source.kind === 'NODE' &&
+-        nodes[source.queryIdx].marker !== undefined &&
+-        width >= MIN_WIDTH_FOR_MARKER;
+-      if (hasMarker) {
+-        ctx.fillStyle = textColor.cssString;
+-        const markerX = x + MARKER_LEFT_MARGIN;
+-        const markerY = y + 2; // Position at top of node with small margin
+-        ctx.fillRect(markerX, markerY, MARKER_SIZE, MARKER_SIZE);
+-      }
++    return [
++      m('.pf-flamegraph-filter-bar-separator'),
++      m(
++        PopupMenu,
++        {
++          trigger: m(Button, {
++            icon: 'tune',
++            label: 'Display',
++            compact: true,
++          }),
++          position: PopupPosition.RightStart,
++        },
++        items,
++      ),
++    ];
++  }
+ 
+-      // Text positioning - no need to reserve space since marker is in top corner
+-      const widthNoPadding = width - LABEL_PADDING_PX * 2;
+-      if (widthNoPadding >= LABEL_MIN_WIDTH_FOR_TEXT_PX) {
+-        ctx.fillStyle = textColor.cssString;
+-        ctx.fillText(
+-          name.substring(0, widthNoPadding / this.labelCharWidth),
+-          x + LABEL_PADDING_PX,
+-          y + (NODE_HEIGHT - 1) / 2,
+-          widthNoPadding,
+-        );
+-      }
+-      if (this.lastClickedNode?.x === x && this.lastClickedNode?.y === y) {
+-        ctx.strokeStyle = 'blue';
+-        ctx.lineWidth = 2;
+-        ctx.beginPath();
+-        ctx.moveTo(x, y);
+-        ctx.lineTo(x + width, y);
+-        ctx.lineTo(x + width, y + NODE_HEIGHT - 1);
+-        ctx.lineTo(x, y + NODE_HEIGHT - 1);
+-        ctx.lineTo(x, y);
+-        ctx.stroke();
+-        ctx.strokeStyle = 'white';
+-        ctx.lineWidth = 0.5;
+-      }
++  // Show/hide by column, rendered into the filter panel: one PopupMultiSelect per
++  // colourable column (e.g. mapping, code type), each a searchable checklist of
++  // that column's values. Everything is checked (shown) by default; unticking a
++  // value adds an exact-match HIDE_FRAME filter that collapses those frames into
++  // their parent (e.g. drop all kernel frames, or one noisy library). Lives here
++  // rather than the Display menu because it is, semantically, a filter.
++  private renderColumnVisibility(): m.Children {
++    if (this.attrs.data === undefined) return undefined;
++    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
++    if (columns.length === 0) return undefined;
++    const {nodes} = this.attrs.data;
++    const metricName = this.attrs.state.selectedMetricName;
++    const selects: m.Children[] = [];
++    for (const c of columns) {
++      const values = this.columnValues(metricName, c.name, nodes);
++      if (values.length === 0) continue;
++      selects.push(
++        m(PopupMultiSelect, {
++          label: `Show ${c.displayName.toLowerCase()}`,
++          icon: 'visibility',
++          compact: true,
++          showSelectAllButton: true,
++          position: PopupPosition.RightStart,
++          options: values.map((v) => ({
++            id: v,
++            name: v === '' ? '(none)' : v,
++            checked: !this.isValueHidden(v),
++          })),
++          onChange: (diffs) => {
++            for (const {id, checked} of diffs) {
++              // `checked` = shown; toggle when the desired shown-state
++              // contradicts the current hidden-state.
++              if (checked === this.isValueHidden(id)) {
++                this.toggleHiddenValue(id);
++              }
++            }
++          },
++        }),
++      );
+     }
++    if (selects.length === 0) return undefined;
++    return m(
++      '.pf-flamegraph-column-visibility',
++      m('.pf-filter-builder__separator'),
++      m('.pf-filter-builder__help-title', 'Show / hide by column'),
++      m('.pf-flamegraph-column-visibility__row', selects),
++    );
+   }
+ 
+-  private isPopupAnchorVisible(): boolean {
+-    if (!this.tooltipPos || !this.viewportRect) {
+-      return false;
++  // Distinct values of `key`, unioned with every value previously seen for this
++  // (metric, column) so a hidden value stays listed even after it drops out of
++  // the filtered data. Keyed by metric so switching metric starts fresh.
++  private columnValues(
++    metricName: string,
++    key: string,
++    nodes: ReadonlyArray<FlamegraphNode>,
++  ): string[] {
++    const cacheKey = `${metricName} ${key}`;
++    let seen = this.seenPropertyValues.get(cacheKey);
++    if (seen === undefined) {
++      seen = new Set<string>();
++      this.seenPropertyValues.set(cacheKey, seen);
+     }
+-    const {y} = this.tooltipPos;
+-    return y >= this.viewportRect.top && y <= this.viewportRect.bottom;
++    for (const v of distinctPropertyValues(nodes, key)) {
++      seen.add(v);
++    }
++    return Array.from(seen).sort();
+   }
+ 
+-  private renderFilterBar(attrs: FlamegraphAttrs) {
+-    const tags = toTags(this.attrs.state);
+-    const hasPivot = this.attrs.state.view.kind === 'PIVOT';
+-    const hasFilters = tags.length > 0;
++  // A single-select menu row: like the workspace switcher, the chosen option
++  // carries a filled radio glyph and the rest an empty one. Stays open on click
++  // so several settings can be adjusted without reopening the menu.
++  private radioItem(label: string, selected: boolean, onclick: () => void) {
++    return m(MenuItem, {
++      label,
++      icon: selected ? 'radio_button_checked' : 'radio_button_unchecked',
++      closePopupOnClick: false,
++      onclick,
++    });
++  }
+ 
+-    const removeTag = (i: number) => {
+-      if (i === this.attrs.state.filters.length) {
+-        this.attrs.onStateChange({
+-          ...this.attrs.state,
+-          view: {kind: 'TOP_DOWN'},
+-        });
+-      } else {
+-        const filters = this.attrs.state.filters.filter((_, j) => j !== i);
+-        this.attrs.onStateChange({...this.attrs.state, filters});
+-      }
+-    };
++  // A value is "hidden" iff an exact-match HIDE_FRAME filter for it exists.
++  private hideFilterFor(value: string): string {
++    return `^${value}$`;
++  }
+ 
+-    const addFilterFn = (filters: Array<{type: FilterType; value: string}>) => {
+-      let newState = this.attrs.state;
+-      for (const {type, value} of filters) {
+-        if (type === 'PIVOT') {
+-          newState = {...newState, view: {kind: 'PIVOT', pivot: value}};
+-        } else {
+-          newState = addFilter(newState, {kind: type, filter: value});
+-        }
+-      }
+-      this.attrs.onStateChange(newState);
+-    };
++  private isValueHidden(value: string): boolean {
++    const f = this.hideFilterFor(value);
++    return this.attrs.state.filters.some(
++      (x) => x.kind === 'HIDE_FRAME' && x.filter === f,
++    );
++  }
+ 
+-    return m(
+-      '.filter-bar',
+-      !attrs.hideMetricSelector && [
+-        m(
+-          Select,
+-          {
+-            value: attrs.state.selectedMetricName,
+-            onchange: (e: Event) => {
+-              const el = e.target as HTMLSelectElement;
+-              attrs.onStateChange({
+-                ...this.attrs.state,
+-                selectedMetricName: el.value,
+-              });
+-            },
+-          },
+-          attrs.metrics.map((x) => {
+-            return m('option', {value: x.name}, x.name);
+-          }),
+-        ),
+-        m('.pf-flamegraph-filter-bar-separator'),
+-      ],
+-      m('span.pf-flamegraph-filter-label', 'Filters:'),
+-      // Tag input: chips + text input combined
+-      m(TagInput, {
+-        tags,
+-        value: this.quickAddValue,
+-        onChange: (text) => {
+-          this.quickAddValue = text;
+-        },
+-        onTagAdd: (text) => {
+-          const filters = splitFilters(text).map((part) => parseFilter(part));
+-          if (filters.length > 0) {
+-            addFilterFn(filters);
+-            this.quickAddValue = '';
+-          }
+-        },
+-        onTagRemove: removeTag,
+-        placeholder: hasFilters ? '' : 'e.g. SS: main HF: alloc.*',
+-        renderTag: (text, onRemove) =>
+-          m(Chip, {
+-            ondblclick: () => {
+-              this.quickAddValue = text;
+-              onRemove();
+-            },
+-            label: m(MiddleEllipsis, {text}),
+-            removable: true,
+-            compact: true,
+-            intent: Intent.Primary,
+-            onRemove,
+-          }),
+-      }),
+-      // [+] button opens guided form dialog
+-      m(
+-        Popup,
+-        {
+-          trigger: m(Button, {
+-            icon: Icons.Add,
+-            compact: true,
+-            active: this.showFilterBuilder,
+-            onclick: () => {
+-              this.showFilterBuilder = !this.showFilterBuilder;
+-            },
+-          }),
+-          isOpen: this.showFilterBuilder,
+-          onChange: (shouldOpen: boolean) => {
+-            this.showFilterBuilder = shouldOpen;
+-          },
+-          position: PopupPosition.RightStart,
+-          closeOnOutsideClick: true,
+-          closeOnEscape: true,
+-          className: 'pf-filter-builder',
+-        },
+-        m(FilterBuilder, {onAdd: addFilterFn, hasPivot}),
+-        this.renderColumnVisibility(),
+-      ),
+-      m(CopyToClipboardButton(), {
+-        textToCopy: () => tags.join(' '),
+-        compact: true,
+-        disabled: !hasFilters,
+-      }),
+-      m(Button, {
+-        icon: 'delete',
+-        compact: true,
+-        disabled: !hasFilters,
+-        onclick: () => {
+-          attrs.onStateChange({
+-            ...this.attrs.state,
+-            filters: [],
+-            view:
+-              this.attrs.state.view.kind === 'PIVOT'
+-                ? {kind: 'TOP_DOWN'}
+-                : this.attrs.state.view,
+-          });
+-        },
+-      }),
+-      m('.pf-flamegraph-filter-bar-separator'),
+-      m(
+-        RadioGroup,
+-        {
+-          selectedValue:
+-            this.attrs.state.view.kind === 'TOP_DOWN'
+-              ? 'top-down'
+-              : 'bottom-up',
+-          onValueChange: (value) => {
+-            this.attrs.onStateChange({
+-              ...this.attrs.state,
+-              view: {kind: value === 'top-down' ? 'TOP_DOWN' : 'BOTTOM_UP'},
+-            });
+-          },
+-          disabled: this.attrs.state.view.kind === 'PIVOT',
+-        },
+-        [
+-          m(RadioGroup.Button, {value: 'top-down'}, 'Top Down'),
+-          m(RadioGroup.Button, {value: 'bottom-up'}, 'Bottom Up'),
+-        ],
+-      ),
+-      this.renderDisplayOptions(),
++  private toggleHiddenValue(value: string) {
++    const f = this.hideFilterFor(value);
++    const filters = this.isValueHidden(value)
++      ? this.attrs.state.filters.filter(
++          (x) => !(x.kind === 'HIDE_FRAME' && x.filter === f),
++        )
++      : this.attrs.state.filters.concat([{kind: 'HIDE_FRAME', filter: f}]);
++    this.attrs.onStateChange({...this.attrs.state, filters});
++  }
++
++  private get selectedMetric() {
++    return this.attrs.metrics.find(
++      (x) => x.name === this.attrs.state.selectedMetricName,
+     );
+   }
++}
++
++export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
++  private attrs: FlamegraphAttrs;
++
++  private dataChangeMonitor = new Monitor([() => this.attrs.data]);
++  private zoomRegion?: ZoomRegion;
++  private canvasApi?: VirtualOverlayCanvasApi;
++  private pendingScrollToY?: number;
++
++  private renderNodesMonitor = new Monitor([
++    () => this.attrs.data,
++    () => this.canvasWidth,
++    () => this.zoomRegion,
++  ]);
++  private renderNodes?: ReadonlyArray<RenderNode>;
++
++  private tooltipPos?: {
++    x: number;
++    y: number;
++    source: Source;
++    state: 'HOVER' | 'CLICK' | 'DECLICK';
++  };
++  private lastClickedNode?: RenderNode;
++
++  // Track hovered node by index to avoid redraws when mouse moves within same node.
++  // We also keep hoveredX/Y so we can re-find the node after render nodes change.
++  private hoveredNodeIdx?: number;
++  private hoveredX?: number;
++  private hoveredY?: number;
++
++  private canvasWidth = 0;
++  private labelCharWidth = 0;
++  private viewportRect?: Rect2D;
++  private lastPopupVisible = false;
++
++  constructor({attrs}: m.Vnode<FlamegraphAttrs, {}>) {
++    this.attrs = attrs;
++  }
++
++  oncreate() {
++    this.flushPendingScroll();
++  }
++
++  onupdate() {
++    this.flushPendingScroll();
++  }
+ 
+-  // "Display" menu: a single settings button gathering everything that governs
+-  // how the flamegraph is presented — how the tree is broken down, how frames
+-  // are coloured, and which frames are hidden. Modelled on the workspace
+-  // switcher: one PopupMenu of flat MenuTitle sections rather than a button per
+-  // control. Hidden entirely when the metric declares no presentation options.
+-  private renderDisplayOptions() {
+-    const dims = this.selectedMetric?.breakdownDimensions ?? [];
+-    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
+-    if (dims.length === 0 && columns.length === 0) {
+-      return undefined;
++  private flushPendingScroll() {
++    if (this.pendingScrollToY === undefined || this.canvasApi === undefined) {
++      return;
+     }
+-    const items: m.Children[] = [];
++    this.canvasApi.scrollTo({y: this.pendingScrollToY});
++    this.pendingScrollToY = undefined;
++  }
+ 
+-    // "Break down by": splits the flamegraph's top level along a metric-declared
+-    // dimension (e.g. thread, process). The widget only records the choice in
+-    // state.breakdownBy; the embedder rebuilds the tree to match.
+-    if (dims.length > 0) {
+-      const selected = this.attrs.state.breakdownBy ?? dims[0].key;
+-      items.push(
+-        m(MenuTitle, {label: 'Break down'}),
+-        dims.map((d) =>
+-          this.radioItem(d.label, d.key === selected, () =>
+-            this.attrs.onStateChange({...this.attrs.state, breakdownBy: d.key}),
+-          ),
+-        ),
+-      );
++  view({attrs}: m.Vnode<FlamegraphAttrs, this>): void | m.Children {
++    this.attrs = attrs;
++    if (this.dataChangeMonitor.ifStateChanged()) {
++      this.zoomRegion = undefined;
++      this.lastClickedNode = undefined;
++      this.tooltipPos = undefined;
++      // Auto-scroll so the root (depth 0) is visible. In TOP_DOWN the root
++      // sits at the top of the canvas; in BOTTOM_UP it sits near the bottom
++      // (only callers/leaves above it); in PIVOT it sits somewhere in the
++      // middle with callers above and callees below.
++      if (attrs.data !== undefined) {
++        if (attrs.state.view.kind === 'BOTTOM_UP') {
++          // Large value — the browser clamps to scrollHeight - clientHeight.
++          this.pendingScrollToY = Number.MAX_SAFE_INTEGER;
++        } else {
++          const rootY = -attrs.data.minDepth * NODE_HEIGHT;
++          this.pendingScrollToY = Math.max(0, rootY - NODE_HEIGHT);
++        }
++      }
+     }
+-
+-    // "Color by": frame name (default) or any unaggregatable property the metric
+-    // declares (e.g. mapping, code type).
+-    if (columns.length > 0) {
+-      if (items.length > 0) items.push(m(MenuDivider));
+-      const nameLabel = this.selectedMetric?.nameColumnLabel ?? 'Name';
+-      const selected = this.attrs.state.colorBy ?? COLOR_BY_NAME;
+-      const options = [
+-        {value: COLOR_BY_NAME, label: nameLabel},
+-        ...columns.map((c) => ({value: c.name, label: c.displayName})),
+-      ];
+-      items.push(
+-        m(MenuTitle, {label: 'Color'}),
+-        options.map((o) =>
+-          this.radioItem(o.label, o.value === selected, () =>
+-            this.attrs.onStateChange({...this.attrs.state, colorBy: o.value}),
++    if (attrs.data === undefined) {
++      return m(
++        '.pf-flamegraph',
++        this.renderFilterBar(attrs),
++        m(
++          '.loading-container',
++          m(
++            EmptyState,
++            {
++              icon: 'bar_chart',
++              title: 'Computing graph ...',
++              className: 'flamegraph-loading',
++            },
++            m(Spinner, {easing: true}),
+           ),
+         ),
+       );
+     }
+-
+-    // Show/hide by column lives in the filter panel (renderColumnVisibility),
+-    // not here — it produces HIDE_FRAME filters, so it belongs with the filters.
+-
+-    return [
+-      m('.pf-flamegraph-filter-bar-separator'),
++    const {minDepth, maxDepth} = attrs.data;
++    const canvasHeight =
++      Math.max(maxDepth - minDepth + PADDING_NODE_COUNT, PADDING_NODE_COUNT) *
++      NODE_HEIGHT;
++    const hoveredNode =
++      this.hoveredNodeIdx !== undefined
++        ? this.renderNodes?.[this.hoveredNodeIdx]
++        : undefined;
++    return m(
++      '.pf-flamegraph',
++      this.renderFilterBar(attrs),
+       m(
+-        PopupMenu,
++        VirtualOverlayCanvas,
+         {
+-          trigger: m(Button, {
+-            icon: 'tune',
+-            label: 'Display',
+-            compact: true,
+-          }),
+-          position: PopupPosition.RightStart,
++          className: 'pf-virtual-canvas',
++          overflowX: 'hidden',
++          overflowY: 'auto',
++          onMount: (api) => {
++            this.canvasApi = api;
++          },
++          onscroll: (e: MithrilEvent<Event>) => {
++            // Only redraw if popup visibility would change
++            if (!this.tooltipPos) {
++              e.redraw = false;
++              return;
++            }
++            const target = e.target as HTMLElement;
++            const scrollTop = target.scrollTop;
++            const clientHeight = target.clientHeight;
++            const tooltipY = this.tooltipPos.y;
++            const nowVisible =
++              tooltipY >= scrollTop && tooltipY <= scrollTop + clientHeight;
++            if (nowVisible === this.lastPopupVisible) {
++              e.redraw = false;
++            }
++          },
++          onCanvasRedraw: ({
++            ctx,
++            virtualCanvasSize,
++            canvasRect,
++            viewportRect,
++          }) => {
++            this.drawCanvas(ctx, virtualCanvasSize, canvasRect, viewportRect);
++          },
+         },
+-        items,
++        m(
++          'div',
++          {
++            style: {
++              height: `${canvasHeight}px`,
++              cursor: hoveredNode === undefined ? 'default' : 'pointer',
++            },
++            onmousemove: (e: MithrilEvent<MouseEvent>) => {
++              const {offsetX, offsetY} = e;
++              this.hoveredX = offsetX;
++              this.hoveredY = offsetY;
++
++              const nodeIdx = this.renderNodes?.findIndex((n) =>
++                isIntersecting(offsetX, offsetY, n),
++              );
++              const newHoveredIdx =
++                nodeIdx !== undefined && nodeIdx !== -1 ? nodeIdx : undefined;
++
++              if (newHoveredIdx === this.hoveredNodeIdx) {
++                e.redraw = false;
++                return;
++              }
++              this.hoveredNodeIdx = newHoveredIdx;
++
++              if (this.tooltipPos?.state === 'CLICK') {
++                return;
++              }
++              if (newHoveredIdx === undefined) {
++                this.tooltipPos = undefined;
++                return;
++              }
++              const renderNode = this.renderNodes![newHoveredIdx];
++              this.tooltipPos = {
++                x: offsetX,
++                y: renderNode.y,
++                source: renderNode.source,
++                state: 'HOVER',
++              };
++            },
++            onmouseout: () => {
++              this.hoveredNodeIdx = undefined;
++              this.hoveredX = undefined;
++              this.hoveredY = undefined;
++              if (
++                this.tooltipPos?.state === 'HOVER' ||
++                this.tooltipPos?.state === 'DECLICK'
++              ) {
++                this.tooltipPos = undefined;
++              }
++            },
++            onclick: ({offsetX, offsetY}: MouseEvent) => {
++              const renderNode = this.renderNodes?.find((n) =>
++                isIntersecting(offsetX, offsetY, n),
++              );
++              this.lastClickedNode = renderNode;
++              if (renderNode === undefined) {
++                this.tooltipPos = undefined;
++              } else if (
++                isIntersecting(
++                  this.tooltipPos?.x,
++                  this.tooltipPos?.y,
++                  renderNode,
++                )
++              ) {
++                this.tooltipPos!.state =
++                  this.tooltipPos?.state === 'CLICK' ? 'DECLICK' : 'CLICK';
++              } else {
++                this.tooltipPos = {
++                  x: offsetX,
++                  y: renderNode.y,
++                  source: renderNode.source,
++                  state: 'CLICK',
++                };
++              }
++            },
++            ondblclick: ({offsetX, offsetY}: MouseEvent) => {
++              const renderNode = this.renderNodes?.find((n) =>
++                isIntersecting(offsetX, offsetY, n),
++              );
++              if (renderNode?.source.kind === 'MERGED') {
++                return;
++              }
++              this.zoomRegion = renderNode?.source;
++            },
++          },
++          (() => {
++            const popupVisible =
++              this.isPopupAnchorVisible() &&
++              (this.tooltipPos?.state === 'HOVER' ||
++                this.tooltipPos?.state === 'CLICK');
++            this.lastPopupVisible = popupVisible;
++            return m(
++              Popup,
++              {
++                trigger: m('.popup-anchor', {
++                  style: {
++                    left: this.tooltipPos?.x + 'px',
++                    top: this.tooltipPos?.y + 'px',
++                  },
++                }),
++                fitContent: true,
++                position: PopupPosition.Right,
++                isOpen: popupVisible,
++                className: 'pf-flamegraph-tooltip-popup',
++                offset: NODE_HEIGHT,
++              },
++              this.renderTooltip(),
++            );
++          })(),
++        ),
+       ),
+-    ];
++    );
++  }
++
++  static createDefaultState(
++    metrics: ReadonlyArray<FlamegraphMetric>,
++  ): FlamegraphState {
++    return {
++      selectedMetricName: metrics[0].name,
++      filters: [],
++      view: {kind: 'TOP_DOWN'},
++    };
+   }
+ 
+-  // Show/hide by column, rendered into the filter panel: one PopupMultiSelect per
+-  // colourable column (e.g. mapping, code type), each a searchable checklist of
+-  // that column's values. Everything is checked (shown) by default; unticking a
+-  // value adds an exact-match HIDE_FRAME filter that collapses those frames into
+-  // their parent (e.g. drop all kernel frames, or one noisy library). Lives here
+-  // rather than the Display menu because it is, semantically, a filter.
+-  private renderColumnVisibility(): m.Children {
+-    if (this.attrs.data === undefined) return undefined;
+-    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
+-    if (columns.length === 0) return undefined;
+-    const {nodes} = this.attrs.data;
+-    const metricName = this.attrs.state.selectedMetricName;
+-    const selects: m.Children[] = [];
+-    for (const c of columns) {
+-      const values = this.columnValues(metricName, c.name, nodes);
+-      if (values.length === 0) continue;
+-      selects.push(
+-        m(PopupMultiSelect, {
+-          label: `Show ${c.displayName.toLowerCase()}`,
+-          icon: 'visibility',
+-          compact: true,
+-          showSelectAllButton: true,
+-          position: PopupPosition.RightStart,
+-          options: values.map((v) => ({
+-            id: v,
+-            name: v === '' ? '(none)' : v,
+-            checked: !this.isValueHidden(v),
+-          })),
+-          onChange: (diffs) => {
+-            for (const {id, checked} of diffs) {
+-              // `checked` = shown; toggle when the desired shown-state
+-              // contradicts the current hidden-state.
+-              if (checked === this.isValueHidden(id)) {
+-                this.toggleHiddenValue(id);
+-              }
+-            }
+-          },
+-        }),
+-      );
++  /**
++   * Updates a FlamegraphState with new metrics, preserving filters where possible.
++   *
++   * If the current state has no metric selected (empty string), this will
++   * initialize it with the first metric. Otherwise, it preserves the selected
++   * metric if it still exists in the new metrics array, or falls back to the
++   * first metric if it doesn't.
++   */
++  static updateState(
++    state: FlamegraphState | undefined,
++    metrics: ReadonlyArray<FlamegraphMetric>,
++  ): FlamegraphState {
++    if (state === undefined) {
++      return Flamegraph.createDefaultState(metrics);
+     }
+-    if (selects.length === 0) return undefined;
+-    return m(
+-      '.pf-flamegraph-column-visibility',
+-      m('.pf-filter-builder__separator'),
+-      m('.pf-filter-builder__help-title', 'Show / hide by column'),
+-      m('.pf-flamegraph-column-visibility__row', selects),
++    const metricStillExists = metrics.some(
++      (m) => m.name === state.selectedMetricName,
+     );
++    return {
++      filters: state.filters,
++      view: state.view,
++      colorBy: state.colorBy,
++      breakdownBy: state.breakdownBy,
++      selectedMetricName: metricStillExists
++        ? state.selectedMetricName
++        : metrics[0].name,
++    };
+   }
+ 
+-  // Distinct values of `key`, unioned with every value previously seen for this
+-  // (metric, column) so a hidden value stays listed even after it drops out of
+-  // the filtered data. Keyed by metric so switching metric starts fresh.
+-  private columnValues(
+-    metricName: string,
+-    key: string,
+-    nodes: ReadonlyArray<FlamegraphNode>,
+-  ): string[] {
+-    const cacheKey = `${metricName} ${key}`;
+-    let seen = this.seenPropertyValues.get(cacheKey);
+-    if (seen === undefined) {
+-      seen = new Set<string>();
+-      this.seenPropertyValues.set(cacheKey, seen);
++  private drawCanvas(
++    ctx: CanvasRenderingContext2D,
++    size: Size2D,
++    canvasRect: Rect2D,
++    viewportRect: Rect2D,
++  ) {
++    this.viewportRect = viewportRect;
++    this.canvasWidth = size.width;
++
++    if (this.renderNodesMonitor.ifStateChanged()) {
++      if (this.attrs.data === undefined) {
++        this.renderNodes = undefined;
++        this.lastClickedNode = undefined;
++      } else {
++        this.renderNodes = computeRenderNodes(
++          this.attrs.data,
++          this.zoomRegion ?? {
++            queryXStart: 0,
++            queryXEnd: this.attrs.data.allRootsCumulativeValue,
++            type: 'ROOT',
++          },
++          size.width,
++        );
++        this.lastClickedNode = this.renderNodes?.find((n) =>
++          isIntersecting(this.lastClickedNode?.x, this.lastClickedNode?.y, n),
++        );
++      }
++      this.tooltipPos = undefined;
++      // Re-find hovered node using stored coordinates
++      const nodeIdx = this.renderNodes?.findIndex((n) =>
++        isIntersecting(this.hoveredX, this.hoveredY, n),
++      );
++      this.hoveredNodeIdx =
++        nodeIdx !== undefined && nodeIdx !== -1 ? nodeIdx : undefined;
+     }
+-    for (const v of distinctPropertyValues(nodes, key)) {
+-      seen.add(v);
++    if (this.attrs.data === undefined || this.renderNodes === undefined) {
++      return;
+     }
+-    return Array.from(seen).sort();
+-  }
+ 
+-  // A single-select menu row: like the workspace switcher, the chosen option
+-  // carries a filled radio glyph and the rest an empty one. Stays open on click
+-  // so several settings can be adjusted without reopening the menu.
+-  private radioItem(label: string, selected: boolean, onclick: () => void) {
+-    return m(MenuItem, {
+-      label,
+-      icon: selected ? 'radio_button_checked' : 'radio_button_unchecked',
+-      closePopupOnClick: false,
+-      onclick,
+-    });
+-  }
++    const yStart = canvasRect.top;
++    const yEnd = canvasRect.bottom;
+ 
+-  // A value is "hidden" iff an exact-match HIDE_FRAME filter for it exists.
+-  private hideFilterFor(value: string): string {
+-    return `^${value}$`;
++    const {allRootsCumulativeValue, unfilteredCumulativeValue, nodes} =
++      this.attrs.data;
++    const unit = assertExists(this.selectedMetric).unit;
++
++    ctx.font = LABEL_FONT_STYLE;
++    ctx.textBaseline = 'middle';
++
++    ctx.strokeStyle = 'white';
++    ctx.lineWidth = 0.5;
++
++    if (this.labelCharWidth === 0) {
++      this.labelCharWidth = ctx.measureText('_').width;
++    }
++
++    for (let i = 0; i < this.renderNodes.length; i++) {
++      const node = this.renderNodes[i];
++      const {x, y, width: width, source, state} = node;
++      if (y + NODE_HEIGHT <= yStart || y >= yEnd) {
++        continue;
++      }
++
++      const hover = isIntersecting(this.hoveredX, this.hoveredY, node);
++      let name: string;
++      let colorScheme;
++      if (source.kind === 'ROOT') {
++        const val = displaySize(allRootsCumulativeValue, unit);
++        const percent = displayPercentage(
++          allRootsCumulativeValue,
++          unfilteredCumulativeValue,
++        );
++        name = `root: ${val} (${percent})`;
++        colorScheme = getFlamegraphColorScheme('root', state === 'PARTIAL');
++      } else if (source.kind === 'MERGED') {
++        name = '(merged)';
++        colorScheme = getFlamegraphColorScheme(name, state === 'PARTIAL');
++      } else {
++        const node = nodes[source.queryIdx];
++        name = node.name;
++        // The label is always the frame name; only the colour key varies. When
++        // colouring by a property, frames sharing that property value (e.g. all
++        // frames from one mapping, or all kernel frames) get the same hue.
++        const colorBy = this.attrs.state.colorBy ?? COLOR_BY_NAME;
++        const colorKey =
++          colorBy === COLOR_BY_NAME
++            ? name
++            : (node.properties.get(colorBy)?.value ?? name);
++        colorScheme = getFlamegraphColorScheme(colorKey, state === 'PARTIAL');
++      }
++      const bgColor = hover ? colorScheme.variant : colorScheme.base;
++      const textColor = hover ? colorScheme.textVariant : colorScheme.textBase;
++      ctx.fillStyle = bgColor.cssString;
++      ctx.fillRect(x, y, width - 1, NODE_HEIGHT - 1);
++
++      // Render marker
++      const MARKER_SIZE = 3;
++      const MARKER_LEFT_MARGIN = 2;
++      const MIN_WIDTH_FOR_MARKER = 15; // Don't show marker on very small nodes
++      const hasMarker =
++        source.kind === 'NODE' &&
++        nodes[source.queryIdx].marker !== undefined &&
++        width >= MIN_WIDTH_FOR_MARKER;
++      if (hasMarker) {
++        ctx.fillStyle = textColor.cssString;
++        const markerX = x + MARKER_LEFT_MARGIN;
++        const markerY = y + 2; // Position at top of node with small margin
++        ctx.fillRect(markerX, markerY, MARKER_SIZE, MARKER_SIZE);
++      }
++
++      // Text positioning - no need to reserve space since marker is in top corner
++      const widthNoPadding = width - LABEL_PADDING_PX * 2;
++      if (widthNoPadding >= LABEL_MIN_WIDTH_FOR_TEXT_PX) {
++        ctx.fillStyle = textColor.cssString;
++        ctx.fillText(
++          name.substring(0, widthNoPadding / this.labelCharWidth),
++          x + LABEL_PADDING_PX,
++          y + (NODE_HEIGHT - 1) / 2,
++          widthNoPadding,
++        );
++      }
++      if (this.lastClickedNode?.x === x && this.lastClickedNode?.y === y) {
++        ctx.strokeStyle = 'blue';
++        ctx.lineWidth = 2;
++        ctx.beginPath();
++        ctx.moveTo(x, y);
++        ctx.lineTo(x + width, y);
++        ctx.lineTo(x + width, y + NODE_HEIGHT - 1);
++        ctx.lineTo(x, y + NODE_HEIGHT - 1);
++        ctx.lineTo(x, y);
++        ctx.stroke();
++        ctx.strokeStyle = 'white';
++        ctx.lineWidth = 0.5;
++      }
++    }
+   }
+ 
+-  private isValueHidden(value: string): boolean {
+-    const f = this.hideFilterFor(value);
+-    return this.attrs.state.filters.some(
+-      (x) => x.kind === 'HIDE_FRAME' && x.filter === f,
+-    );
++  private isPopupAnchorVisible(): boolean {
++    if (!this.tooltipPos || !this.viewportRect) {
++      return false;
++    }
++    const {y} = this.tooltipPos;
++    return y >= this.viewportRect.top && y <= this.viewportRect.bottom;
+   }
+ 
+-  private toggleHiddenValue(value: string) {
+-    const f = this.hideFilterFor(value);
+-    const filters = this.isValueHidden(value)
+-      ? this.attrs.state.filters.filter(
+-          (x) => !(x.kind === 'HIDE_FRAME' && x.filter === f),
+-        )
+-      : this.attrs.state.filters.concat([{kind: 'HIDE_FRAME', filter: f}]);
+-    this.attrs.onStateChange({...this.attrs.state, filters});
++  private renderFilterBar(attrs: FlamegraphAttrs) {
++    if (attrs.hideFilterBar) {
++      return undefined;
++    }
++    return m(FlamegraphFilterBar, {
++      metrics: attrs.metrics,
++      state: attrs.state,
++      data: attrs.data,
++      onStateChange: attrs.onStateChange,
++      hideMetricSelector: attrs.hideMetricSelector,
++    });
+   }
+ 
+   private renderTooltip() {

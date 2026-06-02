@@ -43,6 +43,7 @@ export {
   type CpuSummary,
   type LatencyDetail,
   loadCpuDetail,
+  loadCpuSummary,
   loadLatencyDetail,
 } from './overview';
 
@@ -79,6 +80,7 @@ export {
   loadWindowConsumers,
 } from './activity';
 
+
 export {type CpuTriage, loadCpuTriage} from './triage';
 
 export {
@@ -95,11 +97,15 @@ export {
   type MicroarchCounters,
   type MicroarchData,
   type MicroarchFuncRow,
+  type MicroarchGrouping,
+  type MicroarchGroupRow,
+  type MicroarchGroups,
   type RealCycles,
   type TmaBucket,
   type TmaModel,
   computeTma,
   loadMicroarch,
+  loadMicroarchByGroup,
   loadMicroarchCounters,
   loadRealCycles,
 } from './microarch';

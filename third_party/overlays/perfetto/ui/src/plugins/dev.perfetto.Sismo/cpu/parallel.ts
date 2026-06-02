@@ -21,10 +21,15 @@ import m from 'mithril';
 import type {Engine} from '../../../trace_processor/engine';
 import {LONG_NULL, NUM} from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
-import {fmtDurationNs, fmtPercent} from '../format';
+import {fmtPercent} from '../format';
 import {renderStatCard, type StatCard} from '../page_common';
 import {questionBlock} from './block';
-import {breakdownGrid, type BreakdownGridRow} from './grid';
+import type {BreakdownGridRow} from './grid';
+import {
+  Meter,
+  meterReadout,
+  type MeterColor,
+} from '../../dev.perfetto.SismoWidgets/meter';
 
 export interface ParallelSummary {
   readonly threadCount: number;
@@ -36,6 +41,19 @@ export interface ParallelSummary {
 }
 
 const QUESTION = 'Were your threads running in parallel, or serialized?';
+
+// Meter colour per concurrency band, keyed by the names the loader builds the
+// distribution rows with. Categorical, NOT a good/bad scale — whether serial is
+// "bad" depends on the workload.
+const BAND_COLORS: ReadonlyArray<readonly [string, MeterColor]> = [
+  ['1 thread at a time', 'idle'],
+  ['2–4 threads', 'secondary'],
+  ['5+ threads', 'primary'],
+];
+
+function bandColor(name: string): MeterColor {
+  return BAND_COLORS.find(([n]) => n === name)?.[1] ?? 'idle';
+}
 
 export async function loadParallelSummary(
   engine: Engine,
@@ -123,15 +141,29 @@ export function renderParallelBlock(s: ParallelSummary): m.Children {
   const cards: StatCard[] = [
     {label: 'Threads', value: String(s.threadCount)},
     {label: 'Avg at once', value: avg.toFixed(1)},
-    {label: 'Serial', value: fmtPercent(s.serialFrac)},
   ];
   return questionBlock({question: QUESTION, answer}, [
     m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
-    breakdownGrid({
-      nameTitle: 'Threads at once',
-      valueTitle: 'Active time',
-      formatValue: fmtDurationNs,
-      rows: s.distribution,
+    // Active time split by how many threads were on a CPU at once — a whole
+    // divided into bands, so one stacked bar reads better than a table.
+    m(Meter, {
+      label: 'Concurrency mix',
+      help:
+        'Of the time at least one profiled thread was on a CPU, how it splits ' +
+        'by how many ran at once: one (serial), 2–4, or 5 or more.',
+      primary: meterReadout(
+        fmtPercent(s.serialFrac),
+        ' ran one thread at a time (serial)',
+      ),
+      bar: s.distribution.map((r) => ({
+        color: bandColor(r.name),
+        frac: r.share,
+      })),
+      legend: s.distribution.map((r) => ({
+        color: bandColor(r.name),
+        label: r.name,
+        value: fmtPercent(r.share),
+      })),
     }),
   ]);
 }

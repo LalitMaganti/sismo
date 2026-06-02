@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: nopr: flamegraph hide metric selector
+
+Thread a hideMetricSelector option through Flamegraph / QueryFlamegraph /
+FlamegraphPanel so an embedder that drives the selected metric itself (e.g.
+via its own tabs) can suppress the in-bar metric picker. Sismo-local; no
+upstream PR yet.
+---
+ ui/src/components/flamegraph_panel.ts |  4 +++
+ ui/src/components/query_flamegraph.ts |  6 ++++-
+ ui/src/widgets/flamegraph.ts          | 39 ++++++++++++++++-----------
+ 3 files changed, 32 insertions(+), 17 deletions(-)
+
+diff --git a/ui/src/components/flamegraph_panel.ts b/ui/src/components/flamegraph_panel.ts
+index 30da4a4f..9d8e0244 100644
+--- a/ui/src/components/flamegraph_panel.ts
++++ b/ui/src/components/flamegraph_panel.ts
+@@ -34,6 +34,9 @@ export interface FlamegraphPanelAttrs {
+   // them to the inner `QueryFlamegraph`, which disposes them along with
+   // itself on unmount or when the array reference changes.
+   readonly dependencies?: ReadonlyArray<AsyncDisposable>;
++
++  // Hide the metric-picker dropdown (the embedder drives the metric itself).
++  readonly hideMetricSelector?: boolean;
+ }
+ 
+ // Mithril wrapper around `QueryFlamegraph` that owns the inner instance's
+@@ -61,6 +64,7 @@ export class FlamegraphPanel implements m.ClassComponent<FlamegraphPanelAttrs> {
+       metrics: attrs.metrics,
+       state: attrs.state,
+       onStateChange: attrs.onStateChange,
++      hideMetricSelector: attrs.hideMetricSelector,
+     });
+   }
+ 
+diff --git a/ui/src/components/query_flamegraph.ts b/ui/src/components/query_flamegraph.ts
+index 3b0f9d2d..84768fbb 100644
+--- a/ui/src/components/query_flamegraph.ts
++++ b/ui/src/components/query_flamegraph.ts
+@@ -184,6 +184,9 @@ interface QueryFlamegraphAttrs {
+   // Callback invoked when the flamegraph state changes (e.g., user changes
+   // filters, selects a different metric, etc).
+   readonly onStateChange: (state: FlamegraphState) => void;
++
++  // Hide the metric-picker dropdown (the embedder drives the metric itself).
++  readonly hideMetricSelector?: boolean;
+ }
+ 
+ // A Perfetto UI component which wraps the `Flamegraph` widget and fetches the
+@@ -214,7 +217,7 @@ export class QueryFlamegraph implements AsyncDisposable {
+   }
+ 
+   render(attrs: QueryFlamegraphAttrs) {
+-    const {metrics, state, onStateChange} = attrs;
++    const {metrics, state, onStateChange, hideMetricSelector} = attrs;
+     this.lastAttrs = attrs;
+     if (this.monitor.ifStateChanged()) {
+       this.data = undefined;
+@@ -231,6 +234,7 @@ export class QueryFlamegraph implements AsyncDisposable {
+         filters: [],
+       },
+       onStateChange,
++      hideMetricSelector,
+     });
+   }
+ 
+diff --git a/ui/src/widgets/flamegraph.ts b/ui/src/widgets/flamegraph.ts
+index b246dade..02c594c6 100644
+--- a/ui/src/widgets/flamegraph.ts
++++ b/ui/src/widgets/flamegraph.ts
+@@ -272,6 +272,11 @@ export interface FlamegraphAttrs {
+   readonly data: FlamegraphQueryData | undefined;
+ 
+   readonly onStateChange: (filters: FlamegraphState) => void;
++
++  // Hide the metric-picker dropdown in the filter bar. Use when the embedder
++  // drives the selected metric itself (e.g. its own tabs) so the choice isn't
++  // offered twice.
++  readonly hideMetricSelector?: boolean;
+ }
+ 
+ type FilterType =
+@@ -927,23 +932,25 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+ 
+     return m(
+       '.filter-bar',
+-      m(
+-        Select,
+-        {
+-          value: attrs.state.selectedMetricName,
+-          onchange: (e: Event) => {
+-            const el = e.target as HTMLSelectElement;
+-            attrs.onStateChange({
+-              ...this.attrs.state,
+-              selectedMetricName: el.value,
+-            });
++      !attrs.hideMetricSelector && [
++        m(
++          Select,
++          {
++            value: attrs.state.selectedMetricName,
++            onchange: (e: Event) => {
++              const el = e.target as HTMLSelectElement;
++              attrs.onStateChange({
++                ...this.attrs.state,
++                selectedMetricName: el.value,
++              });
++            },
+           },
+-        },
+-        attrs.metrics.map((x) => {
+-          return m('option', {value: x.name}, x.name);
+-        }),
+-      ),
+-      m('.pf-flamegraph-filter-bar-separator'),
++          attrs.metrics.map((x) => {
++            return m('option', {value: x.name}, x.name);
++          }),
++        ),
++        m('.pf-flamegraph-filter-bar-separator'),
++      ],
+       m('span.pf-flamegraph-filter-label', 'Filters:'),
+       // Tag input: chips + text input combined
+       m(TagInput, {

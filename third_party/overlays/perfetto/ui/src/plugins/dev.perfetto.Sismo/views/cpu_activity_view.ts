@@ -20,29 +20,29 @@
 // column is a portal: click it to open that slice in the timeline.
 
 import m from 'mithril';
-import type {Trace} from '../../../../public/trace';
-import {Section} from '../../../../widgets/section';
-import {Card} from '../../../../widgets/card';
-import {Anchor} from '../../../../widgets/anchor';
-import {Grid, GridCell, GridHeaderCell} from '../../../../widgets/grid';
-import {EmptyState} from '../../../../widgets/empty_state';
-import {Icon} from '../../../../widgets/icon';
-import {Tooltip} from '../../../../widgets/tooltip';
+import type {Trace} from '../../../public/trace';
+import {Section} from '../../../widgets/section';
+import {Card} from '../../../widgets/card';
+import {Anchor} from '../../../widgets/anchor';
+import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
+import {EmptyState} from '../../../widgets/empty_state';
+import {Icon} from '../../../widgets/icon';
+import {Tooltip} from '../../../widgets/tooltip';
 import {
   loadActivityBoard,
   loadWindowConsumers,
   type ActivityBoard,
   type ActivityBucket,
   type WindowThreadRow,
-} from '../../cpu_data';
-import {renderThreadLink, revealInTimeline} from '../../page_common';
+} from '../cpu_data';
+import {renderThreadLink, revealInTimeline} from '../page_common';
 import {
   fmtDuration,
   fmtDurationNs,
   fmtMegacycles,
   fmtPercent,
-} from '../../format';
-import type {PrivilegedSet} from '../../privileged_set';
+} from '../format';
+import type {PrivilegedSet} from '../privileged_set';
 
 interface CpuActivityViewAttrs {
   readonly trace: Trace;
@@ -62,6 +62,8 @@ interface Lane {
 export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
   private board?: ActivityBoard;
   private trace?: Trace;
+  // Stored so the window-consumers drill can scope to the profiled set.
+  private priv?: PrivilegedSet;
   // The committed selection: an inclusive range of bucket indices. A plain
   // click is a one-bucket range; dragging brushes a wider window.
   private selStart?: number;
@@ -150,7 +152,7 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
     if (lo === undefined || hi === undefined) return;
     this.windowRows = undefined;
     const seq = ++this.loadSeq;
-    loadWindowConsumers(trace.engine, lo, hi)
+    loadWindowConsumers(trace.engine, lo, hi, this.priv)
       .then((rows) => {
         if (this.loadSeq === seq) {
           this.windowRows = rows;
@@ -272,7 +274,7 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
           m('span', fmtDuration(attrs.trace, span)),
         ),
       ),
-      this.renderSliceDetail(attrs.trace, board, originTs, attrs.priv),
+      this.renderSliceDetail(attrs.trace, board, originTs),
     );
   }
 
@@ -283,7 +285,6 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
     trace: Trace,
     board: ActivityBoard,
     originTs: bigint,
-    priv: PrivilegedSet,
   ): m.Children {
     const a = this.selStart;
     const z = this.selEnd;
@@ -304,8 +305,8 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
       rows === undefined
         ? m(EmptyState, {icon: 'hourglass_empty', title: 'Loading…'})
         : rows.length === 0
-          ? m(EmptyState, {icon: 'block', title: 'Nothing ran in this window'})
-          : renderWindowTable(trace, rows, priv),
+          ? m(EmptyState, {icon: 'block', title: 'Nothing of yours ran here'})
+          : renderWindowTable(trace, rows),
       m(
         '.pf-sismo-page__question-footer',
         m(
@@ -377,6 +378,7 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
 
   private async load(trace: Trace, priv: PrivilegedSet): Promise<void> {
     this.trace = trace;
+    this.priv = priv;
     try {
       this.board = await loadActivityBoard(trace.engine, priv);
     } catch {
@@ -391,12 +393,11 @@ function clamp01(n: number): number {
   return Math.max(0, Math.min(1, n));
 }
 
-// The threads busy in the selected slice, runtime-descending. Threads belonging
-// to the profiled set are starred so your work stands out against the context.
+// Your threads busy in the selected slice, runtime-descending. Scoped to the
+// profiled set — this tab is about your work's scheduling, not the machine's.
 function renderWindowTable(
   trace: Trace,
   rows: ReadonlyArray<WindowThreadRow>,
-  priv: PrivilegedSet,
 ): m.Children {
   return m(
     Card,
@@ -407,24 +408,15 @@ function renderWindowTable(
         {key: 'process', header: m(GridHeaderCell, 'Process')},
         {key: 'time', header: m(GridHeaderCell, 'Time in slice')},
       ],
-      rowData: rows.map((r) => {
-        const mine = r.upid !== null && priv.upids.includes(r.upid);
-        return [
-          m(
-            GridCell,
-            {wrap: true},
-            mine &&
-              m(Icon, {
-                icon: 'star',
-                filled: true,
-                className: 'pf-sismo-page__help-icon',
-              }),
-            renderThreadLink(trace, r.threadName, r.tid, r.utid),
-          ),
-          m(GridCell, {wrap: true}, r.processName ?? '—'),
-          m(GridCell, {align: 'right'}, fmtDuration(trace, r.runtimeNs)),
-        ];
-      }),
+      rowData: rows.map((r) => [
+        m(
+          GridCell,
+          {wrap: true},
+          renderThreadLink(trace, r.threadName, r.tid, r.utid),
+        ),
+        m(GridCell, {wrap: true}, r.processName ?? '—'),
+        m(GridCell, {align: 'right'}, fmtDuration(trace, r.runtimeNs)),
+      ]),
     }),
   );
 }

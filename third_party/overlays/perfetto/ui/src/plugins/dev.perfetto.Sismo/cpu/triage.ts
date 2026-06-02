@@ -23,11 +23,11 @@ import type {Trace} from '../../../public/trace';
 import type {Engine} from '../../../trace_processor/engine';
 import {LONG_NULL} from '../../../trace_processor/query_result';
 import {Button, ButtonVariant} from '../../../widgets/button';
-import {goToSismoDomain, renderStatCard, type StatCard} from '../page_common';
+import {goToSismoDomain} from '../page_common';
 import type {PrivilegedSet} from '../privileged_set';
-import {fmtDurationNs} from '../format';
+import {fmtPercent} from '../format';
 import {questionBlock} from './block';
-import {breakdownGrid} from './grid';
+import {Meter, meterReadout} from '../../dev.perfetto.SismoWidgets/meter';
 
 // Wall-time split of the profiled threads. running = on-CPU; runnable = ready
 // but the scheduler didn't give it a core; waiting = blocked/sleeping on
@@ -97,33 +97,37 @@ export function renderTriageBlock(
           'this is a CPU story.'
         : `${runPct}% running on the CPU, ${offPct}% waiting off it.`;
 
-  const cards: StatCard[] = [
-    {label: 'On-CPU', value: `${runPct}%`, help: fmtDurationNs(s.runningNs)},
-    {
-      label: 'Off-CPU',
-      value: `${offPct}%`,
-      help: fmtDurationNs(s.runnableNs + s.waitingNs),
-    },
-  ];
   return questionBlock(
     {question: 'Is this even a CPU problem?', answer},
     [
-      m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
-      breakdownGrid({
-        nameTitle: 'State',
-        valueTitle: 'Wall time',
-        formatValue: fmtDurationNs,
-        rows: [
-          {name: 'Running on the CPU', value: s.runningNs, share: runFrac},
+      // Colours are roles, not a good/bad scale; per-state durations live one
+      // tab over in Latency.
+      m(Meter, {
+        label: 'Thread-time split',
+        help:
+          'How the profiled threads’ tracked time divides between running on a ' +
+          'core, ready but not scheduled, and waiting (blocked or asleep).',
+        primary: meterReadout(fmtPercent(runFrac), ' running on the CPU'),
+        bar: [
+          {color: 'primary', frac: runFrac},
+          {color: 'secondary', frac: runnableFrac},
+          {color: 'idle', frac: waitFrac},
+        ],
+        legend: [
           {
-            name: 'Ready, not scheduled',
-            value: s.runnableNs,
-            share: runnableFrac,
+            color: 'primary',
+            label: 'Running on the CPU',
+            value: fmtPercent(runFrac),
           },
           {
-            name: 'Waiting (blocked/sleeping)',
-            value: s.waitingNs,
-            share: waitFrac,
+            color: 'secondary',
+            label: 'Ready, not scheduled',
+            value: fmtPercent(runnableFrac),
+          },
+          {
+            color: 'idle',
+            label: 'Waiting (blocked/sleeping)',
+            value: fmtPercent(waitFrac),
           },
         ],
       }),

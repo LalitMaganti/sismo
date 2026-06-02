@@ -21,10 +21,15 @@ import m from 'mithril';
 import type {Engine} from '../../../trace_processor/engine';
 import {LONG_NULL, NUM} from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
-import {fmtDurationNs} from '../format';
+import {fmtDurationNs, fmtPercent} from '../format';
 import {renderStatCard, type StatCard} from '../page_common';
 import {questionBlock} from './block';
-import {breakdownGrid, type BreakdownGridRow} from './grid';
+import type {BreakdownGridRow} from './grid';
+import {
+  Meter,
+  meterReadout,
+  type MeterColor,
+} from '../../dev.perfetto.SismoWidgets/meter';
 
 export interface BurstSummary {
   readonly count: number;
@@ -35,6 +40,21 @@ export interface BurstSummary {
 }
 
 const QUESTION = 'Steady work, or lots of small bursts?';
+
+// Meter colour per burst-length bucket, keyed by the names the loader builds the
+// distribution rows with. Purely categorical — the bars distinguish buckets,
+// they do NOT rank them; this block asserts no good/bad burst length.
+const BUCKET_COLORS: ReadonlyArray<readonly [string, MeterColor]> = [
+  ['under 100 µs', 'idle'],
+  ['100 µs – 1 ms', 'info'],
+  ['1 – 10 ms', 'secondary'],
+  ['10 – 100 ms', 'caution'],
+  ['100 ms and up', 'primary'],
+];
+
+function bucketColor(name: string): MeterColor {
+  return BUCKET_COLORS.find(([n]) => n === name)?.[1] ?? 'idle';
+}
 
 export async function loadBurstSummary(
   engine: Engine,
@@ -114,13 +134,28 @@ export function renderBurstBlock(s: BurstSummary): m.Children {
     {label: 'Typical', value: fmtDurationNs(s.medianNs)},
     {label: 'Longest', value: fmtDurationNs(s.maxNs)},
   ];
+  const dominant = s.distribution.reduce((a, b) =>
+    b.share > a.share ? b : a,
+  );
   return questionBlock({question: QUESTION, answer}, [
     m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
-    breakdownGrid({
-      nameTitle: 'Burst length',
-      valueTitle: 'CPU time',
-      formatValue: fmtDurationNs,
-      rows: s.distribution,
+    // CPU time split by how long each on-CPU burst lasted — a whole divided
+    // into length buckets, so one stacked bar reads better than a table.
+    m(Meter, {
+      label: 'Burst-length mix',
+      help:
+        'How the threads’ on-CPU time divides by how long each continuous run ' +
+        'lasted before going idle.',
+      primary: meterReadout(fmtPercent(dominant.share), ` in ${dominant.name} bursts`),
+      bar: s.distribution.map((r) => ({
+        color: bucketColor(r.name),
+        frac: r.share,
+      })),
+      legend: s.distribution.map((r) => ({
+        color: bucketColor(r.name),
+        label: r.name,
+        value: fmtPercent(r.share),
+      })),
     }),
   ]);
 }

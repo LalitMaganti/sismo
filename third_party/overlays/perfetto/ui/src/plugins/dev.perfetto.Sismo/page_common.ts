@@ -168,6 +168,28 @@ function goToCpuView(trace: Trace, view: CpuView): void {
   trace.navigate(navToHash({domain: 'cpu', view}));
 }
 
+// A link-styled button that fires an in-app action on click — switch lens tab,
+// open a detail tab, reveal on the timeline. Reads as a link, but the behaviour
+// is a callback, not a URL navigation.
+export function actionLink(
+  label: string,
+  icon: string,
+  onclick: () => void,
+): m.Children {
+  return m(
+    Anchor,
+    {
+      href: '#',
+      icon,
+      onclick: (e: Event) => {
+        e.preventDefault();
+        onclick();
+      },
+    },
+    label,
+  );
+}
+
 // "See all →" footer link into a lens tab.
 export function renderSeeAllLink(
   trace: Trace,

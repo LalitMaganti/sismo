@@ -46,7 +46,7 @@ export default class implements PerfettoPlugin {
       text: 'Overview',
       href: '#!/sismo',
       icon: 'dashboard',
-      sortOrder: 14,
+      sortOrder: 9,
     });
 
     // Land on the Sismo overview rather than the raw timeline when a trace
