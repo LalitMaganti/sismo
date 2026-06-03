@@ -18,6 +18,7 @@
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
+import {QuerySlot, SerialTaskQueue} from '../../../base/query_slot';
 import {Section} from '../../../widgets/section';
 import {Card} from '../../../widgets/card';
 import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
@@ -35,7 +36,11 @@ import {
   type LatencyDetail,
 } from '../cpu_data';
 import {fmtDuration} from '../format';
-import {renderProcessLink, renderThreadLink} from '../page_common';
+import {
+  loadingBody,
+  renderProcessLink,
+  renderThreadLink,
+} from '../page_common';
 import type {PrivilegedSet} from '../privileged_set';
 import {
   renderOffCpuBreakdownMeter,
@@ -50,29 +55,53 @@ interface LatencyViewAttrs {
 }
 
 export class LatencyView implements m.ClassComponent<LatencyViewAttrs> {
-  private data?: LatencyDetail;
-  private triage?: CpuTriage;
-  private error?: string;
+  // Both signals re-key on the privileged set, with stale results dropped by the
+  // slot. Triage failure is non-fatal (its slot falls back to undefined), so the
+  // page still renders the blame tables when only triage data is missing.
+  private readonly queue = new SerialTaskQueue();
+  private readonly detailSlot = new QuerySlot<LatencyDetail>(this.queue);
+  private readonly triageSlot = new QuerySlot<CpuTriage>(this.queue);
   private blameTab: 'processes' | 'threads' = 'processes';
-  private scope = 'all threads';
 
-  oninit({attrs}: m.CVnode<LatencyViewAttrs>) {
-    this.scope = attrs.privileged.upids.length > 0 ? 'your threads' : 'all threads';
-    this.load(attrs.trace, attrs.privileged);
+  onremove(): void {
+    this.detailSlot.dispose();
+    this.triageSlot.dispose();
   }
 
   view({attrs}: m.CVnode<LatencyViewAttrs>): m.Children {
-    if (this.error !== undefined) {
-      return m(Callout, {icon: 'error', intent: Intent.Danger}, this.error);
+    const {trace, privileged} = attrs;
+    const scope =
+      privileged.upids.length > 0 ? 'your threads' : 'all threads';
+    const upids = [...privileged.upids];
+
+    let data: LatencyDetail | undefined;
+    try {
+      data = this.detailSlot.use({
+        key: {upids},
+        queryFn: () => loadLatencyDetail(trace.engine, privileged),
+      }).data;
+    } catch (e) {
+      return m(
+        Callout,
+        {icon: 'error', intent: Intent.Danger},
+        e instanceof Error ? e.message : 'Failed to load latency detail',
+      );
     }
-    if (this.data === undefined) {
-      return m(EmptyState, {
-        icon: 'hourglass_empty',
-        title: 'Loading latency details…',
-      });
+
+    let triage: CpuTriage | undefined;
+    try {
+      triage = this.triageSlot.use({
+        key: {upids},
+        queryFn: () => loadCpuTriage(trace.engine, privileged),
+      }).data;
+    } catch {
+      triage = undefined;
     }
-    const d = this.data;
-    if (!d.hasSched) {
+
+    if (data === undefined) {
+      return loadingBody('Loading latency details…');
+    }
+    if (!data.hasSched) {
       return m(
         Callout,
         {icon: 'info', intent: Intent.Primary},
@@ -81,9 +110,9 @@ export class LatencyView implements m.ClassComponent<LatencyViewAttrs> {
       );
     }
     return [
-      this.renderTriage(attrs.trace),
-      this.renderBlame(attrs.trace, d),
-      this.renderIdleStates(d.idleStates),
+      this.renderTriage(trace, triage, scope),
+      this.renderBlame(trace, data),
+      this.renderIdleStates(data.idleStates),
       this.renderComingSoon(),
     ];
   }
@@ -91,10 +120,12 @@ export class LatencyView implements m.ClassComponent<LatencyViewAttrs> {
   // Mirror of the CPU tab's triage gauge, with the route reversed: on-CPU vs
   // off-CPU, then a breakdown of the off-CPU time by why, plus a standing link
   // back to the CPU views for the on-CPU half.
-  private renderTriage(trace: Trace): m.Children {
-    const d = this.triage;
+  private renderTriage(
+    trace: Trace,
+    d: CpuTriage | undefined,
+    scope: string,
+  ): m.Children {
     if (d === undefined || !d.hasData) return undefined;
-    const scope = this.scope;
     const s = triageShares(d);
     return m(
       Section,
@@ -238,21 +269,6 @@ export class LatencyView implements m.ClassComponent<LatencyViewAttrs> {
         ),
       ),
     );
-  }
-
-  private async load(trace: Trace, priv: PrivilegedSet): Promise<void> {
-    try {
-      const [detail, triage] = await Promise.all([
-        loadLatencyDetail(trace.engine, priv),
-        loadCpuTriage(trace.engine, priv).catch(() => undefined),
-      ]);
-      this.data = detail;
-      this.triage = triage;
-    } catch (e) {
-      this.error =
-        e instanceof Error ? e.message : 'Failed to load latency detail';
-    }
-    m.redraw();
   }
 }
 

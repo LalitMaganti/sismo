@@ -41,7 +41,8 @@ import {
   type SampleListRow,
   type ThreadStateRow,
 } from './cpu_data';
-import {fmtCount, fmtDuration, fmtPercent} from './format';
+import {clamp01, fmtCount, fmtDuration, fmtPercent} from './format';
+import {loadingBody} from './page_common';
 import type {PrivilegedSet} from './privileged_set';
 
 type ViewKey =
@@ -375,7 +376,7 @@ function goToThread(trace: Trace, utid: number): void {
 }
 
 function proportionBar(frac: number, color: string): m.Children {
-  const pct = Math.max(0, Math.min(1, frac)) * 100;
+  const pct = clamp01(frac) * 100;
   return m(
     '.pf-sismo-detail__bar',
     m('.pf-sismo-detail__bar-fill', {
@@ -433,7 +434,7 @@ function renderIpcStub(): m.Children {
 }
 
 function loading(): m.Children {
-  return m(EmptyState, {icon: 'hourglass_empty', title: 'Loading…'});
+  return loadingBody('Loading…');
 }
 
 function errorCallout(msg: string): m.Children {

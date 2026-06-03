@@ -147,17 +147,21 @@ async function queryEntitySpan(
 // Reveal a thread/process AND frame the window where it was active, so the link
 // lands you on the region that matters rather than the current viewport. Falls
 // back to a plain track reveal if the span can't be determined.
-export function revealEntityWindow(
+export async function revealEntityWindow(
   trace: Trace,
   target: {upid?: number; utid?: number},
-): void {
+): Promise<void> {
   const tracks = {
     upids: target.upid !== undefined ? [target.upid] : undefined,
     utids: target.utid !== undefined ? [target.utid] : undefined,
   };
-  queryEntitySpan(trace, target)
-    .then((span) => revealInTimeline(trace, {...tracks, timeRange: span}))
-    .catch(() => revealInTimeline(trace, tracks));
+  try {
+    const span = await queryEntitySpan(trace, target);
+    revealInTimeline(trace, {...tracks, timeRange: span});
+  } catch {
+    // Span lookup failed — fall back to a plain track reveal.
+    revealInTimeline(trace, tracks);
+  }
 }
 
 // Switches the Sismo page to another domain, mirroring the in-page domain
@@ -170,6 +174,15 @@ export function goToSismoDomain(trace: Trace, domain: SismoDomain): void {
 // question block down into the full view that answers it.
 function goToCpuView(trace: Trace, view: CpuView): void {
   trace.navigate(navToHash({domain: 'cpu', view}));
+}
+
+// Wraps a click callback so it runs as an in-app action rather than following
+// the anchor's href. The href stays for middle-click / keyboard affordance.
+export function actionHandler(fn: () => void): (e: Event) => void {
+  return (e: Event) => {
+    e.preventDefault();
+    fn();
+  };
 }
 
 // A link-styled button that fires an in-app action on click — switch lens tab,
@@ -185,10 +198,7 @@ export function actionLink(
     {
       href: '#',
       icon,
-      onclick: (e: Event) => {
-        e.preventDefault();
-        onclick();
-      },
+      onclick: actionHandler(onclick),
     },
     label,
   );
@@ -224,10 +234,7 @@ export function renderSeeAllLink(
     {
       href: navToHash({domain: 'cpu', view}),
       icon: 'arrow_forward',
-      onclick: (e: Event) => {
-        e.preventDefault();
-        goToCpuView(trace, view);
-      },
+      onclick: actionHandler(() => goToCpuView(trace, view)),
     },
     label,
   );
@@ -268,10 +275,7 @@ export function renderProcessLink(
     Anchor,
     {
       href: '#!/viewer',
-      onclick: (e: Event) => {
-        e.preventDefault();
-        revealEntityWindow(trace, {upid});
-      },
+      onclick: actionHandler(() => revealEntityWindow(trace, {upid})),
     },
     name,
     pid !== null && m('span.pf-sismo-page__muted', ` (pid ${pid})`),
@@ -288,10 +292,7 @@ export function renderThreadLink(
     Anchor,
     {
       href: '#!/viewer',
-      onclick: (e: Event) => {
-        e.preventDefault();
-        revealEntityWindow(trace, {utid});
-      },
+      onclick: actionHandler(() => revealEntityWindow(trace, {utid})),
     },
     threadName,
     tid !== null && m('span.pf-sismo-page__muted', ` (tid ${tid})`),

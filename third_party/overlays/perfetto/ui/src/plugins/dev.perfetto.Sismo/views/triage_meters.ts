@@ -29,7 +29,7 @@ import {Intent} from '../../../widgets/common';
 import type {CpuTriage} from '../cpu_data';
 import {Meter, meterReadout} from '../../dev.perfetto.SismoWidgets/meter';
 import {fmtPercent} from '../format';
-import {goToSismoDomain} from '../page_common';
+import {actionHandler, goToSismoDomain} from '../page_common';
 import type {SismoDomain} from '../nav_state';
 
 interface TriageShares {
@@ -92,10 +92,7 @@ export function renderTriageRoute(
         {
           href: `#!/sismo/${opts.domain}`,
           icon: 'arrow_forward',
-          onclick: (e: Event) => {
-            e.preventDefault();
-            goToSismoDomain(trace, opts.domain);
-          },
+          onclick: actionHandler(() => goToSismoDomain(trace, opts.domain)),
         },
         opts.linkText,
       ),

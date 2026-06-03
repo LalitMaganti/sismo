@@ -23,6 +23,7 @@
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
+import {QuerySlot, SerialTaskQueue} from '../../../base/query_slot';
 import {Callout} from '../../../widgets/callout';
 import {EmptyState} from '../../../widgets/empty_state';
 import {FlamegraphPanel} from '../../../components/flamegraph_panel';
@@ -102,24 +103,42 @@ export class CpuEfficiencyTab implements m.ClassComponent<CpuEfficiencyAttrs> {
   // Selected "Break down by" dimension; in-memory only (efficiency doesn't share
   // the where-tab's persisted prefs). 'none' so the control still appears.
   private fgBreakdown: BreakdownKind = 'none';
+  // Counter names, fetched once to unlock the "Backend-bound slots" weighting.
+  private readonly countersSlot = new QuerySlot<ReadonlySet<string>>(
+    new SerialTaskQueue(),
+  );
+  private countersApplied = false;
 
   constructor({attrs}: m.CVnode<CpuEfficiencyAttrs>) {
     this.scope = sampleScopePredicates(attrs.priv);
     this.fgMetrics = buildSampleFlamegraphMetrics(this.scope, this.fgBreakdown);
     this.fgState = Flamegraph.updateState(undefined, this.fgMetrics);
+  }
 
-    // Confirming the counter set unlocks the "Backend-bound slots" weighting.
-    loadPerfCounterNames(attrs.trace.engine, this.scope)
-      .then((counters) => {
-        this.fgCounters = counters;
-        this.fgMetrics = buildSampleFlamegraphMetrics(
-          this.scope,
-          this.fgBreakdown,
-          counters,
-        );
-        m.redraw();
-      })
-      .catch(() => {});
+  onremove(): void {
+    this.countersSlot.dispose();
+  }
+
+  // Confirming the counter set unlocks the "Backend-bound slots" weighting; when
+  // it lands, rebuild the metrics in place so that tab appears.
+  private ensureCounters(trace: Trace): void {
+    let counters: ReadonlySet<string> | undefined;
+    try {
+      counters = this.countersSlot.use({
+        key: {scope: this.scope},
+        queryFn: () => loadPerfCounterNames(trace.engine, this.scope),
+      }).data;
+    } catch {
+      return;
+    }
+    if (counters === undefined || this.countersApplied) return;
+    this.countersApplied = true;
+    this.fgCounters = counters;
+    this.fgMetrics = buildSampleFlamegraphMetrics(
+      this.scope,
+      this.fgBreakdown,
+      counters,
+    );
   }
 
   // The tabs whose metric the trace actually has (backend needs counters).
@@ -129,6 +148,7 @@ export class CpuEfficiencyTab implements m.ClassComponent<CpuEfficiencyAttrs> {
   }
 
   view({attrs}: m.CVnode<CpuEfficiencyAttrs>): m.Children {
+    this.ensureCounters(attrs.trace);
     const tabs = this.availableTabs();
     if (tabs.length === 0) {
       return m(

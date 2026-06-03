@@ -27,6 +27,7 @@ import type {
 import {InMemoryDataSource} from '../../../components/widgets/datagrid/in_memory_data_source';
 import type {Row} from '../../../trace_processor/query_result';
 import {fmtPercent} from '../format';
+import {actionHandler, renderBar} from '../page_common';
 
 export interface BreakdownGridRow {
   readonly name: string;
@@ -70,7 +71,7 @@ export function breakdownGrid(attrs: BreakdownGridAttrs): m.Children {
     share: {
       title: 'Share',
       columnType: 'quantitative',
-      cellRenderer: (v) => renderShare(Number(v)),
+      cellRenderer: (v) => renderBar(Number(v), fmtPercent(Number(v))),
     },
   };
   if (groupTitle !== undefined) {
@@ -111,24 +112,8 @@ function renderNameLink(
     {
       href: '#',
       icon: 'open_in_new',
-      onclick: (e: Event) => {
-        e.preventDefault();
-        onClick(name);
-      },
+      onclick: actionHandler(() => onClick(name)),
     },
     name,
-  );
-}
-
-function renderShare(frac: number): m.Children {
-  return m(
-    '.pf-sismo-cellbar',
-    m(
-      '.pf-sismo-cellbar__track',
-      m('.pf-sismo-cellbar__fill', {
-        style: `width:${Math.min(100, frac * 100).toFixed(1)}%`,
-      }),
-    ),
-    m('span.pf-sismo-cellbar__pct', fmtPercent(frac)),
   );
 }

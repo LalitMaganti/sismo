@@ -23,7 +23,7 @@ import {Card} from '../../../widgets/card';
 import {Button, ButtonVariant} from '../../../widgets/button';
 import {Callout} from '../../../widgets/callout';
 import {Intent} from '../../../widgets/common';
-import {EmptyState} from '../../../widgets/empty_state';
+import {loadingBody} from '../page_common';
 
 export interface QuestionBlockAttrs {
   // The question, as the user would ask it. The block's heading.
@@ -71,8 +71,5 @@ export function subSection(title: string, body: m.Children): m.Children {
 // A block whose data is still loading. Shows the question so the landing stays
 // complete and ordered while the answer arrives.
 export function loadingBlock(question: string): m.Children {
-  return questionBlock(
-    {question},
-    m(EmptyState, {icon: 'hourglass_empty', title: 'Reading the trace…'}),
-  );
+  return questionBlock({question}, loadingBody('Reading the trace…'));
 }

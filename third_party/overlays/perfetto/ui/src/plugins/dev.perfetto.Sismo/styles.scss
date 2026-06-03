@@ -996,6 +996,7 @@
   overflow: auto;
   max-height: 70vh;
   background: var(--pf-color-background);
+  position: relative;
 
   &__toolbar {
     display: flex;
@@ -1004,6 +1005,26 @@
     gap: 12px;
     flex-wrap: wrap;
     margin-bottom: 8px;
+  }
+
+  &__tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  &__head {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--pf-color-background);
+    border-bottom: 1px solid var(--pf-color-border);
+    color: var(--pf-color-text-muted);
+    font-weight: 600;
+  }
+
+  &__body {
+    position: relative;
   }
 
   &__file {
@@ -1025,11 +1046,15 @@
     align-items: center;
     gap: 10px;
     padding: 0 8px;
-    line-height: 1.5;
+    height: 20px; // MUST equal ROW_H in source_view.ts (arrow geometry).
+    line-height: 20px;
     white-space: nowrap;
 
-    &--sampled {
-      background: var(--pf-color-background-secondary);
+    // Per-row heat tint is applied inline (rowShade in source_view.ts), graded
+    // by share of the hottest line.
+
+    &--hottest {
+      box-shadow: inset 2px 0 0 #3478f6;
     }
 
     &--insn {
@@ -1041,9 +1066,51 @@
     }
   }
 
+  // Reserves the horizontal band the absolutely-positioned arrow SVG draws into.
+  &__rail {
+    align-self: stretch;
+  }
+
+  &__arrows {
+    position: absolute;
+    left: 8px; // matches row padding-left
+    top: 0;
+    overflow: visible;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  &__arc {
+    fill: none;
+    stroke: var(--pf-color-text-muted);
+    stroke-width: 1;
+    opacity: 0.55;
+
+    // Back-edges (loops) are distinguished structurally, by a dashed stroke —
+    // NOT a warm/alarm colour, which would read as a severity verdict.
+    &--loop {
+      stroke-dasharray: 3 2;
+      opacity: 0.8;
+    }
+  }
+
+  &__arc-head {
+    fill: none;
+    stroke: var(--pf-color-text-muted);
+    stroke-width: 1;
+  }
+
   &__count {
     flex: 0 0 auto;
     width: 52px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--pf-color-text-muted);
+  }
+
+  &__pct {
+    flex: 0 0 auto;
+    width: 48px;
     text-align: right;
     font-variant-numeric: tabular-nums;
     color: var(--pf-color-text-muted);
@@ -1094,6 +1161,33 @@
     border-radius: 3px;
     padding: 0 4px;
     white-space: nowrap;
+  }
+
+  // Syntax tokens (Tomorrow palette — readable on both light and dark themes).
+  .pf-sismo-syn {
+    &--kw {
+      color: #8959a8;
+    }
+    &--type {
+      color: #3e999f;
+    }
+    &--str {
+      color: #718c00;
+    }
+    &--num {
+      color: #b76b01;
+    }
+    &--com {
+      color: var(--pf-color-text-muted);
+      font-style: italic;
+    }
+    &--mn {
+      color: #4271ae;
+      font-weight: 600;
+    }
+    &--reg {
+      color: #c82829;
+    }
   }
 }
 

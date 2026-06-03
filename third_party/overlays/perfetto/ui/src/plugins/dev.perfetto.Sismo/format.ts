@@ -63,6 +63,13 @@ export function fmtIpc(ipc: number | null): string {
   return ipc.toFixed(2);
 }
 
+// Clamp a fraction to the renderable [0, 1] range (e.g. for bar widths).
+// Non-finite inputs collapse to 0 so they never leak into a style attribute.
+export function clamp01(n: number): number {
+  if (!isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
 // Used for chart axis ticks, which can't handle bigints.
 export function fmtDurationNs(ns: number): string {
   if (!isFinite(ns)) return '—';

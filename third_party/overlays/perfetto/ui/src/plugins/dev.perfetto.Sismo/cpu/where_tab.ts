@@ -123,6 +123,9 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
   private readonly fnSlot = new QuerySlot<ReadonlyArray<BreakdownGridRow>>(
     this.queue,
   );
+  // Counter names, fetched once to unlock the "Backend-bound slots" weighting.
+  private readonly countersSlot = new QuerySlot<ReadonlySet<string>>(this.queue);
+  private countersApplied = false;
 
   constructor({attrs}: m.CVnode<CpuWhereAttrs>) {
     this.scope = sampleScopePredicates(attrs.priv);
@@ -156,39 +159,51 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
       new Set(this.fgMetrics.map((mt) => mt.name)),
       CYCLES_METRIC,
     );
-    loadPerfCounterNames(attrs.trace.engine, this.scope)
-      .then((counters) => {
-        this.fgCounters = counters;
-        this.fgMetrics = buildSampleFlamegraphMetrics(
-          this.scope,
-          this.fgBreakdown,
-          counters,
-          this.funcActions,
-        );
-        // "Backend-bound slots" only appears once counters are confirmed; if the
-        // saved metric was that and we fell back, restore it now (unless the user
-        // has since changed the selection away from the default).
-        const saved = this.prefs.selectedMetricName;
-        const names = new Set(this.fgMetrics.map((mt) => mt.name));
-        if (
-          saved !== undefined &&
-          saved !== this.fgState.selectedMetricName &&
-          this.fgState.selectedMetricName === CYCLES_METRIC &&
-          names.has(saved)
-        ) {
-          this.fgState = {...this.fgState, selectedMetricName: saved};
-        }
-        m.redraw();
-      })
-      .catch(() => {});
   }
 
   onremove(): void {
     this.ctSlot.dispose();
     this.fnSlot.dispose();
+    this.countersSlot.dispose();
+  }
+
+  // Confirming the counter set unlocks the "Backend-bound slots" weighting. Fetch
+  // it once (keyed on the fixed scope); when it lands rebuild the metrics in place
+  // and, if the saved metric was that counter-only one we'd fallen back from,
+  // restore it (unless the user has since changed the selection away).
+  private ensureCounters(trace: Trace): void {
+    let counters: ReadonlySet<string> | undefined;
+    try {
+      counters = this.countersSlot.use({
+        key: {scope: this.scope},
+        queryFn: () => loadPerfCounterNames(trace.engine, this.scope),
+      }).data;
+    } catch {
+      return;
+    }
+    if (counters === undefined || this.countersApplied) return;
+    this.countersApplied = true;
+    this.fgCounters = counters;
+    this.fgMetrics = buildSampleFlamegraphMetrics(
+      this.scope,
+      this.fgBreakdown,
+      counters,
+      this.funcActions,
+    );
+    const saved = this.prefs.selectedMetricName;
+    const names = new Set(this.fgMetrics.map((mt) => mt.name));
+    if (
+      saved !== undefined &&
+      saved !== this.fgState.selectedMetricName &&
+      this.fgState.selectedMetricName === CYCLES_METRIC &&
+      names.has(saved)
+    ) {
+      this.fgState = {...this.fgState, selectedMetricName: saved};
+    }
   }
 
   view({attrs}: m.CVnode<CpuWhereAttrs>): m.Children {
+    this.ensureCounters(attrs.trace);
     return m(
       '.pf-sismo-tab',
       this.renderModeBar(),

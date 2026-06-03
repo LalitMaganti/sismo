@@ -36,8 +36,14 @@ import {
   type ActivityBucket,
   type WindowThreadRow,
 } from '../cpu_data';
-import {renderThreadLink, revealInTimeline} from '../page_common';
 import {
+  actionHandler,
+  loadingBody,
+  renderThreadLink,
+  revealInTimeline,
+} from '../page_common';
+import {
+  clamp01,
   fmtDuration,
   fmtDurationNs,
   fmtMegacycles,
@@ -159,7 +165,7 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
       return m(
         Section,
         {title: 'Activity over time', subtitle},
-        m(EmptyState, {icon: 'hourglass_empty', title: 'Loading activity…'}),
+        loadingBody('Loading activity…'),
       );
     }
     if (!board.hasData) {
@@ -295,7 +301,7 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
       '.pf-sismo-page__tab-pane',
       m('.pf-sismo-page__tab-pane-label', `Busiest in ${label} (${span})`),
       rows === undefined
-        ? m(EmptyState, {icon: 'hourglass_empty', title: 'Loading…'})
+        ? loadingBody('Loading…')
         : rows.length === 0
           ? m(EmptyState, {icon: 'block', title: 'Nothing of yours ran here'})
           : renderWindowTable(trace, rows),
@@ -306,10 +312,9 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
           {
             href: '#!/viewer',
             icon: 'arrow_forward',
-            onclick: (e: Event) => {
-              e.preventDefault();
-              revealInTimeline(trace, {timeRange: {start, end}});
-            },
+            onclick: actionHandler(() =>
+              revealInTimeline(trace, {timeRange: {start, end}}),
+            ),
           },
           'Open this window in the timeline',
         ),
@@ -367,11 +372,6 @@ export class CpuActivityView implements m.ClassComponent<CpuActivityViewAttrs> {
       ),
     );
   }
-}
-
-function clamp01(n: number): number {
-  if (!isFinite(n)) return 0;
-  return Math.max(0, Math.min(1, n));
 }
 
 // Your threads busy in the selected slice, runtime-descending. Scoped to the

@@ -20,7 +20,8 @@ import {
   STR_NULL,
 } from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
-import {privInClause, privNotInClause} from './sql';
+import {clamp01} from '../format';
+import {getSchedBounds, privInClause, privNotInClause} from './sql';
 import {
   clipDurExpr,
   overlapClause,
@@ -658,15 +659,12 @@ export async function loadCoreSeries(
     lo = window.start;
     hi = window.end;
   } else {
-    const bounds = await engine.query(
-      `SELECT min(ts) AS lo, max(ts + dur) AS hi FROM sched WHERE dur > 0`,
-    );
-    const b = bounds.firstRow({lo: LONG_NULL, hi: LONG_NULL});
-    if (b.lo === null || b.hi === null || b.hi <= b.lo) {
+    const bounds = await getSchedBounds(engine);
+    if (bounds === undefined) {
       return {numBuckets, byCpu: new Map()};
     }
-    lo = b.lo;
-    hi = b.hi;
+    lo = bounds.lo;
+    hi = bounds.hi;
   }
   const span = hi - lo;
   const width = span / BigInt(numBuckets) > 0n ? span / BigInt(numBuckets) : 1n;
@@ -708,7 +706,7 @@ export async function loadCoreSeries(
       arr = new Array<number>(numBuckets).fill(0);
       byCpu.set(it.cpu, arr);
     }
-    arr[it.bucket] = Math.max(0, Math.min(1, Number(it.busy ?? 0n) / widthNum));
+    arr[it.bucket] = clamp01(Number(it.busy ?? 0n) / widthNum);
   }
   return {numBuckets, byCpu};
 }

@@ -41,12 +41,13 @@ import {
 import type {PrivilegedSet} from '../privileged_set';
 import {MeterBar} from '../../dev.perfetto.SismoWidgets/meter';
 import {
+  actionHandler,
   renderStatCard,
   renderThreadLink,
   revealInTimeline,
   type StatCard,
 } from '../page_common';
-import {fmtCount, fmtDuration, fmtPercent} from '../format';
+import {clamp01, fmtCount, fmtDuration, fmtPercent} from '../format';
 
 // Per-core drill state threaded into the render: which core's "what ran here"
 // detail is open, the loaded per-core threads (your set + an "others" total),
@@ -76,7 +77,7 @@ export class CpuCoresView implements m.ClassComponent<CpuCoresViewAttrs> {
   // the focus and they all re-fetch, with stale results dropped by the slot. The
   // aggregate table renders as soon as perCore lands; the sparkline / contention
   // / drill columns fill in as their slots resolve (each .data is undefined until
-  // then). Replaces the old oninit + five hand-cancelled .then() loads.
+  // it does).
   private readonly queue = new SerialTaskQueue();
   private readonly perCoreSlot = new QuerySlot<CpuCoreRow[]>(this.queue);
   private readonly seriesSystemSlot = new QuerySlot<CoreSeries>(this.queue);
@@ -411,7 +412,7 @@ function renderCoreTable(
     const privFrac = mineScope
       ? 1
       : runtime > 0
-        ? Math.max(0, Math.min(1, priv / runtime))
+        ? clamp01(priv / runtime)
         : 0;
     const c = contention?.get(r.cpu);
     const detail = drill?.threads.get(r.cpu);
@@ -435,10 +436,7 @@ function renderCoreTable(
           {
             href: '#!/viewer',
             title: `Open CPU ${r.cpu} in the timeline`,
-            onclick: (e: Event) => {
-              e.preventDefault();
-              revealInTimeline(trace, {cpus: [r.cpu]});
-            },
+            onclick: actionHandler(() => revealInTimeline(trace, {cpus: [r.cpu]})),
           },
           `CPU ${r.cpu}`,
         ),
@@ -480,7 +478,7 @@ function renderCoreBar(
   privFrac: number,
   hasPriv: boolean,
 ): m.Children {
-  const busy = Math.max(0, Math.min(1, busyFrac));
+  const busy = clamp01(busyFrac);
   return m(MeterBar, {
     segments: hasPriv
       ? [

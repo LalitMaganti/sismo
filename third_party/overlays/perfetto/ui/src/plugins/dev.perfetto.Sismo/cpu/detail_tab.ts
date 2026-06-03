@@ -510,19 +510,24 @@ export class CpuDetailTab implements m.ClassComponent<CpuDetailAttrs> {
 
   // ---- Shared bits ---------------------------------------------------------
 
-  private revealFunctionSample(attrs: CpuDetailAttrs): void {
-    loadRepresentativeSample(attrs.trace.engine, attrs.id, attrs.priv)
-      .then((rep) => {
-        if (rep === null) {
-          revealInTimeline(attrs.trace, {});
-          return;
-        }
-        revealInTimeline(attrs.trace, {
-          utids: [rep.utid],
-          timeRange: {start: rep.window.start, end: rep.window.end},
-        });
-      })
-      .catch(() => {});
+  private async revealFunctionSample(attrs: CpuDetailAttrs): Promise<void> {
+    try {
+      const rep = await loadRepresentativeSample(
+        attrs.trace.engine,
+        attrs.id,
+        attrs.priv,
+      );
+      if (rep === null) {
+        revealInTimeline(attrs.trace, {});
+        return;
+      }
+      revealInTimeline(attrs.trace, {
+        utids: [rep.utid],
+        timeRange: {start: rep.window.start, end: rep.window.end},
+      });
+    } catch {
+      // Best-effort reveal — a failed sample lookup just leaves the view put.
+    }
   }
 
   // A one-line "what stands out" fact on the Summary, with an optional jump into

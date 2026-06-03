@@ -12,7 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import type {Engine} from '../../../trace_processor/engine';
+import {LONG_NULL} from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
+
+// Time span covered by scheduling slices: [lo, hi). Returns undefined when the
+// trace has no sched data or the span is degenerate, so callers can bail out.
+export async function getSchedBounds(
+  engine: Engine,
+): Promise<{lo: bigint; hi: bigint} | undefined> {
+  const res = await engine.query(
+    `SELECT min(ts) AS lo, max(ts + dur) AS hi FROM sched WHERE dur > 0`,
+  );
+  const b = res.firstRow({lo: LONG_NULL, hi: LONG_NULL});
+  if (b.lo === null || b.hi === null || b.hi <= b.lo) return undefined;
+  return {lo: b.lo, hi: b.hi};
+}
 
 // `IN (-1)` stands in for the unrepresentable `IN ()` so SQL stays valid
 // when the privileged set is empty.

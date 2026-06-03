@@ -19,6 +19,7 @@
 
 import m from 'mithril';
 import type {Trace} from '../../public/trace';
+import {QuerySlot} from '../../base/query_slot';
 import {Button, ButtonVariant} from '../../widgets/button';
 import {MenuItem, PopupMenu} from '../../widgets/menu';
 import {goToTimeline, renderPrivilegedBanner} from './page_common';
@@ -38,14 +39,17 @@ interface SismoPageAttrs {
 }
 
 export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
-  private privileged: PrivilegedSet = EMPTY_PRIVILEGED_SET;
+  // The profiled set is the bootstrap dependency every child reads; fetched once
+  // and falling back to the empty set if it can't be resolved.
+  private readonly privSlot = new QuerySlot<PrivilegedSet>();
 
-  oninit({attrs}: m.CVnode<SismoPageAttrs>) {
-    this.load(attrs.trace);
+  onremove(): void {
+    this.privSlot.dispose();
   }
 
   view({attrs}: m.CVnode<SismoPageAttrs>) {
     const nav = subpageToNav(attrs.subpage);
+    const privileged = this.loadPrivileged(attrs.trace);
     return m(
       '.pf-sismo-page',
       m(
@@ -62,9 +66,9 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
               onclick: () => goToTimeline(attrs.trace),
             }),
           ),
-          renderPrivilegedBanner(this.privileged),
+          renderPrivilegedBanner(privileged),
         ),
-        this.renderDomain(attrs.trace, nav),
+        this.renderDomain(attrs.trace, nav, privileged),
       ),
     );
   }
@@ -99,29 +103,38 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
     );
   }
 
-  private renderDomain(trace: Trace, nav: SismoNav): m.Children {
+  private renderDomain(
+    trace: Trace,
+    nav: SismoNav,
+    privileged: PrivilegedSet,
+  ): m.Children {
     switch (nav.domain) {
       case 'cpu':
         // Rendered full-width (no __body padding) so the tab bar sits flush
         // under the header divider; the tabs pad their own content.
-        return m(CpuTabsView, {trace, priv: this.privileged});
+        return m(CpuTabsView, {trace, priv: privileged});
       case 'latency':
         return m(
           '.pf-sismo-page__body',
-          m(LatencyView, {trace, privileged: this.privileged}),
+          m(LatencyView, {trace, privileged}),
         );
       case 'memory':
         return m('.pf-sismo-page__body', renderMemoryView());
     }
   }
 
-  private async load(trace: Trace): Promise<void> {
+  private loadPrivileged(trace: Trace): PrivilegedSet {
     try {
-      this.privileged = await loadPrivilegedSet(trace);
+      return (
+        this.privSlot.use({
+          key: {},
+          queryFn: () => loadPrivilegedSet(trace),
+        }).data ?? EMPTY_PRIVILEGED_SET
+      );
     } catch (e) {
       console.warn('Sismo: failed to load privileged set', e);
+      return EMPTY_PRIVILEGED_SET;
     }
-    m.redraw();
   }
 }
 

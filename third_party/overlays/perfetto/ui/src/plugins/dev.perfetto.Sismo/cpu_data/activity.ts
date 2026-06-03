@@ -20,7 +20,7 @@ import {
   STR_NULL,
 } from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
-import {privInClause, sampleScopePredicate} from './sql';
+import {getSchedBounds, privInClause, sampleScopePredicate} from './sql';
 
 // One time-bucket of the Activity board. Slices are bucketed by their start ts
 // — for a coarse board (~hundreds of buckets, each far wider than a sched
@@ -66,13 +66,9 @@ export async function loadActivityBoard(
   priv: PrivilegedSet,
   numBuckets = 160,
 ): Promise<ActivityBoard> {
-  const bounds = await engine.query(
-    `SELECT min(ts) AS lo, max(ts + dur) AS hi FROM sched WHERE dur > 0`,
-  );
-  const b = bounds.firstRow({lo: LONG_NULL, hi: LONG_NULL});
-  const lo = b.lo;
-  const hi = b.hi;
-  if (lo === null || hi === null || hi <= lo) return EMPTY_BOARD;
+  const bounds = await getSchedBounds(engine);
+  if (bounds === undefined) return EMPTY_BOARD;
+  const {lo, hi} = bounds;
 
   const span = hi - lo;
   const width = span / BigInt(numBuckets) > 0n ? span / BigInt(numBuckets) : 1n;

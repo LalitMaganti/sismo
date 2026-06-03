@@ -29,7 +29,12 @@
 // actually stalled, so a hot line is a neighbourhood, not a precise culprit.
 
 import type {Engine} from '../../../trace_processor/engine';
-import {LONG, NUM, NUM_NULL, STR_NULL} from '../../../trace_processor/query_result';
+import {
+  LONG,
+  NUM,
+  NUM_NULL,
+  STR_NULL,
+} from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
 import {frameNameExpr, sampleScopePredicate} from './sql';
 
@@ -41,6 +46,10 @@ export interface AnnInsn {
   // Mnemonic + operands, or a synthetic `0x…` label when no disasm was bundled.
   readonly text: string;
   readonly samples: number;
+  // For a local control-transfer (jump/branch) this is the target instruction's
+  // relPc, used to draw the arrow gutter; null/undefined for straight-line code
+  // or transfers that leave the function (calls into other symbols).
+  readonly branchTargetRelPc?: bigint | null;
 }
 
 // One source line: its text (when bundled), the self samples summed over the
@@ -52,6 +61,11 @@ export interface AnnRow {
   readonly insns: ReadonlyArray<AnnInsn>;
 }
 
+// Only SELF (timer samples) is attributed per line/instruction. Other counters
+// (cycles, cache misses, Top-Down) are too noisy at this granularity on a survey
+// trace — skid + sampling smear them — so they live at the FUNCTION level (the
+// per-function attribution table), not here. Precise per-line counter columns
+// only become honest under a PEBS focus trace; see docs/sismo_focus_mode.md.
 export interface SourceAsm {
   readonly name: string;
   readonly file: string | null;
@@ -98,16 +112,17 @@ export async function loadSourceAsm(
   const sampleByRelPc = new Map<bigint, number>();
   for (const r of counts) sampleByRelPc.set(r.relPc, r.samples);
 
-  const disasm = file !== null || counts.length > 0
-    ? await loadDisasm(engine, name)
-    : null;
+  const disasm =
+    file !== null || counts.length > 0 ? await loadDisasm(engine, name) : null;
   const source = file !== null ? await loadSourceText(engine, file) : null;
 
   // Per-line self-sample totals (only lines belonging to the chosen file).
   const lineSamples = new Map<number, number>();
   for (const r of counts) {
     if (r.line === null) continue;
-    if (file !== null && r.sourceFile !== null && r.sourceFile !== file) continue;
+    if (file !== null && r.sourceFile !== null && r.sourceFile !== file) {
+      continue;
+    }
     lineSamples.set(r.line, (lineSamples.get(r.line) ?? 0) + r.samples);
   }
 
@@ -153,8 +168,40 @@ export async function loadSourceAsm(
     rows,
     hasSource: source !== null,
     hasDisasm: disasm !== null,
-    insnCounts,
+    insnCounts: resolveBranchTargets(insnCounts),
   };
+}
+
+// x86 (jmp/je/loop/…) and aarch64 (b/b.cond/cbz/tbz/…) control-transfer
+// mnemonics. `call`/`bl` are deliberately excluded: their targets are other
+// functions, so an in-function arrow would be misleading.
+const BRANCH_MNEMONIC = /^(j[a-z]+|loop[a-z]*|b|b\.[a-z]+|cbn?z|tbn?z|br)\b/;
+
+// yaxpeax has no base address at decode time, so it renders relative targets as
+// `$+0x..` / `$-0x..` (displacement from the instruction). We don't trust the
+// exact `$` convention; instead we snap the computed target to a real decoded
+// instruction boundary, so an arrow only ever connects two real instructions.
+const REL_DISP = /\$([+-])0x([0-9a-f]+)/;
+
+function resolveBranchTargets(insns: AnnInsn[]): AnnInsn[] {
+  const relSet = new Set(insns.map((i) => i.relPc));
+  return insns.map((insn) => {
+    if (!BRANCH_MNEMONIC.test(insn.text)) return insn;
+    const m = REL_DISP.exec(insn.text);
+    if (m === null) return insn;
+    const disp = BigInt(`0x${m[2]}`) * (m[1] === '-' ? -1n : 1n);
+    const len = BigInt(insn.bytes.length / 2);
+    // Try both `$`-conventions (instruction start vs next instruction); whichever
+    // lands on a decoded boundary is the real target.
+    const fromStart = insn.relPc + disp;
+    const fromNext = insn.relPc + len + disp;
+    const target = relSet.has(fromStart)
+      ? fromStart
+      : relSet.has(fromNext)
+        ? fromNext
+        : null;
+    return target === null ? insn : {...insn, branchTargetRelPc: target};
+  });
 }
 
 // Per-rel_pc self-sample counts for the function, with the innermost symbol's
@@ -243,7 +290,7 @@ function buildRows(
 
   const mk = (line: number): AnnRow => ({
     line,
-    text: source !== null ? (source[line - 1] ?? '') : '',
+    text: source !== null ? source[line - 1] ?? '' : '',
     samples: lineSamples.get(line) ?? 0,
     insns: insnsByLine.get(line) ?? [],
   });
