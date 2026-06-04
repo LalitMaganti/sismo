@@ -89,17 +89,29 @@ runs:
           perfetto-out-ui-${{ runner.os }}-
 
     # build.js auto-detects ccache on PATH (sets GN cc_wrapper="ccache").
-    # ubuntu-latest does not preinstall ccache, so apt-install it first.
+    # The bulk of the build is the trace_processor WASM compile, which goes
+    # through emscripten (emcc/em++ ... --em-config ...). ccache only learned to
+    # parse --em-config in 4.10 (ccache#1457); before that every emcc call is
+    # logged "uncacheable" and recompiled from scratch — which is why apt's
+    # 4.9.1 left the WASM build (~1500 TUs) entirely uncached. Pin a static
+    # release ≥4.10 instead of apt so the WASM objects actually cache.
     - name: Install and configure ccache
       shell: bash
+      env:
+        CCACHE_VERSION: 4.12.3
+        CCACHE_SHA256: a99aa455873c978f6905f07e3176cfdf48bb610990c23ce0e1b718da0f38faa7
       run: |
-        if ! command -v ccache >/dev/null; then
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ccache
-        fi
+        tarball="ccache-${CCACHE_VERSION}-linux-x86_64.tar.xz"
+        url="https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/${tarball}"
+        curl -fsSL -o "/tmp/${tarball}" "$url"
+        echo "${CCACHE_SHA256}  /tmp/${tarball}" | sha256sum -c -
+        tar -xJf "/tmp/${tarball}" -C /tmp
+        sudo install -m 0755 "/tmp/ccache-${CCACHE_VERSION}-linux-x86_64/ccache" /usr/local/bin/ccache
+        hash -r
+        ccache --version | head -1
         mkdir -p ~/.ccache
         cat > ~/.ccache/ccache.conf <<'EOF'
-        max_size = 2.0G
+        max_size = 5.0G
         compression = true
         compression_level = 6
         sloppiness = include_file_ctime,include_file_mtime
