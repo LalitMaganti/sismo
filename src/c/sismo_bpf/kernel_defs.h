@@ -44,8 +44,20 @@ struct task_struct {
   char comm[16];
 } __attribute__((preserve_access_index));
 
-// perf_event program context — opaque; we only forward it to bpf_get_stack.
-struct bpf_perf_event_data;
+// perf_event program context. We forward it to bpf_get_stack and read `addr`
+// (the PERF_SAMPLE_ADDR data linear address). The kernel rewrites loads from
+// this context type (convert_ctx_access for BPF_PROG_TYPE_PERF_EVENT), so only
+// the field *offsets* must match the UAPI layout
+//   struct bpf_perf_event_data { bpf_user_pt_regs_t regs; __u64 sample_period;
+//                                __u64 addr; };
+// `regs` is the arch's user pt_regs (x86_64: 21 * 8 = 168 bytes); this BPF
+// object is built x86-only (-D__TARGET_ARCH_x86 / -target bpf). An opaque blob
+// keeps the UAPI ptrace headers out of the minimal-defs build.
+struct bpf_perf_event_data {
+  unsigned long long regs[21];  // bpf_user_pt_regs_t (x86_64 struct pt_regs)
+  unsigned long long sample_period;
+  unsigned long long addr;
+};
 
 // Stable UAPI layout filled by bpf_perf_event_read_value (not CO-RE relocated).
 struct bpf_perf_event_value {

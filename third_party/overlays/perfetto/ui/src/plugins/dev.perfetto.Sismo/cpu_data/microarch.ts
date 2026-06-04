@@ -13,11 +13,7 @@
 // limitations under the License.
 
 import type {Engine} from '../../../trace_processor/engine';
-import {
-  NUM,
-  NUM_NULL,
-  STR_NULL,
-} from '../../../trace_processor/query_result';
+import {NUM, NUM_NULL, STR_NULL} from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
 import {frameNameExpr, sampleScopePredicate} from './sql';
 import {tsRangeClause, type FocusWindow} from './focus_window';
@@ -68,9 +64,7 @@ export async function loadMicroarch(
   // on Linux, sismo's mach_sampler on macOS). Missing table or empty table
   // both land in EMPTY_MICROARCH so the UI can render a "no samples" state.
   const hasTable = await engine
-    .query(
-      `SELECT name FROM sqlite_master WHERE name = 'perf_sample' LIMIT 1`,
-    )
+    .query(`SELECT name FROM sqlite_master WHERE name = 'perf_sample' LIMIT 1`)
     .catch(() => undefined);
   if (hasTable === undefined || hasTable.numRows() === 0) {
     return EMPTY_MICROARCH;
@@ -463,6 +457,19 @@ export async function loadMicroarchCounters(
 // execution, not a precise per-instruction measurement — its value is the
 // CONTRAST with `baseline` (the whole profiled set), which tells you whether
 // this function runs hotter/stallier than the workload average.
+// One time bucket of a function's rates — the SHAPE of how it executed over the
+// trace, to sit beside the aggregate `self`. Each rate is null when that bucket
+// caught too little of the function (or the wrong counters) to form one.
+export interface UarchSeriesPoint {
+  readonly ipc: number | null;
+  readonly cacheMpki: number | null;
+  readonly branchMpki: number | null;
+}
+
+// Equal time buckets the per-function rate series is split into across the whole
+// trace. A round count that reads as a compact sparkline.
+const UARCH_SERIES_BUCKETS = 32;
+
 export interface FunctionMicroarch {
   state: MicroarchState;
   // Samples (delta intervals) attributed to this function's leaf.
@@ -471,6 +478,9 @@ export interface FunctionMicroarch {
   // a stable derivation (we don't print a precise-looking number from noise).
   self: TmaModel | null;
   baseline: TmaModel | null;
+  // Per-time-bucket rates (length UARCH_SERIES_BUCKETS), oldest first; empty when
+  // counters are absent. Noisier than `self` by construction — it's a shape.
+  series: UarchSeriesPoint[];
 }
 
 export async function loadFunctionMicroarch(
@@ -505,13 +515,25 @@ export async function loadFunctionMicroarch(
     if (role !== undefined && it.total !== null) baseRoles.set(role, it.total);
   }
   if (baseRoles.size === 0) {
-    return {state: 'no-counters', samples: 0, self: null, baseline: null};
+    return {
+      state: 'no-counters',
+      samples: 0,
+      self: null,
+      baseline: null,
+      series: [],
+    };
   }
   if (
     (baseRoles.get('cycles') ?? 0) === 0 &&
     (baseRoles.get('instructions') ?? 0) === 0
   ) {
-    return {state: 'all-zero', samples: 0, self: null, baseline: null};
+    return {
+      state: 'all-zero',
+      samples: 0,
+      self: null,
+      baseline: null,
+      series: [],
+    };
   }
 
   // Self = per-function role sums via the consecutive-sample delta, restricted
@@ -554,11 +576,74 @@ export async function loadFunctionMicroarch(
   });
   const self =
     sr.samples >= FUNC_TMA_MIN_SAMPLES ? computeTma(rowRoles(sr)) : null;
+
+  // Rate over time: the same per-interval deltas credited to this function's
+  // leaf, summed into equal time buckets across the trace, then turned into the
+  // per-bucket IPC / miss rates in TS. A bucket that caught nothing of the
+  // function stays null (rendered as a gap, not a zero).
+  const seriesRes = await engine.query(`
+    WITH b AS (SELECT start_ts AS s0, end_ts AS e0 FROM trace_bounds),
+    d AS (
+      SELECT
+        s.callsite_id AS callsite_id,
+        s.ts AS ts,
+        t.name AS cname,
+        s.counter_value - lag(s.counter_value) OVER (
+          PARTITION BY s.utid, s.track_id ORDER BY s.ts
+        ) AS dv
+      FROM linux_perf_sample_with_counters s
+      JOIN track t ON t.id = s.track_id
+      WHERE s.callsite_id IS NOT NULL ${scope}
+    )
+    SELECT
+      min(${UARCH_SERIES_BUCKETS - 1}, cast((d.ts - b.s0) * ${UARCH_SERIES_BUCKETS}
+        / nullif(b.e0 - b.s0, 0) AS INT)) AS bucket,
+      sum(CASE WHEN cname = 'cpu-cycles' AND dv > 0 THEN dv END) AS cycles,
+      sum(CASE WHEN cname = 'instructions' AND dv > 0 THEN dv END) AS instructions,
+      sum(CASE WHEN cname = 'cache-misses' AND dv > 0 THEN dv END) AS cache_miss,
+      sum(CASE WHEN cname = 'branch-misses' AND dv > 0 THEN dv END) AS branch_miss
+    FROM d
+    JOIN stack_profile_callsite c ON c.id = d.callsite_id
+    JOIN stack_profile_frame spf ON spf.id = c.frame_id
+    CROSS JOIN b
+    WHERE ${nameExpr} = '${esc}'
+    GROUP BY bucket
+  `);
+  const series: UarchSeriesPoint[] = Array.from(
+    {length: UARCH_SERIES_BUCKETS},
+    () => ({ipc: null, cacheMpki: null, branchMpki: null}),
+  );
+  for (
+    const it = seriesRes.iter({
+      bucket: NUM_NULL,
+      cycles: NUM_NULL,
+      instructions: NUM_NULL,
+      cache_miss: NUM_NULL,
+      branch_miss: NUM_NULL,
+    });
+    it.valid();
+    it.next()
+  ) {
+    if (it.bucket === null) continue;
+    // The last sample (ts === end_ts) lands one past the last bucket; fold it in.
+    const i = Math.min(UARCH_SERIES_BUCKETS - 1, Math.max(0, it.bucket));
+    const instr = it.instructions;
+    series[i] = {
+      ipc:
+        instr !== null && it.cycles !== null && it.cycles !== 0
+          ? instr / it.cycles
+          : null,
+      cacheMpki: mpki(it.cache_miss, instr),
+      branchMpki: mpki(it.branch_miss, instr),
+    };
+  }
+
   return {
     state: 'ok',
     samples: sr.samples,
     self,
     baseline: computeTma(baseRoles),
+    series,
   };
 }
 
@@ -733,7 +818,11 @@ const STRATEGIES: ReadonlyArray<TmaStrategy> = [
       const ff = (fe ?? 0) / cycles;
       const bf = (be ?? 0) / cycles;
       return [
-        {key: 'not-stalled', label: 'Not stalled', frac: Math.max(0, 1 - ff - bf)},
+        {
+          key: 'not-stalled',
+          label: 'Not stalled',
+          frac: Math.max(0, 1 - ff - bf),
+        },
         {key: 'frontend', label: 'Frontend stall', frac: ff},
         {key: 'backend', label: 'Backend stall', frac: bf},
       ];
@@ -741,8 +830,12 @@ const STRATEGIES: ReadonlyArray<TmaStrategy> = [
   },
 ];
 
-function mpki(misses: number | null, instructions: number | null): number | null {
-  if (misses === null || instructions === null || instructions === 0) return null;
+function mpki(
+  misses: number | null,
+  instructions: number | null,
+): number | null {
+  if (misses === null || instructions === null || instructions === 0)
+    return null;
   return (misses / instructions) * 1000;
 }
 
@@ -786,4 +879,3 @@ export function computeTma(roles: RoleTotals): TmaModel | null {
     branchMpki: mpki(roles.get('branch-miss') ?? null, instructions),
   };
 }
-

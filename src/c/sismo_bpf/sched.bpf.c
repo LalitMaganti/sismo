@@ -267,8 +267,14 @@ int on_tick(struct bpf_perf_event_data *ctx) {
   e->hdr.tid = BPF_CORE_READ(cur, pid);
   e->hdr.pid = tgid;
   e->hdr.cpu = bpf_get_smp_processor_id();
+  // Which sampler (timebase) overflowed: the per-link attach cookie set when
+  // openSampler attached on_tick. 0 for the single-timebase (survey) path.
+  e->hdr.timebase = (unsigned int)bpf_get_attach_cookie(ctx);
   e->hdr.nr_kernel_frames = nr_kernel;
   e->hdr.ts = bpf_ktime_get_ns();
+  // Data linear address of the sampled access (the kernel fills ctx->addr only
+  // when the leader event sampled PERF_SAMPLE_ADDR — the cache focus; 0 else).
+  e->data_addr = ctx->addr;
 #pragma unroll
   for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
     e->counters[s] = tc->v[s];

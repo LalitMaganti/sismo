@@ -29,7 +29,7 @@ import {
 } from '../cpu_data';
 import {fmtDurationNs, fmtPercent} from '../format';
 import {renderStatCard, type StatCard} from '../page_common';
-import {questionBlock, subSection} from './block';
+import {questionBlock, subSection, type DeeperAction} from './block';
 import {breakdownGrid, type BreakdownGridRow} from './grid';
 
 export interface WhereSummary {
@@ -41,6 +41,8 @@ export interface WhereSummary {
 }
 
 const QUESTION = 'How much CPU did you use, and where did it go?';
+const DESCRIPTION =
+  'Your share of CPU time and the functions, threads and processes it went to.';
 const TOP_N = 6;
 
 export async function loadWhereSummary(
@@ -90,6 +92,7 @@ export async function loadWhereSummary(
 export function renderWhereBlock(
   s: WhereSummary,
   onFunctionClick?: (name: string) => void,
+  deeper?: ReadonlyArray<DeeperAction>,
 ): m.Children {
   const cards: StatCard[] = [
     {label: 'CPU used', value: fmtDurationNs(s.cpuUsedNs)},
@@ -102,7 +105,7 @@ export function renderWhereBlock(
       help: s.byFunction[0].name,
     });
   }
-  return questionBlock({question: QUESTION}, [
+  return questionBlock({question: QUESTION, description: DESCRIPTION, deeper}, [
     m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
     subSection(
       'By function',

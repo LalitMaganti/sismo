@@ -23,6 +23,7 @@ extern "c" fn sismo_disasm_module(
     path: [*]const u8,
     path_len: usize,
     arch: u32,
+    load_bias: u64,
     rel_pcs: [*]const u64,
     rel_pcs_len: usize,
     cb: InsnCallback,
@@ -40,6 +41,7 @@ pub fn currentArch() ?Arch {
 pub fn disassembleModule(
     path: []const u8,
     arch: Arch,
+    load_bias: u64,
     rel_pcs: []const u64,
     cb: InsnCallback,
     ctx: ?*anyopaque,
@@ -49,6 +51,7 @@ pub fn disassembleModule(
         path.ptr,
         path.len,
         @intFromEnum(arch),
+        load_bias,
         rel_pcs.ptr,
         rel_pcs.len,
         cb,

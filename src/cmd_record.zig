@@ -49,6 +49,7 @@ const heap_protocol = @import("heap_protocol.zig");
 const sismo_config = @import("sismo_config.zig");
 const paths = @import("sismo_paths.zig");
 const privileged_marker = @import("sismo_privileged_marker.zig");
+const focus_presets = @import("focus_presets.zig");
 const perf_symbolize = @import("perf_symbolize.zig");
 const c = @cImport({
     @cInclude("src/c/perfetto_shim.h");
@@ -543,6 +544,14 @@ pub const RecordArgs = struct {
     cpu_mode: SourceMode = .in_process,
     heap_mode: SourceMode = .in_process,
     no_instrumentation: bool = false,
+    // A focus recording (Linux/x86 only): sample on a hardware event with PEBS
+    // instead of the survey's timer timebase. null = a normal survey trace.
+    focus_preset: ?focus_presets.FocusPreset = null,
+    // Sampling density for the focus recording, relative to the preset's tuned
+    // default (1.0 = default). >1 yields proportionally more samples, <1 fewer —
+    // preset-agnostic, so it reads the same whatever event the focus samples on.
+    // null = use the preset default.
+    sample_density: ?f64 = null,
     workload_argv: std.ArrayList([]const u8) = .empty,
 
     pub fn deinit(self: *RecordArgs, gpa: std.mem.Allocator) void {
@@ -588,6 +597,13 @@ fn printRecordHelp() void {
     );
     if (comptime builtin.os.tag == .linux) {
         std.debug.print(
+            "  --focus <preset> sample on a hardware event with PEBS instead of a\n" ++
+                "                 timer (a focus recording). Presets: cache.\n" ++
+                "  --sample-density <x> scale --focus sampling vs the preset default\n" ++
+                "                 (1.0 = default, 8 = 8x the samples, 0.5 = half).\n",
+            .{},
+        );
+        std.debug.print(
             "\nLinux requires CAP_PERFMON for perf_event_open and read access\n" ++
                 "to /sys/kernel/tracing for ftrace; running with sudo is the\n" ++
                 "easiest path.\n",
@@ -629,6 +645,13 @@ fn parseRecordArgs(
     }.f;
 
     while (iter.next()) |arg| {
+        // `--` ends option parsing: everything after it is the workload command
+        // + args, even if it begins with `--`. (Idiomatic and what the --focus
+        // help / focus refusal commands print.)
+        if (args.workload_argv.items.len == 0 and std.mem.eql(u8, arg, "--")) {
+            while (iter.next()) |w| args.workload_argv.append(gpa, w) catch return null;
+            break;
+        }
         // After the first positional, every subsequent token is workload
         // argv (so the workload can have its own --flags).
         if (args.workload_argv.items.len > 0 or !std.mem.startsWith(u8, arg, "--")) {
@@ -716,6 +739,35 @@ fn parseRecordArgs(
             }
         } else if (std.mem.eql(u8, arg, "--no-instrumentation")) {
             args.no_instrumentation = true;
+        } else if (std.mem.eql(u8, arg, "--focus")) {
+            if (comptime builtin.os.tag != .linux) {
+                std.debug.print(
+                    "sismo record: --focus needs the Linux BPF/PEBS path (not supported on {s})\n",
+                    .{@tagName(builtin.os.tag)},
+                );
+                return null;
+            }
+            const v = iter.next() orelse {
+                std.debug.print("sismo record: --focus needs a preset (e.g. cache)\n", .{});
+                return null;
+            };
+            args.focus_preset = focus_presets.fromName(v) orelse {
+                std.debug.print(
+                    "sismo record: unknown focus preset '{s}' (supported: cache)\n",
+                    .{v},
+                );
+                return null;
+            };
+        } else if (std.mem.eql(u8, arg, "--sample-density")) {
+            const v = iter.next() orelse {
+                std.debug.print("sismo record: --sample-density needs a value (e.g. 8 for 8x the samples)\n", .{});
+                return null;
+            };
+            args.sample_density = std.fmt.parseFloat(f64, v) catch null;
+            if (args.sample_density == null or !(args.sample_density.? > 0)) {
+                std.debug.print("sismo record: --sample-density must be a positive number, got '{s}'\n", .{v});
+                return null;
+            }
         } else if (std.mem.eql(u8, arg, "--help")) {
             printRecordHelp();
             return null; // defer handles cleanup
@@ -737,6 +789,22 @@ fn parseRecordArgs(
             "sismo record: need {s}\n",
             .{if (comptime PlatformCaps.supports_pid_attach) "either --pid <pid> or a workload <command>" else "a workload <command>"},
         );
+        return null;
+    }
+
+    // Focus is the CPU sampler in a different timebase, so it needs that source
+    // on, and v1 captures by re-running (no flight-recorder trigger yet).
+    if (args.focus_preset != null) {
+        if (args.cpu_mode == .off) {
+            std.debug.print("sismo record: --focus needs the CPU sampler (remove --no-cpu)\n", .{});
+            return null;
+        }
+        if (args.flight_recorder) {
+            std.debug.print("sismo record: --focus is not supported with --flight-recorder yet\n", .{});
+            return null;
+        }
+    } else if (args.sample_density != null) {
+        std.debug.print("sismo record: --sample-density only applies with --focus\n", .{});
         return null;
     }
 
@@ -1201,7 +1269,8 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     } else {
         std.debug.print("sismo record: trace saved to {s}\n", .{output_path});
         // TODO: replace with JSON-in-zip sidecar. See sismo_privileged_marker.zig.
-        privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}) catch |err| {
+        // macOS has no focus path, so the focus annotation is always null here.
+        privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}, null, false) catch |err| {
             std.debug.print("sismo record: failed to write privileged marker: {s}\n", .{@errorName(err)});
         };
     }
@@ -1337,7 +1406,7 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     const bpf = if (no_cpu)
         null
     else
-        linux_bpf_capture.Capture.init(gpa, @intCast(target.pid)) catch |err| blk: {
+        linux_bpf_capture.Capture.init(gpa, @intCast(target.pid), args.focus_preset, args.sample_density) catch |err| blk: {
             std.debug.print("sismo record: bpf capture init failed: {s} — CPU samples disabled\n", .{@errorName(err)});
             break :blk null;
         };
@@ -1346,6 +1415,11 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         std.debug.print(
             "sismo record: bpf — {d} samples across {d} threads (busiest {d} cycles)\n",
             .{ s.samples, s.threads, s.busiest_cycles },
+        );
+        // Cache focus: how many samples got a resolved data-region leaf frame.
+        if (s.data_frames > 0) std.debug.print(
+            "sismo record: cache — {d} of {d} samples carry a data-region frame\n",
+            .{ s.data_frames, s.samples },
         );
     };
 
@@ -1475,7 +1549,11 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     } else {
         std.debug.print("sismo record: trace saved to {s}\n", .{output_path});
         // TODO: replace with JSON-in-zip sidecar. See sismo_privileged_marker.zig.
-        privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}) catch |err| {
+        const focus_name: ?[]const u8 =
+            if (args.focus_preset) |p| focus_presets.presetName(p) else null;
+        // Honest precision: only claim PEBS if the sampler actually got it.
+        const focus_precise = if (bpf) |b| b.sampler_precise_ip >= 2 else false;
+        privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}, focus_name, focus_precise) catch |err| {
             std.debug.print("sismo record: failed to write privileged marker: {s}\n", .{@errorName(err)});
         };
         // Resolve perf sample frames to function names. The BPF collector

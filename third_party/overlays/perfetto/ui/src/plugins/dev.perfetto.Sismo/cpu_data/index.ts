@@ -76,7 +76,6 @@ export {
   loadWindowConsumers,
 } from './activity';
 
-
 export {
   type EntitySplitRow,
   type FunctionDetail,
@@ -84,11 +83,7 @@ export {
   loadFunctionDetail,
 } from './entity_detail';
 
-export {
-  type Butterfly,
-  type ButterflyEdge,
-  loadButterfly,
-} from './butterfly';
+export {type Butterfly, type ButterflyEdge, loadButterfly} from './butterfly';
 
 export {
   type AnnInsn,
@@ -108,6 +103,7 @@ export {
   type MicroarchFuncRow,
   type TmaBucket,
   type TmaModel,
+  type UarchSeriesPoint,
   computeTma,
   loadFunctionMicroarch,
   loadMicroarch,

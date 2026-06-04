@@ -24,7 +24,7 @@
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
 import {QuerySlot, SerialTaskQueue} from '../../../base/query_slot';
-import {Callout} from '../../../widgets/callout';
+import {Section} from '../../../widgets/section';
 import {EmptyState} from '../../../widgets/empty_state';
 import {FlamegraphPanel} from '../../../components/flamegraph_panel';
 import {Flamegraph, type FlamegraphState} from '../../../widgets/flamegraph';
@@ -37,6 +37,11 @@ import {
 import type {PrivilegedSet} from '../privileged_set';
 import {Setting, oneOf} from '../settings';
 import {segmentedSwitcher, type Segment} from './segmented';
+import {
+  loadFocusSuggestion,
+  renderCacheFocusSuggestion,
+  type FocusSuggestion,
+} from './focus_cta';
 
 // Each tab weights the same stacks by one stall counter. The metric strings
 // match the labels buildSampleFlamegraphMetrics produces.
@@ -103,20 +108,50 @@ export class CpuEfficiencyTab implements m.ClassComponent<CpuEfficiencyAttrs> {
   // Selected "Break down by" dimension; in-memory only (efficiency doesn't share
   // the where-tab's persisted prefs). 'none' so the control still appears.
   private fgBreakdown: BreakdownKind = 'none';
+  private fgBottom: BreakdownKind = 'none';
   // Counter names, fetched once to unlock the "Backend-bound slots" weighting.
   private readonly countersSlot = new QuerySlot<ReadonlySet<string>>(
     new SerialTaskQueue(),
   );
   private countersApplied = false;
+  // Density-sized rerun hint for the cache weighting; loaded lazily when that
+  // tab is shown.
+  private readonly focusSlot = new QuerySlot<FocusSuggestion>(
+    new SerialTaskQueue(),
+  );
 
   constructor({attrs}: m.CVnode<CpuEfficiencyAttrs>) {
     this.scope = sampleScopePredicates(attrs.priv);
-    this.fgMetrics = buildSampleFlamegraphMetrics(this.scope, this.fgBreakdown);
+    this.fgMetrics = buildSampleFlamegraphMetrics(
+      this.scope,
+      this.fgBreakdown,
+      undefined,
+      undefined,
+      false,
+      this.fgBottom,
+    );
     this.fgState = Flamegraph.updateState(undefined, this.fgMetrics);
   }
 
   onremove(): void {
     this.countersSlot.dispose();
+    this.focusSlot.dispose();
+  }
+
+  // The cache weighting is approximate (sampled on time); offer the exact,
+  // focus-recorded alternative with a pre-sized density. Only the cache tab.
+  private renderFocusHint(attrs: CpuEfficiencyAttrs): m.Children {
+    let s: FocusSuggestion | undefined;
+    try {
+      s = this.focusSlot.use({
+        key: {upids: [...attrs.priv.upids]},
+        queryFn: () => loadFocusSuggestion(attrs.trace.engine, attrs.priv),
+      }).data;
+    } catch {
+      return null;
+    }
+    if (s === undefined) return null;
+    return renderCacheFocusSuggestion(s);
   }
 
   // Confirming the counter set unlocks the "Backend-bound slots" weighting; when
@@ -138,6 +173,9 @@ export class CpuEfficiencyTab implements m.ClassComponent<CpuEfficiencyAttrs> {
       this.scope,
       this.fgBreakdown,
       counters,
+      undefined,
+      false,
+      this.fgBottom,
     );
   }
 
@@ -185,32 +223,41 @@ export class CpuEfficiencyTab implements m.ClassComponent<CpuEfficiencyAttrs> {
           metricSetting.set(k);
         }),
       ),
-      m(Callout, {icon: 'help_outline'}, active.caption),
       m(
         '.pf-sismo-tab__body',
         m(
-          '.pf-sismo-tab__flamegraph',
-          m(FlamegraphPanel, {
-            trace: attrs.trace,
-            metrics: this.fgMetrics,
-            state: this.fgState,
-            hideMetricSelector: true,
-            onStateChange: (s: FlamegraphState) => {
-              this.fgState = s;
-              // The breakdown lives in the widget's Display menu; when it changes
-              // rebuild the metrics (new tree shape) so a counter weighting splits
-              // per thread/process. A new array re-triggers the query.
-              const next = (s.breakdownBy ?? 'none') as BreakdownKind;
-              if (next !== this.fgBreakdown) {
-                this.fgBreakdown = next;
-                this.fgMetrics = buildSampleFlamegraphMetrics(
-                  this.scope,
-                  next,
-                  this.fgCounters,
-                );
-              }
-            },
-          }),
+          Section,
+          {title: active.label, subtitle: active.caption},
+          active.key === 'cache' && this.renderFocusHint(attrs),
+          m(
+            '.pf-sismo-tab__flamegraph',
+            m(FlamegraphPanel, {
+              trace: attrs.trace,
+              metrics: this.fgMetrics,
+              state: this.fgState,
+              hideMetricSelector: true,
+              onStateChange: (s: FlamegraphState) => {
+                this.fgState = s;
+                // The breakdown lives in the widget's Display menu; when it changes
+                // rebuild the metrics (new tree shape) so a counter weighting splits
+                // per thread/process. A new array re-triggers the query.
+                const top = (s.breakdownBy ?? 'none') as BreakdownKind;
+                const bottom = (s.breakdownBottom ?? 'none') as BreakdownKind;
+                if (top !== this.fgBreakdown || bottom !== this.fgBottom) {
+                  this.fgBreakdown = top;
+                  this.fgBottom = bottom;
+                  this.fgMetrics = buildSampleFlamegraphMetrics(
+                    this.scope,
+                    top,
+                    this.fgCounters,
+                    undefined,
+                    false,
+                    this.fgBottom,
+                  );
+                }
+              },
+            }),
+          ),
         ),
       ),
     );

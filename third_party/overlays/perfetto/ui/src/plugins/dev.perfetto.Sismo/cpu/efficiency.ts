@@ -23,7 +23,7 @@ import type {Engine} from '../../../trace_processor/engine';
 import {computeTma, loadMicroarchCounters} from '../cpu_data';
 import {renderStatCard, type StatCard} from '../page_common';
 import type {PrivilegedSet} from '../privileged_set';
-import {questionBlock} from './block';
+import {questionBlock, type DeeperAction} from './block';
 import {breakdownGrid, type BreakdownGridRow} from './grid';
 
 const TOP_N = 8;
@@ -41,6 +41,9 @@ export interface EfficiencySummary {
 }
 
 const QUESTION = 'How efficiently did the CPU run?';
+const DESCRIPTION =
+  'How much work each cycle did (IPC) and where the core stalled — cache, ' +
+  'branch, backend.';
 
 // Plain mechanism for each Top-Down bucket — what the cycles were physically
 // doing, not whether that is good or bad.
@@ -94,10 +97,14 @@ export async function loadEfficiencySummary(
   };
 }
 
-export function renderEfficiencyBlock(s: EfficiencySummary): m.Children {
+export function renderEfficiencyBlock(
+  s: EfficiencySummary,
+  deeper?: ReadonlyArray<DeeperAction>,
+): m.Children {
   if (!s.hasCounters) {
     return questionBlock({
       question: QUESTION,
+      description: DESCRIPTION,
       answer:
         'No CPU performance counters were recorded, so efficiency can’t be ' +
         'measured here. Re-record with counters enabled to see it.',
@@ -106,6 +113,8 @@ export function renderEfficiencyBlock(s: EfficiencySummary): m.Children {
   if (s.ipc === null) {
     return questionBlock({
       question: QUESTION,
+      description: DESCRIPTION,
+      deeper,
       answer:
         'Counters were recorded, but there weren’t enough to compute ' +
         'instructions-per-cycle for this scope.',
@@ -133,13 +142,16 @@ export function renderEfficiencyBlock(s: EfficiencySummary): m.Children {
       help: 'Branch mispredictions per 1,000 instructions',
     });
   }
-  return questionBlock({question: QUESTION, answer}, [
-    m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
-    breakdownGrid({
-      nameTitle: 'Function',
-      valueTitle: 'IPC',
-      formatValue: (n) => (n >= 0 ? n.toFixed(2) : '—'),
-      rows: s.byFunction,
-    }),
-  ]);
+  return questionBlock(
+    {question: QUESTION, description: DESCRIPTION, answer, deeper},
+    [
+      m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
+      breakdownGrid({
+        nameTitle: 'Function',
+        valueTitle: 'IPC',
+        formatValue: (n) => (n >= 0 ? n.toFixed(2) : '—'),
+        rows: s.byFunction,
+      }),
+    ],
+  );
 }

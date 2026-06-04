@@ -302,7 +302,11 @@ fn collectModuleDisasm(
 ) !void {
     var ctx: DisasmCtx = .{ .gpa = gpa };
     defer ctx.deinit();
-    if (!disasm.disassembleModule(m.name, arch, m.rel_pcs.items, &onInsn, &ctx)) return;
+    // rel_pcs are absolute avmas; the disassembler needs load_bias to reach the
+    // link-time addresses in the ELF symbol table (a PIE's differ by the load
+    // slide). It tags decoded instructions back in avma space, so func_start and
+    // insn rel_pcs below still resolve and match the trace's rel_pc unchanged.
+    if (!disasm.disassembleModule(m.name, arch, m.load_bias, m.rel_pcs.items, &onInsn, &ctx)) return;
     if (ctx.failed) return;
 
     var name_buf: [1024]u8 = undefined;
@@ -481,6 +485,10 @@ fn printGuidance(io: std.Io, stats: []const ModuleStat) void {
 }
 
 fn fileExists(io: std.Io, path: []const u8) bool {
+    // openFileAbsolute asserts the path is absolute (a precondition, not an
+    // error), so a non-absolute mapping name from /proc/maps ([vdso], anon,
+    // memfd, a relative or "(deleted)" path) would panic, not just fail. Guard.
+    if (!std.fs.path.isAbsolute(path)) return false;
     var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
     file.close(io);
     return true;
@@ -489,6 +497,7 @@ fn fileExists(io: std.Io, path: []const u8) bool {
 /// Read up to `buf.len` bytes of an absolute path. Returns null if it can't
 /// be opened/read — callers treat that as "info unavailable".
 fn readFileAbsolute(io: std.Io, path: []const u8, buf: []u8) ?[]u8 {
+    if (!std.fs.path.isAbsolute(path)) return null;
     var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer file.close(io);
     const n = file.readPositional(io, &.{buf}, 0) catch return null;

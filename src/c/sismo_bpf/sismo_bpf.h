@@ -41,6 +41,7 @@ struct sismo_hdr {
   unsigned int tid;           // thread id (kernel task_struct.pid)
   unsigned int pid;           // process id / tgid (kernel task_struct.tgid)
   unsigned int cpu;           // SAMPLE: CPU the sample fired on
+  unsigned int timebase;      // SAMPLE: which sampler/timebase fired (attach cookie index)
   unsigned int nr_frames;     // SAMPLE: number of valid entries in stack[]
   unsigned int nr_kernel_frames;  // SAMPLE: number of valid entries in kernel_stack[]
   unsigned long long ts;      // CLOCK_MONOTONIC ns
@@ -55,6 +56,11 @@ struct sismo_hdr {
 // KASLR slide) ever reaches userspace.
 struct sismo_sample_rec {
   struct sismo_hdr hdr;
+  // SAMPLE: linear (virtual) address of the sampled memory access — the
+  // PERF_SAMPLE_ADDR / Data_LA value. 0 unless the sampler leader is a precise
+  // load event that carries it (the cache focus). Userspace maps it to the
+  // memory region (heap/stack/object) the miss landed in.
+  unsigned long long data_addr;
   unsigned long long counters[SISMO_MAX_COUNTERS];
   unsigned long long stack[SISMO_MAX_STACK];
   unsigned int kernel_ids[SISMO_MAX_KERNEL_STACK];

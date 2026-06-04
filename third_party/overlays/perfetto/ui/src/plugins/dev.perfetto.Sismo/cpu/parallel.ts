@@ -23,7 +23,7 @@ import {LONG_NULL, NUM} from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
 import {fmtPercent} from '../format';
 import {renderStatCard, type StatCard} from '../page_common';
-import {questionBlock} from './block';
+import {questionBlock, type DeeperAction} from './block';
 import type {BreakdownGridRow} from './grid';
 import {
   Meter,
@@ -41,6 +41,9 @@ export interface ParallelSummary {
 }
 
 const QUESTION = 'Were your threads running in parallel, or serialized?';
+const DESCRIPTION =
+  'Whether your threads ran at the same time across cores or mostly one at a ' +
+  'time.';
 
 // Meter colour per concurrency band, keyed by the names the loader builds the
 // distribution rows with. Categorical, NOT a good/bad scale — whether serial is
@@ -125,7 +128,10 @@ export async function loadParallelSummary(
   };
 }
 
-export function renderParallelBlock(s: ParallelSummary): m.Children {
+export function renderParallelBlock(
+  s: ParallelSummary,
+  deeper?: ReadonlyArray<DeeperAction>,
+): m.Children {
   const avg = s.avgConcurrency;
   const answer =
     s.threadCount < 2
@@ -142,28 +148,31 @@ export function renderParallelBlock(s: ParallelSummary): m.Children {
     {label: 'Threads', value: String(s.threadCount)},
     {label: 'Avg at once', value: avg.toFixed(1)},
   ];
-  return questionBlock({question: QUESTION, answer}, [
-    m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
-    // Active time split by how many threads were on a CPU at once — a whole
-    // divided into bands, so one stacked bar reads better than a table.
-    m(Meter, {
-      label: 'Concurrency mix',
-      help:
-        'Of the time at least one profiled thread was on a CPU, how it splits ' +
-        'by how many ran at once: one (serial), 2–4, or 5 or more.',
-      primary: meterReadout(
-        fmtPercent(s.serialFrac),
-        ' ran one thread at a time (serial)',
-      ),
-      bar: s.distribution.map((r) => ({
-        color: bandColor(r.name),
-        frac: r.share,
-      })),
-      legend: s.distribution.map((r) => ({
-        color: bandColor(r.name),
-        label: r.name,
-        value: fmtPercent(r.share),
-      })),
-    }),
-  ]);
+  return questionBlock(
+    {question: QUESTION, description: DESCRIPTION, answer, deeper},
+    [
+      m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
+      // Active time split by how many threads were on a CPU at once — a whole
+      // divided into bands, so one stacked bar reads better than a table.
+      m(Meter, {
+        label: 'Concurrency mix',
+        help:
+          'Of the time at least one profiled thread was on a CPU, how it splits ' +
+          'by how many ran at once: one (serial), 2–4, or 5 or more.',
+        primary: meterReadout(
+          fmtPercent(s.serialFrac),
+          ' ran one thread at a time (serial)',
+        ),
+        bar: s.distribution.map((r) => ({
+          color: bandColor(r.name),
+          frac: r.share,
+        })),
+        legend: s.distribution.map((r) => ({
+          color: bandColor(r.name),
+          label: r.name,
+          value: fmtPercent(r.share),
+        })),
+      }),
+    ],
+  );
 }

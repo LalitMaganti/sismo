@@ -40,6 +40,8 @@ export interface BurstSummary {
 }
 
 const QUESTION = 'Steady work, or lots of small bursts?';
+const DESCRIPTION =
+  'Whether your work ran in sustained stretches or many short on-CPU bursts.';
 
 // Meter colour per burst-length bucket, keyed by the names the loader builds the
 // distribution rows with. Purely categorical — the bars distinguish buckets,
@@ -122,6 +124,7 @@ export function renderBurstBlock(s: BurstSummary): m.Children {
   if (s.count === 0) {
     return questionBlock({
       question: QUESTION,
+      description: DESCRIPTION,
       answer: 'No on-CPU bursts were recorded for these threads.',
     });
   }
@@ -134,10 +137,8 @@ export function renderBurstBlock(s: BurstSummary): m.Children {
     {label: 'Typical', value: fmtDurationNs(s.medianNs)},
     {label: 'Longest', value: fmtDurationNs(s.maxNs)},
   ];
-  const dominant = s.distribution.reduce((a, b) =>
-    b.share > a.share ? b : a,
-  );
-  return questionBlock({question: QUESTION, answer}, [
+  const dominant = s.distribution.reduce((a, b) => (b.share > a.share ? b : a));
+  return questionBlock({question: QUESTION, description: DESCRIPTION, answer}, [
     m('.pf-sismo-page__stat-row', cards.map(renderStatCard)),
     // CPU time split by how long each on-CPU burst lasted — a whole divided
     // into length buckets, so one stacked bar reads better than a table.
@@ -146,7 +147,10 @@ export function renderBurstBlock(s: BurstSummary): m.Children {
       help:
         'How the threads’ on-CPU time divides by how long each continuous run ' +
         'lasted before going idle.',
-      primary: meterReadout(fmtPercent(dominant.share), ` in ${dominant.name} bursts`),
+      primary: meterReadout(
+        fmtPercent(dominant.share),
+        ` in ${dominant.name} bursts`,
+      ),
       bar: s.distribution.map((r) => ({
         color: bucketColor(r.name),
         frac: r.share,

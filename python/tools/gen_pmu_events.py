@@ -44,6 +44,12 @@ SPEC = {
     "fetch_bubbles": ["IDQ_UOPS_NOT_DELIVERED.CORE"],
     "cache_miss": ["LONGEST_LAT_CACHE.MISS"],
     "branch_miss": ["BR_MISP_RETIRED.ALL_BRANCHES"],
+    # Cache-focus sampler leader: a precise (PEBS) load-retirement event that
+    # carries Data_LA, so a sample's PERF_SAMPLE_ADDR is the linear address of
+    # the missed load. LONGEST_LAT_CACHE.MISS (the cache_miss counter role)
+    # counts references, not load uops, and has no Data_LA — it can't drive the
+    # data-address attribution.
+    "l3_miss_load": ["MEM_LOAD_RETIRED.L3_MISS"],
 }
 ROLES = list(SPEC.keys())
 

@@ -22,6 +22,7 @@ import m from 'mithril';
 import type {Trace} from '../../../public/trace';
 import {QuerySlot, SerialTaskQueue} from '../../../base/query_slot';
 import {Callout} from '../../../widgets/callout';
+import {Section} from '../../../widgets/section';
 import {EmptyState} from '../../../widgets/empty_state';
 import {Grid, GridCell, GridHeaderCell} from '../../../widgets/grid';
 import {FlamegraphPanel} from '../../../components/flamegraph_panel';
@@ -33,9 +34,16 @@ import {
   Flamegraph,
   FlamegraphFilterBar,
   type FlamegraphOptionalAction,
-  type FlamegraphQueryData,
   type FlamegraphState,
 } from '../../../widgets/flamegraph';
+import {
+  ROOT,
+  buildCalltree,
+  flattenFunctions,
+  EMPTY_BUILT_TREE,
+  type BuiltTree,
+  type CtNode,
+} from './flamegraph_tree';
 import {
   buildSampleFlamegraphMetrics,
   loadPerfCounterNames,
@@ -60,6 +68,13 @@ import {Setting, oneOf} from '../settings';
 const MODES = ['flamegraph', 'calltree', 'functions'] as const;
 type Mode = (typeof MODES)[number];
 
+// Section heading per mode (the subtitle is the per-mode caption below).
+const MODE_TITLES: Record<Mode, string> = {
+  flamegraph: 'Flamegraph',
+  calltree: 'Call tree',
+  functions: 'Functions',
+};
+
 // Which sub-view was last used, carried across traces. The call-tree direction
 // is shared with the flamegraph (state.view), so it persists via the flamegraph
 // prefs rather than its own setting.
@@ -69,27 +84,42 @@ const modeSetting = new Setting<Mode>(
   oneOf(MODES),
 );
 
-// All three views are cycle-weighted: the metric is fixed to the CPU-cycles
-// timebase rather than raw sample count, independent of the flamegraph's (hidden)
-// metric picker. Matches the label in buildSampleFlamegraphMetrics
-// (COUNTER_WEIGHTS); a trace with no cpu-cycles counter just yields an empty tree.
-const CYCLES_METRIC = 'CPU cycles (approx)';
+// How the three views are weighted. The survey default is the CPU-cycles
+// timebase (cycles, not raw sample count); a focus page passes its own — e.g. a
+// cache focus weights by sample count, where every sample is an LLC miss, so the
+// same tree becomes a miss map. `metricName` must match a metric built by
+// buildSampleFlamegraphMetrics; a trace lacking it just yields an empty tree.
+export interface WhereWeighting {
+  readonly metricName: string;
+  readonly selfTitle: string; // column header for self weight
+  readonly totalTitle: string; // column header for cumulative weight
+  readonly valueTitle: string; // flat functions-table value header
+  readonly emptyTitle: string; // empty-state when no stacks attributed
+  readonly captions: Record<Mode, string>;
+}
 
-// One-line orientation per mode, so you're never dropped into a view cold.
-const CAPTION: Record<Mode, string> = {
-  flamegraph:
-    'Top-down: where CPU cycles went, by call stack. Each block is a function; ' +
-    'wider = more cycles. Click a block to zoom in.',
-  calltree:
-    'The same cycles as an expandable tree, sharing the flamegraph’s metric and ' +
-    'filters. Top-down lists callees under each caller; bottom-up starts from hot ' +
-    'leaves and shows who called them. Total % is share of the displayed cycles; ' +
-    'Self is cycles in the function itself.',
-  functions:
-    'A flattened table (no call structure): every function with its self cycles ' +
-    'summed across every place it was called from, ranked — the flat ' +
-    '“where did the cycles go”. Stack filters still apply (Show-from-frame narrows ' +
-    'it; pivot, which only re-roots the tree, does not).',
+export const CYCLES_WEIGHTING: WhereWeighting = {
+  metricName: 'CPU cycles (approx)',
+  selfTitle: 'Self cycles',
+  totalTitle: 'Total cycles',
+  valueTitle: 'Self cycles',
+  emptyTitle: 'No cycle-attributed stacks for this scope',
+  // One-line orientation per mode, so you're never dropped into a view cold.
+  captions: {
+    flamegraph:
+      'Top-down: where CPU cycles went, by call stack. Each block is a function; ' +
+      'wider = more cycles. Click a block to zoom in.',
+    calltree:
+      'The same cycles as an expandable tree, sharing the flamegraph’s metric and ' +
+      'filters. Top-down lists callees under each caller; bottom-up starts from hot ' +
+      'leaves and shows who called them. Total % is share of the displayed cycles; ' +
+      'Self is cycles in the function itself.',
+    functions:
+      'A flattened table (no call structure): every function with its self cycles ' +
+      'summed across every place it was called from, ranked — the flat ' +
+      '“where did the cycles go”. Stack filters still apply (Show-from-frame narrows ' +
+      'it; pivot, which only re-roots the tree, does not).',
+  },
 };
 
 interface CpuWhereAttrs {
@@ -98,17 +128,25 @@ interface CpuWhereAttrs {
   // Open a detail tab: the flat Functions table drills a function (bottom-up),
   // the flamegraph/call tree drill a stack (the top-down path at that frame).
   readonly onDrill: (kind: EntityKind, id: string, label: string) => void;
+  // Defaults to cycle weighting; focus pages override (e.g. cache → misses).
+  readonly weighting?: WhereWeighting;
+  // [cache focus] Offer "Break down by → Data region" — regroups the flamegraph
+  // and call tree by the memory region each miss touched. Set by the cache page.
+  readonly offerDataRegion?: boolean;
 }
 
 export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
   private mode: Mode = modeSetting.get();
   private readonly scope: string[];
+  private readonly weighting: WhereWeighting;
+  private readonly offerDataRegion: boolean;
 
   // Flamegraph state.
   private fgMetrics;
   private fgState: FlamegraphState;
   private fgCounters?: ReadonlySet<string>;
   private fgBreakdown: BreakdownKind = 'none';
+  private fgBottom: BreakdownKind = 'none';
   // "Open this stack" drilldown appended to every flamegraph node menu.
   private readonly funcActions: ReadonlyArray<FlamegraphOptionalAction>;
   // Cross-trace view preferences, restored on construction (see ./prefs).
@@ -124,10 +162,14 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
     this.queue,
   );
   // Counter names, fetched once to unlock the "Backend-bound slots" weighting.
-  private readonly countersSlot = new QuerySlot<ReadonlySet<string>>(this.queue);
+  private readonly countersSlot = new QuerySlot<ReadonlySet<string>>(
+    this.queue,
+  );
   private countersApplied = false;
 
   constructor({attrs}: m.CVnode<CpuWhereAttrs>) {
+    this.weighting = attrs.weighting ?? CYCLES_WEIGHTING;
+    this.offerDataRegion = attrs.offerDataRegion ?? false;
     this.scope = sampleScopePredicates(attrs.priv);
     this.funcActions = [
       {
@@ -152,12 +194,14 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
       this.fgBreakdown,
       undefined,
       this.funcActions,
+      this.offerDataRegion,
+      this.fgBottom,
     );
     this.fgState = applyPrefs(
       Flamegraph.updateState(undefined, this.fgMetrics),
       this.prefs,
       new Set(this.fgMetrics.map((mt) => mt.name)),
-      CYCLES_METRIC,
+      this.weighting.metricName,
     );
   }
 
@@ -189,13 +233,15 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
       this.fgBreakdown,
       counters,
       this.funcActions,
+      this.offerDataRegion,
+      this.fgBottom,
     );
     const saved = this.prefs.selectedMetricName;
     const names = new Set(this.fgMetrics.map((mt) => mt.name));
     if (
       saved !== undefined &&
       saved !== this.fgState.selectedMetricName &&
-      this.fgState.selectedMetricName === CYCLES_METRIC &&
+      this.fgState.selectedMetricName === this.weighting.metricName &&
       names.has(saved)
     ) {
       this.fgState = {...this.fgState, selectedMetricName: saved};
@@ -207,23 +253,37 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
     return m(
       '.pf-sismo-tab',
       this.renderModeBar(),
-      m(Callout, {icon: 'help_outline'}, CAPTION[this.mode]),
-      // One filter bar shared by all three sub-views: the same filters apply to
-      // the flamegraph, the call tree and the functions table. The flamegraph's
-      // own bar is hidden (hideFilterBar, in renderFlamegraph) so it isn't shown
-      // twice. The Top Down / Bottom Up toggle drives both the flamegraph and
-      // the call tree, so it shows for both but not the flat functions table;
-      // the metric picker and the colour / break-down display options are
-      // flamegraph-only.
-      m(FlamegraphFilterBar, {
-        metrics: this.fgMetrics,
-        state: this.fgState,
-        onStateChange: (s) => this.onFgStateChange(s),
-        hideMetricSelector: true,
-        showViewControls: this.mode === 'flamegraph' || this.mode === 'calltree',
-        showDisplayOptions: this.mode === 'flamegraph',
-      }),
-      m('.pf-sismo-tab__body', this.renderActive(attrs)),
+      m(
+        '.pf-sismo-tab__body',
+        m(
+          Section,
+          {
+            title: MODE_TITLES[this.mode],
+            subtitle: this.weighting.captions[this.mode],
+          },
+          // One filter bar shared by all three sub-views: the same filters apply
+          // to the flamegraph, the call tree and the functions table. The
+          // flamegraph's own bar is hidden (hideFilterBar, in renderFlamegraph)
+          // so it isn't shown twice. The Top Down / Bottom Up toggle drives both
+          // the flamegraph and the call tree, so it shows for both but not the
+          // flat functions table; the metric picker and the colour / break-down
+          // display options are flamegraph-only.
+          m(FlamegraphFilterBar, {
+            metrics: this.fgMetrics,
+            state: this.fgState,
+            onStateChange: (s) => this.onFgStateChange(s),
+            hideMetricSelector: true,
+            showViewControls:
+              this.mode === 'flamegraph' || this.mode === 'calltree',
+            // Colour-by is flamegraph-only; the break-down shows on both the
+            // flamegraph and the call tree (it reshapes both).
+            showDisplayOptions: this.mode === 'flamegraph',
+            showBreakdown:
+              this.mode === 'flamegraph' || this.mode === 'calltree',
+          }),
+          this.renderActive(attrs),
+        ),
+      ),
     );
   }
 
@@ -232,7 +292,11 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
       '.pf-sismo-tab__modebar',
       segmentedSwitcher<Mode>(
         [
-          {key: 'flamegraph', label: 'Flamegraph', icon: 'local_fire_department'},
+          {
+            key: 'flamegraph',
+            label: 'Flamegraph',
+            icon: 'local_fire_department',
+          },
           {key: 'calltree', label: 'Call tree', icon: 'account_tree'},
           {key: 'functions', label: 'Functions', icon: 'list'},
         ],
@@ -280,25 +344,31 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
   private onFgStateChange(s: FlamegraphState): void {
     this.fgState = s;
     saveFlamegraphPrefs(prefsFromState(s));
-    const next = (s.breakdownBy ?? 'none') as BreakdownKind;
-    if (next !== this.fgBreakdown) {
-      this.fgBreakdown = next;
+    const top = (s.breakdownBy ?? 'none') as BreakdownKind;
+    const bottom = (s.breakdownBottom ?? 'none') as BreakdownKind;
+    if (top !== this.fgBreakdown || bottom !== this.fgBottom) {
+      this.fgBreakdown = top;
+      this.fgBottom = bottom;
       this.fgMetrics = buildSampleFlamegraphMetrics(
         this.scope,
-        next,
+        top,
         this.fgCounters,
         this.funcActions,
+        this.offerDataRegion,
+        this.fgBottom,
       );
     }
   }
 
-  // The cycle-weighted metric the call tree and functions run on. Built without
-  // a breakdown so those views are stable regardless of the flamegraph's
+  // The weighting metric the call tree and functions run on. Built without a
+  // breakdown so those views are stable regardless of the flamegraph's
   // break-down setting (which only reshapes the flamegraph itself).
-  private cycleMetric(): QueryFlamegraphMetric | undefined {
-    return buildSampleFlamegraphMetrics(this.scope, 'none', this.fgCounters).find(
-      (mt) => mt.name === CYCLES_METRIC,
-    );
+  private weightMetric(): QueryFlamegraphMetric | undefined {
+    return buildSampleFlamegraphMetrics(
+      this.scope,
+      'none',
+      this.fgCounters,
+    ).find((mt) => mt.name === this.weighting.metricName);
   }
 
   // ---- Call tree -----------------------------------------------------------
@@ -306,9 +376,22 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
   private renderCalltree(attrs: CpuWhereAttrs): m.Children {
     const view = this.fgState.view;
     const built = this.ctSlot.use({
-      key: {view, filters: this.fgState.filters},
+      // Keyed on the break-down too: the call tree mirrors the flamegraph's
+      // grouping, so switching "Break down by" must re-run it.
+      key: {
+        view,
+        filters: this.fgState.filters,
+        breakdown: this.fgBreakdown,
+        bottom: this.fgBottom,
+      },
       queryFn: async () => {
-        const metric = this.cycleMetric();
+        // The break-down-applied weighting metric (from fgMetrics, which is
+        // rebuilt on break-down change) — so the tree groups exactly as the
+        // flamegraph does. The flat Functions table keeps weightMetric() (no
+        // break-down), since a grouped tree has no flat-leaf ranking.
+        const metric =
+          this.fgMetrics.find((mt) => mt.name === this.weighting.metricName) ??
+          this.weightMetric();
         if (metric === undefined) return EMPTY_BUILT_TREE;
         const data = await computeFlamegraphTree(attrs.trace.engine, metric, {
           selectedMetricName: metric.name,
@@ -322,7 +405,7 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
     // A tree-table can only grow one way, so the call tree shows the callee half
     // and points at the flamegraph for the callers.
     const pivotLabel =
-      view.kind === 'PIVOT' ? (view.displayLabel ?? view.pivot) : undefined;
+      view.kind === 'PIVOT' ? view.displayLabel ?? view.pivot : undefined;
     return m(
       '.pf-sismo-tab__view',
       pivotLabel !== undefined &&
@@ -350,7 +433,7 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
     if (!built.hasRows) {
       return m(EmptyState, {
         icon: 'science',
-        title: 'No cycle-attributed stacks for this scope',
+        title: this.weighting.emptyTitle,
       });
     }
     const total = built.totalValue;
@@ -386,9 +469,9 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
     return m(Grid, {
       columns: [
         {key: 'fn', header: m(GridHeaderCell, 'Function')},
-        {key: 'total', header: m(GridHeaderCell, 'Total cycles')},
+        {key: 'total', header: m(GridHeaderCell, this.weighting.totalTitle)},
         {key: 'totalpct', header: m(GridHeaderCell, 'Total %')},
-        {key: 'self', header: m(GridHeaderCell, 'Self cycles')},
+        {key: 'self', header: m(GridHeaderCell, this.weighting.selfTitle)},
       ],
       rowData: rows,
     });
@@ -405,7 +488,7 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
     const rows = this.fnSlot.use({
       key: {filters: this.fgState.filters},
       queryFn: async () => {
-        const metric = this.cycleMetric();
+        const metric = this.weightMetric();
         if (metric === undefined) return [];
         // A bottom-up tree merges every sampled leaf by function name at its
         // roots, so the roots ARE the flat self-cycles-per-function ranking —
@@ -422,7 +505,10 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
     }).data;
     const body =
       rows === undefined
-        ? m(EmptyState, {icon: 'hourglass_empty', title: 'Loading functions…'})
+        ? m(EmptyState, {
+            icon: 'hourglass_empty',
+            title: 'Loading functions…',
+          })
         : breakdownGrid({
             nameTitle: 'Function',
             valueTitle: 'Self cycles',
@@ -432,100 +518,4 @@ export class CpuWhereTab implements m.ClassComponent<CpuWhereAttrs> {
           });
     return m('.pf-sismo-tab__view', body);
   }
-}
-
-// Synthetic parent id of the displayed roots (computeFlamegraphTree emits -1 for
-// a node with no parent).
-const ROOT = -1;
-
-interface CtNode {
-  readonly id: number;
-  readonly parentId: number; // ROOT at the top of the displayed tree
-  readonly name: string;
-  readonly self: number; // self cycles
-  readonly total: number; // cumulative cycles
-}
-
-interface BuiltTree {
-  readonly childrenOf: Map<number, CtNode[]>; // keyed by parentId (ROOT = roots)
-  readonly expanded: Set<number>;
-  readonly totalValue: number; // denominator for Total %
-  readonly hasRows: boolean;
-}
-
-const EMPTY_BUILT_TREE: BuiltTree = {
-  childrenOf: new Map(),
-  expanded: new Set(),
-  totalValue: 1,
-  hasRows: false,
-};
-
-// Turn the flamegraph's laid-out nodes into an expandable call-tree model. For a
-// pivot we keep only the callee half (depth >= 1): the pivot frame and what it
-// called. (computeFlamegraphTree puts callees at positive depth and callers at
-// negative depth; a tree-table can't show the callers above the root.)
-function buildCalltree(
-  data: FlamegraphQueryData,
-  isPivot: boolean,
-): BuiltTree {
-  const childrenOf = new Map<number, CtNode[]>();
-  for (const n of data.nodes) {
-    if (isPivot && n.depth < 1) continue;
-    const node: CtNode = {
-      id: n.id,
-      parentId: n.parentId,
-      name: n.name,
-      self: n.selfValue,
-      total: n.cumulativeValue,
-    };
-    const arr = childrenOf.get(node.parentId);
-    if (arr) arr.push(node);
-    else childrenOf.set(node.parentId, [node]);
-  }
-  // No JS sort: computeFlamegraphTree already lays the nodes out heaviest-first
-  // within each parent (the SQL layout orders siblings by cumulative value), so
-  // appending in node order preserves that ranking per parent.
-  const roots = childrenOf.get(ROOT) ?? [];
-  const totalValue = roots.reduce((a, r) => a + r.total, 0) || 1;
-  const expanded = new Set<number>();
-  expandToFill(childrenOf, expanded, 20);
-  return {childrenOf, expanded, totalValue, hasRows: roots.length > 0};
-}
-
-// The roots of the bottom-up tree are the sampled leaf functions, already merged
-// by name and laid out heaviest-first by SQL. So the flat self-cycles-per-function
-// ranking is just those roots, read in order — no JS aggregation or sorting. Share
-// is each function's self over the total self across all roots.
-function flattenFunctions(
-  data: FlamegraphQueryData,
-): ReadonlyArray<BreakdownGridRow> {
-  const total = data.allRootsCumulativeValue || 1;
-  const rows: BreakdownGridRow[] = [];
-  for (const n of data.nodes) {
-    if (n.parentId !== ROOT) continue; // bottom-up roots = leaf functions
-    rows.push({
-      name: n.name,
-      value: n.cumulativeValue,
-      share: n.cumulativeValue / total,
-    });
-  }
-  return rows;
-}
-
-// Depth-first: open the heaviest path until at least `target` rows are visible.
-function expandToFill(
-  childrenOf: ReadonlyMap<number, CtNode[]>,
-  expanded: Set<number>,
-  target: number,
-): void {
-  let visible = 0;
-  const dfs = (node: CtNode): void => {
-    visible++;
-    const kids = childrenOf.get(node.id) ?? [];
-    if (kids.length > 0 && visible < target) {
-      expanded.add(node.id);
-      for (const k of kids) dfs(k);
-    }
-  };
-  for (const root of childrenOf.get(ROOT) ?? []) dfs(root);
 }

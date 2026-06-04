@@ -324,19 +324,31 @@ pub const PerfSample = struct {
     /// Cumulative follower counter readings (field 7), in the same order as
     /// `PerfSampleDefaults.followers`.
     follower_counts: []const u64 = &.{},
+    /// Data linear address of the sampled access (field 20, sismo extension);
+    /// 0 omits. Set only on a cache focus (PERF_SAMPLE_ADDR on a Data_LA event).
+    data_address: u64 = 0,
+    /// The memory region `data_address` resolved to at record time (field 21,
+    /// sismo extension): "[heap]", "[stack]", an object basename, "[anon]", … —
+    /// null omits. trace_processor surfaces it as `perf_sample.data_symbol`.
+    data_symbol: ?[]const u8 = null,
 };
 
 pub fn encodePerfSample(gpa: std.mem.Allocator, s: PerfSample) ![]u8 {
     var w = ProtoWriter.init(gpa);
     errdefer w.deinit();
     // PerfSample.cpu = 1, pid = 2, tid = 3, callstack_iid = 4, timebase_count
-    // = 6, follower_counts = 7 — matches profiling/profile_packet.proto.
+    // = 6, follower_counts = 7 — matches profiling/profile_packet.proto. The
+    // data_address (20) / data_symbol (21) fields are a sismo extension to that
+    // proto (see the matching patch + the perf_sample columns in
+    // trace_processor's profiler_tables.py / profile_module.cc).
     try w.writeUint32(1, s.cpu);
     try w.writeUint32(2, s.pid);
     try w.writeUint32(3, s.tid);
     if (s.callstack_iid != 0) try w.writeUint64(4, s.callstack_iid);
     if (s.timebase_count != 0) try w.writeUint64(6, s.timebase_count);
     for (s.follower_counts) |fc| try w.writeUint64(7, fc);
+    if (s.data_address != 0) try w.writeUint64(20, s.data_address);
+    if (s.data_symbol) |sym| try w.writeString(21, sym);
     return w.buf.toOwnedSlice(gpa);
 }
 

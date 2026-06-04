@@ -14,6 +14,7 @@ pub const Role = enum {
     fetch_bubbles,
     cache_miss,
     branch_miss,
+    l3_miss_load,
 };
 
 pub const Event = struct { role: Role, config: u64, name: []const u8 };
@@ -160,6 +161,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 79, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -176,6 +178,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 85, .steppings = &[_]u8{5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -184,6 +187,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 86, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -205,6 +209,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 106, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -214,6 +219,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 108, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -223,6 +229,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 125, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -232,6 +239,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 126, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -241,6 +249,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 133, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -255,6 +264,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 141, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -264,6 +274,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 142, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -272,6 +283,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 143, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -281,6 +293,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 151, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -296,6 +309,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 154, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -311,6 +325,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 158, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -319,6 +334,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 165, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -327,6 +343,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 166, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -335,6 +352,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 167, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -344,6 +362,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 170, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -359,6 +378,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 172, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -374,6 +394,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 173, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -383,6 +404,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 174, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -392,6 +414,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 175, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -413,6 +436,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 182, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -434,6 +458,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 186, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -449,6 +474,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 189, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -463,6 +489,7 @@ pub const MODELS = [_]Model{
         .{ .role = .retired, .config = 0x2c2, .name = "UOPS_RETIRED.SLOTS" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 190, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -484,6 +511,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 197, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -498,6 +526,7 @@ pub const MODELS = [_]Model{
         .{ .role = .retired, .config = 0x2c2, .name = "UOPS_RETIRED.SLOTS" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 197, .steppings = &[_]u8{}, .core = "LowPower_Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -518,6 +547,7 @@ pub const MODELS = [_]Model{
         .{ .role = .retired, .config = 0x2c2, .name = "UOPS_RETIRED.SLOTS" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 204, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -532,6 +562,7 @@ pub const MODELS = [_]Model{
         .{ .role = .retired, .config = 0x2c2, .name = "UOPS_RETIRED.SLOTS" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 207, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -541,6 +572,7 @@ pub const MODELS = [_]Model{
         .{ .role = .fetch_bubbles, .config = 0x19c, .name = "IDQ_UOPS_NOT_DELIVERED.CORE" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 213, .steppings = &[_]u8{}, .core = "Atom", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },
@@ -555,6 +587,7 @@ pub const MODELS = [_]Model{
         .{ .role = .retired, .config = 0x2c2, .name = "UOPS_RETIRED.SLOTS" },
         .{ .role = .cache_miss, .config = 0x412e, .name = "LONGEST_LAT_CACHE.MISS" },
         .{ .role = .branch_miss, .config = 0xc5, .name = "BR_MISP_RETIRED.ALL_BRANCHES" },
+        .{ .role = .l3_miss_load, .config = 0x20d1, .name = "MEM_LOAD_RETIRED.L3_MISS" },
     } },
     .{ .family = 6, .model = 221, .steppings = &[_]u8{}, .core = "", .events = &.{
         .{ .role = .cycles, .config = 0x3c, .name = "CPU_CLK_UNHALTED.THREAD_P" },

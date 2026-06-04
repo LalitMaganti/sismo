@@ -22,11 +22,10 @@ import m from 'mithril';
 import type {Trace} from '../../../public/trace';
 import type {Engine} from '../../../trace_processor/engine';
 import {LONG_NULL} from '../../../trace_processor/query_result';
-import {Button, ButtonVariant} from '../../../widgets/button';
 import {goToSismoDomain} from '../page_common';
 import type {PrivilegedSet} from '../privileged_set';
 import {fmtPercent} from '../format';
-import {questionBlock} from './block';
+import {questionBlock, type DeeperAction} from './block';
 import {Meter, meterReadout} from '../../dev.perfetto.SismoWidgets/meter';
 
 // Wall-time split of the profiled threads. running = on-CPU; runnable = ready
@@ -75,10 +74,7 @@ export async function loadTriage(
   };
 }
 
-export function renderTriageBlock(
-  trace: Trace,
-  s: TriageSummary,
-): m.Children {
+export function renderTriageBlock(trace: Trace, s: TriageSummary): m.Children {
   const total = s.totalNs > 0 ? s.totalNs : 1;
   const runFrac = s.runningNs / total;
   const runnableFrac = s.runnableNs / total;
@@ -97,8 +93,28 @@ export function renderTriageBlock(
           'this is a CPU story.'
         : `${runPct}% running on the CPU, ${offPct}% waiting off it.`;
 
+  // Hand-off to the Latency domain when a meaningful share was off-CPU — in the
+  // header alongside the question, like every other block's "go deeper" link.
+  const deeper: DeeperAction[] =
+    offFrac >= 0.2
+      ? [
+          {
+            label: 'Open the Latency section',
+            icon: 'open_in_new',
+            onclick: () => goToSismoDomain(trace, 'latency'),
+          },
+        ]
+      : [];
+
   return questionBlock(
-    {question: 'Is this even a CPU problem?', answer},
+    {
+      question: 'Is this even a CPU problem?',
+      description:
+        'Whether your work was on-CPU or waiting (blocked, asleep, runnable) — ' +
+        'so you tune the real bottleneck.',
+      answer,
+      deeper,
+    },
     [
       // Colours are roles, not a good/bad scale; per-state durations live one
       // tab over in Latency.
@@ -131,16 +147,6 @@ export function renderTriageBlock(
           },
         ],
       }),
-      offFrac >= 0.2 &&
-        m(
-          '.pf-sismo-qblock__route',
-          m(Button, {
-            label: 'Open the Latency section',
-            icon: 'open_in_new',
-            variant: ButtonVariant.Minimal,
-            onclick: () => goToSismoDomain(trace, 'latency'),
-          }),
-        ),
     ],
   );
 }

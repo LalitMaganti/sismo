@@ -8,11 +8,14 @@
 //! that lands, this whole file and its caller in cmd_record.zig should be
 //! deleted in one go.
 //!
-//! Do not extend this file. Do not move it to perfetto_proto.zig. Do not
-//! grow a "metadata namespace" around it. The Sismo UI matches on the
-//! deliberately-ugly event name `sismo_temporary_privileged_pid_marker` —
-//! see third_party/overlays/perfetto/ui/src/plugins/dev.perfetto.Sismo/
-//! privileged_set.ts.
+//! Keep it narrow: the only metadata that rides this marker is the privileged
+//! pids plus the optional focus-preset name (a focus recording stamps which
+//! preset it used so the UI can gate the focus sub-domains). Do not move it to
+//! perfetto_proto.zig and do not grow a "metadata namespace" around it. The
+//! Sismo UI matches on the deliberately-ugly event name
+//! `sismo_temporary_privileged_pid_marker` — see
+//! third_party/overlays/perfetto/ui/src/plugins/dev.perfetto.Sismo/
+//! privileged_set.ts and focus/focus_meta.ts.
 
 const std = @import("std");
 const ProtoWriter = @import("proto_writer.zig").ProtoWriter;
@@ -40,6 +43,7 @@ const TD_FIELD_UUID: u32 = 1;
 const TD_FIELD_NAME: u32 = 2;
 
 const DA_FIELD_INT_VALUE: u32 = 4;
+const DA_FIELD_STRING_VALUE: u32 = 6;
 const DA_FIELD_NAME: u32 = 10;
 
 const MARKER_NAME: []const u8 = "sismo_temporary_privileged_pid_marker";
@@ -48,12 +52,16 @@ const MARKER_SEQUENCE_ID: u32 = 0xC0DECAFE;
 
 /// Append the privileged-pid marker (TrackDescriptor + TYPE_INSTANT TrackEvent)
 /// to an existing trace file. Caller passes the pids that `sismo record`
-/// targeted at record time. No-op if `pids` is empty.
+/// targeted at record time, the focus-preset name if this was a focus recording
+/// (else null), and whether that focus actually got PEBS precision. No-op if
+/// `pids` is empty.
 pub fn appendPrivilegedMarker(
     gpa: std.mem.Allocator,
     io: std.Io,
     output_path: []const u8,
     pids: []const i32,
+    focus_preset: ?[]const u8,
+    focus_precise: bool,
 ) !void {
     if (pids.len == 0) return;
 
@@ -67,7 +75,7 @@ pub fn appendPrivilegedMarker(
 
     const desc_bytes = try buildTrackDescriptorPacket(gpa, timestamp_ns);
     defer gpa.free(desc_bytes);
-    const event_bytes = try buildTrackEventPacket(gpa, pids, timestamp_ns);
+    const event_bytes = try buildTrackEventPacket(gpa, pids, focus_preset, focus_precise, timestamp_ns);
     defer gpa.free(event_bytes);
 
     var out = ProtoWriter.init(gpa);
@@ -101,6 +109,8 @@ fn buildTrackDescriptorPacket(gpa: std.mem.Allocator, timestamp_ns: u64) ![]u8 {
 fn buildTrackEventPacket(
     gpa: std.mem.Allocator,
     pids: []const i32,
+    focus_preset: ?[]const u8,
+    focus_precise: bool,
     timestamp_ns: u64,
 ) ![]u8 {
     var te = ProtoWriter.init(gpa);
@@ -115,6 +125,23 @@ fn buildTrackEventPacket(
         try ann.writeUint64(DA_FIELD_INT_VALUE, @intCast(pid));
         try te.writeMessage(TE_FIELD_DEBUG_ANNOTATIONS, ann.bytes());
     }
+    // Focus recordings stamp their preset name so the UI can gate the focus
+    // sub-domains (focus/focus_meta.ts reads `focus_preset`), plus whether PEBS
+    // precision was actually obtained — so the source viewer only drops its skid
+    // caveat when the trace is genuinely precise (`focus_precise`).
+    if (focus_preset) |preset| {
+        var ann = ProtoWriter.init(gpa);
+        defer ann.deinit();
+        try ann.writeString(DA_FIELD_NAME, "focus_preset");
+        try ann.writeString(DA_FIELD_STRING_VALUE, preset);
+        try te.writeMessage(TE_FIELD_DEBUG_ANNOTATIONS, ann.bytes());
+
+        var pann = ProtoWriter.init(gpa);
+        defer pann.deinit();
+        try pann.writeString(DA_FIELD_NAME, "focus_precise");
+        try pann.writeUint64(DA_FIELD_INT_VALUE, if (focus_precise) 1 else 0);
+        try te.writeMessage(TE_FIELD_DEBUG_ANNOTATIONS, pann.bytes());
+    }
 
     var tp = ProtoWriter.init(gpa);
     errdefer tp.deinit();
@@ -127,7 +154,7 @@ fn buildTrackEventPacket(
 
 test "buildTrackEventPacket carries the marker name and pid varints" {
     const gpa = std.testing.allocator;
-    const event_bytes = try buildTrackEventPacket(gpa, &.{ 1234, 5678 }, 0);
+    const event_bytes = try buildTrackEventPacket(gpa, &.{ 1234, 5678 }, null, false, 0);
     defer gpa.free(event_bytes);
 
     var occurrences: usize = 0;
@@ -149,4 +176,17 @@ test "buildTrackEventPacket carries the marker name and pid varints" {
     }
     try std.testing.expect(has_1234);
     try std.testing.expect(has_5678);
+}
+
+test "buildTrackEventPacket stamps the focus preset and precision when present" {
+    const gpa = std.testing.allocator;
+    const without = try buildTrackEventPacket(gpa, &.{42}, null, false, 0);
+    defer gpa.free(without);
+    try std.testing.expect(std.mem.indexOf(u8, without, "focus_preset") == null);
+
+    const with = try buildTrackEventPacket(gpa, &.{42}, "stalls", true, 0);
+    defer gpa.free(with);
+    try std.testing.expect(std.mem.indexOf(u8, with, "focus_preset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with, "stalls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with, "focus_precise") != null);
 }

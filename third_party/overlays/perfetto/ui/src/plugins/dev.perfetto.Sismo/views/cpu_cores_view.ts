@@ -458,7 +458,11 @@ function renderCoreTable(
     {className: 'pf-sismo-page__table-card'},
     m(Grid, {
       columns: [
-        {key: 'core', header: m(GridHeaderCell, 'Core')},
+        // The cell is just a short "CPU N" link, so auto-sizing floors it to the
+        // grid minimum — but a chevron is added once the per-core thread slot
+        // resolves, after the column width has already locked, and squeezes the
+        // link. Floor the width to fit link + chevron up to "CPU NNN".
+        {key: 'core', header: m(GridHeaderCell, 'Core'), minWidthPx: 110},
         {key: 'busy', header: m(GridHeaderCell, 'Busy')},
         {key: 'pct', header: m(GridHeaderCell, '% busy')},
         {key: 'bar', header: m(GridHeaderCell, '')},

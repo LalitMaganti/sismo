@@ -39,6 +39,9 @@ const ROW_H = 20;
 // Horizontal step between nested arrow lanes, and the rail's right-edge padding.
 const LANE_STEP = 9;
 const RAIL_PAD = 7;
+// Cap the per-line data-region rows shown in the "Data this code touches"
+// section — the hottest lines carry the signal; the tail is noise.
+const MAX_DATA_LINES = 8;
 
 interface Attrs {
   readonly data: SourceAsm;
@@ -69,7 +72,70 @@ export class SourceAsmPanel implements m.ClassComponent<Attrs> {
       '.pf-sismo-detail__pane',
       this.renderToolbar(d),
       m(Callout, {icon: 'help_outline'}, captionFor(d)),
+      this.renderDataTouched(d),
       this.renderListing(d),
+    );
+  }
+
+  // [cache focus] What data this function's misses touched — the data-side of
+  // the drill: you came down code → line, here is the memory each line hit. Only
+  // shown when the trace carried data addresses (a cache focus). Counts are
+  // misses, not time, and region-level (heap vs an object vs a stack), not the
+  // exact variable — the honest first rung.
+  private renderDataTouched(d: SourceAsm): m.Children {
+    if (d.dataTotal <= 0 || d.functionData.length === 0) return null;
+    const denom = d.dataTotal;
+    const chip = (r: {symbol: string; count: number}) =>
+      m(
+        'span.pf-sismo-srcasm__dataregion',
+        m('span.pf-sismo-srcasm__dataregion-name', r.symbol),
+        m(
+          'span.pf-sismo-srcasm__dataregion-val',
+          `${fmtCount(r.count)} · ${fmtPercent(r.count / denom)}`,
+        ),
+      );
+
+    // Lines that touched data, hottest first, capped — the per-line drill.
+    const lines = [...d.dataByLine.entries()]
+      .map(([line, regions]) => ({
+        line,
+        regions,
+        total: regions.reduce((a, r) => a + r.count, 0),
+      }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, MAX_DATA_LINES);
+
+    return m(
+      '.pf-sismo-srcasm__data',
+      m(
+        '.pf-sismo-srcasm__data-head',
+        m('span.pf-sismo-srcasm__data-title', 'Data this code touches'),
+        m(
+          'span.pf-sismo-srcasm__data-sub',
+          'memory regions the sampled misses hit — region-level, counts are ' +
+            'misses not time',
+        ),
+      ),
+      m('.pf-sismo-srcasm__dataregions', d.functionData.map(chip)),
+      lines.length > 0 &&
+        m(
+          '.pf-sismo-srcasm__datalines',
+          lines.map((l) =>
+            m(
+              '.pf-sismo-srcasm__dataline',
+              m(
+                'span.pf-sismo-srcasm__dataline-line',
+                l.line !== null ? `line ${l.line}` : '—',
+              ),
+              m(
+                'span.pf-sismo-srcasm__dataline-regions',
+                l.regions
+                  .map((r) => `${r.symbol} (${fmtCount(r.count)})`)
+                  .join(', '),
+              ),
+            ),
+          ),
+        ),
     );
   }
 
@@ -337,11 +403,16 @@ function heatBar(samples: number, max: number): m.Children {
 }
 
 function captionFor(d: SourceAsm): string {
-  const base =
-    'Counts are self time — timer samples whose instruction pointer was caught ' +
-    'in this function. Without PEBS/LBR the IP can skid a few instructions past ' +
-    'the one that actually stalled, so read a hot line as a neighbourhood, not ' +
-    'an exact culprit.';
+  // On a PEBS-precise focus trace the IP has 0 skid, so the hedge is gone and a
+  // hot line is the exact instruction. A survey (timer) trace keeps the caveat.
+  const base = d.precise
+    ? 'Counts are self time, PEBS-precise — the sampled instruction pointer has ' +
+      'zero skid, so a hot line is the exact instruction that stalled, not a ' +
+      'neighbourhood.'
+    : 'Counts are self time — timer samples whose instruction pointer was caught ' +
+      'in this function. Without PEBS/LBR the IP can skid a few instructions past ' +
+      'the one that actually stalled, so read a hot line as a neighbourhood, not ' +
+      'an exact culprit.';
   if (!d.hasSource && d.hasDisasm) {
     return (
       'Source text was not bundled for this binary — showing the disassembly ' +

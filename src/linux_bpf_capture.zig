@@ -16,11 +16,13 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const perfetto_proto = @import("perfetto_proto.zig");
 const proc_maps = @import("linux_proc_maps.zig");
+const data_regions = @import("data_regions.zig");
 const ProtoWriter = @import("proto_writer.zig").ProtoWriter;
 // PMU event encodings per Intel CPU model, generated from Intel's perfmon DB by
 // python/tools/gen_pmu_events.py. On x86 we resolve the active counters from
 // this at runtime (by CPUID) instead of hardcoding raw configs.
 const pmu = @import("gen/pmu_events.zig");
+const focus_presets = @import("focus_presets.zig");
 
 const c = @cImport({
     @cInclude("bpf/libbpf.h");
@@ -100,6 +102,17 @@ fn roleName(role: pmu.Role) []const u8 {
         .fetch_bubbles => "topdown-fetch-bubbles",
         .cache_miss => "cache-misses",
         .branch_miss => "branch-misses",
+        .l3_miss_load => "mem-load-l3-miss",
+    };
+}
+
+// Roles that exist only to be a focus sampler's *leader* event, never a survey
+// follower counter. countersFromTable skips them so adding one to the PMU table
+// doesn't silently park an extra counter on every (non-focus) recording.
+fn isLeaderOnlyRole(role: pmu.Role) bool {
+    return switch (role) {
+        .l3_miss_load => true,
+        else => false,
     };
 }
 
@@ -230,10 +243,10 @@ fn selectCounters(buf: *[c.SISMO_MAX_COUNTERS]Counter) []const Counter {
     return COUNTERS;
 }
 
-// Looks up this CPU model in the generated table and builds the counter list
-// (role → stable name + group + raw config). Prefers the non-Atom (P-core /
-// non-hybrid) row when a model has both. Null if the model isn't in the table.
-fn countersFromTable(buf: *[c.SISMO_MAX_COUNTERS]Counter) ?[]const Counter {
+// This host's perfmon-table row (matched by CPUID), or null if the model isn't
+// in the table. Prefers the non-Atom (P-core / non-hybrid) row when a model has
+// both — same choice the counter and focus-leader resolvers want.
+fn matchModel() ?*const pmu.Model {
     const id = readCpuId() orelse return null;
     var best: ?*const pmu.Model = null;
     for (&pmu.MODELS) |*m| {
@@ -243,7 +256,24 @@ fn countersFromTable(buf: *[c.SISMO_MAX_COUNTERS]Counter) ?[]const Counter {
         best = m;
         if (!std.mem.eql(u8, m.core, "Atom")) break; // prefer P-core / non-hybrid
     }
-    const m = best orelse return null;
+    return best;
+}
+
+// The raw PMU config for a role on this host (the focus sampler's leader event),
+// or null if the model isn't in the table or doesn't carry the role.
+fn configForRole(role: pmu.Role) ?u64 {
+    const m = matchModel() orelse return null;
+    for (m.events) |ev| {
+        if (ev.role == role) return ev.config;
+    }
+    return null;
+}
+
+// Looks up this CPU model in the generated table and builds the counter list
+// (role → stable name + group + raw config). Prefers the non-Atom (P-core /
+// non-hybrid) row when a model has both. Null if the model isn't in the table.
+fn countersFromTable(buf: *[c.SISMO_MAX_COUNTERS]Counter) ?[]const Counter {
+    const m = matchModel() orelse return null;
     // Trust the PMU's own enumeration: if the slots fixed counter isn't present,
     // drop the whole slot-based Top-Down set (matching perf), keeping only the
     // counters the hardware actually advertises.
@@ -251,6 +281,7 @@ fn countersFromTable(buf: *[c.SISMO_MAX_COUNTERS]Counter) ?[]const Counter {
     var n: usize = 0;
     for (m.events) |ev| {
         if (n >= buf.len) break;
+        if (isLeaderOnlyRole(ev.role)) continue;
         if (isTopdownRole(ev.role) and !td) continue;
         buf[n] = .{
             .group = roleGroup(ev.role),
@@ -269,6 +300,11 @@ pub const Stats = struct {
     samples: u64,
     threads: u32,
     busiest_cycles: u64,
+    /// Samples whose data address was resolved to a memory region and emitted as
+    /// the innermost (data) frame of the callstack — the cache focus's data-side
+    /// attribution. 0 for the survey and for focus traces that captured no data
+    /// address (e.g. PEBS fell back below precise).
+    data_frames: u64 = 0,
 };
 
 /// Frame interning key: a module-relative pc within a given mapping.
@@ -358,6 +394,28 @@ pub const Capture = struct {
     active_slots: [c.SISMO_MAX_COUNTERS]u8,
     n_active: usize,
 
+    /// The focus preset this capture is recording (null = survey). The cache
+    /// focus resolves each sample's data_addr to its memory region.
+    focus: ?focus_presets.FocusPreset,
+
+    /// Cache-focus data-side attribution. `data_regions` is the target's address
+    /// space (all mappings — heap/stack/objects/anon — parsed lazily on the
+    /// worker thread). Each cache sample's data address is resolved against it
+    /// and emitted as the innermost ([sismo:data]) frame of the callstack, so
+    /// the miss histogram bottoms out in the data a line touched. `data_frames`
+    /// counts how many samples got such a frame (the Stats tally).
+    data_regions: ?data_regions.Regions,
+    /// CLOCK_MONOTONIC ns of the last data-regions parse; rate-limits the
+    /// refresh-on-miss so a growing address space stays resolvable (0 = never).
+    last_data_parse_ns: u64,
+    data_frames: u64,
+
+    /// The precise_ip (PEBS skid constraint) the sampler actually opened with,
+    /// after falling back if the host couldn't honor the requested level. A
+    /// focus trace is only honestly "PEBS-precise" when this reached 2; the UI
+    /// reads it from the marker so it never over-claims precision.
+    sampler_precise_ip: u2,
+
     /// Data source slot from `sismo_ds_register`. Emission is gated on the
     /// session activating this source (`active`).
     ds_slot: u32,
@@ -365,8 +423,21 @@ pub const Capture = struct {
     /// Set on each start so the worker re-emits PerfSampleDefaults at the head
     /// of the (incremental-state-cleared) sequence before any sample.
     need_defaults: std.atomic.Value(bool),
+    /// Pending async flush/stop completion handles (a C++ std::function* as
+    /// usize; 0 = none). onFlush/onStop run on the producer task-runner thread
+    /// but ring_buffer__consume must only be touched by the worker — so they
+    /// just hand the handle here and the worker drains the ring to empty, emits
+    /// the tail, and only then acks. Without acking the stop, the service waits
+    /// out its full stop-ack timeout (~5s) on every recording.
+    flush_req: std.atomic.Value(usize),
+    stop_req: std.atomic.Value(usize),
 
-    pub fn init(gpa: std.mem.Allocator, target_pid: u32) !*Capture {
+    pub fn init(
+        gpa: std.mem.Allocator,
+        target_pid: u32,
+        focus: ?focus_presets.FocusPreset,
+        density: ?f64,
+    ) !*Capture {
         const self = try gpa.create(Capture);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -382,6 +453,10 @@ pub const Capture = struct {
             .target_pid = target_pid,
             .maps = null,
             .maps_tried = false,
+            .focus = focus,
+            .data_regions = null,
+            .last_data_parse_ns = 0,
+            .data_frames = 0,
             .ksym_names = .empty,
             .ksym_arena = std.heap.ArenaAllocator.init(gpa),
             .last_maps_ns = 0,
@@ -390,9 +465,12 @@ pub const Capture = struct {
             .counters_buf = undefined,
             .active_slots = undefined,
             .n_active = 0,
+            .sampler_precise_ip = 0,
             .ds_slot = std.math.maxInt(u32),
             .active = std.atomic.Value(bool).init(false),
             .need_defaults = std.atomic.Value(bool).init(false),
+            .flush_req = std.atomic.Value(usize).init(0),
+            .stop_req = std.atomic.Value(usize).init(0),
         };
         // Resolve the candidate counters now that `self` is allocated (the
         // table-derived list is backed by self.counters_buf).
@@ -470,17 +548,40 @@ pub const Capture = struct {
 
         try self.attach("on_sched_switch");
 
-        // Per-CPU cycles-PMU overflow → on_tick (the sampler + counter flush).
+        // Per-CPU sampler overflow → on_tick (the sampler + counter flush). The
+        // leader is the survey cycles event, or the focus preset's event+PEBS. A
+        // null here means an event-timebase focus leader isn't available on this
+        // CPU — honest no-op rather than secretly sampling cycles.
+        const sampler_cfg = resolveSampler(focus, density);
+        if (sampler_cfg == null) {
+            if (focus) |p| std.debug.print(
+                "sismo record: --focus {s}: leader event unavailable on this CPU " ++
+                    "(model not in the PMU table); no CPU samples recorded\n",
+                .{focus_presets.presetName(p)},
+            );
+        }
         const tick_prog = c.bpf_object__find_program_by_name(obj, "on_tick") orelse return error.NoProg;
         cpu = 0;
-        while (cpu < ncpu) : (cpu += 1) {
-            const tfd = openSampler(cpu) orelse continue;
-            const link = c.bpf_program__attach_perf_event(tick_prog, tfd);
-            if (link) |l| {
-                try self.links.append(gpa, l);
-                try self.perf_fds.append(gpa, tfd);
-            } else {
-                _ = std.c.close(tfd);
+        var any_sampler = false;
+        while (sampler_cfg != null and cpu < ncpu) : (cpu += 1) {
+            const h = openSampler(cpu, sampler_cfg.?, tick_prog) orelse continue;
+            try self.links.append(gpa, h.link);
+            try self.perf_fds.append(gpa, h.fd);
+            if (!any_sampler or h.precise_ip < self.sampler_precise_ip) {
+                self.sampler_precise_ip = h.precise_ip;
+            }
+            any_sampler = true;
+        }
+        // A focus preset asks for PEBS; on a host without it the sampler falls
+        // back to skiddy sampling. Warn so the downgrade isn't silent — the trace
+        // still records, but the UI keeps the skid caveat (sampler_precise_ip<2).
+        if (sampler_cfg) |scfg| {
+            if (focus != null and any_sampler and self.sampler_precise_ip < scfg.precise_ip) {
+                std.debug.print(
+                    "sismo record: focus sampler could not get PEBS (precise_ip {d} < {d}); " ++
+                        "samples will skid — this host may not support PEBS\n",
+                    .{ self.sampler_precise_ip, scfg.precise_ip },
+                );
             }
         }
 
@@ -508,6 +609,7 @@ pub const Capture = struct {
             .samples = self.samples,
             .threads = self.acc.count(),
             .busiest_cycles = busiest,
+            .data_frames = self.data_frames,
         };
 
         c.ring_buffer__free(self.rb);
@@ -521,6 +623,7 @@ pub const Capture = struct {
         self.ksym_names.deinit(self.gpa);
         self.ksym_arena.deinit();
         if (self.maps) |*m| m.deinit();
+        if (self.data_regions) |*r| r.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
         return stats;
@@ -634,6 +737,17 @@ pub const Capture = struct {
                 nf += 1;
             }
         }
+        // Cache focus: carry the sampled access's data address and the memory
+        // region it resolved to, so the UI can ask "for the misses at this
+        // function/line, what data did they touch?" — code-correlated because
+        // it rides the same sample as the callstack.
+        var data_address: u64 = 0;
+        var data_symbol: ?[]const u8 = null;
+        if (self.focus == .cache and rec.data_addr != 0) {
+            data_address = rec.data_addr;
+            data_symbol = self.dataRegionLabel(rec.data_addr, hdr.ts);
+            self.data_frames += 1;
+        }
         const ps = perfetto_proto.encodePerfSample(gpa, .{
             .cpu = hdr.cpu,
             .pid = hdr.pid,
@@ -641,6 +755,8 @@ pub const Capture = struct {
             .timebase_count = timebase_count,
             .follower_counts = follower_buf[0..nf],
             .callstack_iid = cs_iid,
+            .data_address = data_address,
+            .data_symbol = data_symbol,
         }) catch return;
         defer gpa.free(ps);
 
@@ -653,6 +769,46 @@ pub const Capture = struct {
         tp.writeMessage(perfetto_proto.TP_FIELD_PERF_SAMPLE, ps) catch return;
         const body = tp.bytes();
         perfetto.sismo_ds_emit(self.ds_slot, body.ptr, body.len);
+    }
+
+    // x86-64 user space tops out at the 47-bit canonical boundary; anything above
+    // is a kernel (or non-canonical) address. The data linear address of a miss
+    // taken in kernel mode — copy_to/from_user during read(), page-fault handling
+    // — lands there and is never in /proc/<pid>/maps, so don't waste a reparse on
+    // it (and don't mislabel it "[unmapped]", which means "user addr we missed").
+    const USER_ADDR_MAX: u64 = 0x0000_7fff_ffff_ffff;
+
+    /// Resolve a sampled access's data address to the label of the memory region
+    /// it landed in (heap/stack/object/anon), "[kernel]" for a kernel-space
+    /// address, or "[unmapped]" for a user address in no known mapping. The
+    /// region snapshot is refreshed on a miss (rate-limited), because a workload
+    /// grows its heap (brk) and mmaps fresh arenas as it runs — a single early
+    /// snapshot goes stale fast (trace_processor parsing leaves ~88% unresolved
+    /// without this). `now_ns` is the sample's CLOCK_MONOTONIC ts. The returned
+    /// slice borrows from data_regions.arena; copy it to keep it (the caller
+    /// interns it into a frame name, which dupes).
+    fn dataRegionLabel(self: *Capture, addr: u64, now_ns: u64) []const u8 {
+        if (addr > USER_ADDR_MAX) return "[kernel]";
+        if (self.data_regions == null) {
+            self.data_regions = data_regions.parse(self.gpa, self.target_pid) catch {
+                self.data_regions = null;
+                return "[unmapped]";
+            };
+            self.last_data_parse_ns = now_ns;
+        }
+        if (self.data_regions.?.find(addr)) |r| return r.label;
+        // Miss: the layout has likely grown since the last snapshot. Refresh, but
+        // no more than ~10x/s so a storm of unresolvable addresses (a transient
+        // mapping, or the tail after the target exits) can't thrash /proc.
+        if (now_ns -% self.last_data_parse_ns > 100 * std.time.ns_per_ms) {
+            self.last_data_parse_ns = now_ns;
+            if (data_regions.parse(self.gpa, self.target_pid)) |fresh| {
+                self.data_regions.?.deinit();
+                self.data_regions = fresh;
+                if (self.data_regions.?.find(addr)) |r| return r.label;
+            } else |_| {}
+        }
+        return "[unmapped]";
     }
 
     /// Parse the target's address space on first use (the workload has mapped
@@ -887,13 +1043,22 @@ pub const Capture = struct {
         self.active.store(true, .release);
     }
 
-    fn onStop(user_arg: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    // Hand the async stop/flush completion to the worker so it can drain the
+    // ring (emitting the tail) before acking — and, for stop, only flip `active`
+    // off AFTER that final drain, since `handle` drops records once inactive.
+    // A null handle (no async completion expected) means nothing to ack.
+    fn onStop(user_arg: ?*anyopaque, stopper: ?*anyopaque) callconv(.c) void {
         const self: *Capture = @ptrCast(@alignCast(user_arg.?));
-        self.active.store(false, .release);
+        if (stopper) |s| {
+            self.stop_req.store(@intFromPtr(s), .release);
+        } else {
+            self.active.store(false, .release);
+        }
     }
 
-    fn onFlush(_: ?*anyopaque, flusher: ?*anyopaque) callconv(.c) void {
-        if (flusher) |f| perfetto.sismo_flush_done(f);
+    fn onFlush(user_arg: ?*anyopaque, flusher: ?*anyopaque) callconv(.c) void {
+        const self: *Capture = @ptrCast(@alignCast(user_arg.?));
+        if (flusher) |f| self.flush_req.store(@intFromPtr(f), .release);
     }
 };
 
@@ -907,10 +1072,30 @@ fn onEvent(ctx: ?*anyopaque, data: ?*anyopaque, size: usize) callconv(.c) c_int 
 fn workerEntry(self: *Capture) void {
     while (!self.exit_requested.load(.acquire)) {
         _ = c.ring_buffer__consume(self.rb);
+        serviceAcks(self);
         const ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
         _ = std.c.nanosleep(&ts, null);
     }
     _ = c.ring_buffer__consume(self.rb);
+    // Defensive: if shutdown raced ahead of an unacked flush/stop, ack it now so
+    // the service never waits out its timeout.
+    serviceAcks(self);
+}
+
+// Drain the ring once more and complete any pending async flush/stop. Runs only
+// on the worker thread, so ring_buffer__consume is never touched concurrently.
+fn serviceAcks(self: *Capture) void {
+    const fh = self.flush_req.swap(0, .acq_rel);
+    if (fh != 0) {
+        _ = c.ring_buffer__consume(self.rb); // emit everything up to the flush
+        perfetto.sismo_flush_done(@ptrFromInt(fh));
+    }
+    const sh = self.stop_req.swap(0, .acq_rel);
+    if (sh != 0) {
+        _ = c.ring_buffer__consume(self.rb); // final drain while still active
+        self.active.store(false, .release); // now stop emitting
+        perfetto.sismo_stop_done(@ptrFromInt(sh));
+    }
 }
 
 // Open one counting event (pid=-1, the given cpu) as a member of a perf group:
@@ -937,18 +1122,111 @@ fn openCounter(cpu: u32, src: Src, group_fd: i32) ?i32 {
     return if (s < 0) null else @intCast(s);
 }
 
-// Sample on the cycles PMU (CPU_CLK_UNHALTED) at a fixed period rather than a
-// wall-clock timer, so every sample is an equal slice of cycles — the same
-// denominator the TMA/IPC/MPKI attribution uses. A prime period avoids aliasing
-// against code that runs on a regular cadence. ~1M cycles lands near 1-3 kHz
-// depending on core clock.
-fn openSampler(cpu: u32) ?i32 {
-    var attr = std.mem.zeroes(linux.perf_event_attr);
-    attr.type = .HARDWARE;
-    attr.size = @sizeOf(linux.perf_event_attr);
-    attr.config = @intFromEnum(linux.PERF.COUNT.HW.CPU_CYCLES);
-    attr.sample_period_or_freq = 1_000_003; // cycles (freq mode left off)
-    const rc = linux.perf_event_open(&attr, -1, @intCast(cpu), -1, 0);
-    const s: isize = @bitCast(rc);
-    return if (s < 0) null else @intCast(s);
+// The resolved sampler leader: what to overflow on, how often, and whether to
+// ask for PEBS precision. The survey samples on the cycles PMU at a fixed period
+// so every sample is an equal slice of cycles — the same denominator the
+// TMA/IPC/MPKI attribution uses. A focus trace overrides this to sample *on the
+// event of interest* with PEBS, so the histogram maps the event itself.
+const SamplerCfg = struct {
+    typ: linux.PERF.TYPE,
+    config: u64,
+    period: u64,
+    precise_ip: u2,
+    /// Request PERF_SAMPLE_ADDR so each overflow carries the access's data
+    /// linear address (the cache focus's data-side attribution).
+    sample_data_addr: bool = false,
+};
+
+// Divide the preset's tuned period by the density multiplier (null/1.0 leaves it
+// untouched), with a floor of 1 since the kernel rejects a 0 period. Note a very
+// high density approaches one sample per event, where the PEBS assist starts to
+// perturb the workload it measures — that's on the caller, not clamped here.
+fn scalePeriod(default_period: u64, density: ?f64) u64 {
+    const d = density orelse return default_period;
+    const scaled = @as(f64, @floatFromInt(default_period)) / d;
+    if (scaled < 1) return 1;
+    return @intFromFloat(scaled);
+}
+
+// Resolve the sampler leader from the optional focus preset. Survey (focus null)
+// keeps the historical cycles/~1M-period/no-PEBS leader. A focus preset supplies
+// the timebase event, period and precision; an event-timebase leader is resolved
+// from the perfmon table. Returns null when an event leader can't be resolved on
+// this CPU — we must NOT silently fall back to cycles, since that would change
+// *what is measured* (a cache focus that secretly sampled cycles would be a lie).
+//
+// `density` scales how many samples a focus yields relative to the preset's tuned
+// default (1.0 = default): the period is divided by it, so 8 means ~8x the
+// samples. It's intentionally preset-agnostic — it never touches the survey
+// leader, only the focus period.
+fn resolveSampler(focus: ?focus_presets.FocusPreset, density: ?f64) ?SamplerCfg {
+    const cycles_config = @intFromEnum(linux.PERF.COUNT.HW.CPU_CYCLES);
+    const p = focus orelse return .{
+        .typ = .HARDWARE,
+        .config = cycles_config,
+        .period = 1_000_003,
+        .precise_ip = 0,
+    };
+    const s = focus_presets.spec(p);
+    const period = scalePeriod(s.period, density);
+    switch (s.leader) {
+        .cycles => return .{
+            .typ = .HARDWARE,
+            .config = cycles_config,
+            .period = period,
+            .precise_ip = s.precise_ip,
+        },
+        .role => |role| {
+            const cfg = configForRole(role) orelse return null;
+            return .{
+                .typ = .RAW,
+                .config = cfg,
+                .period = period,
+                .precise_ip = s.precise_ip,
+                .sample_data_addr = s.sample_data_addr,
+            };
+        },
+    }
+}
+
+const SamplerHandle = struct { fd: i32, link: *c.struct_bpf_link, precise_ip: u2 };
+
+// Open the per-CPU sampler perf event AND attach on_tick to it (the sampler +
+// counter flush). `precise_ip = 2` requests PEBS (0-skid IP); the kernel applies
+// the PEBS fixup before the BPF overflow handler runs, so the captured stack
+// lands on the precise instruction. Both the open AND the BPF attach can reject
+// a precise event (the host lacks PEBS, or the kernel refuses a get_stack BPF
+// prog on a precise event), so try the requested precise_ip and fall back
+// through lower levels as one unit rather than dropping the sampler — the
+// returned `precise_ip` reports what actually worked.
+fn openSampler(cpu: u32, cfg: SamplerCfg, tick_prog: *c.struct_bpf_program) ?SamplerHandle {
+    var want: u2 = cfg.precise_ip;
+    while (true) {
+        var attr = std.mem.zeroes(linux.perf_event_attr);
+        attr.type = cfg.typ;
+        attr.size = @sizeOf(linux.perf_event_attr);
+        attr.config = cfg.config;
+        attr.sample_period_or_freq = cfg.period; // freq mode left off
+        attr.flags.precise_ip = want;
+        // The kernel rejects attaching a BPF program that calls bpf_get_stack
+        // (on_tick does) to a PEBS event unless the event carries a callchain —
+        // without this the attach fails with -EPROTO. bpf_get_stack then reads
+        // the callchain from perf_sample_data (the safe path on precise events).
+        if (want > 0) attr.sample_type |= linux.PERF.SAMPLE.CALLCHAIN;
+        // Data_LA only resolves on a precise event; once fallback drops precise
+        // to 0 the kernel can't supply the address, so stop asking for it (the
+        // event would otherwise still open but ctx->addr would be meaningless).
+        if (cfg.sample_data_addr and want > 0) attr.sample_type |= linux.PERF.SAMPLE.ADDR;
+        const rc = linux.perf_event_open(&attr, -1, @intCast(cpu), -1, 0);
+        const s: isize = @bitCast(rc);
+        if (s >= 0) {
+            const fd: i32 = @intCast(s);
+            if (c.bpf_program__attach_perf_event(tick_prog, fd)) |link| {
+                return .{ .fd = fd, .link = link, .precise_ip = want };
+            }
+            _ = std.c.close(fd); // attach refused this event; retry lower
+        }
+        if (want == 0) return null;
+        want -= 1;
+    }
 }

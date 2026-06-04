@@ -34,6 +34,7 @@ import {
   type FunctionMicroarch,
   type SourceAsm,
   type TmaModel,
+  type UarchSeriesPoint,
 } from '../cpu_data';
 import type {PrivilegedSet} from '../privileged_set';
 import {
@@ -48,6 +49,11 @@ import {segmentedSwitcher, type Segment} from './segmented';
 import {renderButterfly} from './butterfly';
 import {SourceAsmPanel} from './source_view';
 import type {EntityKind} from './session';
+import {
+  loadFocusSuggestion,
+  renderCacheFocusSuggestion,
+  type FocusSuggestion,
+} from './focus_cta';
 
 type FnSub = 'summary' | 'butterfly' | 'source' | 'uarch';
 const FN_SEGMENTS: ReadonlyArray<Segment<FnSub>> = [
@@ -78,12 +84,16 @@ export class CpuDetailTab implements m.ClassComponent<CpuDetailAttrs> {
   private readonly uarchSlot = new QuerySlot<FunctionMicroarch>(this.queue);
   private readonly bfSlot = new QuerySlot<Butterfly>(this.queue);
   private readonly srcSlot = new QuerySlot<SourceAsm>(this.queue);
+  // Density-sized cache-focus rerun suggestion (workload-scoped, so independent
+  // of which function is open); shown in the Microarchitecture pane.
+  private readonly focusSlot = new QuerySlot<FocusSuggestion>(this.queue);
 
   onremove(): void {
     this.fnSlot.dispose();
     this.uarchSlot.dispose();
     this.bfSlot.dispose();
     this.srcSlot.dispose();
+    this.focusSlot.dispose();
   }
 
   view({attrs}: m.CVnode<CpuDetailAttrs>): m.Children {
@@ -236,7 +246,10 @@ export class CpuDetailTab implements m.ClassComponent<CpuDetailAttrs> {
       ua?.self != null &&
         ua.baseline != null &&
         ua.self.tier !== 'none' &&
-        m('.pf-sismo-detail__pane-inset', this.renderTopdown(ua.self, ua.baseline)),
+        m(
+          '.pf-sismo-detail__pane-inset',
+          this.renderTopdown(ua.self, ua.baseline),
+        ),
       m(
         '.pf-sismo-page__question-footer',
         actionLink(
@@ -315,15 +328,81 @@ export class CpuDetailTab implements m.ClassComponent<CpuDetailAttrs> {
         ),
       );
     }
-    return pane(this.renderEfficiencyBody(ua.self, ua.baseline));
+    return m(
+      '.pf-sismo-uarch',
+      this.renderEfficiencyBody(attrs, ua.self, ua.baseline, ua.series),
+    );
   }
 
-  private renderEfficiencyBody(self: TmaModel, base: TmaModel): m.Children {
+  // Best-effort: the cache-focus suggestion loads on its own slot; render it once
+  // it lands, skip it silently while in flight or if it fails.
+  private focusSuggestion(attrs: CpuDetailAttrs): FocusSuggestion | undefined {
+    try {
+      return this.focusSlot.use({
+        key: {upids: [...attrs.priv.upids]},
+        queryFn: () => loadFocusSuggestion(attrs.trace.engine, attrs.priv),
+      }).data;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // One card per microarchitecture category — IPC, cache, branch, Top-Down —
+  // each pairing the aggregate (this-fn vs workload) with that metric's rate
+  // over the trace, so a category can be read on its own.
+  private renderEfficiencyBody(
+    attrs: CpuDetailAttrs,
+    self: TmaModel,
+    base: TmaModel,
+    series: ReadonlyArray<UarchSeriesPoint>,
+  ): m.Children {
+    // The cache-focus rerun only sharpens the cache figure (PEBS pins each
+    // sampled miss to its source line), so it lives on the Cache-misses card,
+    // not the whole pane where it read as applying to IPC, branches and slots.
+    const focus = this.focusSuggestion(attrs);
+    const cacheFocus =
+      focus !== undefined ? renderCacheFocusSuggestion(focus) : undefined;
+    return [
+      this.headlineCard(self, base),
+      this.metricCard({
+        title: 'Instructions per cycle',
+        sub: 'higher is faster',
+        self: self.ipc,
+        base: base.ipc,
+        fmt: (n) => fmtIpc(n),
+        trend: series.map((p) => p.ipc),
+      }),
+      this.metricCard({
+        title: 'Cache misses',
+        sub: 'per 1,000 instructions · fewer is better',
+        self: self.cacheMpki,
+        base: base.cacheMpki,
+        fmt: (n) => n.toFixed(1),
+        trend: series.map((p) => p.cacheMpki),
+        extra: cacheFocus,
+      }),
+      this.metricCard({
+        title: 'Branch misses',
+        sub: 'per 1,000 instructions · fewer is better',
+        self: self.branchMpki,
+        base: base.branchMpki,
+        fmt: (n) => n.toFixed(2),
+        trend: series.map((p) => p.branchMpki),
+      }),
+      this.topdownCard(self, base),
+    ];
+  }
+
+  // The cost headline: cycles attributed here and the share of the profiled set,
+  // with the leaf-attribution caveat that governs every figure below it.
+  private headlineCard(self: TmaModel, base: TmaModel): m.Children {
     const cycShare =
       self.cycles !== null && base.cycles !== null && base.cycles > 0
         ? self.cycles / base.cycles
         : null;
-    return [
+    return m(
+      '.pf-sismo-uarch__card',
+      m('.pf-sismo-uarch__title', 'Cost in cycles'),
       self.cycles !== null &&
         m(
           '.pf-sismo-eff__headline',
@@ -341,74 +420,82 @@ export class CpuDetailTab implements m.ClassComponent<CpuDetailAttrs> {
           'them as the shape of execution and the size of the gap, not exact ' +
           'per-instruction values. “Workload” is the whole profiled set.',
       ),
-      this.renderVitals(self, base),
-      this.renderTopdown(self, base),
-      this.renderPointer(self, base),
-    ];
+    );
   }
 
-  private renderVitals(self: TmaModel, base: TmaModel): m.Children {
-    const vitals: m.Children[] = [];
-    const add = (
-      label: string,
-      sub: string,
-      s: number | null,
-      b: number | null,
-      fmt: (n: number) => string,
-    ) => {
-      if (s === null && b === null) return;
-      const max = Math.max(s ?? 0, b ?? 0, 1e-9);
-      vitals.push(
+  // One metric category card: title, the aggregate bar (this-fn value scaled
+  // against the larger of fn/workload, with a tick at the workload's value), and
+  // the rate over the trace. `extra` is category-scoped trailing content (the
+  // cache card's focus rerun). Skipped when neither fn nor workload has it.
+  private metricCard(opts: {
+    title: string;
+    sub: string;
+    self: number | null;
+    base: number | null;
+    fmt: (n: number) => string;
+    trend: ReadonlyArray<number | null>;
+    extra?: m.Children;
+  }): m.Children {
+    if (opts.self === null && opts.base === null) return undefined;
+    const hasTrend = opts.trend.some((v) => v !== null);
+    return m(
+      '.pf-sismo-uarch__card',
+      m(
+        '.pf-sismo-uarch__head',
+        m('span.pf-sismo-uarch__title', opts.title),
+        m('span.pf-sismo-uarch__sub', opts.sub),
+      ),
+      this.vitalBar(opts.self, opts.base, opts.fmt),
+      hasTrend &&
         m(
-          '.pf-sismo-vital',
-          m(
-            '.pf-sismo-vital__head',
-            m('span.pf-sismo-vital__label', label),
-            m('span.pf-sismo-vital__sub', sub),
-          ),
-          m(
-            '.pf-sismo-vital__row',
-            m('span.pf-sismo-vital__self', s === null ? '—' : fmt(s)),
-            m(
-              '.pf-sismo-vital__track',
-              m('.pf-sismo-vital__fill', {
-                style: `width:${((Math.max(0, s ?? 0) / max) * 100).toFixed(
-                  1,
-                )}%`,
-              }),
-              b !== null &&
-                m('.pf-sismo-vital__mark', {
-                  style: `left:${((b / max) * 100).toFixed(1)}%`,
-                  title: `workload: ${fmt(b)}`,
-                }),
-            ),
-            m('span.pf-sismo-vital__base', b === null ? '' : `vs ${fmt(b)}`),
-          ),
+          '.pf-sismo-uarch__trend',
+          m('.pf-sismo-uarch__trend-label', 'Rate over the trace'),
+          rateSpark(opts.trend),
         ),
-      );
-    };
-    add(
-      'IPC',
-      'instructions per cycle · higher is faster',
-      self.ipc,
-      base.ipc,
-      (n) => fmtIpc(n),
+      opts.extra,
     );
-    add(
-      'Cache misses',
-      'per 1,000 instructions · fewer is better',
-      self.cacheMpki,
-      base.cacheMpki,
-      (n) => n.toFixed(1),
+  }
+
+  // This-fn value, a track scaled to the larger of fn/workload with a fill and a
+  // tick at the workload's value, then the workload figure.
+  private vitalBar(
+    s: number | null,
+    b: number | null,
+    fmt: (n: number) => string,
+  ): m.Children {
+    const max = Math.max(s ?? 0, b ?? 0, 1e-9);
+    return m(
+      '.pf-sismo-vital__row',
+      m('span.pf-sismo-vital__self', s === null ? '—' : fmt(s)),
+      m(
+        '.pf-sismo-vital__track',
+        m('.pf-sismo-vital__fill', {
+          style: `width:${((Math.max(0, s ?? 0) / max) * 100).toFixed(1)}%`,
+        }),
+        b !== null &&
+          m('.pf-sismo-vital__mark', {
+            style: `left:${((b / max) * 100).toFixed(1)}%`,
+            title: `workload: ${fmt(b)}`,
+          }),
+      ),
+      m('span.pf-sismo-vital__base', b === null ? '' : `vs ${fmt(b)}`),
     );
-    add(
-      'Branch misses',
-      'per 1,000 instructions · fewer is better',
-      self.branchMpki,
-      base.branchMpki,
-      (n) => n.toFixed(2),
+  }
+
+  // The Top-Down split + its plain-language pointer, as one card.
+  private topdownCard(self: TmaModel, base: TmaModel): m.Children {
+    const td = this.renderTopdown(self, base);
+    if (td === undefined) return undefined;
+    const title =
+      self.tier === 'true-l1'
+        ? 'Where its issue slots went'
+        : 'Where its cycles stalled';
+    return m(
+      '.pf-sismo-uarch__card',
+      m('.pf-sismo-uarch__title', title),
+      td,
+      this.renderPointer(self, base),
     );
-    return m('.pf-sismo-vitals', vitals);
   }
 
   // The Top-Down split as one stacked bar + legend; the dominant bucket flagged
@@ -418,12 +505,6 @@ export class CpuDetailTab implements m.ClassComponent<CpuDetailAttrs> {
     if (self.tier === 'none' || self.buckets.length === 0) return undefined;
     return m(
       '.pf-sismo-tma',
-      m(
-        '.pf-sismo-eff__sublabel',
-        self.tier === 'true-l1'
-          ? 'Where its issue slots went'
-          : 'Where its cycles stalled',
-      ),
       m(
         '.pf-sismo-tma__bar',
         self.buckets.map((bk) =>
@@ -589,4 +670,19 @@ export class CpuDetailTab implements m.ClassComponent<CpuDetailAttrs> {
 function fmtCpi(ipc: number | null): string {
   if (ipc === null || !isFinite(ipc) || ipc <= 0) return '—';
   return (1 / ipc).toFixed(2);
+}
+
+// A compact bar sparkline of one metric's per-bucket rate, each bar scaled to
+// the series' own max (it shows the SHAPE, not absolute levels). A null bucket —
+// the function wasn't caught then — renders as a gap, not a zero.
+function rateSpark(values: ReadonlyArray<number | null>): m.Children {
+  const max = Math.max(1e-9, ...values.map((v) => v ?? 0));
+  return m(
+    '.pf-sismo-spark',
+    values.map((v) =>
+      m('.pf-sismo-spark__bar', {
+        style: {height: v === null ? '0' : `${Math.max(6, (v / max) * 100)}%`},
+      }),
+    ),
+  );
 }

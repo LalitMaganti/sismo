@@ -25,36 +25,64 @@ import {Callout} from '../../../widgets/callout';
 import {Intent} from '../../../widgets/common';
 import {loadingBody} from '../page_common';
 
+// An in-card navigation/drill link. A plain action (no icon) reads as "go deeper
+// →" with a trailing arrow; supplying an icon (e.g. 'help_outline' for a drill)
+// uses it as a leading glyph instead.
+export interface DeeperAction {
+  readonly label: string;
+  readonly onclick: () => void;
+  readonly icon?: string;
+}
+
 export interface QuestionBlockAttrs {
   // The question, as the user would ask it. The block's heading.
   readonly question: string;
+  // One static line on what this section examines — shown under the heading,
+  // before the trace-derived answer. Orients the reader the way a tab section's
+  // subtitle does.
+  readonly description?: string;
   // One-line plain-language answer from the trace; shown under the heading.
   readonly answer?: m.Children;
-  // Optional drill into the matching deep-dive tab.
-  readonly deeper?: {readonly label: string; readonly onclick: () => void};
+  // Drill/navigation links rendered as a quiet row at the foot of the card —
+  // part of the block, not a detached button strip below it.
+  readonly deeper?: DeeperAction | ReadonlyArray<DeeperAction>;
+}
+
+function deeperButton(a: DeeperAction): m.Children {
+  return m(Button, {
+    label: a.label,
+    ...(a.icon !== undefined ? {icon: a.icon} : {rightIcon: 'arrow_forward'}),
+    variant: ButtonVariant.Minimal,
+    onclick: a.onclick,
+  });
 }
 
 export function questionBlock(
   attrs: QuestionBlockAttrs,
   body?: m.Children,
 ): m.Children {
+  const deeper =
+    attrs.deeper === undefined
+      ? []
+      : Array.isArray(attrs.deeper)
+        ? attrs.deeper
+        : [attrs.deeper as DeeperAction];
   return m(
     Card,
     {className: 'pf-sismo-qblock'},
-    m('.pf-sismo-qblock__q', attrs.question),
+    // Question on the left, its "go deeper" links on the right of the same row —
+    // up top where they're seen, not buried under the evidence.
+    m(
+      '.pf-sismo-qblock__header',
+      m('.pf-sismo-qblock__q', attrs.question),
+      deeper.length > 0 &&
+        m('.pf-sismo-qblock__actions', deeper.map(deeperButton)),
+    ),
+    attrs.description !== undefined &&
+      m('.pf-sismo-qblock__desc', attrs.description),
     attrs.answer !== undefined &&
       m(Callout, {icon: 'lightbulb', intent: Intent.Primary}, attrs.answer),
     body !== undefined && m('.pf-sismo-qblock__body', body),
-    attrs.deeper !== undefined &&
-      m(
-        '.pf-sismo-qblock__deeper',
-        m(Button, {
-          label: attrs.deeper.label,
-          rightIcon: 'arrow_forward',
-          variant: ButtonVariant.Minimal,
-          onclick: attrs.deeper.onclick,
-        }),
-      ),
   );
 }
 

@@ -33,9 +33,11 @@ import {
   LONG,
   NUM,
   NUM_NULL,
+  STR,
   STR_NULL,
 } from '../../../trace_processor/query_result';
 import type {PrivilegedSet} from '../privileged_set';
+import {EMPTY_FOCUS_META, loadFocusMeta} from '../focus/focus_meta';
 import {frameNameExpr, sampleScopePredicate} from './sql';
 
 // One disassembled instruction with its sample count.
@@ -78,6 +80,26 @@ export interface SourceAsm {
   // The flat per-instruction counts — the honest floor, always present even when
   // neither source nor disasm was bundled (rel_pc comes from the frame table).
   readonly insnCounts: ReadonlyArray<AnnInsn>;
+  // True on a PEBS-precise (focus) trace: the sampled IP has 0 skid, so a hot
+  // line is the exact culprit, not a neighbourhood — the caption drops its hedge.
+  readonly precise: boolean;
+  // [cache focus] Which memory regions this function's misses touched, ranked by
+  // miss count — the data-side of "where did the cycles/misses go". Empty unless
+  // the trace sampled data addresses (PERF_SAMPLE_ADDR on a Data_LA event).
+  readonly functionData: ReadonlyArray<DataRegionCount>;
+  // [cache focus] The same, broken down per source line, so a hot line can show
+  // exactly what data it touched. Keyed by line number; only lines that touched
+  // resolved data appear.
+  readonly dataByLine: ReadonlyMap<number, ReadonlyArray<DataRegionCount>>;
+  // Sum of `functionData` counts (the data-share denominator). 0 = no data.
+  readonly dataTotal: number;
+}
+
+// A memory region (heap/stack/object/anon) and how many of a function's — or a
+// line's — sampled misses landed in it.
+export interface DataRegionCount {
+  readonly symbol: string;
+  readonly count: number;
 }
 
 // The sidecar track name the collector appends to (kept identical here and in
@@ -160,6 +182,39 @@ export async function loadSourceAsm(
   const rows = buildRows(file, source, lineSamples, insnsByLine, counts);
   const maxLineSamples = rows.reduce((a, r) => Math.max(a, r.samples), 0);
 
+  // Per-line attribution is exact only when the focus recording actually got
+  // PEBS — read the honest precision from the trace's focus marker, not merely
+  // the presence of a preset (a focus trace on a host without PEBS still skids).
+  const focus = await loadFocusMeta(engine).catch(() => EMPTY_FOCUS_META);
+
+  // [cache focus] Data-side attribution: which memory region each sampled miss
+  // touched, per rel_pc. Fold to per-line (reusing the rel_pc→line mapping) and
+  // to a function-level ranking. Empty on traces without data addresses.
+  const dataCounts = await loadRelPcData(engine, priv, name).catch(() => []);
+  const lineByRelPc = new Map<bigint, number | null>();
+  for (const r of counts) lineByRelPc.set(r.relPc, r.line);
+  const dataByLineMut = new Map<number, Map<string, number>>();
+  const functionDataMut = new Map<string, number>();
+  let dataTotal = 0;
+  for (const d of dataCounts) {
+    functionDataMut.set(d.symbol, (functionDataMut.get(d.symbol) ?? 0) + d.count);
+    dataTotal += d.count;
+    const line = lineByRelPc.get(d.relPc) ?? null;
+    if (line === null) continue;
+    if (file !== null && r2file(counts, d.relPc) !== null && r2file(counts, d.relPc) !== file) {
+      continue;
+    }
+    let m = dataByLineMut.get(line);
+    if (m === undefined) dataByLineMut.set(line, (m = new Map()));
+    m.set(d.symbol, (m.get(d.symbol) ?? 0) + d.count);
+  }
+  const rank = (m: Map<string, number>): DataRegionCount[] =>
+    [...m.entries()]
+      .map(([symbol, count]) => ({symbol, count}))
+      .sort((a, b) => b.count - a.count);
+  const dataByLine = new Map<number, ReadonlyArray<DataRegionCount>>();
+  for (const [line, m] of dataByLineMut) dataByLine.set(line, rank(m));
+
   return {
     name,
     file,
@@ -169,7 +224,21 @@ export async function loadSourceAsm(
     hasSource: source !== null,
     hasDisasm: disasm !== null,
     insnCounts: resolveBranchTargets(insnCounts),
+    precise: focus.precise,
+    functionData: rank(functionDataMut),
+    dataByLine,
+    dataTotal,
   };
+}
+
+// The source file a rel_pc resolved to (for filtering line data to the chosen
+// file, mirroring the lineSamples filter above).
+function r2file(
+  counts: ReadonlyArray<RelPcCount>,
+  relPc: bigint,
+): string | null {
+  for (const r of counts) if (r.relPc === relPc) return r.sourceFile;
+  return null;
 }
 
 // x86 (jmp/je/loop/…) and aarch64 (b/b.cond/cbz/tbz/…) control-transfer
@@ -248,6 +317,47 @@ async function loadRelPcCounts(
       sourceFile: it.source_file,
       samples: it.samples,
     });
+  }
+  return out;
+}
+
+interface RelPcData {
+  relPc: bigint;
+  symbol: string;
+  count: number;
+}
+
+// [cache focus] Per-rel_pc data-region counts for the function: of the misses
+// whose leaf frame is in `name`, how many touched each memory region. The same
+// leaf-frame join and function filter as loadRelPcCounts, grouped additionally
+// by the sample's data_symbol (NULL on non-cache traces → no rows).
+async function loadRelPcData(
+  engine: Engine,
+  priv: PrivilegedSet,
+  name: string,
+): Promise<RelPcData[]> {
+  const scope = sampleScopePredicate(priv);
+  const esc = name.replace(/'/g, "''");
+  const nameExpr = frameNameExpr('f', null);
+  const res = await engine.query(`
+    SELECT
+      f.rel_pc AS rel_pc,
+      s.data_symbol AS data_symbol,
+      count(*) AS samples
+    FROM perf_sample s
+    JOIN stack_profile_callsite c ON c.id = s.callsite_id
+    JOIN stack_profile_frame f ON f.id = c.frame_id
+    WHERE s.callsite_id IS NOT NULL AND s.data_symbol IS NOT NULL
+      AND ${nameExpr} = '${esc}' ${scope}
+    GROUP BY f.rel_pc, s.data_symbol
+  `);
+  const out: RelPcData[] = [];
+  for (
+    const it = res.iter({rel_pc: LONG, data_symbol: STR, samples: NUM});
+    it.valid();
+    it.next()
+  ) {
+    out.push({relPc: it.rel_pc, symbol: it.data_symbol, count: it.samples});
   }
   return out;
 }

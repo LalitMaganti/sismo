@@ -2,10 +2,19 @@
 // Licensed under the MIT License.
 
 //! Disassembly FFI for the source/asm view. Given a binary path and the set of
-//! sampled module-relative addresses, finds each containing function in the ELF
-//! symbol table, reads its code bytes, and streams decoded instructions back to
-//! Zig via a callback — one call per instruction, tagged with the function's
-//! start address so the caller can group them.
+//! sampled addresses, finds each containing function in the ELF symbol table,
+//! reads its code bytes, and streams decoded instructions back to Zig via a
+//! callback — one call per instruction, tagged with the function's start address
+//! so the caller can group them.
+//!
+//! The sampled `rel_pc`s arrive as absolute runtime virtual addresses (the same
+//! convention the wholesym symbolizer is fed). ELF symbol/section addresses, by
+//! contrast, are link-time virtual addresses. For a non-PIE `ET_EXEC` the two
+//! coincide (no relocation slide); for a PIE `ET_DYN` they differ by the load
+//! slide, so a raw comparison finds no containing symbol and nothing decodes.
+//! `load_bias` lets us recover the slide (`load_bias - image_base`) and map each
+//! avma to its link-time address before the lookup, then map decoded addresses
+//! back to avma so the caller's addresses still match the trace's `rel_pc`.
 //!
 //! Pure-Rust decoders (the yaxpeax family) so this links into the staticlib with
 //! no C dependency. The decode loop reads a `U8Reader` whose `total_offset()`
@@ -15,7 +24,7 @@ use std::collections::HashSet;
 use std::os::raw::{c_int, c_void};
 use std::slice;
 
-use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 use yaxpeax_arch::{Decoder, Reader, U8Reader};
 
 /// Per-instruction callback. `func_start` identifies the function (its
@@ -35,8 +44,12 @@ const ARCH_X86_64: u32 = 0;
 const ARCH_AARCH64: u32 = 1;
 
 /// Disassemble the functions containing `rel_pcs` in the binary at `path`.
-/// Returns 0 on success, -1 on bad arguments / unreadable / unparseable file.
-/// Each distinct containing function is decoded once.
+/// `rel_pcs` are absolute runtime virtual addresses; `load_bias` is the mapping's
+/// load bias, used to translate them to the link-time addresses the ELF symbol
+/// table uses (see the module doc). Returns 0 on success, -1 on bad arguments /
+/// unreadable / unparseable file. Each distinct containing function is decoded
+/// once. The addresses passed to `cb` are mapped back to the avma space, so they
+/// match the caller's `rel_pcs`.
 ///
 /// # Safety
 /// `path_utf8`/`rel_pcs` must be valid for their stated lengths, and `cb` must
@@ -46,6 +59,7 @@ pub unsafe extern "C" fn sismo_disasm_module(
     path_utf8: *const u8,
     path_len: usize,
     arch: u32,
+    load_bias: u64,
     rel_pcs: *const u64,
     rel_pcs_len: usize,
     cb: InsnCb,
@@ -71,6 +85,13 @@ pub unsafe extern "C" fn sismo_disasm_module(
         Err(_) => return -1,
     };
 
+    // Runtime slide between an avma and the ELF's link-time addresses. The image
+    // base is the lowest loadable-segment vaddr (0 for a PIE, the link base for a
+    // non-PIE), so `load_bias - image_base` is 0 for a non-PIE EXEC — leaving its
+    // already-working path untouched — and the true slide for a PIE.
+    let image_base = obj.segments().map(|s| s.address()).min().unwrap_or(0);
+    let slide = load_bias.wrapping_sub(image_base);
+
     let mut syms: Vec<(u64, u64)> = obj
         .symbols()
         .filter(|s| s.kind() == SymbolKind::Text && s.size() > 0)
@@ -81,7 +102,8 @@ pub unsafe extern "C" fn sismo_disasm_module(
     let pcs = unsafe { slice::from_raw_parts(rel_pcs, rel_pcs_len) };
     let mut done: HashSet<u64> = HashSet::new();
     for &pc in pcs {
-        let containing = syms.iter().find(|(a, sz)| pc >= *a && pc < a + *sz);
+        let svma = pc.wrapping_sub(slide); // link-time address of the sample
+        let containing = syms.iter().find(|(a, sz)| svma >= *a && svma < a + *sz);
         let (start, size) = match containing {
             Some(&(a, s)) => (a, s),
             None => continue,
@@ -93,9 +115,13 @@ pub unsafe extern "C" fn sismo_disasm_module(
             Some(c) => c,
             None => continue,
         };
+        // Decode in link-time space (matches read_code/the symbol table) but tag
+        // each instruction with its avma, so the caller's addresses line up with
+        // the trace's rel_pc and resolve back through the same symbolizer.
+        let func_avma = start.wrapping_add(slide);
         match arch {
-            ARCH_X86_64 => decode_x86(code, start, cb, ctx),
-            ARCH_AARCH64 => decode_arm(code, start, cb, ctx),
+            ARCH_X86_64 => decode_x86(code, func_avma, cb, ctx),
+            ARCH_AARCH64 => decode_arm(code, func_avma, cb, ctx),
             _ => {}
         }
     }

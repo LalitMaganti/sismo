@@ -240,6 +240,10 @@ fn readWholeFile(
     path: []const u8,
     max: usize,
 ) ?[]u8 {
+    // openFileAbsolute asserts the path is absolute (a precondition, not an
+    // error), so a relative DWARF source path would panic rather than fall
+    // through to the null path this function promises. Skip non-absolute paths.
+    if (!std.fs.path.isAbsolute(path)) return null;
     var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer file.close(io);
     const size_u64 = file.length(io) catch return null;

@@ -12,6 +12,72 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Shared typography. Two heading tiers and a muted descriptive line, all on the
+// --pf-font-size-* scale, so every heading/sub-heading/description across the
+// page, the tabs and the landing blocks reads as one design.
+@mixin sismo-heading {
+  font-size: var(--pf-font-size-xxl);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--pf-color-text);
+}
+
+@mixin sismo-subheading {
+  font-size: var(--pf-font-size-m);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--pf-color-text);
+}
+
+// The muted one-line description under a heading (section subtitle, block
+// description, page lead-in).
+@mixin sismo-subtitle {
+  font-size: var(--pf-font-size-m);
+  color: var(--pf-color-text-muted);
+  line-height: 1.45;
+}
+
+// The Section widget's default look is a bordered box; inside our content areas
+// we want it borderless with a large heading, muted subtitle and an evenly
+// spaced article. Shared by the page body and the in-tab body so a Section
+// looks the same wherever it's rendered.
+@mixin sismo-section {
+  .pf-section {
+    border: none;
+    border-radius: 0;
+    margin-bottom: 36px;
+
+    &:last-child {
+      margin-bottom: 0;
+    }
+
+    header {
+      border-bottom: none;
+      margin-bottom: 16px;
+      padding: 0;
+
+      h1 {
+        @include sismo-heading;
+        margin-bottom: 4px;
+      }
+    }
+
+    .pf-section__subtitle {
+      @include sismo-subtitle;
+      margin: 0;
+    }
+
+    // Uniform vertical rhythm between a block's pieces (meters, stat rows,
+    // tables, callouts, footer) instead of each carrying its own margin.
+    article {
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+  }
+}
+
 .pf-sismo-page {
   overflow-y: auto;
   overflow-x: hidden;
@@ -82,50 +148,38 @@
   &__body {
     padding: 24px 32px 32px;
 
-    .pf-section {
-      border: none;
-      border-radius: 0;
-      margin-bottom: 36px;
-
-      &:last-child {
-        margin-bottom: 0;
-      }
-
-      header {
-        border-bottom: none;
-        margin-bottom: 16px;
-        padding: 0;
-
-        h1 {
-          font-size: var(--pf-font-size-xxl);
-          font-weight: 600;
-          color: var(--pf-color-text);
-          letter-spacing: -0.01em;
-          margin-bottom: 4px;
-        }
-      }
-
-      .pf-section__subtitle {
-        font-size: var(--pf-font-size-m);
-        color: var(--pf-color-text-muted);
-        line-height: 1.4;
-        margin: 0;
-      }
-
-      // Uniform vertical rhythm between a block's pieces (meters, stat rows,
-      // tables, callouts, footer) instead of each carrying its own margin.
-      article {
-        padding: 0;
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-      }
-    }
+    @include sismo-section;
 
     .pf-grid-layout {
       gap: 16px;
       margin-bottom: 0;
     }
+  }
+
+  // Refusal state body: shown when a domain isn't available on this trace.
+  // A copyable command line + the mutual-exclusion cost callout.
+  &__refusal {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    max-width: 560px;
+    margin: 0 auto;
+
+    p {
+      margin: 0;
+      color: var(--pf-color-text-muted);
+    }
+  }
+
+  &__refusal-cmd {
+    font-family: var(--pf-font-family-monospace, monospace);
+    font-size: var(--pf-font-size-s);
+    background: var(--pf-color-background-secondary);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 4px;
+    padding: 8px 12px;
+    user-select: all;
   }
 
   // CPU domain tab strip: aligns the tab handles with the header padding.
@@ -278,10 +332,7 @@
   }
 
   &__tab-pane-label {
-    font-size: var(--pf-font-size-m);
-    font-weight: 600;
-    color: var(--pf-color-text);
-    letter-spacing: -0.005em;
+    @include sismo-subheading;
   }
 
   // A lighter heading for a sub-block inside a tab-pane (e.g. the Top-Down split
@@ -343,9 +394,9 @@
     }
 
     &--active {
-      background: #3478f6;
-      color: #fff;
-      border-color: #3478f6;
+      background: var(--pf-color-accent);
+      color: var(--pf-color-text-on-accent);
+      border-color: var(--pf-color-accent);
     }
   }
 
@@ -693,20 +744,6 @@
   border: 1px solid var(--pf-color-border);
   border-radius: 8px;
 
-  &__title {
-    font-size: var(--pf-font-size-m);
-    font-weight: 600;
-    letter-spacing: -0.005em;
-  }
-
-  &__sublabel {
-    font-size: var(--pf-font-size-s);
-    font-weight: 600;
-    color: var(--pf-color-text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-
   &__note {
     display: flex;
     align-items: center;
@@ -766,27 +803,87 @@
   }
 }
 
-// IPC / miss-rate rows: value, a bar scaled to the larger of this-fn and
-// workload, and a tick marking the workload's position.
-.pf-sismo-vitals {
+// "Record focused for exact misses" suggestion. A quiet bordered callout reused
+// wherever a cache figure is shown sampled-on-time (cache flamegraph weighting,
+// function Microarchitecture pane) — icon + lead + copyable command + sizing.
+.pf-sismo-focus {
   display: flex;
-  flex-direction: column;
-  gap: 14px;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--pf-color-border);
+  border-radius: 8px;
+  background: var(--pf-color-background-secondary);
+
+  &__icon {
+    flex-shrink: 0;
+    margin-top: 1px;
+    color: var(--pf-color-text-muted);
+  }
+
+  &__text {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  &__lead {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+    line-height: 1.45;
+  }
+
+  &__cmd {
+    align-self: flex-start;
+    max-width: 100%;
+    overflow-x: auto;
+    white-space: pre;
+    font-family: var(--pf-font-family-monospace, monospace);
+    font-size: var(--pf-font-size-s);
+    background: var(--pf-color-background-secondary);
+    border: 1px solid var(--pf-color-border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    user-select: all;
+  }
+
+  &__note {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+
+    code {
+      font-family: var(--pf-font-family-monospace, monospace);
+    }
+  }
 }
 
-.pf-sismo-vital {
+// Microarchitecture pane: one card per metric category (cost, IPC, cache,
+// branch, Top-Down). Each pairs the aggregate (this-fn vs workload) with that
+// metric's rate over the trace, so a category reads on its own.
+.pf-sismo-uarch {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 12px;
+  margin-top: 4px;
+
+  &__card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    border: 1px solid var(--pf-color-border);
+    border-radius: 8px;
+  }
 
   &__head {
     display: flex;
     align-items: baseline;
     gap: 8px;
+    flex-wrap: wrap;
   }
 
-  &__label {
-    font-weight: 600;
+  &__title {
+    @include sismo-subheading;
   }
 
   &__sub {
@@ -794,6 +891,23 @@
     color: var(--pf-color-text-muted);
   }
 
+  // The rate-over-the-trace sparkline and its label, under the aggregate bar.
+  &__trend {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  &__trend-label {
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
+}
+
+// One metric's aggregate row: the this-fn value, a bar scaled to the larger of
+// this-fn and workload, a tick marking the workload's position, and the workload
+// figure. One sits in each microarchitecture category card.
+.pf-sismo-vital {
   &__row {
     display: flex;
     align-items: center;
@@ -824,7 +938,7 @@
     left: 0;
     top: 0;
     bottom: 0;
-    background: #3478f6;
+    background: var(--pf-color-accent);
   }
 
   // Workload reference tick: a full-height line at the workload's value.
@@ -981,6 +1095,192 @@
 // Source/Assembly: a monospace listing, one row per source line (or
 // instruction), with a sample count + a muted intensity bar in the gutter. The
 // bar is a sparkline, NOT a stoplight — single hue, opacity ∝ the hottest line.
+// [cache focus] Function page: headline band above the source/asm listing.
+.pf-sismo-cachedetail__head {
+  padding: 8px 10px 12px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--pf-color-border);
+}
+
+.pf-sismo-cachedetail__name {
+  font-family: var(--pf-font-family-code, ui-monospace, monospace);
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.pf-sismo-cachedetail__stats {
+  display: flex;
+  gap: 28px;
+  margin: 10px 0;
+}
+
+.pf-sismo-cachedetail__stat-val {
+  font-size: 1.5em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.pf-sismo-cachedetail__stat-label {
+  color: var(--pf-color-text-muted);
+  font-size: var(--pf-font-size-s);
+}
+
+.pf-sismo-cachedetail__data-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.pf-sismo-cachedetail__bar {
+  height: 16px;
+  margin-bottom: 6px;
+}
+
+// [cache focus] Bespoke "Functions" view: misses + the memory each hits.
+.pf-sismo-cachefn {
+  padding: 8px 4px;
+}
+
+.pf-sismo-cachefn__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 8px 2px 12px;
+  font-size: var(--pf-font-size-s);
+  color: var(--pf-color-text-muted);
+}
+
+.pf-sismo-cachefn__legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.pf-sismo-cachefn__swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+// The "Memory missed" cell: the stacked bar + a dominant-region annotation.
+.pf-sismo-cachefn__memcell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+// The bar (a DataGrid cellRenderer) and the function-page header bar share this.
+.pf-sismo-cachefn__bar {
+  display: flex;
+  height: 12px;
+  width: 100%;
+  min-width: 120px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--pf-color-border);
+}
+
+.pf-sismo-cachefn__seg {
+  height: 100%;
+}
+
+.pf-sismo-cachefn__topregion {
+  flex: 0 0 auto;
+  font-size: var(--pf-font-size-s);
+  color: var(--pf-color-text-muted);
+  white-space: nowrap;
+}
+
+// Hover-popup content for a "Memory missed" bar segment.
+.pf-sismo-cachefn__segtip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.pf-sismo-cachefn__segtip-name {
+  font-weight: 600;
+}
+
+.pf-sismo-cachefn__segtip-val {
+  color: var(--pf-color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+// [cache focus] "Data this code touches" section above the source listing.
+.pf-sismo-srcasm__data {
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--pf-color-border);
+  border-radius: 6px;
+  background: var(--pf-color-background-secondary);
+}
+
+.pf-sismo-srcasm__data-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.pf-sismo-srcasm__data-title {
+  font-weight: 600;
+}
+
+.pf-sismo-srcasm__data-sub {
+  color: var(--pf-color-text-muted);
+  font-size: var(--pf-font-size-s);
+}
+
+.pf-sismo-srcasm__dataregions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pf-sismo-srcasm__dataregion {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--pf-color-border);
+  border-radius: 10px;
+}
+
+.pf-sismo-srcasm__dataregion-name {
+  font-weight: 600;
+}
+
+.pf-sismo-srcasm__dataregion-val {
+  color: var(--pf-color-text-muted);
+  font-size: var(--pf-font-size-s);
+}
+
+.pf-sismo-srcasm__datalines {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pf-sismo-srcasm__dataline {
+  display: flex;
+  gap: 10px;
+  font-size: var(--pf-font-size-s);
+}
+
+.pf-sismo-srcasm__dataline-line {
+  flex: 0 0 auto;
+  min-width: 64px;
+  color: var(--pf-color-text-muted);
+}
+
+.pf-sismo-srcasm__dataline-regions {
+  flex: 1 1 auto;
+}
+
 .pf-sismo-srcasm {
   font-family: var(
     --pf-font-family-code,
@@ -1054,7 +1354,7 @@
     // by share of the hottest line.
 
     &--hottest {
-      box-shadow: inset 2px 0 0 #3478f6;
+      box-shadow: inset 2px 0 0 var(--pf-color-accent);
     }
 
     &--insn {
@@ -1128,7 +1428,7 @@
 
   &__heat-fill {
     height: 100%;
-    background: #3478f6;
+    background: var(--pf-color-accent);
   }
 
   &__lineno {
@@ -1260,7 +1560,7 @@
       background: #9aa0a6;
     }
     &--priv {
-      background: #3478f6;
+      background: var(--pf-color-accent);
     }
     &--churn {
       background: #f5a623;
@@ -1294,7 +1594,7 @@
   &__bar {
     flex: 1 1 0;
     min-width: 0;
-    background: #3478f6;
+    background: var(--pf-color-accent);
     border-radius: 1px;
   }
 }
@@ -1415,16 +1715,13 @@
   }
 
   &__intro-title {
-    font-size: var(--pf-font-size-l);
-    font-weight: 600;
+    @include sismo-heading;
   }
 
   &__intro-sub {
+    @include sismo-subtitle;
     margin-top: 4px;
     max-width: 72ch;
-    color: var(--pf-color-text-muted);
-    font-size: var(--pf-font-size-m);
-    line-height: 1.45;
   }
 }
 
@@ -1434,18 +1731,33 @@
   gap: 10px;
   padding: 16px;
 
+  // Title row: question on the left, "go deeper" actions pushed to the right.
+  &__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
   &__q {
-    font-size: var(--pf-font-size-l);
-    font-weight: 500;
+    @include sismo-heading;
   }
 
-
-  &__route {
-    margin-top: 2px;
+  // One-line description under the question; tightened toward the heading
+  // against the block's gap so it reads as part of it.
+  &__desc {
+    @include sismo-subtitle;
+    margin-top: -6px;
+    max-width: 72ch;
   }
 
-  &__deeper {
-    margin-top: 2px;
+  // The drill/navigation links, kept together at the right of the header.
+  &__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    flex-shrink: 0;
   }
 }
 
@@ -1479,6 +1791,11 @@
     flex-direction: column;
     gap: 10px;
     min-height: 0;
+
+    // A tab whose view is a Section (e.g. "How cycles were scheduled") gets the
+    // same borderless, large-heading treatment as the page body, rather than the
+    // Section widget's default bordered box.
+    @include sismo-section;
   }
 
   // Every mode renders into the same fixed-height viewport with internal
@@ -1507,11 +1824,7 @@
   margin-top: 12px;
 
   &__title {
-    font-size: var(--pf-font-size-m);
-    font-weight: 600;
-    color: var(--pf-color-text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    @include sismo-subheading;
     margin-bottom: 6px;
   }
 }
@@ -1552,7 +1865,7 @@
 
   &__fill {
     height: 100%;
-    background: #3478f6;
+    background: var(--pf-color-accent);
   }
 
   &__pct {
@@ -1562,4 +1875,18 @@
     font-weight: 600;
     font-variant-numeric: tabular-nums;
   }
+}
+
+// Domain-selector entry for a lens the recording can't support. The menu lives
+// in a portaled popup outside .pf-sismo-page, so this is a top-level rule. Muted
+// Subtle trailing status on each lens (available / not available / soon). We
+// don't grey unavailable entries — they read normally and stay navigable (the
+// click lands on the refusal page with the enable command); this small muted
+// label just notes what the current trace supports.
+.pf-sismo-page__avail {
+  margin-left: 8px;
+  font-size: 0.82em;
+  font-weight: 400;
+  font-style: italic;
+  color: var(--pf-color-text-muted);
 }

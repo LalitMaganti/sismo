@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 3 Jun 2026 13:13:59 +0100
+Subject: nopr: perf_sample data_address + data_symbol
+
+Sismo cache-focus data-side attribution: carry the sampled access's data
+linear address (PERF_SAMPLE_ADDR / Data_LA) and the memory region it
+resolved to on each PerfSample, so a cache miss can be attributed to the
+data it touched, not just the code that touched it.
+
+  - PerfSample.data_address (uint64, 20) + data_symbol (string, 21)
+  - perf_sample table columns + public view columns
+  - parser populates them in ProfileModule::ParsePerfSample
+---
+ .../perfetto/trace/profiling/profile_packet.proto   | 11 +++++++++++
+ .../importers/proto/profile_module.cc               | 12 +++++++++++-
+ .../perfetto_sql/stdlib/linux/perf/counters.sql     |  7 +++++--
+ .../stdlib/prelude/before_eof/views.sql             | 10 ++++++++--
+ src/trace_processor/tables/profiler_tables.py       | 13 ++++++++++++-
+ 5 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/protos/perfetto/trace/profiling/profile_packet.proto b/protos/perfetto/trace/profiling/profile_packet.proto
+index 1126c128..61e6944b 100644
+--- a/protos/perfetto/trace/profiling/profile_packet.proto
++++ b/protos/perfetto/trace/profiling/profile_packet.proto
+@@ -354,6 +354,17 @@ message PerfSample {
+     }
+   }
+   optional ProducerEvent producer_event = 19;
++
++  // [sismo extension] Data linear address of the sampled memory access — the
++  // PERF_SAMPLE_ADDR / Data_LA value — for samples taken on a precise load
++  // event (sismo's cache focus). Lets a miss be attributed to the data it
++  // touched, not just the code that touched it.
++  optional uint64 data_address = 20;
++
++  // [sismo extension] The memory region `data_address` resolved to at record
++  // time (from /proc/<pid>/maps): "[heap]", "[stack]", an object basename,
++  // "[anon]", … Surfaced as the `data_symbol` column of the perf_sample table.
++  optional string data_symbol = 21;
+ }
+ 
+ // Submessage for TracePacketDefaults.
+diff --git a/src/trace_processor/importers/proto/profile_module.cc b/src/trace_processor/importers/proto/profile_module.cc
+index ed5af465..85f4bf31 100644
+--- a/src/trace_processor/importers/proto/profile_module.cc
++++ b/src/trace_processor/importers/proto/profile_module.cc
+@@ -358,9 +358,19 @@ void ProfileModule::ParsePerfSample(
+     unwind_error_id = storage->InternString(
+         ProfilePacketUtils::StringifyStackUnwindError(unwind_error));
+   }
++  // [sismo extension] Data-side attribution for cache-focus samples: the data
++  // linear address of the sampled access and the memory region it resolved to.
++  std::optional<int64_t> data_address;
++  if (sample.has_data_address())
++    data_address = static_cast<int64_t>(sample.data_address());
++  std::optional<StringPool::Id> data_symbol_id;
++  if (sample.has_data_symbol())
++    data_symbol_id = storage->InternString(sample.data_symbol());
++
+   tables::PerfSampleTable::Row sample_row(
+       ts, utid, sample.cpu(), cpu_mode_id, cs_id, unwind_error_id,
+-      sampling_stream.perf_session_id, counter_set_id);
++      sampling_stream.perf_session_id, counter_set_id, data_address,
++      data_symbol_id);
+   context_->storage->mutable_perf_sample_table()->Insert(sample_row);
+ }
+ 
+diff --git a/src/trace_processor/perfetto_sql/stdlib/linux/perf/counters.sql b/src/trace_processor/perfetto_sql/stdlib/linux/perf/counters.sql
+index 5224bf3e..673ea2a8 100644
+--- a/src/trace_processor/perfetto_sql/stdlib/linux/perf/counters.sql
++++ b/src/trace_processor/perfetto_sql/stdlib/linux/perf/counters.sql
+@@ -54,7 +54,9 @@ CREATE PERFETTO VIEW linux_perf_sample_with_counters(
+   -- Track ID for the counter.
+   track_id JOINID(track.id),
+   -- Counter value at this sample point.
+-  counter_value DOUBLE
++  counter_value DOUBLE,
++  -- [sismo] Memory region the sampled access touched (cache focus only).
++  data_symbol STRING
+ )
+ AS
+ SELECT
+@@ -68,7 +70,8 @@ SELECT
+   ps.perf_session_id,
+   pcs.counter_id,
+   c.track_id,
+-  c.value AS counter_value
++  c.value AS counter_value,
++  ps.data_symbol
+ FROM __intrinsic_perf_sample AS ps
+ JOIN __intrinsic_perf_counter_set AS pcs
+   ON ps.counter_set_id = pcs.perf_counter_set_id
+diff --git a/src/trace_processor/perfetto_sql/stdlib/prelude/before_eof/views.sql b/src/trace_processor/perfetto_sql/stdlib/prelude/before_eof/views.sql
+index 734dffe6..eae057eb 100644
+--- a/src/trace_processor/perfetto_sql/stdlib/prelude/before_eof/views.sql
++++ b/src/trace_processor/perfetto_sql/stdlib/prelude/before_eof/views.sql
+@@ -33,8 +33,14 @@ CREATE PERFETTO VIEW perf_sample(
+   unwind_error STRING,
+   -- Distinguishes samples from different profiling streams
+   -- (i.e. multiple data sources).
+-  perf_session_id JOINID(perf_session.id)
++  perf_session_id JOINID(perf_session.id),
++  -- [sismo] Data linear address of the sampled memory access (cache focus only).
++  data_address LONG,
++  -- [sismo] Memory region the data_address resolved to at record time
++  -- (e.g. "[heap]", an object basename).
++  data_symbol STRING
+ )
+ AS
+-SELECT id, ts, utid, cpu, cpu_mode, callsite_id, unwind_error, perf_session_id
++SELECT id, ts, utid, cpu, cpu_mode, callsite_id, unwind_error, perf_session_id,
++       data_address, data_symbol
+ FROM __intrinsic_perf_sample;
+diff --git a/src/trace_processor/tables/profiler_tables.py b/src/trace_processor/tables/profiler_tables.py
+index 7471dc34..3110d6f7 100644
+--- a/src/trace_processor/tables/profiler_tables.py
++++ b/src/trace_processor/tables/profiler_tables.py
+@@ -562,6 +562,11 @@ PERF_SAMPLE_TABLE = Table(
+             cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+             sql_access=SqlAccess.HIGH_PERF,
+         ),
++        # [sismo extension] Data linear address of the sampled access and the
++        # memory region it resolved to (set only on a cache focus). See the
++        # PerfSample data_address/data_symbol proto fields.
++        C('data_address', CppOptional(CppInt64())),
++        C('data_symbol', CppOptional(CppString())),
+     ],
+     tabledoc=TableDoc(
+         doc='''Samples from the traced_perf profiler.''',
+@@ -588,7 +593,13 @@ PERF_SAMPLE_TABLE = Table(
+                 streams (i.e. multiple data sources).''',
+             'counter_set_id':
+                 '''References the set of counter values associated with this
+-                   sample in __intrinsic_perf_counter_set.'''
++                   sample in __intrinsic_perf_counter_set.''',
++            'data_address':
++                '''[sismo] Data linear address of the sampled memory access
++                   (cache focus only).''',
++            'data_symbol':
++                '''[sismo] Memory region the data_address resolved to at record
++                   time (e.g. "[heap]", an object basename).'''
+         }))
+ 
+ INSTRUMENTS_SAMPLE_TABLE = Table(
