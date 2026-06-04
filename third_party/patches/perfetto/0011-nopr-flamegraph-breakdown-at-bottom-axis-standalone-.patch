@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: nopr: flamegraph breakdown-at-bottom axis + standalone breakdown
+ control
+
+---
+ ui/src/components/query_flamegraph.ts |  9 ++-
+ ui/src/widgets/flamegraph.ts          | 87 +++++++++++++++++++++------
+ 2 files changed, 76 insertions(+), 20 deletions(-)
+
+diff --git a/ui/src/components/query_flamegraph.ts b/ui/src/components/query_flamegraph.ts
+index 25b719c0..057993bc 100644
+--- a/ui/src/components/query_flamegraph.ts
++++ b/ui/src/components/query_flamegraph.ts
+@@ -119,7 +119,7 @@ export interface QueryFlamegraphMetric {
+   // Examples include marking inlined functions, optimized code, etc.
+   readonly optionalMarker?: FlamegraphOptionalMarker;
+ 
+-  // Optional "Break down by" dimensions. When present the widget shows a
++  // Optional "Breakdown at top" dimensions. When present the widget shows a
+   // selector populated with these; the selected `key` is written to
+   // `FlamegraphState.breakdownBy`. Reshaping the tree for a chosen breakdown is
+   // up to the embedder (it rebuilds the metric in response) — the widget only
+@@ -128,6 +128,13 @@ export interface QueryFlamegraphMetric {
+     readonly key: string;
+     readonly label: string;
+   }>;
++
++  // Optional "Breakdown at bottom" dimensions (independent of the top axis);
++  // the selected `key` is written to `FlamegraphState.breakdownBottom`.
++  readonly breakdownLeafDimensions?: ReadonlyArray<{
++    readonly key: string;
++    readonly label: string;
++  }>;
+ }
+ 
+ export interface MetricsFromTableOrSubqueryOptions {
+diff --git a/ui/src/widgets/flamegraph.ts b/ui/src/widgets/flamegraph.ts
+index 7d74e8d3..476e3dec 100644
+--- a/ui/src/widgets/flamegraph.ts
++++ b/ui/src/widgets/flamegraph.ts
+@@ -234,10 +234,13 @@ export const FLAMEGRAPH_STATE_SCHEMA = z
+     // by that property instead. Absent on older persisted states → treated as
+     // 'name'.
+     colorBy: z.string().optional(),
+-    // Selected "Break down by" dimension key (from the metric's
+-    // breakdownDimensions). The embedder reshapes the tree to match; the widget
+-    // just records the choice. Absent → no breakdown.
++    // Selected "Breakdown at Top" dimension key (from breakdownDimensions): hangs
++    // the tree under group roots. The embedder reshapes the tree; the widget just
++    // records the choice. Absent → no top breakdown.
+     breakdownBy: z.string().optional(),
++    // Selected "Breakdown at Bottom" dimension key (from breakdownLeafDimensions):
++    // appends group leaves under the sampled frames. Independent of breakdownBy.
++    breakdownBottom: z.string().optional(),
+   })
+   .readonly();
+ 
+@@ -260,10 +263,20 @@ interface FlamegraphMetric {
+     readonly displayName: string;
+   }>;
+   // "Break down by" dimensions, if the metric supports the breakdown control.
++  // "Breakdown at Top" dimensions: each hangs the tree under group roots. The
++  // selected key is written to state.breakdownBy; the embedder rebuilds the tree.
+   readonly breakdownDimensions?: ReadonlyArray<{
+     readonly key: string;
+     readonly label: string;
+   }>;
++
++  // "Breakdown at Bottom" dimensions: each appends group leaves under the sampled
++  // frames. Independent of the top axis — the selected key is written to
++  // state.breakdownBottom. Omit to offer no bottom axis.
++  readonly breakdownLeafDimensions?: ReadonlyArray<{
++    readonly key: string;
++    readonly label: string;
++  }>;
+ }
+ 
+ export interface FlamegraphAttrs {
+@@ -484,9 +497,16 @@ export interface FlamegraphFilterBarAttrs {
+   readonly showViewControls?: boolean;
+ 
+   // Whether to show the "Display" options menu (break-down-by, colour-by).
+-  // Defaults to true. These only affect the flamegraph, so a shared bar hides
+-  // them outside flamegraph mode.
++  // Defaults to true. Colour-by only affects the flamegraph, so a shared bar
++  // hides it outside flamegraph mode.
+   readonly showDisplayOptions?: boolean;
++
++  // Whether to show the "Break down by" control specifically, even when the full
++  // Display options (colour-by) are hidden. The break-down reshapes the call
++  // tree too, so a shared bar driving a call tree sets this to expose the
++  // control there without the flamegraph-only colour options. Defaults to
++  // showDisplayOptions.
++  readonly showBreakdown?: boolean;
+ }
+ 
+ // The flamegraph's filter / display bar, split out so it can be rendered either
+@@ -658,7 +678,9 @@ export class FlamegraphFilterBar
+           ],
+         ),
+       ],
+-      (this.attrs.showDisplayOptions ?? true) && this.renderDisplayOptions(),
++      ((this.attrs.showDisplayOptions ?? true) ||
++        (this.attrs.showBreakdown ?? false)) &&
++        this.renderDisplayOptions(),
+     );
+   }
+ 
+@@ -668,26 +690,52 @@ export class FlamegraphFilterBar
+   // switcher: one PopupMenu of flat MenuTitle sections rather than a button per
+   // control. Hidden entirely when the metric declares no presentation options.
+   private renderDisplayOptions() {
+-    const dims = this.selectedMetric?.breakdownDimensions ?? [];
+-    const columns = this.selectedMetric?.unaggregatableProperties ?? [];
+-    if (dims.length === 0 && columns.length === 0) {
++    // Colour-by is flamegraph-only (it has no meaning on a call tree); the
++    // break-down can also be shown alone (it reshapes the call tree too).
++    const showColor = this.attrs.showDisplayOptions ?? true;
++    const showBreak = showColor || (this.attrs.showBreakdown ?? false);
++    const topDims = showBreak
++      ? (this.selectedMetric?.breakdownDimensions ?? [])
++      : [];
++    const bottomDims = showBreak
++      ? (this.selectedMetric?.breakdownLeafDimensions ?? [])
++      : [];
++    const columns = showColor
++      ? (this.selectedMetric?.unaggregatableProperties ?? [])
++      : [];
++    if (topDims.length === 0 && bottomDims.length === 0 && columns.length === 0) {
+       return undefined;
+     }
+     const items: m.Children[] = [];
+ 
+-    // "Break down by": splits the flamegraph's top level along a metric-declared
+-    // dimension (e.g. thread, process). The widget only records the choice in
+-    // state.breakdownBy; the embedder rebuilds the tree to match.
+-    if (dims.length > 0) {
+-      const selected = this.attrs.state.breakdownBy ?? dims[0].key;
+-      items.push(
+-        m(MenuTitle, {label: 'Break down'}),
+-        dims.map((d) =>
++    // Two independent breakdown axes. "At top" hangs the tree under group roots
++    // (state.breakdownBy); "at bottom" appends group leaves under sampled frames
++    // (state.breakdownBottom). The widget records the choice; the embedder
++    // rebuilds the tree to match both.
++    if (topDims.length > 0) {
++      const selected = this.attrs.state.breakdownBy ?? topDims[0].key;
++      items.push(m(MenuTitle, {label: 'Breakdown at top'}));
++      for (const d of topDims) {
++        items.push(
+           this.radioItem(d.label, d.key === selected, () =>
+             this.attrs.onStateChange({...this.attrs.state, breakdownBy: d.key}),
+           ),
+-        ),
+-      );
++        );
++      }
++    }
++    if (bottomDims.length > 0) {
++      const selected = this.attrs.state.breakdownBottom ?? bottomDims[0].key;
++      items.push(m(MenuTitle, {label: 'Breakdown at bottom'}));
++      for (const d of bottomDims) {
++        items.push(
++          this.radioItem(d.label, d.key === selected, () =>
++            this.attrs.onStateChange({
++              ...this.attrs.state,
++              breakdownBottom: d.key,
++            }),
++          ),
++        );
++      }
+     }
+ 
+     // "Color by": frame name (default) or any unaggregatable property the metric
+@@ -1124,6 +1172,7 @@ export class Flamegraph implements m.ClassComponent<FlamegraphAttrs> {
+       view: state.view,
+       colorBy: state.colorBy,
+       breakdownBy: state.breakdownBy,
++      breakdownBottom: state.breakdownBottom,
+       selectedMetricName: metricStillExists
+         ? state.selectedMetricName
+         : metrics[0].name,
