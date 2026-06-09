@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 # Copyright 2026 The Sismo Authors. All rights reserved.
 # Licensed under the MIT License.
-"""Builds a single sismo UI channel and deploys it to Cloudflare R2.
+"""Builds the sismo UI once and deploys it to Cloudflare R2.
 
 Mirrors third_party/src/perfetto/ui/release/build_channel.py but targets
 R2 via the S3 API instead of GCS via gsutil. Same channel/version-archive
 model: each release writes /v<version>/ (immutable, kept forever) and
 CAS-updates the /index.html version map.
 
+--channel takes a comma-separated list; a single build is uploaded and
+every listed channel's slot in the version map is pointed at it. CI
+deploys every push to main with --channel=stable,canary,autopush, so all
+three slots track main together; the per-channel granularity remains for
+manual surgery (e.g. pinning canary to an experiment build).
+
 Channels:
-  autopush -- every push to main, updates only autopush slot
-  canary   -- manual / canary branch, updates only canary slot
-  stable   -- tag pushes, swaps the HTML body AND updates stable slot
-              (preserves the other channels' map entries)
-  release  -- uploads /v<version>/ only, no shared-state mutation
+  autopush -- updates only the autopush slot
+  canary   -- updates only the canary slot
+  stable   -- swaps the HTML body AND updates the stable slot
+              (preserves unlisted channels' map entries)
+  release  -- uploads /v<version>/ only, no shared-state mutation;
+              cannot be combined with other channels
 
 Required env vars (from GitHub Actions secrets):
   R2_ACCOUNT_ID         -- Cloudflare account ID
@@ -160,23 +167,25 @@ def replace_version_map(html, version_map):
       "data-perfetto_version='%s'" % json.dumps(version_map), html, count=1)
 
 
-def patch_one_channel(html, channel, new_version):
-  """Update only this channel's slot in the remote HTML's version map."""
+def patch_channels(html, channels, new_version):
+  """Update only these channels' slots in the remote HTML's version map."""
   version_map = parse_version_map(html)
   if version_map is None:
     raise Exception(
         'data-perfetto_version attribute not found in remote HTML; '
         'refusing to write. The stable channel must seed the root HTML '
         'before canary/autopush can update their entries.')
-  if version_map.get(channel) == new_version:
+  if all(version_map.get(c) == new_version for c in channels):
     return html
-  version_map[channel] = new_version
+  for channel in channels:
+    version_map[channel] = new_version
   return replace_version_map(html, version_map)
 
 
-def make_stable_updater(local_html_path, new_version):
+def make_stable_updater(local_html_path, channels, new_version):
   """For stable: swap in the freshly-built HTML body, splice in the
-  existing canary/autopush entries from the current remote map."""
+  remaining channels' entries from the current remote map, and point every
+  requested channel at the new version."""
   with open(local_html_path) as f:
     new_body = f.read()
   if VERSION_ATTR_RE.search(new_body) is None:
@@ -185,21 +194,21 @@ def make_stable_updater(local_html_path, new_version):
         'ui/build did not bake it in correctly.')
 
   def update(remote_html):
-    existing = parse_version_map(remote_html) or {}
-    merged = dict(existing)
-    merged['stable'] = new_version
+    merged = parse_version_map(remote_html) or {}
+    for channel in channels:
+      merged[channel] = new_version
     return replace_version_map(new_body, merged)
 
   return update
 
 
-def make_other_channel_updater(channel, new_version):
+def make_other_channel_updater(channels, new_version):
   def update(remote_html):
-    return patch_one_channel(remote_html, channel, new_version)
+    return patch_channels(remote_html, channels, new_version)
   return update
 
 
-def build(channel):
+def build(channels):
   # Compute the sismo-side SHA *before* chdir to PERFETTO_ROOT so it's the
   # sismo repo's HEAD, not perfetto's. Pass it through as a build-time env
   # var so write_version_header.py bakes it into perfetto_version{.gen.h,.ts}
@@ -210,7 +219,7 @@ def build(channel):
 
   os.chdir(PERFETTO_ROOT)
   print('=' * 70)
-  print(f'Building UI for channel {channel} @ sismo {sismo_sha}')
+  print(f'Building UI for channels {",".join(channels)} @ sismo {sismo_sha}')
   print('=' * 70)
   version = check_output_str(['tools/write_version_header.py', '--stdout'])
   check_call_and_log(['tools/install-build-deps', '--ui'])
@@ -254,18 +263,19 @@ def upload_versioned_dir(s3, bucket, version, dist_dir):
       )
 
 
-def upload_loose_files(s3, bucket, channel, version, dist_dir):
+def upload_loose_files(s3, bucket, channels, version, dist_dir):
   """Iterate the loose files at the root of dist_dir.
 
   HTML files: CAS-updated by every index channel (stable swaps the body,
-  others patch only their slot in the version map).
+  others patch only their slots in the version map).
 
-  Non-HTML files (service_worker.*, etc.): uploaded plain by the stable
-  channel only -- canary/autopush must not touch shared loose files.
+  Non-HTML files (service_worker.*, etc.): uploaded plain only when stable
+  is among the channels -- canary/autopush must not touch shared loose
+  files.
 
   release: skipped entirely. /v<version>/ alone is published, no shared
   state mutated."""
-  if channel == 'release':
+  if channels == ['release']:
     print('Skipping loose-file upload for release mode')
     return
   for fname in sorted(os.listdir(dist_dir)):
@@ -273,12 +283,12 @@ def upload_loose_files(s3, bucket, channel, version, dist_dir):
     if not os.path.isfile(fpath):
       continue
     if fname.endswith('.html'):
-      if channel == 'stable':
-        update = make_stable_updater(fpath, version)
+      if 'stable' in channels:
+        update = make_stable_updater(fpath, channels, version)
       else:
-        update = make_other_channel_updater(channel, version)
+        update = make_other_channel_updater(channels, version)
       cas_write_html(s3, bucket, fname, update)
-    elif channel == 'stable':
+    elif 'stable' in channels:
       with open(fpath, 'rb') as f:
         body = f.read()
       print(f'put {fname} ({len(body)} bytes)')
@@ -306,14 +316,25 @@ def check_env():
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument('--channel', required=True, choices=CHANNELS)
+  parser.add_argument(
+      '--channel',
+      required=True,
+      help='comma-separated list of channels to update: ' +
+      ', '.join(CHANNELS))
   parser.add_argument('--upload', action='store_true')
   args = parser.parse_args()
+
+  channels = args.channel.split(',')
+  bad = sorted(set(channels) - set(CHANNELS))
+  if bad:
+    parser.error(f'unknown channel(s): {", ".join(bad)}')
+  if 'release' in channels and len(channels) > 1:
+    parser.error("'release' cannot be combined with other channels")
 
   if args.upload:
     check_env()
 
-  version, dist_dir = build(args.channel)
+  version, dist_dir = build(channels)
 
   if not args.upload:
     return
@@ -322,10 +343,10 @@ def main():
   s3 = make_s3_client()
 
   print('=' * 70)
-  print(f'Uploading channel {args.channel} @ {version} to r2://{bucket}')
+  print(f'Uploading channels {args.channel} @ {version} to r2://{bucket}')
   print('=' * 70)
   upload_versioned_dir(s3, bucket, version, dist_dir)
-  upload_loose_files(s3, bucket, args.channel, version, dist_dir)
+  upload_loose_files(s3, bucket, channels, version, dist_dir)
 
 
 if __name__ == '__main__':

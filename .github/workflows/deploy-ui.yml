@@ -1,13 +1,16 @@
-name: Deploy UI (Autopush)
+name: Deploy UI
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+# cancel-in-progress is deliberately off: killing a deploy mid-upload can
+# leave /v<version>/ half-written yet skipped by later runs (the existence
+# check only looks for manifest.json). Queued runs coalesce to the newest.
 concurrency:
-  group: deploy-ui-autopush
-  cancel-in-progress: true
+  group: deploy-ui
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
@@ -21,13 +24,13 @@ jobs:
       - name: Install boto3
         run: pip install --user --upgrade 'boto3>=1.35.10'
 
-      - name: Build & deploy autopush
+      - name: Build & deploy to all channels
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: python3 infra/sismo-ui/deploy_to_r2.py --channel=autopush --upload
+        run: python3 infra/sismo-ui/deploy_to_r2.py --channel=stable,canary,autopush --upload
 
       - name: Print ccache stats
         if: always()
