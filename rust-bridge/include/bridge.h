@@ -163,6 +163,40 @@ size_t sismo_symbolizer_resolve(sismo_symbolizer_t *s,
                                 uint8_t *out_utf8,
                                 size_t cap);
 
+// ===== /proc/<pid>/maps reader (Linux) ====================================
+//
+// Parses /proc/<pid>/maps into the executable, file-backed mappings a
+// sampled user PC can land in, resolving each file's GNU build-id and base
+// avma. One handle per parse; the recorder re-parses to pick up dlopen()s.
+//
+//   1. sismo_proc_maps_parse(pid)        — read + parse (null on failure).
+//   2. sismo_proc_maps_find(addr, &out)  — mapping containing addr.
+//   3. sismo_proc_maps_destroy(handle)   — release.
+
+typedef struct sismo_proc_maps sismo_proc_maps_t;
+
+// `path`/`build_id` borrow the handle and stay valid until destroy.
+typedef struct {
+  uint64_t start;
+  uint64_t end;
+  uint64_t offset;
+  uint64_t base_avma;  // avma of the file's lowest mapping (image base)
+  const uint8_t *path;
+  size_t path_len;
+  const uint8_t *build_id;  // GNU build-id, or a 16-byte synthetic id
+  size_t build_id_len;
+} sismo_mapping_t;
+
+sismo_proc_maps_t *sismo_proc_maps_parse(uint32_t pid);
+
+void sismo_proc_maps_destroy(sismo_proc_maps_t *m);
+
+// Fills *out with the executable file-backed mapping containing `addr`.
+// Returns 1 if found (out written), 0 otherwise (out untouched).
+int sismo_proc_maps_find(const sismo_proc_maps_t *m,
+                         uint64_t addr,
+                         sismo_mapping_t *out);
+
 #ifdef __cplusplus
 }
 #endif

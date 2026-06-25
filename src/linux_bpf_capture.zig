@@ -369,7 +369,7 @@ pub const Capture = struct {
     /// Address-space map of the target, parsed lazily on the first emitted
     /// sample (by then the workload has mapped its libraries) and re-parsed
     /// (bounded to ~1/s) when a PC misses, to pick up later dlopen()s.
-    maps: ?proc_maps.Maps,
+    maps: ?*proc_maps.Maps,
     maps_tried: bool,
     /// CLOCK_MONOTONIC ns of the last maps parse (0 = never).
     last_maps_ns: u64,
@@ -622,7 +622,7 @@ pub const Capture = struct {
         self.interner.reset(self.gpa);
         self.ksym_names.deinit(self.gpa);
         self.ksym_arena.deinit();
-        if (self.maps) |*m| m.deinit();
+        if (self.maps) |m| m.deinit();
         if (self.data_regions) |*r| r.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
@@ -817,7 +817,7 @@ pub const Capture = struct {
     fn ensureMaps(self: *Capture, now_ns: u64) void {
         if (self.maps_tried) return;
         self.maps_tried = true;
-        self.maps = proc_maps.parse(self.gpa, self.target_pid) catch null;
+        self.maps = proc_maps.parse(self.target_pid);
         self.last_maps_ns = now_ns;
     }
 
@@ -827,8 +827,8 @@ pub const Capture = struct {
     fn reparseMaps(self: *Capture, now_ns: u64) void {
         if (now_ns -% self.last_maps_ns < std.time.ns_per_s) return;
         self.last_maps_ns = now_ns;
-        const fresh = proc_maps.parse(self.gpa, self.target_pid) catch return;
-        if (self.maps) |*old| old.deinit();
+        const fresh = proc_maps.parse(self.target_pid) orelse return;
+        if (self.maps) |old| old.deinit();
         self.maps = fresh;
     }
 
@@ -856,19 +856,20 @@ pub const Capture = struct {
             while (i < nr) : (i += 1) {
                 const pc = rec.stack[i];
                 if (pc == 0) continue;
-                var m = self.maps.?.find(pc);
-                if (m == null and !reparsed) {
+                var mm: proc_maps.Mapping = undefined;
+                var found = self.maps.?.find(pc, &mm);
+                if (!found and !reparsed) {
                     // A miss may be a freshly dlopen()'d library — reparse once.
                     reparsed = true;
                     self.reparseMaps(rec.hdr.ts);
-                    m = self.maps.?.find(pc);
+                    found = self.maps.?.find(pc, &mm);
                 }
-                const mm = m orelse continue;
+                if (!found) continue;
                 // rel_pc is the absolute pc; paired with load_bias = base_avma
                 // (see internMapping), `rel_pc - load_bias` is the image-relative
                 // address the symbolizer resolves, with a positive per-module base.
                 const rel_pc = pc;
-                const mapping_iid = self.internMapping(mm, idw) catch return 0;
+                const mapping_iid = self.internMapping(&mm, idw) catch return 0;
                 const frame_iid = self.internFrame(.{ .mapping_iid = mapping_iid, .rel_pc = rel_pc, .name_iid = 0 }, idw) catch return 0;
                 fids[n] = frame_iid;
                 n += 1;
@@ -953,9 +954,10 @@ pub const Capture = struct {
         const iid = self.interner.next_mapping;
         self.interner.next_mapping += 1;
         gop.value_ptr.* = iid;
-        const path_iid = try self.internPath(m.path, idw);
-        const build_id_iid: u64 = if (m.build_id.len > 0)
-            try self.internBuildId(m.build_id, idw)
+        const path_iid = try self.internPath(m.path(), idw);
+        const build_id = m.buildId();
+        const build_id_iid: u64 = if (build_id.len > 0)
+            try self.internBuildId(build_id, idw)
         else
             0;
         // InternedData.mappings (19): Mapping { iid=1, build_id=2, start=4,
