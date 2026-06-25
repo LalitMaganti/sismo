@@ -1,3 +1,8 @@
+$ sismo 
+exit: 0
+--- stdout ---
+
+--- stderr ---
 sismo - cross-platform desktop tracing/profiling tool
 
 Usage:
