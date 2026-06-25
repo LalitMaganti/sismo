@@ -5,6 +5,7 @@
 //! wholesym symbolizer) to Zig over a cargo→staticlib→Zig link.
 
 pub mod cli;
+pub mod data_regions;
 pub mod disasm;
 pub mod proc_maps;
 pub mod symbolizer;
