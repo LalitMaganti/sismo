@@ -101,6 +101,24 @@ pub fn build(b: *std.Build) void {
     }
 
     // -------------------------------------------------------------------------
+    // `zig build test` — run the unit tests in OS-portable, link-light
+    // modules (see src/tests.zig for what's in and what's deliberately out).
+    // No Perfetto / rust-bridge link, so it runs anywhere zig itself runs.
+    // -------------------------------------------------------------------------
+    {
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const tests = b.addTest(.{ .root_module = test_mod });
+        const run_tests = b.addRunArtifact(tests);
+        const test_step = b.step("test", "Run unit tests for OS-portable modules");
+        test_step.dependOn(&run_tests.step);
+    }
+
+    // -------------------------------------------------------------------------
     // rust-bridge: Cargo staticlib produced by an external `cargo build`
     // step. Linked into the sismo binary on every OS where we have a
     // full pipeline.
