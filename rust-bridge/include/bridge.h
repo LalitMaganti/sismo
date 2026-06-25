@@ -197,6 +197,32 @@ int sismo_proc_maps_find(const sismo_proc_maps_t *m,
                          uint64_t addr,
                          sismo_mapping_t *out);
 
+// ===== /proc/<pid>/maps data regions (Linux) ==============================
+//
+// The data-address counterpart to proc_maps: keeps EVERY mapping and labels
+// it (file basename / "[heap]" / "[anon]" / …) for the cache focus's
+// data-side attribution. Same handle lifecycle as proc_maps.
+
+typedef struct sismo_data_regions sismo_data_regions_t;
+
+// `label` borrows the handle and stays valid until destroy.
+typedef struct {
+  uint64_t start;
+  uint64_t end;
+  const uint8_t *label;
+  size_t label_len;
+} sismo_region_t;
+
+sismo_data_regions_t *sismo_data_regions_parse(uint32_t pid);
+
+void sismo_data_regions_destroy(sismo_data_regions_t *r);
+
+// Fills *out with the region containing `addr`. Returns 1 if found (out
+// written), 0 otherwise (out untouched).
+int sismo_data_regions_find(const sismo_data_regions_t *r,
+                            uint64_t addr,
+                            sismo_region_t *out);
+
 #ifdef __cplusplus
 }
 #endif

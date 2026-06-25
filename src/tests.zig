@@ -14,7 +14,6 @@ comptime {
     _ = @import("proto_writer.zig");
     _ = @import("perfetto_proto.zig");
     _ = @import("sismo_config.zig");
-    _ = @import("data_regions.zig");
     _ = @import("source_asm_sidecar.zig");
     _ = @import("sismo_privileged_marker.zig");
 }

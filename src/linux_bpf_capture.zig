@@ -404,7 +404,7 @@ pub const Capture = struct {
     /// and emitted as the innermost ([sismo:data]) frame of the callstack, so
     /// the miss histogram bottoms out in the data a line touched. `data_frames`
     /// counts how many samples got such a frame (the Stats tally).
-    data_regions: ?data_regions.Regions,
+    data_regions: ?*data_regions.Regions,
     /// CLOCK_MONOTONIC ns of the last data-regions parse; rate-limits the
     /// refresh-on-miss so a growing address space stays resolvable (0 = never).
     last_data_parse_ns: u64,
@@ -623,7 +623,7 @@ pub const Capture = struct {
         self.ksym_names.deinit(self.gpa);
         self.ksym_arena.deinit();
         if (self.maps) |m| m.deinit();
-        if (self.data_regions) |*r| r.deinit();
+        if (self.data_regions) |r| r.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
         return stats;
@@ -785,28 +785,26 @@ pub const Capture = struct {
     /// grows its heap (brk) and mmaps fresh arenas as it runs — a single early
     /// snapshot goes stale fast (trace_processor parsing leaves ~88% unresolved
     /// without this). `now_ns` is the sample's CLOCK_MONOTONIC ts. The returned
-    /// slice borrows from data_regions.arena; copy it to keep it (the caller
-    /// interns it into a frame name, which dupes).
+    /// slice borrows the Regions handle; copy it to keep it (the caller interns
+    /// it into a frame name, which dupes).
     fn dataRegionLabel(self: *Capture, addr: u64, now_ns: u64) []const u8 {
         if (addr > USER_ADDR_MAX) return "[kernel]";
+        var region: data_regions.Region = undefined;
         if (self.data_regions == null) {
-            self.data_regions = data_regions.parse(self.gpa, self.target_pid) catch {
-                self.data_regions = null;
-                return "[unmapped]";
-            };
+            self.data_regions = data_regions.parse(self.target_pid) orelse return "[unmapped]";
             self.last_data_parse_ns = now_ns;
         }
-        if (self.data_regions.?.find(addr)) |r| return r.label;
+        if (self.data_regions.?.find(addr, &region)) return region.label();
         // Miss: the layout has likely grown since the last snapshot. Refresh, but
         // no more than ~10x/s so a storm of unresolvable addresses (a transient
         // mapping, or the tail after the target exits) can't thrash /proc.
         if (now_ns -% self.last_data_parse_ns > 100 * std.time.ns_per_ms) {
             self.last_data_parse_ns = now_ns;
-            if (data_regions.parse(self.gpa, self.target_pid)) |fresh| {
+            if (data_regions.parse(self.target_pid)) |fresh| {
                 self.data_regions.?.deinit();
                 self.data_regions = fresh;
-                if (self.data_regions.?.find(addr)) |r| return r.label;
-            } else |_| {}
+                if (self.data_regions.?.find(addr, &region)) return region.label();
+            }
         }
         return "[unmapped]";
     }
