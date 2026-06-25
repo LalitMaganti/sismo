@@ -6,5 +6,6 @@
 
 pub mod cli;
 pub mod disasm;
+pub mod proc_maps;
 pub mod symbolizer;
 pub mod unwinder;
