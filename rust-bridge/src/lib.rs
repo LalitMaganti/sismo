@@ -4,6 +4,7 @@
 //! extern "C" facade exposing the Rust-side helpers (framehop unwinder,
 //! wholesym symbolizer) to Zig over a cargo→staticlib→Zig link.
 
+pub mod cli;
 pub mod disasm;
 pub mod symbolizer;
 pub mod unwinder;

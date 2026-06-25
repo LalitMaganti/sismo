@@ -22,6 +22,29 @@
 extern "C" {
 #endif
 
+// ===== CLI dispatch =======================================================
+//
+// Top-level `sismo` subcommand routing. The caller (Zig `main`) extracts the
+// subcommand token argv[1] and passes it here; the bridge owns the help text,
+// the unknown-subcommand error, and the routing decision.
+//
+// `cmd_utf8` is argv[1] or NULL when no subcommand was given. Matching is by
+// raw bytes, so a non-UTF-8 token is just an unknown subcommand.
+//
+// Returns one of SISMO_CLI_*. On SISMO_CLI_HANDLED the bridge already printed
+// help (or the unknown-subcommand error) to stderr and *exit_code holds the
+// process exit status (0 for help, 2 for unknown). On any other value the
+// caller runs that subcommand and *exit_code is untouched.
+#define SISMO_CLI_HANDLED 0
+#define SISMO_CLI_RECORD 1
+#define SISMO_CLI_PREPARE 2
+#define SISMO_CLI_SNAPSHOT 3
+#define SISMO_CLI_DATASOURCE 4
+
+int32_t sismo_cli_dispatch(const uint8_t *cmd_utf8,
+                           size_t cmd_len,
+                           int32_t *exit_code);
+
 // ===== Unwinder ===========================================================
 //
 // One handle per profiled process. Lifecycle:
