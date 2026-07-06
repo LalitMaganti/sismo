@@ -94,8 +94,16 @@ def ensure_venv() -> None:
 
 
 def reexec_in_venv_if_needed() -> None:
-    """Re-exec under the venv interpreter if we aren't already running there."""
-    if os.path.realpath(sys.executable) == os.path.realpath(VENV_PY):
+    """Re-exec under the venv interpreter if we aren't already running there.
+
+    Detect venv membership via sys.prefix, not by comparing interpreter paths:
+    on macOS (homebrew/framework Python) the venv's bin/python3 is a symlink
+    whose realpath resolves back to the base interpreter, so a realpath
+    comparison wrongly concludes we're already inside the venv, skips the
+    re-exec, and then fails to import perfetto from the base site-packages.
+    Inside a venv sys.prefix is the venv dir; outside it's the base prefix.
+    """
+    if os.path.realpath(sys.prefix) == os.path.realpath(VENV_DIR):
         return
     wrapper = os.path.join(ROOT_DIR, "tools", "e2e-all-sources")
     os.execv(VENV_PY, [VENV_PY, wrapper] + sys.argv[1:])
