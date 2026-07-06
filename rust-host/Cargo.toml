@@ -1,0 +1,23 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
+# Host-flip binary crate: Rust owns `main`, the Zig code is linked in as
+# libsismo_zig.a. Depends on rust-bridge (rlib) so std is shared and the
+# bridge's #[no_mangle] exports the Zig staticlib calls are pulled in.
+[package]
+name = "sismo-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sismo"
+path = "src/main.rs"
+
+[dependencies]
+rust-bridge = { path = "../rust-bridge" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
