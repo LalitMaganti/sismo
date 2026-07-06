@@ -197,13 +197,29 @@ pub fn connectAndAttach(pid: i32, shm_fd: c_int, config: AttachConfig) !c_int {
     var path_buf: [128]u8 = undefined;
     const path = try socketPath(pid, &path_buf);
 
-    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
-    if (fd < 0) return error.SocketCreate;
-    errdefer _ = std.c.close(fd);
-
     var sa: SockaddrUn = undefined;
     fillSockaddr(&sa, path);
-    if (std.c.connect(fd, @ptrCast(&sa), @sizeOf(SockaddrUn)) != 0) return error.SocketConnect;
+
+    // The target binds this socket from its heap-preload listener thread,
+    // which dyld only starts after it finishes mapping the inserted dylib —
+    // that can lag the spawn by more than any fixed settle sleep. Retry the
+    // connect on a short cadence until the socket is up or the deadline
+    // passes (the target may never load the preload — e.g. hardened runtime
+    // strips DYLD_INSERT_LIBRARIES — so we must not block forever).
+    const retry_delay: std.c.timespec = .{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
+    const max_attempts = 120; // 120 * 25ms = 3s
+    const fd = attempt: {
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            const s = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+            if (s < 0) return error.SocketCreate;
+            if (std.c.connect(s, @ptrCast(&sa), @sizeOf(SockaddrUn)) == 0) break :attempt s;
+            _ = std.c.close(s);
+            if (i + 1 >= max_attempts) return error.SocketConnect;
+            _ = std.c.nanosleep(&retry_delay, null);
+        }
+    };
+    errdefer _ = std.c.close(fd);
 
     var cfg_local = config;
     var iov = std.posix.iovec_const{
