@@ -560,6 +560,7 @@ fn buildTraceData(
     defer frame_by_pc.deinit();
 
     var name_buf: [256]u8 = undefined;
+    var file_buf: [1024]u8 = undefined;
     var next_callstack_iid: u64 = 1;
     var it = sizes_map.iterator();
     while (it.next()) |entry| {
@@ -571,8 +572,8 @@ fn buildTraceData(
         for (site.pcs[0..site.pc_count]) |pc| {
             const gop = try frame_by_pc.getOrPut(pc);
             if (!gop.found_existing) {
-                const k = symbolizer.resolve(sym, pc, &name_buf);
-                const name_str = if (k > 0) name_buf[0..k] else "?";
+                const r = symbolizer.resolve(sym, pc, &name_buf, &file_buf);
+                const name_str = if (r.name_len > 0) name_buf[0..r.name_len] else "?";
                 const owned_name = try gpa.dupe(u8, name_str);
                 try strings.append(gpa, owned_name);
                 const fn_iid = strings.items.len;
