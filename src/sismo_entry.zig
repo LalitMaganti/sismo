@@ -1,18 +1,38 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! C-ABI entry for the host-flipped build, where cargo produces the `sismo`
-//! binary and a Rust `main` calls in here. A Zig staticlib has no runtime
-//! start code, so this reconstructs the `std.process.Init` that std/start.zig's
-//! `callMain` would normally build (io.Threaded backend, arena, gpa, env,
-//! preopens), then runs the real dispatcher `sismo.main`.
+//! The single Zig entry point. cargo produces the `sismo` binary and a Rust
+//! `main` (rust-host/src/main.rs) calls `zig_sismo_main` with the process's
+//! raw argc/argv/envp. A Zig staticlib has no runtime start code, so this
+//! reconstructs the `std.process.Init` that std/start.zig's `callMain` would
+//! build (io.Threaded backend, arena, gpa, env, preopens), then dispatches to
+//! the subcommand.
 //!
-//! The Rust caller passes the process's raw argc/argv/envp (see
-//! rust-bridge/src/main.rs), exactly as the C runtime would hand them to a
-//! C `main`.
+//! Subcommands:
+//!   record       Run the unified recorder (orchestrator + in-process
+//!                producers), writing a single Perfetto trace.
+//!   prepare      Launch a workload with the sismo dormant heap client
+//!                preloaded, to attach to later via `sismo record --pid`.
+//!   datasource   Run a single producer in daemonized mode.
+//!
+//! The routing decision — help text, unknown-subcommand error, and which
+//! subcommand to run — lives in rust-bridge (src/cli.rs). Each subcommand
+//! parses its own args from `init.minimal.args`.
 
 const std = @import("std");
-const sismo = @import("sismo.zig");
+const record = @import("cmd_record.zig");
+const prepare = @import("cmd_prepare.zig");
+const snapshot = @import("cmd_snapshot.zig");
+const datasource = @import("cmd_datasource.zig");
+
+// rust-bridge/src/cli.rs — see rust-bridge/include/bridge.h for the contract.
+const cli_handled: i32 = 0;
+const cli_record: i32 = 1;
+const cli_prepare: i32 = 2;
+const cli_snapshot: i32 = 3;
+const cli_datasource: i32 = 4;
+
+extern fn sismo_cli_dispatch(cmd_utf8: ?[*]const u8, cmd_len: usize, exit_code: *i32) i32;
 
 export fn zig_sismo_main(
     argc: c_int,
@@ -54,7 +74,32 @@ export fn zig_sismo_main(
         .preopens = preopens,
     };
 
-    sismo.main(init) catch |err| {
+    return dispatch(init);
+}
+
+fn dispatch(init: std.process.Init) c_int {
+    var iter = init.minimal.args.iterate();
+    _ = iter.next(); // exe path
+    const cmd = iter.next(); // subcommand token, or null
+
+    var exit_code: i32 = 0;
+    const decision = sismo_cli_dispatch(
+        if (cmd) |c| c.ptr else null,
+        if (cmd) |c| c.len else 0,
+        &exit_code,
+    );
+
+    const result = switch (decision) {
+        // Bridge already printed help or the unknown-subcommand error; exit
+        // with the code it chose (0 for help, 2 for unknown).
+        cli_handled => return exit_code,
+        cli_record => record.runRecord(init),
+        cli_prepare => prepare.runPrepare(init),
+        cli_snapshot => snapshot.runSnapshot(init),
+        cli_datasource => datasource.runDatasource(init),
+        else => unreachable,
+    };
+    result catch |err| {
         std.log.err("{t}", .{err});
         return 1;
     };

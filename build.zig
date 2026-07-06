@@ -119,46 +119,18 @@ pub fn build(b: *std.Build) void {
     }
 
     // -------------------------------------------------------------------------
-    // rust-bridge: Cargo staticlib produced by an external `cargo build`
-    // step. Linked into the sismo binary on every OS where we have a
-    // full pipeline.
-    // -------------------------------------------------------------------------
-    const cargo_profile: []const u8 = switch (optimize) {
-        .Debug => "dev",
-        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => "release",
-    };
-    const cargo_target_subdir: []const u8 = switch (optimize) {
-        .Debug => "debug",
-        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => "release",
-    };
-
-    const cargo = b.addSystemCommand(&.{
-        "cargo",
-        "build",
-        "--manifest-path",
-        b.pathFromRoot("rust-bridge/Cargo.toml"),
-        "--profile",
-        cargo_profile,
-    });
-
-    // -------------------------------------------------------------------------
-    // Per-OS pipelines.
+    // Per-OS pipelines. The `sismo` binary itself is produced by cargo (the
+    // rust-host crate) linking libsismo_zig.a — see `zig build sismo-staticlib`
+    // and rust-host/. build.zig here builds the auxiliary Zig binaries.
     //
-    // macOS:   sample-target + heap-preload + sismo (full data-source set)
-    // Linux:   sample-target + sismo (cmd_record/datasource print "not yet
-    //          implemented" for the macOS-specific data sources; the SDK
-    //          and tracing service do work). Heap preload is macOS-only —
-    //          a Linux LD_PRELOAD variant will land alongside the Linux
-    //          producers.
+    // macOS:   sample-target + heap-preload
+    // Linux:   sample-target + sismo-run (BPF cap launcher)
     // Windows: sample-target only — the orchestrator's POSIX bits
     //          (sismo_paths' flock-based session lock, posix_spawnp,
-    //          POSIX Args.iterate) need Windows analogs first. The
-    //          Perfetto SDK and tracing service themselves work on
-    //          Windows so the sample-target consumer is enough to verify
-    //          the SDK link surface.
+    //          POSIX Args.iterate) need Windows analogs first.
     // -------------------------------------------------------------------------
     switch (os_tag) {
-        .macos, .linux => addUnixPipeline(b, target, optimize, cargo, cargo_target_subdir),
+        .macos, .linux => addUnixPipeline(b, target, optimize),
         .windows => addWindowsPipeline(b, target, optimize),
         else => {},
     }
@@ -168,8 +140,6 @@ fn addUnixPipeline(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    cargo: *std.Build.Step.Run,
-    cargo_target_subdir: []const u8,
 ) void {
     const os_tag = target.result.os.tag;
     const is_macos = os_tag == .macos;
@@ -280,90 +250,12 @@ fn addUnixPipeline(
     }
 
     // -------------------------------------------------------------------------
-    // sismo: the top-level CLI. Dispatches subcommands (`sismo record`,
-    // `sismo datasource <name>`, ...). On macOS hosts the kdebug / Mach
-    // sampler / heap consumer in-process; on Linux the macOS data
-    // sources stub out and only the SDK + tracing service path is wired
-    // (perf_event-based producers TBD).
-    //
-    // Link surface: perfetto C++ + shim, the C++ ServiceIPCHost wrapper,
-    // and the rust-bridge staticlib (framehop unwinding + wholesym
-    // symbolication).
-    // -------------------------------------------------------------------------
-    {
-        const sismo_mod = b.createModule(.{
-            .root_source_file = b.path("src/sismo.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        });
-        addComponentSources(b, sismo_mod, .sismo_unix, is_macos);
-        // Linux-only: the embedded traced_probes producer runs in-process
-        // as a worker thread (mirroring sismo_traced.cc), covering ftrace +
-        // procfs. CPU sampling is the in-process BPF collector (no upstream
-        // traced_perf). Gated `is_linux` — not built on macOS.
-        if (is_linux) {
-            addComponentSources(b, sismo_mod, .sismo_linux, is_macos);
-            // BPF CPU collector: compile the kernel-side hooks with clang to a
-            // BPF object and embed it, so the Zig loader can hand the bytes to
-            // libbpf at runtime. vmlinux.h + sismo_bpf.h resolve from the
-            // -I include dir.
-            const bpf_inc = b.fmt("-I{s}", .{b.path("src/c/sismo_bpf").getPath(b)});
-            const bpf_compile = b.addSystemCommand(&.{ "clang", "-target", "bpf", "-D__TARGET_ARCH_x86", bpf_inc, "-Wno-missing-declarations", "-O2", "-g", "-c" });
-            bpf_compile.addFileArg(b.path("src/c/sismo_bpf/sched.bpf.c"));
-            bpf_compile.addArg("-o");
-            const bpf_o = bpf_compile.addOutputFileArg("sched.bpf.o");
-            sismo_mod.addAnonymousImport("sched.bpf.o", .{ .root_source_file = bpf_o });
-            sismo_mod.linkSystemLibrary("bpf", .{});
-        }
-        sismo_mod.addIncludePath(perfetto_root.path(b, "include"));
-        // Linux producer shims include "src/profiling/perf/perf_producer.h"
-        // and "src/traced/probes/probes_producer.h" — both are
-        // non-public headers that resolve from Perfetto's repo root.
-        // perf_producer.h transitively reaches <unwindstack/Unwinder.h>
-        // via src/profiling/common/callstack_trie.h, so the bundled
-        // libunwindstack headers (buildtools/android-unwinding) need to
-        // be on the include path too. Mirror buildtools/BUILD.gn's
-        // libunwindstack_config.
-        if (!is_macos) {
-            sismo_mod.addIncludePath(perfetto_root);
-            sismo_mod.addIncludePath(perfetto_root.path(b, "buildtools/android-unwinding/libunwindstack/include"));
-        }
-        sismo_mod.addIncludePath(perfetto_out.path(b, "gen"));
-        sismo_mod.addIncludePath(perfetto_out.path(b, "gen/build_config"));
-        sismo_mod.addLibraryPath(b.path(b.fmt("rust-bridge/target/{s}", .{cargo_target_subdir})));
-        sismo_mod.linkSystemLibrary("rust_bridge", .{});
-        // wholesym pulls in CoreFoundation/Security via core_foundation-rs
-        // and uses Spotlight (CoreServices) to locate dSYM bundles —
-        // all macOS-specific. On Linux wholesym uses /usr/lib/debug and
-        // .gnu_debuglink; no extra system libs needed for the symbolizer.
-        if (is_macos) {
-            sismo_mod.linkFramework("Foundation", .{});
-            sismo_mod.linkFramework("Security", .{});
-            sismo_mod.linkFramework("CoreServices", .{});
-        }
-        const sismo_exe = b.addExecutable(.{
-            .name = "sismo",
-            .root_module = sismo_mod,
-        });
-        linkPerfetto(sismo_mod, &sismo_exe.step, repo_root_include, lib_a, &perfetto_build.step, os_tag);
-        sismo_exe.step.dependOn(&cargo.step);
-        b.installArtifact(sismo_exe);
-        const sismo_step = b.step("sismo", "Build the sismo CLI (subcommand dispatcher)");
-        sismo_step.dependOn(&b.addInstallArtifact(sismo_exe, .{}).step);
-    }
-
-    // -------------------------------------------------------------------------
-    // libsismo_zig.a — the Zig + C/C++ half of sismo as a static archive, for
-    // the host-flipped build where cargo produces the binary and a Rust main
-    // calls `zig_sismo_main` (src/sismo_entry.zig). Mirrors the sismo exe
-    // module's COMPILE config, minus the final link: no perfetto .a, no
-    // rust_bridge, no system libs — cargo performs that link. compiler_rt is
-    // bundled so a non-Zig linker (cargo) resolves __zig_probe_stack etc.
-    //
-    // Transitional: coexists with the sismo exe until the flip is validated,
-    // then the exe block is deleted. Keep this compile config in sync with it.
+    // libsismo_zig.a — the Zig + C/C++ half of sismo as a static archive. The
+    // `sismo` binary is produced by cargo (rust-host/), whose Rust main calls
+    // `zig_sismo_main` (src/sismo_entry.zig). This archive holds the Zig + C/C++
+    // shims + compiler_rt; cargo links it against libsismo_libperfetto.a,
+    // rust-bridge, and the system/C++-runtime libs (see rust-host/build.rs).
+    // compiler_rt is bundled so a non-Zig linker resolves __zig_probe_stack etc.
     // `zig build sismo-staticlib` emits zig-out/lib/libsismo_zig.a.
     // -------------------------------------------------------------------------
     {

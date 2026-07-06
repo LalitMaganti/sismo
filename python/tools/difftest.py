@@ -31,7 +31,9 @@ import tempfile
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN: str = os.path.join(ROOT_DIR, "zig-out", "bin")
-SISMO: str = os.path.join(BIN, "sismo")
+# `sismo` is the cargo-built binary (rust-host/); sample-target/sismo-run are
+# the Zig-built auxiliaries in zig-out/bin.
+SISMO: str = os.path.join(ROOT_DIR, "rust-host", "target", "debug", "sismo")
 SISMO_RUN: str = os.path.join(BIN, "sismo-run")
 SAMPLE_TARGET: str = os.path.join(BIN, "sample-target")
 TP_SHELL: str = os.path.join(

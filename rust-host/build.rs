@@ -20,6 +20,15 @@ fn main() {
         .to_path_buf();
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
+    // Drive the Zig build so `cargo build` alone produces everything: the
+    // static archive we link (+ its Perfetto dependency) and the auxiliary
+    // Zig binaries (sample-target, sismo-run). Zig caches, so this is cheap
+    // when nothing changed. Reruns when any Zig source or build.zig changes.
+    zig_build(&root, &["sismo-staticlib"]);
+    zig_build(&root, &[]);
+    println!("cargo:rerun-if-changed={}", root.join("src").display());
+    println!("cargo:rerun-if-changed={}", root.join("build.zig").display());
+
     // libsismo_zig.a (Zig + C/C++ shims + compiler_rt).
     println!("cargo:rustc-link-search=native={}", root.join("zig-out/lib").display());
     println!("cargo:rustc-link-lib=static=sismo_zig");
@@ -40,6 +49,18 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Run `zig build <steps>` via the pinned hermetic toolchain.
+fn zig_build(root: &PathBuf, steps: &[&str]) {
+    let mut cmd = Command::new("python3");
+    cmd.current_dir(root) // build.zig lives at the repo root
+        .arg(root.join("tools/zig"))
+        .arg("--hermetic")
+        .arg("build");
+    cmd.args(steps);
+    let status = cmd.status().expect("run zig build");
+    assert!(status.success(), "zig build {steps:?} failed");
 }
 
 /// Compile+link a tiny libc++-using program with `zig c++ -v` and scrape the

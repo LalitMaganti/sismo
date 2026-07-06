@@ -49,13 +49,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         _ = linux.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, @as(usize, cap), 0, 0);
     }
 
-    // Resolve `sismo` as a sibling of this launcher in zig-out/bin.
+    // `sismo` is the cargo-built binary (rust-host/). This launcher installs
+    // to zig-out/bin, so the binary is ../../rust-host/target/debug/sismo
+    // relative to it. execve resolves the `..` components.
     var exebuf: [4096]u8 = undefined;
     const rc = linux.readlinkat(linux.AT.FDCWD, "/proc/self/exe", &exebuf, exebuf.len);
     if (@as(isize, @bitCast(rc)) <= 0) return error.SelfExePath;
     const dir = std.fs.path.dirname(exebuf[0..rc]) orelse return error.NoBinDir;
     var pathbuf: [4096]u8 = undefined;
-    const sismo = try std.fmt.bufPrintZ(&pathbuf, "{s}/sismo", .{dir});
+    const sismo = try std.fmt.bufPrintZ(&pathbuf, "{s}/../../rust-host/target/debug/sismo", .{dir});
 
     // Forward our argv to sismo, replacing argv[0] with sismo's own path.
     const argv = init.args.vector;

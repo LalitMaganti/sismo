@@ -33,7 +33,7 @@ import sys
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SISMO_BIN: str = os.path.join(ROOT_DIR, "zig-out", "bin", "sismo")
+SISMO_BIN: str = os.path.join(ROOT_DIR, "rust-host", "target", "debug", "sismo")
 SAMPLE_TARGET_BIN: str = os.path.join(ROOT_DIR, "zig-out", "bin", "sample-target")
 TRACE_PATH: str = "/tmp/sismo-e2e.pftrace"
 RUN_LOG: str = "/tmp/sismo-e2e-run.log"
@@ -127,8 +127,11 @@ def main() -> int:
     from perfetto.trace_processor import TraceProcessor
 
     print("==> building")
+    # cargo drives the whole build (build.rs invokes the Zig staticlib + aux).
     subprocess.check_call(
-        ["zig", "build"], cwd=ROOT_DIR, stdout=subprocess.DEVNULL
+        [sys.executable, os.path.join(ROOT_DIR, "tools", "cargo"), "--hermetic",
+         "build", "--manifest-path", os.path.join(ROOT_DIR, "rust-host", "Cargo.toml")],
+        cwd=ROOT_DIR, stdout=subprocess.DEVNULL,
     )
 
     print("==> priming sudo (password may be asked once)")

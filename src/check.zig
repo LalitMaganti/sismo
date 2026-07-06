@@ -35,7 +35,6 @@ pub export fn sismo_check_cmds() void {
     // sample-target only.
     if (comptime builtin.os.tag == .windows) return;
     const init: std.process.Init = undefined;
-    @import("sismo.zig").main(init) catch {};
     @import("cmd_record.zig").runRecord(init) catch {};
     @import("cmd_prepare.zig").runPrepare(init) catch {};
     @import("cmd_snapshot.zig").runSnapshot(init) catch {};
