@@ -95,11 +95,21 @@ pub fn readRecorderPid() ReadPidError!c_int {
 }
 
 /// Path to the heap preload dylib, relative to the running sismo
-/// binary's directory. Layout assumption matches what `zig build`
-/// produces: `zig-out/bin/sismo` + `zig-out/lib/libsismo_heap.dylib`.
-/// When sismo ships installed (homebrew libexec layout), this becomes
-/// `<bindir>/../libexec/sismo/libsismo_heap.dylib`, tried first with a
-/// fall back to the dev-tree layout.
+/// binary's directory. Several layouts are possible depending on how
+/// sismo was built/installed, so we try each in order and return the
+/// first that exists:
+///
+///   1. Installed (homebrew libexec):
+///        `<bindir>/../libexec/sismo/libsismo_heap.dylib`
+///   2. Cargo dev tree: the binary is the cargo host-flip binary at
+///      `rust-host/target/{debug,release}/sismo`, three levels below the
+///      repo root; `zig build` installs the dylib into `zig-out/lib`.
+///        `<bindir>/../../../zig-out/lib/libsismo_heap.dylib`
+///   3. Legacy zig-exe dev tree (`zig-out/bin/sismo`):
+///        `<bindir>/../lib/libsismo_heap.dylib`
+///
+/// If none exist, the cargo dev-tree candidate (the current default) is
+/// returned as a best-effort so the caller surfaces a concrete path.
 ///
 /// Caller frees the returned slice.
 pub fn heapDylibPath(io: std.Io, allocator: std.mem.Allocator) ![:0]u8 {
@@ -110,23 +120,27 @@ pub fn heapDylibPath(io: std.Io, allocator: std.mem.Allocator) ![:0]u8 {
     const exe_path = buf[0..n];
     const bin_dir = std.fs.path.dirname(exe_path) orelse return error.NoBinDir;
 
-    // Try installed layout first.
-    const installed = try std.fmt.allocPrintSentinel(
-        allocator,
+    // Most-specific first. Index 1 (cargo dev tree) is the best-effort
+    // fallback when nothing exists on disk.
+    const layouts = [_][]const u8{
         "{s}/../libexec/sismo/libsismo_heap.dylib",
-        .{bin_dir},
-        0,
-    );
-    if (fileExists(installed)) return installed;
-    allocator.free(installed);
-
-    // Fall back to dev-tree layout.
-    return try std.fmt.allocPrintSentinel(
-        allocator,
+        "{s}/../../../zig-out/lib/libsismo_heap.dylib",
         "{s}/../lib/libsismo_heap.dylib",
-        .{bin_dir},
-        0,
-    );
+    };
+    const fallback_index = 1;
+
+    var fallback: [:0]u8 = undefined;
+    // inline for so each `fmt` is comptime-known (std.fmt requires it).
+    inline for (layouts, 0..) |fmt, i| {
+        const path = try std.fmt.allocPrintSentinel(allocator, fmt, .{bin_dir}, 0);
+        if (fileExists(path)) return path;
+        if (i == fallback_index) {
+            fallback = path;
+        } else {
+            allocator.free(path);
+        }
+    }
+    return fallback;
 }
 
 fn fileExists(path_z: [:0]const u8) bool {
