@@ -354,6 +354,62 @@ fn addUnixPipeline(
         sismo_step.dependOn(&b.addInstallArtifact(sismo_exe, .{}).step);
     }
 
+    // -------------------------------------------------------------------------
+    // libsismo_zig.a — the Zig + C/C++ half of sismo as a static archive, for
+    // the host-flipped build where cargo produces the binary and a Rust main
+    // calls `zig_sismo_main` (src/sismo_entry.zig). Mirrors the sismo exe
+    // module's COMPILE config, minus the final link: no perfetto .a, no
+    // rust_bridge, no system libs — cargo performs that link. compiler_rt is
+    // bundled so a non-Zig linker (cargo) resolves __zig_probe_stack etc.
+    //
+    // Transitional: coexists with the sismo exe until the flip is validated,
+    // then the exe block is deleted. Keep this compile config in sync with it.
+    // `zig build sismo-staticlib` emits zig-out/lib/libsismo_zig.a.
+    // -------------------------------------------------------------------------
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/sismo_entry.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+            // Trap on C/C++ UB (ud2) rather than call __ubsan_handle_* — the
+            // Zig-exe link pulls those from Zig's ubsan runtime, but the cargo
+            // link has no such runtime, so keep the archive self-contained.
+            .sanitize_c = .trap,
+        });
+        addComponentSources(b, mod, .sismo_unix, is_macos);
+        if (is_linux) {
+            addComponentSources(b, mod, .sismo_linux, is_macos);
+            const bpf_inc = b.fmt("-I{s}", .{b.path("src/c/sismo_bpf").getPath(b)});
+            const bpf_compile = b.addSystemCommand(&.{ "clang", "-target", "bpf", "-D__TARGET_ARCH_x86", bpf_inc, "-Wno-missing-declarations", "-O2", "-g", "-c" });
+            bpf_compile.addFileArg(b.path("src/c/sismo_bpf/sched.bpf.c"));
+            bpf_compile.addArg("-o");
+            const bpf_o = bpf_compile.addOutputFileArg("sched.bpf.o");
+            mod.addAnonymousImport("sched.bpf.o", .{ .root_source_file = bpf_o });
+        }
+        // Include paths to COMPILE the C/C++ shims: repo-root for
+        // "src/c/…"-qualified includes + perfetto's public/gen headers.
+        mod.addIncludePath(b.path("."));
+        mod.addIncludePath(perfetto_root.path(b, "include"));
+        if (!is_macos) {
+            mod.addIncludePath(perfetto_root);
+            mod.addIncludePath(perfetto_root.path(b, "buildtools/android-unwinding/libunwindstack/include"));
+        }
+        mod.addIncludePath(perfetto_out.path(b, "gen"));
+        mod.addIncludePath(perfetto_out.path(b, "gen/build_config"));
+
+        const lib = b.addLibrary(.{
+            .name = "sismo_zig",
+            .root_module = mod,
+            .linkage = .static,
+        });
+        lib.bundle_compiler_rt = true;
+        lib.step.dependOn(&perfetto_build.step); // shims need perfetto's gen headers
+        const step = b.step("sismo-staticlib", "Build libsismo_zig.a for the cargo-linked binary");
+        step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+    }
+
     // sismo-run: capability-stable launcher (Linux only). File caps live on
     // this tiny binary (it rebuilds only when its own source changes), so
     // `sismo` never needs re-setcap after a build — the launcher raises the
