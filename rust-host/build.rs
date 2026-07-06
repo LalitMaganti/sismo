@@ -38,17 +38,39 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", pf.display());
     println!("cargo:rustc-link-lib=static=sismo_libperfetto");
 
-    // Zig's C++ runtime archives, discovered from `zig c++ -v`.
-    for archive in discover_cxx_runtime(&root, &out) {
-        println!("cargo:rustc-link-arg={archive}");
-    }
+    // Target OS drives the link surface. On Linux there is no system libc++,
+    // so we hand the linker Zig's static libc++/libc++abi/libunwind. macOS
+    // ships a system libc++ that is ABI-compatible with the one Zig used for
+    // the C/C++ shims (both are LLVM libc++), so we link that instead.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    if target_os == "macos" {
+        link_macos();
+    } else {
+        // Zig's C++ runtime archives, discovered from `zig c++ -v`.
+        for archive in discover_cxx_runtime(&root, &out) {
+            println!("cargo:rustc-link-arg={archive}");
+        }
 
-    // System libs the Zig/perfetto code needs.
-    for lib in ["bpf", "dl", "pthread", "rt", "m"] {
-        println!("cargo:rustc-link-lib=dylib={lib}");
+        // System libs the Zig/perfetto code needs.
+        for lib in ["bpf", "dl", "pthread", "rt", "m"] {
+            println!("cargo:rustc-link-lib=dylib={lib}");
+        }
     }
 
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// macOS link surface. Mirrors what the deleted Zig `sismo` executable linked:
+/// the system libc++ (pthread/m live in libSystem, no separate -lpthread/-lm),
+/// libdl (perfetto + wholesym), CoreFoundation (perfetto), and the frameworks
+/// wholesym pulls in via core-foundation-rs — Foundation/Security — plus
+/// CoreServices (Spotlight, to locate dSYM bundles). No bpf/rt: those are Linux.
+fn link_macos() {
+    println!("cargo:rustc-link-lib=dylib=c++");
+    println!("cargo:rustc-link-lib=dylib=dl");
+    for framework in ["CoreFoundation", "Foundation", "Security", "CoreServices"] {
+        println!("cargo:rustc-link-lib=framework={framework}");
+    }
 }
 
 /// Run `zig build <steps>` via the pinned hermetic toolchain.
