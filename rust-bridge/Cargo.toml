@@ -8,9 +8,12 @@ edition = "2021"
 publish = false
 
 [lib]
-# staticlib for the current Zig-exe link; rlib so the host-flip binary crate
+# staticlib for the Zig staticlib link; rlib so the host-flip binary crate
 # (rust-host) can depend on this crate and pull its #[no_mangle] exports in.
 crate-type = ["staticlib", "rlib"]
+# No runnable doc examples; the rlib crate-type otherwise makes `cargo test`
+# invoke rustdoc, which isn't wired to the pinned toolchain.
+doctest = false
 
 [profile.release]
 opt-level = 3
