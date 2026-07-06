@@ -33,6 +33,20 @@ extern fn sismo_encode_perf_defaults_packet(
     out: [*]u8,
     cap: usize,
 ) usize;
+extern fn sismo_encode_perf_sample(
+    cpu: u32,
+    pid: u32,
+    tid: u32,
+    callstack_iid: u64,
+    timebase_count: u64,
+    follower_counts: ?[*]const u64,
+    follower_count: usize,
+    data_address: u64,
+    data_symbol: ?[*]const u8,
+    data_symbol_len: usize,
+    out: [*]u8,
+    cap: usize,
+) usize;
 const SAMPLE_SCOPE_THREAD: u32 = 2;
 // PMU event encodings per Intel CPU model, generated from Intel's perfmon DB by
 // python/tools/gen_pmu_events.py. On x86 we resolve the active counters from
@@ -758,17 +772,22 @@ pub const Capture = struct {
             data_symbol = self.dataRegionLabel(rec.data_addr, hdr.ts);
             self.data_frames += 1;
         }
-        const ps = perfetto_proto.encodePerfSample(gpa, .{
-            .cpu = hdr.cpu,
-            .pid = hdr.pid,
-            .tid = hdr.tid,
-            .timebase_count = timebase_count,
-            .follower_counts = follower_buf[0..nf],
-            .callstack_iid = cs_iid,
-            .data_address = data_address,
-            .data_symbol = data_symbol,
-        }) catch return;
-        defer gpa.free(ps);
+        var ps_buf: [8192]u8 = undefined;
+        const ps_len = sismo_encode_perf_sample(
+            hdr.cpu,
+            hdr.pid,
+            hdr.tid,
+            cs_iid,
+            timebase_count,
+            if (nf > 0) &follower_buf else null,
+            nf,
+            data_address,
+            if (data_symbol) |sym| sym.ptr else null,
+            if (data_symbol) |sym| sym.len else 0,
+            &ps_buf,
+            ps_buf.len,
+        );
+        if (ps_len == 0) return;
 
         // TracePacket { timestamp, sequence_flags, interned_data?, perf_sample }.
         var tp = ProtoWriter.init(gpa);
@@ -776,7 +795,7 @@ pub const Capture = struct {
         tp.writeUint64(8, hdr.ts) catch return;
         tp.writeUint32(13, perfetto_proto.SEQ_NEEDS_INCREMENTAL_STATE) catch return;
         if (idw.bytes().len > 0) tp.writeMessage(12, idw.bytes()) catch return;
-        tp.writeMessage(perfetto_proto.TP_FIELD_PERF_SAMPLE, ps) catch return;
+        tp.writeMessage(perfetto_proto.TP_FIELD_PERF_SAMPLE, ps_buf[0..ps_len]) catch return;
         const body = tp.bytes();
         perfetto.sismo_ds_emit(self.ds_slot, body.ptr, body.len);
     }

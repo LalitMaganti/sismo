@@ -249,6 +249,21 @@ size_t sismo_encode_perf_defaults_packet(const uint8_t *timebase_name,
                                          uint8_t *out,
                                          size_t cap);
 
+// Encode a PerfSample body (TracePacket field 66). Fields omitted when 0 /
+// null. Writes into out[..cap], returns bytes written (0 if cap too small).
+size_t sismo_encode_perf_sample(uint32_t cpu,
+                                uint32_t pid,
+                                uint32_t tid,
+                                uint64_t callstack_iid,
+                                uint64_t timebase_count,
+                                const uint64_t *follower_counts,
+                                size_t follower_count,
+                                uint64_t data_address,
+                                const uint8_t *data_symbol,
+                                size_t data_symbol_len,
+                                uint8_t *out,
+                                size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

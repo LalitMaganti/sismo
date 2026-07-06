@@ -171,6 +171,62 @@ pub unsafe extern "C" fn sismo_encode_perf_defaults_packet(
     b.len()
 }
 
+/// Encode a PerfSample (TracePacket field 66 body). Fields: cpu=1, pid=2,
+/// tid=3, callstack_iid=4, timebase_count=6, follower_counts=7 (repeated),
+/// data_address=20, data_symbol=21 (the last two are sismo extensions).
+/// Fields are omitted when 0 / absent (null pointer). Writes into out[..cap];
+/// returns bytes written, or 0 if cap is too small.
+///
+/// # Safety
+/// `follower_counts`/`data_symbol` must be valid for their lengths or null;
+/// `out` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sismo_encode_perf_sample(
+    cpu: u32,
+    pid: u32,
+    tid: u32,
+    callstack_iid: u64,
+    timebase_count: u64,
+    follower_counts: *const u64,
+    follower_count: usize,
+    data_address: u64,
+    data_symbol: *const u8,
+    data_symbol_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    let mut w = ProtoWriter::new();
+    w.write_uint32(1, cpu);
+    w.write_uint32(2, pid);
+    w.write_uint32(3, tid);
+    if callstack_iid != 0 {
+        w.write_uint64(4, callstack_iid);
+    }
+    if timebase_count != 0 {
+        w.write_uint64(6, timebase_count);
+    }
+    if !follower_counts.is_null() {
+        for &fc in unsafe { slice::from_raw_parts(follower_counts, follower_count) } {
+            w.write_uint64(7, fc);
+        }
+    }
+    if data_address != 0 {
+        w.write_uint64(20, data_address);
+    }
+    if !data_symbol.is_null() {
+        w.write_string(21, unsafe { slice::from_raw_parts(data_symbol, data_symbol_len) });
+    }
+
+    let b = w.bytes();
+    if b.len() > cap {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
+    }
+    b.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +237,38 @@ mod tests {
         w.write_uint64(1, 150);
         // tag = 1<<3|0 = 0x08; varint(150) = 0x96 0x01
         assert_eq!(w.bytes(), &[0x08, 0x96, 0x01]);
+    }
+
+    #[test]
+    fn perf_sample_bytes_are_exact() {
+        // cpu=1, pid=2, tid=3, callstack_iid=5; no timebase/followers/data.
+        let mut out = [0u8; 64];
+        let n = unsafe {
+            sismo_encode_perf_sample(
+                1, 2, 3, 5, 0, std::ptr::null(), 0, 0, std::ptr::null(), 0,
+                out.as_mut_ptr(), out.len(),
+            )
+        };
+        // cpu(1)=1: 08 01; pid(2)=2: 10 02; tid(3)=3: 18 03; callstack(4)=5: 20 05
+        assert_eq!(&out[..n], &[0x08, 0x01, 0x10, 0x02, 0x18, 0x03, 0x20, 0x05]);
+    }
+
+    #[test]
+    fn perf_sample_followers_and_data_symbol() {
+        let followers = [100u64, 200u64];
+        let mut out = [0u8; 64];
+        let n = unsafe {
+            sismo_encode_perf_sample(
+                0, 0, 0, 0, 0, followers.as_ptr(), followers.len(), 0xdead,
+                b"[heap]".as_ptr(), 6, out.as_mut_ptr(), out.len(),
+            )
+        };
+        let got = &out[..n];
+        // follower_counts field 7 (tag 0x38): 38 64 (100), 38 C8 01 (200).
+        assert!(got.windows(2).any(|w| w == [0x38, 0x64]));
+        assert!(got.windows(3).any(|w| w == [0x38, 0xC8, 0x01]));
+        // data_symbol field 21 (tag 0xAA 0x01, len 6) = "[heap]".
+        assert!(got.windows(3).any(|w| w == [0xAA, 0x01, 0x06]));
     }
 
     #[test]

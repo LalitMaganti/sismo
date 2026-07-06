@@ -27,6 +27,22 @@ const perfetto = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
 
+// rust-bridge/src/proto.rs — see rust-bridge/include/bridge.h.
+extern fn sismo_encode_perf_sample(
+    cpu: u32,
+    pid: u32,
+    tid: u32,
+    callstack_iid: u64,
+    timebase_count: u64,
+    follower_counts: ?[*]const u64,
+    follower_count: usize,
+    data_address: u64,
+    data_symbol: ?[*]const u8,
+    data_symbol_len: usize,
+    out: [*]u8,
+    cap: usize,
+) usize;
+
 const DS_NAME = "sismo.macos_cpu_samples";
 
 comptime {
@@ -381,19 +397,28 @@ fn sampleOnce(self: *Capture, state: *ThreadState, u: *unwinder.Unwinder, ctx: *
     _ = n; // callstack interning is a follow-up; emit leaf-only sample for now
 
     // Build PerfSample → wrap in TracePacket body → emit.
-    const sample_bytes = perfetto_proto.encodePerfSample(self.allocator, .{
-        .cpu = 0, // core not tracked
-        .pid = @intCast(self.target_pid),
-        .tid = @intCast(state.tid),
-        .callstack_iid = 0,
-    }) catch return;
-    defer self.allocator.free(sample_bytes);
+    var sample_buf: [4096]u8 = undefined;
+    const sample_len = sismo_encode_perf_sample(
+        0, // cpu — core not tracked
+        @intCast(self.target_pid),
+        @intCast(state.tid),
+        0, // callstack_iid — interning is a follow-up
+        0, // timebase_count
+        null,
+        0,
+        0, // data_address
+        null,
+        0,
+        &sample_buf,
+        sample_buf.len,
+    );
+    if (sample_len == 0) return;
     const body = perfetto_proto.encodeTracePacketBody(
         self.allocator,
         nowMonotonicNs(),
         0,
         perfetto_proto.TP_FIELD_PERF_SAMPLE,
-        sample_bytes,
+        sample_buf[0..sample_len],
     ) catch return;
     defer self.allocator.free(body);
     perfetto.sismo_ds_emit(self.ds_slot, body.ptr, body.len);

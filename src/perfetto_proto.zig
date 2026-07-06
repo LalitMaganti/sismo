@@ -312,44 +312,9 @@ pub const TP_FIELD_PERF_SAMPLE: u32 = 66;
 pub const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
 pub const SEQ_NEEDS_INCREMENTAL_STATE: u32 = 2;
 
-pub const PerfSample = struct {
-    cpu: u32,
-    pid: u32,
-    tid: u32,
-    /// 0 = no callstack (proto absence semantic).
-    callstack_iid: u64 = 0,
-    /// Cumulative timebase counter reading for this sample (field 6). 0 omits.
-    timebase_count: u64 = 0,
-    /// Cumulative follower counter readings (field 7), in the same order as
-    /// `PerfSampleDefaults.followers`.
-    follower_counts: []const u64 = &.{},
-    /// Data linear address of the sampled access (field 20, sismo extension);
-    /// 0 omits. Set only on a cache focus (PERF_SAMPLE_ADDR on a Data_LA event).
-    data_address: u64 = 0,
-    /// The memory region `data_address` resolved to at record time (field 21,
-    /// sismo extension): "[heap]", "[stack]", an object basename, "[anon]", … —
-    /// null omits. trace_processor surfaces it as `perf_sample.data_symbol`.
-    data_symbol: ?[]const u8 = null,
-};
-
-pub fn encodePerfSample(gpa: std.mem.Allocator, s: PerfSample) ![]u8 {
-    var w = ProtoWriter.init(gpa);
-    errdefer w.deinit();
-    // PerfSample.cpu = 1, pid = 2, tid = 3, callstack_iid = 4, timebase_count
-    // = 6, follower_counts = 7 — matches profiling/profile_packet.proto. The
-    // data_address (20) / data_symbol (21) fields are a sismo extension to that
-    // proto (see the matching patch + the perf_sample columns in
-    // trace_processor's profiler_tables.py / profile_module.cc).
-    try w.writeUint32(1, s.cpu);
-    try w.writeUint32(2, s.pid);
-    try w.writeUint32(3, s.tid);
-    if (s.callstack_iid != 0) try w.writeUint64(4, s.callstack_iid);
-    if (s.timebase_count != 0) try w.writeUint64(6, s.timebase_count);
-    for (s.follower_counts) |fc| try w.writeUint64(7, fc);
-    if (s.data_address != 0) try w.writeUint64(20, s.data_address);
-    if (s.data_symbol) |sym| try w.writeString(21, sym);
-    return w.buf.toOwnedSlice(gpa);
-}
+// The PerfSample body is encoded in rust-bridge/src/proto.rs
+// (sismo_encode_perf_sample), called from linux_bpf_capture's emitSample and
+// macos_cpu_samples_capture.
 
 // PerfSampleDefaults + TracePacketDefaults (the once-per-sequence defaults
 // packet) are built in rust-bridge/src/proto.rs
@@ -877,29 +842,6 @@ test "macosSchedVmProgram matches Perfetto's gen-proto serialization byte-for-by
         i += w.len;
     }
     try std.testing.expectEqualSlices(u8, expected_hex, hex_buf[0..i]);
-}
-
-test "encodePerfSample carries timebase + follower counts" {
-    const counts = [_]u64{ 100, 200 };
-    const bytes = try encodePerfSample(std.testing.allocator, .{
-        .cpu = 1,
-        .pid = 7,
-        .tid = 9,
-        .timebase_count = 4242,
-        .follower_counts = &counts,
-    });
-    defer std.testing.allocator.free(bytes);
-    // timebase_count is field 6 (tag 6<<3|0 = 0x30); follower_counts field 7
-    // (tag 7<<3|0 = 0x38) appears once per value.
-    var saw_timebase = false;
-    var followers: usize = 0;
-    var i: usize = 0;
-    while (i < bytes.len) : (i += 1) {
-        if (bytes[i] == 0x30) saw_timebase = true;
-        if (bytes[i] == 0x38) followers += 1;
-    }
-    try std.testing.expect(saw_timebase);
-    try std.testing.expectEqual(@as(usize, 2), followers);
 }
 
 test "encodeDataSourceConfig sismo_vendor with protovm_memory_limit" {
