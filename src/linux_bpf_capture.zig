@@ -18,6 +18,22 @@ const perfetto_proto = @import("perfetto_proto.zig");
 const proc_maps = @import("linux_proc_maps.zig");
 const data_regions = @import("data_regions.zig");
 const ProtoWriter = @import("proto_writer.zig").ProtoWriter;
+
+// rust-bridge/src/proto.rs — builds the PerfSampleDefaults TracePacket body.
+const SismoStr = extern struct { ptr: [*]const u8, len: usize };
+extern fn sismo_encode_perf_defaults_packet(
+    timebase_name: [*]const u8,
+    timebase_name_len: usize,
+    timebase_freq: u64,
+    followers: [*]const SismoStr,
+    followers_count: usize,
+    sample_scope: u32,
+    timestamp_clock_id: u32,
+    sequence_flags: u32,
+    out: [*]u8,
+    cap: usize,
+) usize;
+const SAMPLE_SCOPE_THREAD: u32 = 2;
 // PMU event encodings per Intel CPU model, generated from Intel's perfmon DB by
 // python/tools/gen_pmu_events.py. On x86 we resolve the active counters from
 // this at runtime (by CPUID) instead of hardcoding raw configs.
@@ -677,41 +693,35 @@ pub const Capture = struct {
     }
 
     fn emitDefaults(self: *Capture) void {
-        const gpa = self.gpa;
         // timebase = active_slots[0], followers = the rest (all thread-scoped).
         // With no PMU counters, fall back to a bare cpu-clock timebase.
-        var followers_buf: [c.SISMO_MAX_COUNTERS]perfetto_proto.PerfEventName = undefined;
+        var followers_buf: [c.SISMO_MAX_COUNTERS]SismoStr = undefined;
         var nf: usize = 0;
         var timebase_name: []const u8 = "cpu-clock";
         if (self.n_active > 0) {
             timebase_name = self.counters[self.active_slots[0]].name;
             var i: usize = 1;
             while (i < self.n_active) : (i += 1) {
-                followers_buf[nf] = .{ .name = self.counters[self.active_slots[i]].name };
+                const nm = self.counters[self.active_slots[i]].name;
+                followers_buf[nf] = .{ .ptr = nm.ptr, .len = nm.len };
                 nf += 1;
             }
         }
-        const psd = perfetto_proto.encodePerfSampleDefaults(gpa, .{
-            .timebase = .{ .name = timebase_name },
-            .followers = followers_buf[0..nf],
-            .sample_scope = .thread,
-        }) catch return;
-        defer gpa.free(psd);
-        const tpd = perfetto_proto.encodeTracePacketDefaults(
-            gpa,
-            perfetto_proto.BUILTIN_CLOCK_MONOTONIC,
-            psd,
-        ) catch return;
-        defer gpa.free(tpd);
-        const body = perfetto_proto.encodeTracePacketBody(
-            gpa,
+        var buf: [8192]u8 = undefined;
+        const n = sismo_encode_perf_defaults_packet(
+            timebase_name.ptr,
+            timebase_name.len,
             0,
+            &followers_buf,
+            nf,
+            SAMPLE_SCOPE_THREAD,
+            perfetto_proto.BUILTIN_CLOCK_MONOTONIC,
             perfetto_proto.SEQ_INCREMENTAL_STATE_CLEARED,
-            perfetto_proto.TP_FIELD_TRACE_PACKET_DEFAULTS,
-            tpd,
-        ) catch return;
-        defer gpa.free(body);
-        perfetto.sismo_ds_emit(self.ds_slot, body.ptr, body.len);
+            &buf,
+            buf.len,
+        );
+        if (n == 0) return;
+        perfetto.sismo_ds_emit(self.ds_slot, &buf, n);
     }
 
     fn emitSample(self: *Capture, rec: *const c.struct_sismo_sample_rec) void {

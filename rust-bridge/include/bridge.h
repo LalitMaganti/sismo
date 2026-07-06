@@ -223,6 +223,32 @@ int sismo_data_regions_find(const sismo_data_regions_t *r,
                             uint64_t addr,
                             sismo_region_t *out);
 
+// ===== Proto emission =====================================================
+//
+// Minimal protobuf encoder (src/proto.rs) + the trace-packet encoders
+// migrated off perfetto_proto.zig.
+
+// A borrowed byte string (e.g. a follower counter name).
+typedef struct {
+  const uint8_t *ptr;
+  size_t len;
+} sismo_str_t;
+
+// Build the once-per-sequence PerfSampleDefaults TracePacket body, ready for
+// sismo_ds_emit. Writes into out[..cap], returns bytes written (0 if cap is
+// too small). Fields omitted when their value is 0. See proto.rs for the
+// layout.
+size_t sismo_encode_perf_defaults_packet(const uint8_t *timebase_name,
+                                         size_t timebase_name_len,
+                                         uint64_t timebase_freq,
+                                         const sismo_str_t *followers,
+                                         size_t followers_count,
+                                         uint32_t sample_scope,
+                                         uint32_t timestamp_clock_id,
+                                         uint32_t sequence_flags,
+                                         uint8_t *out,
+                                         size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

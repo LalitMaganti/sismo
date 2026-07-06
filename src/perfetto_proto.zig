@@ -307,7 +307,6 @@ pub fn encodeTracePacketBodyInto(
 // ---------------------------------------------------------------------------
 
 pub const TP_FIELD_PERF_SAMPLE: u32 = 66;
-pub const TP_FIELD_TRACE_PACKET_DEFAULTS: u32 = 59;
 
 /// TracePacket.sequence_flags values (trace_packet.proto SequenceFlags).
 pub const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
@@ -352,88 +351,14 @@ pub fn encodePerfSample(gpa: std.mem.Allocator, s: PerfSample) ![]u8 {
     return w.buf.toOwnedSlice(gpa);
 }
 
-// ---------------------------------------------------------------------------
-// PerfSampleDefaults + TracePacketDefaults
-// schema: profiling/profile_packet.proto, trace_packet_defaults.proto
-//
-// Emitted once per sequence on a SEQ_INCREMENTAL_STATE_CLEARED packet; every
-// later PerfSample on the same sequence inherits the timebase/follower names
-// and the sample scope.
-// ---------------------------------------------------------------------------
-
-/// PerfSampleDefaults.SampleScope (sismo extension). THREAD makes each sample's
-/// counters per-thread, routed to thread-scoped counter tracks.
-pub const SampleScope = enum(u32) {
-    unspecified = 0,
-    cpu = 1,
-    thread = 2,
-};
-
-/// A named counting event. `name` becomes the counter track's display name.
-pub const PerfEventName = struct {
-    name: []const u8,
-    /// PerfEvents.Timebase.frequency (informational; 0 omits). Only meaningful
-    /// on the timebase.
-    frequency: u64 = 0,
-};
-
-pub const PerfSampleDefaults = struct {
-    timebase: PerfEventName,
-    followers: []const PerfEventName = &.{},
-    sample_scope: SampleScope = .unspecified,
-};
-
-pub fn encodePerfSampleDefaults(
-    gpa: std.mem.Allocator,
-    d: PerfSampleDefaults,
-) ![]u8 {
-    var w = ProtoWriter.init(gpa);
-    errdefer w.deinit();
-
-    // timebase = 1 (PerfEvents.Timebase: frequency = 2, name = 10).
-    {
-        var tb = ProtoWriter.init(gpa);
-        defer tb.deinit();
-        if (d.timebase.frequency != 0) try tb.writeUint64(2, d.timebase.frequency);
-        try tb.writeString(10, d.timebase.name);
-        try w.writeMessage(1, tb.bytes());
-    }
-
-    // followers = 4 (repeated FollowerEvent: name = 4).
-    for (d.followers) |f| {
-        var fe = ProtoWriter.init(gpa);
-        defer fe.deinit();
-        try fe.writeString(4, f.name);
-        try w.writeMessage(4, fe.bytes());
-    }
-
-    // sample_scope = 5 (sismo extension).
-    if (d.sample_scope != .unspecified) {
-        try w.writeEnum(5, d.sample_scope);
-    }
-    return w.buf.toOwnedSlice(gpa);
-}
+// PerfSampleDefaults + TracePacketDefaults (the once-per-sequence defaults
+// packet) are built in rust-bridge/src/proto.rs
+// (sismo_encode_perf_defaults_packet), called from linux_bpf_capture's
+// emitDefaults.
 
 /// BuiltinClock values (clock_snapshot.proto). MONOTONIC matches
 /// bpf_ktime_get_ns().
 pub const BUILTIN_CLOCK_MONOTONIC: u32 = 3;
-
-/// Wrap PerfSampleDefaults bytes in a TracePacketDefaults
-/// (perf_sample_defaults = field 12, timestamp_clock_id = field 58). The
-/// result is the payload for
-/// `encodeTracePacketBody(..., TP_FIELD_TRACE_PACKET_DEFAULTS, ...)`.
-/// `timestamp_clock_id` = 0 omits the field (inherits the trace default).
-pub fn encodeTracePacketDefaults(
-    gpa: std.mem.Allocator,
-    timestamp_clock_id: u32,
-    perf_sample_defaults: []const u8,
-) ![]u8 {
-    var w = ProtoWriter.init(gpa);
-    errdefer w.deinit();
-    if (timestamp_clock_id != 0) try w.writeUint32(58, timestamp_clock_id);
-    try w.writeMessage(12, perf_sample_defaults);
-    return w.buf.toOwnedSlice(gpa);
-}
 
 // ---------------------------------------------------------------------------
 // GenericKernelTaskStateEvent (TracePacket field 117)
@@ -975,23 +900,6 @@ test "encodePerfSample carries timebase + follower counts" {
     }
     try std.testing.expect(saw_timebase);
     try std.testing.expectEqual(@as(usize, 2), followers);
-}
-
-test "encodePerfSampleDefaults emits thread scope" {
-    const followers = [_]PerfEventName{.{ .name = "instructions" }};
-    const bytes = try encodePerfSampleDefaults(std.testing.allocator, .{
-        .timebase = .{ .name = "cpu-cycles", .frequency = 1000 },
-        .followers = &followers,
-        .sample_scope = .thread,
-    });
-    defer std.testing.allocator.free(bytes);
-    // sample_scope = field 5 (tag 5<<3|0 = 0x28), value 2 (THREAD).
-    var found = false;
-    var i: usize = 0;
-    while (i + 1 < bytes.len) : (i += 1) {
-        if (bytes[i] == 0x28 and bytes[i + 1] == 0x02) found = true;
-    }
-    try std.testing.expect(found);
 }
 
 test "encodeDataSourceConfig sismo_vendor with protovm_memory_limit" {
