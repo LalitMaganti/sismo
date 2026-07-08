@@ -19,6 +19,18 @@ const proc_maps = @import("linux_proc_maps.zig");
 const data_regions = @import("data_regions.zig");
 const ProtoWriter = @import("proto_writer.zig").ProtoWriter;
 
+// rust-bridge/src/session_config.rs — DataSourceDescriptor encoder.
+extern fn sismo_encode_data_source_descriptor(
+    name: [*]const u8,
+    name_len: usize,
+    will_notify_on_stop: bool,
+    will_notify_on_start: bool,
+    protovm_program: ?[*]const u8,
+    protovm_program_len: usize,
+    out: [*]u8,
+    cap: usize,
+) usize;
+
 // rust-bridge/src/proto.rs — builds the PerfSampleDefaults TracePacket body.
 const SismoStr = extern struct { ptr: [*]const u8, len: usize };
 extern fn sismo_encode_perf_defaults_packet(
@@ -506,14 +518,14 @@ pub const Capture = struct {
         // table-derived list is backed by self.counters_buf).
         self.counters = selectCounters(&self.counters_buf);
 
-        const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
-            gpa,
-            .{ .name = DS_NAME, .will_notify_on_stop = false },
+        var desc_buf: [2048]u8 = undefined;
+        const desc_len = sismo_encode_data_source_descriptor(
+            DS_NAME.ptr, DS_NAME.len, false, false, null, 0, &desc_buf, desc_buf.len,
         );
-        defer gpa.free(desc_bytes);
+        if (desc_len == 0) return error.DescriptorEncodeFailed;
         const slot = perfetto.sismo_ds_register(
-            desc_bytes.ptr,
-            desc_bytes.len,
+            &desc_buf,
+            desc_len,
             onSetup,
             onStart,
             onStop,
