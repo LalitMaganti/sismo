@@ -25,7 +25,6 @@ const wire = @import("heap_wire.zig");
 const ring = @import("heap_ring.zig");
 const protocol = @import("heap_protocol.zig");
 const sampler = @import("macos/mach_sampler.zig");
-const dyld_images = @import("macos/dyld_images.zig");
 const unwinder = @import("unwinder.zig");
 const symbolizer = @import("symbolizer.zig");
 const sismo_config = @import("sismo_config.zig");
@@ -61,6 +60,29 @@ extern fn sismo_heap_build_profile_packet(
 ) ?[*]u8;
 extern fn sismo_heap_build_clock_snapshot_packet(timestamp_ns: u64, out_len: *usize) ?[*]u8;
 extern fn sismo_heap_free(ptr: [*]u8, len: usize) void;
+
+// rust-bridge/src/dyld_images.rs — enumerate + read + register the target's
+// modules into the symbolizer/unwinder, returning the sorted image list.
+const ImageList = opaque {};
+extern fn sismo_load_target_modules(
+    task: sampler.task_t,
+    symbolizer_h: ?*symbolizer.Symbolizer,
+    unwinder_h: ?*unwinder.Unwinder,
+    poll_interval_ns: u64,
+    max_total_ns: u64,
+    abort_ctx: ?*anyopaque,
+    abort_cb: ?*const fn (?*anyopaque) callconv(.c) bool,
+    out_err: *u32,
+) ?*ImageList;
+extern fn sismo_dyld_list_count(list: *const ImageList) usize;
+extern fn sismo_dyld_list_get(
+    list: *const ImageList,
+    idx: usize,
+    out_base: *u64,
+    out_path: *[*]const u8,
+    out_path_len: *usize,
+) void;
+extern fn sismo_dyld_list_free(list: *ImageList) void;
 
 // rust-bridge/src/session_config.rs — DataSourceDescriptor encoder.
 extern fn sismo_encode_data_source_descriptor(
@@ -255,7 +277,7 @@ pub const Capture = struct {
     }
 };
 
-fn exitRequestedAbort(ctx: ?*anyopaque) bool {
+fn exitRequestedAbort(ctx: ?*anyopaque) callconv(.c) bool {
     const self: *Capture = @ptrCast(@alignCast(ctx.?));
     return self.exit_requested.load(.acquire);
 }
@@ -293,27 +315,7 @@ fn workerEntry(self: *Capture) void {
         return;
     };
 
-    // Retry on EmptyImageList — same race as cpu_sampler.
-    const target_images = dyld_images.enumerateImagesWaitReady(
-        task,
-        self.allocator,
-        50 * std.time.ns_per_ms,
-        5 * std.time.ns_per_s,
-        @ptrCast(self),
-        exitRequestedAbort,
-    ) catch |err| {
-        std.debug.print("heap_capture: enumerateImagesWaitReady failed: {s}\n", .{@errorName(err)});
-        self.setup_failed.store(true, .release);
-        parkUntilExit(self);
-        return;
-    };
-    defer dyld_images.freeImages(self.allocator, target_images);
-    std.mem.sort(dyld_images.Image, target_images, {}, struct {
-        fn lt(_: void, a: dyld_images.Image, b: dyld_images.Image) bool {
-            return a.base_avma < b.base_avma;
-        }
-    }.lt);
-
+    // Unwinder + symbolizer must exist before we register modules into them.
     const u = unwinder.create() catch |err| {
         std.debug.print("heap_capture: unwinder.create failed: {s}\n", .{@errorName(err)});
         self.setup_failed.store(true, .release);
@@ -329,21 +331,28 @@ fn workerEntry(self: *Capture) void {
     };
     defer symbolizer.destroy(sym);
 
-    for (target_images, 0..) |*img, idx| {
-        const image = dyld_images.readImageMachO(task, img.base_avma, self.allocator) catch continue;
-        defer self.allocator.free(image.bytes);
-
-        const claimed_end = img.base_avma +% image.text_vmsize;
-        const next_base = if (idx + 1 < target_images.len)
-            target_images[idx + 1].base_avma
-        else
-            std.math.maxInt(u64);
-        const end_avma = @min(claimed_end, next_base);
-
-        const arch = dyld_images.archString(image.cputype, image.cpusubtype);
-        symbolizer.addModule(sym, img.base_avma, end_avma, img.path, &image.uuid, arch, null) catch {};
-        unwinder.addModule(u, img.base_avma, image.bytes) catch continue;
-    }
+    // Enumerate the target's modules and register each into the symbolizer +
+    // unwinder — all in Rust (rust-bridge/src/dyld_images.rs), so the mach-o
+    // __TEXT bytes never cross FFI. Retries the post-spawn empty-list window,
+    // polling exitRequestedAbort so shutdown interrupts the wait. The returned
+    // list (sorted by base) is kept for the heap profile's mappings.
+    var load_err: u32 = 0;
+    const image_list = sismo_load_target_modules(
+        task,
+        sym,
+        u,
+        50 * std.time.ns_per_ms,
+        5 * std.time.ns_per_s,
+        @ptrCast(self),
+        exitRequestedAbort,
+        &load_err,
+    ) orelse {
+        std.debug.print("heap_capture: load_target_modules failed (err={d})\n", .{load_err});
+        self.setup_failed.store(true, .release);
+        parkUntilExit(self);
+        return;
+    };
+    defer sismo_dyld_list_free(image_list);
 
     var rb = ring.RingBuffer.create(ring_size_bytes) catch |err| {
         std.debug.print("heap_capture: ring.create failed: {s}\n", .{@errorName(err)});
@@ -400,7 +409,7 @@ fn workerEntry(self: *Capture) void {
             // emit took (10s of ms with wholesym in the loop).
             const snapshot_ts = nowNs();
             self.sites_observed.store(@intCast(sizes_by_top_pc.count()), .release);
-            emitProfile(self, &sizes_by_top_pc, target_images, sym, snapshot_ts) catch |err| {
+            emitProfile(self, &sizes_by_top_pc, image_list, sym, snapshot_ts) catch |err| {
                 std.debug.print("heap_capture: flush emit failed: {s}\n", .{@errorName(err)});
             };
             perfetto.sismo_flush_done(@ptrFromInt(flusher_addr));
@@ -427,7 +436,7 @@ fn workerEntry(self: *Capture) void {
             drainShmInto(self, &rb, u, &sizes_by_top_pc);
             const snapshot_ts = nowNs();
             self.sites_observed.store(@intCast(sizes_by_top_pc.count()), .release);
-            emitProfile(self, &sizes_by_top_pc, target_images, sym, snapshot_ts) catch |err| {
+            emitProfile(self, &sizes_by_top_pc, image_list, sym, snapshot_ts) catch |err| {
                 std.debug.print("heap_capture: stop emit failed: {s}\n", .{@errorName(err)});
             };
             perfetto.sismo_stop_done(@ptrFromInt(stopper_addr));
@@ -523,7 +532,7 @@ fn processRecord(
 fn emitProfile(
     self: *Capture,
     sizes_map: *const std.AutoHashMap(u64, AllocStats),
-    target_images: []const dyld_images.Image,
+    image_list: *ImageList,
     sym: *symbolizer.Symbolizer,
     snapshot_ts_ns: u64,
 ) !void {
@@ -532,15 +541,21 @@ fn emitProfile(
     else
         self.config.sample_interval_bytes;
 
-    // Images are already base-sorted (see workerEntry) — pass them in order so
-    // frame mapping_iids line up with the Rust builder's iid = index + 1.
-    const images = try self.allocator.alloc(HeapImage, target_images.len);
+    // Build the HeapImage array directly from the Rust image list (sorted by
+    // base in load_target_modules) — paths point into the list, which outlives
+    // this call. iid = index + 1 in the Rust heap builder, so order matters.
+    const image_count = sismo_dyld_list_count(image_list);
+    const images = try self.allocator.alloc(HeapImage, image_count);
     defer self.allocator.free(images);
-    for (target_images, 0..) |img, i| {
+    for (0..image_count) |i| {
+        var base: u64 = 0;
+        var path_ptr: [*]const u8 = undefined;
+        var path_len: usize = 0;
+        sismo_dyld_list_get(image_list, i, &base, &path_ptr, &path_len);
         images[i] = .{
-            .base_avma = img.base_avma,
-            .path_ptr = img.path.ptr,
-            .path_len = img.path.len,
+            .base_avma = base,
+            .path_ptr = path_ptr,
+            .path_len = path_len,
         };
     }
 

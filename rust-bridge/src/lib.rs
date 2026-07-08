@@ -7,6 +7,9 @@
 pub mod cli;
 pub mod data_regions;
 pub mod disasm;
+// macOS Mach-based module enumeration + mach-o reading.
+#[cfg(target_os = "macos")]
+pub mod dyld_images;
 pub mod heap;
 // macOS libproc bindings (proc_pidinfo/proc_pidpath are Darwin symbols).
 #[cfg(target_os = "macos")]

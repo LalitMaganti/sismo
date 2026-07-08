@@ -18,7 +18,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const sampler = @import("macos/mach_sampler.zig");
-const dyld_images = @import("macos/dyld_images.zig");
 const unwinder = @import("unwinder.zig");
 const sismo_config = @import("sismo_config.zig");
 const perfetto_proto = @import("perfetto_proto.zig");
@@ -53,6 +52,22 @@ extern fn sismo_encode_trace_packet_body(
     out: [*]u8,
     cap: usize,
 ) usize;
+
+// rust-bridge/src/dyld_images.rs — enumerate + read + register the target's
+// modules into the unwinder (cpu doesn't symbolize inline — that's the
+// post-record step — so the symbolizer handle is null here).
+const ImageList = opaque {};
+extern fn sismo_load_target_modules(
+    task: sampler.task_t,
+    symbolizer_h: ?*anyopaque,
+    unwinder_h: ?*unwinder.Unwinder,
+    poll_interval_ns: u64,
+    max_total_ns: u64,
+    abort_ctx: ?*anyopaque,
+    abort_cb: ?*const fn (?*anyopaque) callconv(.c) bool,
+    out_err: *u32,
+) ?*ImageList;
+extern fn sismo_dyld_list_free(list: *ImageList) void;
 
 // rust-bridge/src/session_config.rs — DataSourceDescriptor encoder.
 extern fn sismo_encode_data_source_descriptor(
@@ -232,7 +247,7 @@ pub const Capture = struct {
     }
 };
 
-fn exitRequestedAbort(ctx: ?*anyopaque) bool {
+fn exitRequestedAbort(ctx: ?*anyopaque) callconv(.c) bool {
     const self: *Capture = @ptrCast(@alignCast(ctx.?));
     return self.exit_requested.load(.acquire);
 }
@@ -272,39 +287,33 @@ fn workerEntry(self: *Capture) void {
         return;
     };
 
-    // Retry on EmptyImageList — the target was just `posix_spawn`'d and
-    // its `dyld_all_image_infos` may not be populated for a brief
-    // window even though `task_for_pid` already succeeded.
-    const target_images = dyld_images.enumerateImagesWaitReady(
-        task,
-        self.allocator,
-        50 * std.time.ns_per_ms,
-        5 * std.time.ns_per_s,
-        @ptrCast(self),
-        exitRequestedAbort,
-    ) catch |err| {
-        std.debug.print("cpu_sampler: enumerateImagesWaitReady failed: {s}\n", .{@errorName(err)});
-        parkUntilExit(self);
-        return;
-    };
-    defer dyld_images.freeImages(self.allocator, target_images);
-    std.mem.sort(dyld_images.Image, target_images, {}, struct {
-        fn lt(_: void, a: dyld_images.Image, b: dyld_images.Image) bool {
-            return a.base_avma < b.base_avma;
-        }
-    }.lt);
-
     const u = unwinder.create() catch |err| {
         std.debug.print("cpu_sampler: unwinder.create failed: {s}\n", .{@errorName(err)});
         parkUntilExit(self);
         return;
     };
     defer unwinder.destroy(u);
-    for (target_images) |*img| {
-        const image = dyld_images.readImageMachO(task, img.base_avma, self.allocator) catch continue;
-        defer self.allocator.free(image.bytes);
-        unwinder.addModule(u, img.base_avma, image.bytes) catch continue;
-    }
+
+    // Enumerate the target's modules and register each into the unwinder — all
+    // in Rust (rust-bridge/src/dyld_images.rs). Retries the post-spawn
+    // empty-list window, polling exitRequestedAbort so shutdown interrupts the
+    // wait. cpu doesn't reuse the list, so free it immediately.
+    var load_err: u32 = 0;
+    const image_list = sismo_load_target_modules(
+        task,
+        null, // no symbolizer — cpu samples are symbolized post-record
+        u,
+        50 * std.time.ns_per_ms,
+        5 * std.time.ns_per_s,
+        @ptrCast(self),
+        exitRequestedAbort,
+        &load_err,
+    ) orelse {
+        std.debug.print("cpu_sampler: load_target_modules failed (err={d})\n", .{load_err});
+        parkUntilExit(self);
+        return;
+    };
+    sismo_dyld_list_free(image_list);
 
     var thread_states = std.AutoHashMap(sampler.thread_t, ThreadState).init(self.allocator);
     defer thread_states.deinit();
