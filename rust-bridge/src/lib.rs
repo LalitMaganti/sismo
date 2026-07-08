@@ -10,6 +10,9 @@ pub mod disasm;
 // macOS Mach-based module enumeration + mach-o reading.
 #[cfg(target_os = "macos")]
 pub mod dyld_images;
+// macOS kdebug (sched-event sysctl ring).
+#[cfg(target_os = "macos")]
+pub mod kdebug;
 pub mod heap;
 // macOS per-sample CPU capture (Mach thread ops + unwind + encode).
 #[cfg(target_os = "macos")]
