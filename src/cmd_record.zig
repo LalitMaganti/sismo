@@ -93,6 +93,48 @@ const linux_bpf_capture = switch (builtin.os.tag) {
 // inherits.
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
+// rust-bridge/src/session_config.rs — TraceConfig encoder. `data_sources` is a
+// flat array of DataSourceEntryC (built via the ds* helpers below).
+const DataSourceEntryC = extern struct {
+    kind: u32, // 0=track_event, 1=sismo_vendor, 2=linux_ftrace
+    name: ?[*]const u8,
+    name_len: usize,
+    sismo_config: ?[*]const u8,
+    sismo_config_len: usize,
+    protovm_memory_limit_kb: u32,
+};
+extern fn sismo_encode_trace_config(
+    mode: u32, // 0=ring, 1=capped, 2=file
+    buffer_size_kb: u32,
+    duration_ms: u32,
+    output_path: ?[*]const u8,
+    output_path_len: usize,
+    max_file_size_bytes: u64,
+    session_name: [*]const u8,
+    session_name_len: usize,
+    entries: [*]const DataSourceEntryC,
+    entries_len: usize,
+    out: [*]u8,
+    cap: usize,
+) usize;
+
+fn dsTrackEvent() DataSourceEntryC {
+    return .{ .kind = 0, .name = null, .name_len = 0, .sismo_config = null, .sismo_config_len = 0, .protovm_memory_limit_kb = 0 };
+}
+fn dsLinuxFtrace() DataSourceEntryC {
+    return .{ .kind = 2, .name = null, .name_len = 0, .sismo_config = null, .sismo_config_len = 0, .protovm_memory_limit_kb = 0 };
+}
+fn dsSismoVendor(name: []const u8, cfg: []const u8, protovm_kb: u32) DataSourceEntryC {
+    return .{
+        .kind = 1,
+        .name = name.ptr,
+        .name_len = name.len,
+        .sismo_config = cfg.ptr,
+        .sismo_config_len = cfg.len,
+        .protovm_memory_limit_kb = protovm_kb,
+    };
+}
+
 // `std.c.posix_spawnp` only exposes the Darwin variant in zig 0.16; on
 // Linux it's a libc symbol not surfaced through std.c. Declared locally
 // with `?*const anyopaque` for the file_actions / attrp pointers, both
@@ -1059,13 +1101,12 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     // their producer registration can be polled before StartBlocking —
     // otherwise the session would start without the external producer
     // ever connecting.
-    const perfetto_proto = @import("perfetto_proto.zig");
-    var entries_buf: [4]perfetto_proto.DataSourceEntry = undefined;
+    var entries_buf: [4]DataSourceEntryC = undefined;
     var n_entries: usize = 0;
     var external_names_buf: [3][]const u8 = undefined;
     var n_external: usize = 0;
     if (!no_instrumentation) {
-        entries_buf[n_entries] = .{ .track_event = .{ .enabled_categories = &.{"*"} } };
+        entries_buf[n_entries] = dsTrackEvent();
         n_entries += 1;
     }
     // Heap: in-process when `heap` capture exists; external when caller
@@ -1074,7 +1115,7 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     // capture is null but mode is still in_process — don't promote
     // those to external silently).
     if (heap != null or heap_mode == .external) {
-        entries_buf[n_entries] = .{ .sismo_vendor = .{ .name = "sismo.heap", .sismo_config = heap_cfg } };
+        entries_buf[n_entries] = dsSismoVendor("sismo.heap", heap_cfg, 0);
         n_entries += 1;
         if (heap_mode == .external) {
             external_names_buf[n_external] = "sismo.heap";
@@ -1082,7 +1123,7 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         }
     }
     if (cpu != null or cpu_mode == .external) {
-        entries_buf[n_entries] = .{ .sismo_vendor = .{ .name = "sismo.macos_cpu_samples", .sismo_config = cpu_cfg } };
+        entries_buf[n_entries] = dsSismoVendor("sismo.macos_cpu_samples", cpu_cfg, 0);
         n_entries += 1;
         if (cpu_mode == .external) {
             external_names_buf[n_external] = "sismo.macos_cpu_samples";
@@ -1100,11 +1141,7 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         // a busy macOS system surfaces (~200 procs × ~5 threads/proc).
         // Below ~512 KB, ApplyPatch starts aborting with allocator
         // exhaustion mid-merge.
-        entries_buf[n_entries] = .{ .sismo_vendor = .{
-            .name = "sismo.macos_sched",
-            .sismo_config = sched_cfg,
-            .protovm_memory_limit_kb = 4 * 1024,
-        } };
+        entries_buf[n_entries] = dsSismoVendor("sismo.macos_sched", sched_cfg, 4 * 1024);
         n_entries += 1;
         if (sched_mode == .external) {
             external_names_buf[n_external] = "sismo.macos_sched";
@@ -1126,18 +1163,28 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     // (snapshots use `sismo snapshot --output ...`), so don't touch
     // any file the user named.
     if (!flight_recorder) _ = std.c.unlink(@ptrCast(output_path.ptr));
-    const trace_cfg: perfetto_proto.TraceConfig = .{
-        .mode = if (flight_recorder) .ring else .file,
-        .buffer_size_kb = buffer_kb,
-        .output_path = if (flight_recorder) "" else output_path,
-        .max_file_size_bytes = 1024 * 1024 * 1024,
-        .data_sources = entries,
-    };
-    const cfg_bytes = perfetto_proto.encodeTraceConfig(gpa, trace_cfg) catch |err| {
-        std.debug.print("sismo record: encodeTraceConfig failed: {s}\n", .{@errorName(err)});
+    const out_path: []const u8 = if (flight_recorder) "" else output_path;
+    const session_name = "sismo_record";
+    var cfg_buf: [16384]u8 = undefined;
+    const cfg_len = sismo_encode_trace_config(
+        if (flight_recorder) 0 else 2, // ring : file
+        buffer_kb,
+        0, // duration_ms (capped mode only)
+        out_path.ptr,
+        out_path.len,
+        1024 * 1024 * 1024,
+        session_name.ptr,
+        session_name.len,
+        entries.ptr,
+        entries.len,
+        &cfg_buf,
+        cfg_buf.len,
+    );
+    if (cfg_len == 0) {
+        std.debug.print("sismo record: encodeTraceConfig failed (config exceeds buffer)\n", .{});
         return;
-    };
-    defer gpa.free(cfg_bytes);
+    }
+    const cfg_bytes = cfg_buf[0..cfg_len];
 
     const session = c.sismo_consumer_session_create() orelse {
         std.debug.print("sismo record: session_create failed\n", .{});
@@ -1426,24 +1473,23 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     // Build the TraceConfig in Zig. traced_probes gets the Perfetto-native
     // FtraceConfig nested submessage embedded inside the DataSourceConfig;
     // the BPF collector is a sismo vendor data source — see perfetto_proto.zig.
-    const perfetto_proto = @import("perfetto_proto.zig");
-    var entries_buf: [3]perfetto_proto.DataSourceEntry = undefined;
+    var entries_buf: [3]DataSourceEntryC = undefined;
     var n_entries: usize = 0;
     if (!no_instrumentation) {
-        entries_buf[n_entries] = .{ .track_event = .{ .enabled_categories = &.{"*"} } };
+        entries_buf[n_entries] = dsTrackEvent();
         n_entries += 1;
     }
     if (probes != null) {
         // ftrace stays system-wide because traced_probes can't filter
         // by pid. trace_processor handles separating the workload's
         // events out post-hoc.
-        entries_buf[n_entries] = .{ .linux_ftrace = .{} };
+        entries_buf[n_entries] = dsLinuxFtrace();
         n_entries += 1;
     }
     // The in-process BPF collector emits thread-scoped PerfSamples via its own
     // producer; traced only activates it if the config names it.
     if (bpf != null) {
-        entries_buf[n_entries] = .{ .sismo_vendor = .{ .name = linux_bpf_capture.DS_NAME } };
+        entries_buf[n_entries] = dsSismoVendor(linux_bpf_capture.DS_NAME, "", 0);
         n_entries += 1;
     }
     if (n_entries == 0) {
@@ -1456,18 +1502,28 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     const entries = entries_buf[0..n_entries];
 
     if (!flight_recorder) _ = std.c.unlink(@ptrCast(output_path.ptr));
-    const trace_cfg: perfetto_proto.TraceConfig = .{
-        .mode = if (flight_recorder) .ring else .file,
-        .buffer_size_kb = buffer_kb,
-        .output_path = if (flight_recorder) "" else output_path,
-        .max_file_size_bytes = 1024 * 1024 * 1024,
-        .data_sources = entries,
-    };
-    const cfg_bytes = perfetto_proto.encodeTraceConfig(gpa, trace_cfg) catch |err| {
-        std.debug.print("sismo record: encodeTraceConfig failed: {s}\n", .{@errorName(err)});
+    const out_path: []const u8 = if (flight_recorder) "" else output_path;
+    const session_name = "sismo_record";
+    var cfg_buf: [16384]u8 = undefined;
+    const cfg_len = sismo_encode_trace_config(
+        if (flight_recorder) 0 else 2, // ring : file
+        buffer_kb,
+        0, // duration_ms (capped mode only)
+        out_path.ptr,
+        out_path.len,
+        1024 * 1024 * 1024,
+        session_name.ptr,
+        session_name.len,
+        entries.ptr,
+        entries.len,
+        &cfg_buf,
+        cfg_buf.len,
+    );
+    if (cfg_len == 0) {
+        std.debug.print("sismo record: encodeTraceConfig failed (config exceeds buffer)\n", .{});
         return;
-    };
-    defer gpa.free(cfg_bytes);
+    }
+    const cfg_bytes = cfg_buf[0..cfg_len];
 
     const session = c.sismo_consumer_session_create() orelse {
         std.debug.print("sismo record: session_create failed\n", .{});

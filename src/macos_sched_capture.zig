@@ -49,6 +49,18 @@ extern fn sismo_encode_trace_packet_body(
     cap: usize,
 ) usize;
 
+// rust-bridge/src/session_config.rs — DataSourceDescriptor encoder.
+extern fn sismo_encode_data_source_descriptor(
+    name: [*]const u8,
+    name_len: usize,
+    will_notify_on_stop: bool,
+    will_notify_on_start: bool,
+    protovm_program: ?[*]const u8,
+    protovm_program_len: usize,
+    out: [*]u8,
+    cap: usize,
+) usize;
+
 const DS_NAME = "sismo.macos_sched";
 
 // Per-tid cache entry. `pid` identifies the owning process when the cache
@@ -249,18 +261,23 @@ pub const Capture = struct {
         // overwrites).
         const protovm_program = try perfetto_proto.macosSchedVmProgram(allocator);
         defer allocator.free(protovm_program);
-        const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
-            allocator,
-            .{
-                .name = DS_NAME,
-                .will_notify_on_stop = true,
-                .protovm_program = protovm_program,
-            },
+        // Size the descriptor buffer off the (variable) protovm program.
+        const desc_buf = try allocator.alloc(u8, protovm_program.len + 256);
+        defer allocator.free(desc_buf);
+        const desc_len = sismo_encode_data_source_descriptor(
+            DS_NAME.ptr,
+            DS_NAME.len,
+            true,
+            false,
+            protovm_program.ptr,
+            protovm_program.len,
+            desc_buf.ptr,
+            desc_buf.len,
         );
-        defer allocator.free(desc_bytes);
+        if (desc_len == 0) return error.DescriptorEncodeFailed;
         const slot = perfetto.sismo_ds_register(
-            desc_bytes.ptr,
-            desc_bytes.len,
+            desc_buf.ptr,
+            desc_len,
             onSetupTrampoline,
             onStartTrampoline,
             onStopTrampoline,

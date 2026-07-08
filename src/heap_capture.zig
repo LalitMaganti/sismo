@@ -29,7 +29,6 @@ const dyld_images = @import("macos/dyld_images.zig");
 const unwinder = @import("unwinder.zig");
 const symbolizer = @import("symbolizer.zig");
 const sismo_config = @import("sismo_config.zig");
-const perfetto_proto = @import("perfetto_proto.zig");
 
 const perfetto = @cImport({
     @cInclude("src/c/perfetto_shim.h");
@@ -62,6 +61,18 @@ extern fn sismo_heap_build_profile_packet(
 ) ?[*]u8;
 extern fn sismo_heap_build_clock_snapshot_packet(timestamp_ns: u64, out_len: *usize) ?[*]u8;
 extern fn sismo_heap_free(ptr: [*]u8, len: usize) void;
+
+// rust-bridge/src/session_config.rs — DataSourceDescriptor encoder.
+extern fn sismo_encode_data_source_descriptor(
+    name: [*]const u8,
+    name_len: usize,
+    will_notify_on_stop: bool,
+    will_notify_on_start: bool,
+    protovm_program: ?[*]const u8,
+    protovm_program_len: usize,
+    out: [*]u8,
+    cap: usize,
+) usize;
 
 const DS_NAME = "sismo.heap";
 
@@ -172,13 +183,13 @@ pub const Capture = struct {
             .sites_observed = std.atomic.Value(u32).init(0),
         };
 
-        const desc_bytes = try perfetto_proto.encodeDataSourceDescriptor(
-            allocator,
-            .{ .name = DS_NAME, .will_notify_on_stop = true },
+        var desc_buf: [2048]u8 = undefined;
+        const desc_len = sismo_encode_data_source_descriptor(
+            DS_NAME.ptr, DS_NAME.len, true, false, null, 0, &desc_buf, desc_buf.len,
         );
-        defer allocator.free(desc_bytes);
+        if (desc_len == 0) return error.DescriptorEncodeFailed;
         const slot = perfetto.sismo_ds_register(
-            desc_bytes.ptr, desc_bytes.len,
+            &desc_buf, desc_len,
             onSetupTrampoline,
             onStartTrampoline,
             onStopTrampoline,

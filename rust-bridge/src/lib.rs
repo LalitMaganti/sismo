@@ -10,5 +10,6 @@ pub mod disasm;
 pub mod heap;
 pub mod proc_maps;
 pub mod proto;
+pub mod session_config;
 pub mod symbolizer;
 pub mod unwinder;
