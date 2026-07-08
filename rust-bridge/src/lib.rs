@@ -8,6 +8,9 @@ pub mod cli;
 pub mod data_regions;
 pub mod disasm;
 pub mod heap;
+// macOS libproc bindings (proc_pidinfo/proc_pidpath are Darwin symbols).
+#[cfg(target_os = "macos")]
+pub mod proc_info;
 pub mod proc_maps;
 pub mod proto;
 pub mod session_config;

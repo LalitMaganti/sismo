@@ -554,7 +554,7 @@ fn refreshAndEmitTree(self: *Capture, thread_map: []const kdebug.KdThreadMap) vo
         if (p_gop.found_existing) continue;
 
         var pe: ProcessEntry = .{ .ppid = 0, .cmdline_buf = undefined, .cmdline_len = 0 };
-        if (process_tree.bsdinfo(pid)) |bi| pe.ppid = @intCast(bi.pbi_ppid);
+        if (process_tree.parentPid(pid)) |ppid| pe.ppid = @intCast(ppid);
         if (process_tree.pidPath(pid, &pe.cmdline_buf)) |path| {
             // proc_pidpath's return length includes the NUL
             // terminator; drop it (and any other trailing NULs)
