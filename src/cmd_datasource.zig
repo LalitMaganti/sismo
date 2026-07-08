@@ -44,10 +44,10 @@ const macos_sched_capture = switch (builtin.os.tag) {
     .macos => @import("macos_sched_capture.zig"),
     else => struct {},
 };
-const macos_cpu_samples_capture = switch (builtin.os.tag) {
-    .macos => @import("macos_cpu_samples_capture.zig"),
-    else => struct {},
-};
+// CPU-samples capture worker lives in Rust (rust-bridge/src/macos_cpu_capture.rs).
+const CpuCapture = opaque {};
+extern fn sismo_cpu_capture_init(default_interval_ns: u64) ?*CpuCapture;
+extern fn sismo_cpu_capture_shutdown(cap: *CpuCapture, out_samples: *u64, out_active_samples: *u64) void;
 const heap_capture = switch (builtin.os.tag) {
     .macos => @import("heap_capture.zig"),
     else => struct {},
@@ -158,7 +158,7 @@ pub fn runDatasource(init: std.process.Init) !void {
 const Slot = struct {
     kind: Kind,
     sched: ?*macos_sched_capture.Capture = null,
-    cpu: ?*macos_cpu_samples_capture.Capture = null,
+    cpu: ?*CpuCapture = null,
     heap: ?*heap_capture.Capture = null,
 };
 
@@ -192,7 +192,7 @@ fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
                 std.debug.print("sismo datasource: sismo.macos_sched registered\n", .{});
             },
             .cpu => {
-                slot.cpu = try macos_cpu_samples_capture.Capture.init(init.gpa, init.io, .{});
+                slot.cpu = sismo_cpu_capture_init(0) orelse return error.CpuCaptureInitFailed;
                 std.debug.print("sismo datasource: sismo.macos_cpu_samples registered\n", .{});
             },
             .heap => {
@@ -229,10 +229,12 @@ fn shutdownSlot(slot: Slot) void {
             );
         },
         .cpu => if (slot.cpu) |s| {
-            const stats = s.shutdown();
+            var samples: u64 = 0;
+            var active: u64 = 0;
+            sismo_cpu_capture_shutdown(s, &samples, &active);
             std.debug.print(
                 "sismo datasource: sismo.macos_cpu_samples stopped — {d} samples ({d} active)\n",
-                .{ stats.samples, stats.active_samples },
+                .{ samples, active },
             );
         },
         .heap => if (slot.heap) |s| {

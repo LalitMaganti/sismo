@@ -63,10 +63,12 @@ const macos_sched_capture = switch (builtin.os.tag) {
     .macos => @import("macos_sched_capture.zig"),
     else => struct {},
 };
-const macos_cpu_samples_capture = switch (builtin.os.tag) {
-    .macos => @import("macos_cpu_samples_capture.zig"),
-    else => struct {},
-};
+// CPU-samples capture worker now lives in Rust (rust-bridge/src/
+// macos_cpu_capture.rs) — it owns its thread + the C++ SDK data-source
+// lifecycle. cmd_record just init/shutdowns it over the C ABI.
+const CpuCapture = opaque {};
+extern fn sismo_cpu_capture_init(default_interval_ns: u64) ?*CpuCapture;
+extern fn sismo_cpu_capture_shutdown(cap: *CpuCapture, out_samples: *u64, out_active_samples: *u64) void;
 const heap_capture = switch (builtin.os.tag) {
     .macos => @import("heap_capture.zig"),
     else => struct {},
@@ -1044,12 +1046,11 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
             break :blk null;
         };
     };
-    const cpu = blk: {
+    const cpu: ?*CpuCapture = blk: {
         if (cpu_mode != .in_process) break :blk null;
-        break :blk macos_cpu_samples_capture.Capture.init(gpa, io, .{}) catch |err| {
-            std.debug.print("sismo record: macos_cpu_samples_capture.init failed: {s}\n", .{@errorName(err)});
-            break :blk null;
-        };
+        const cap = sismo_cpu_capture_init(0); // 0 = default 1 kHz interval
+        if (cap == null) std.debug.print("sismo record: cpu capture init failed\n", .{});
+        break :blk cap;
     };
     const heap = blk: {
         if (heap_mode != .in_process) break :blk null;
@@ -1331,10 +1332,12 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         );
     }
     if (cpu) |s| {
-        const stats = s.shutdown();
+        var samples: u64 = 0;
+        var active: u64 = 0;
+        sismo_cpu_capture_shutdown(s, &samples, &active);
         std.debug.print(
             "sismo record: cpu — {d} samples ({d} active)\n",
-            .{ stats.samples, stats.active_samples },
+            .{ samples, active },
         );
     }
     if (sched) |s| {

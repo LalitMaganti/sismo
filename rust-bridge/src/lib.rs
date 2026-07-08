@@ -14,6 +14,9 @@ pub mod dyld_images;
 #[cfg(target_os = "macos")]
 pub mod kdebug;
 pub mod heap;
+// macOS CPU-samples capture worker (owns the worker thread + SDK lifecycle).
+#[cfg(target_os = "macos")]
+pub mod macos_cpu_capture;
 // macOS per-sample CPU capture (Mach thread ops + unwind + encode).
 #[cfg(target_os = "macos")]
 pub mod mach_sampler;
