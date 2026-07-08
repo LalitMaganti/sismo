@@ -17,7 +17,6 @@ const builtin = @import("builtin");
 const heap_wire = @import("heap_wire.zig");
 const proto_writer = @import("proto_writer.zig");
 const sismo_config = @import("sismo_config.zig");
-const heap_emit = @import("heap_emit.zig");
 const heap_protocol = @import("heap_protocol.zig");
 const heap_ring = @import("heap_ring.zig");
 
@@ -25,7 +24,6 @@ comptime {
     _ = heap_wire;
     _ = proto_writer;
     _ = sismo_config;
-    _ = heap_emit;
 }
 
 pub export fn sismo_check_cmds() void {

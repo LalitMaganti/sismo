@@ -1,9 +1,9 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Minimal protobuf wire-format encoder. Used by heap_emit.zig to
-//! emit ProfilePacket / InternedData / Mapping / Frame / Callstack
-//! messages directly into a .pftrace file.
+//! Minimal protobuf wire-format encoder. Used by the remaining Zig-side
+//! encoders (perfetto_proto.zig, source_asm_sidecar.zig,
+//! sismo_privileged_marker.zig) to build trace-packet messages.
 //!
 //! Wire format reference:
 //!   https://protobuf.dev/programming-guides/encoding/

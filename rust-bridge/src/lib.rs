@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod data_regions;
 pub mod disasm;
+pub mod heap;
 pub mod proc_maps;
 pub mod proto;
 pub mod symbolizer;

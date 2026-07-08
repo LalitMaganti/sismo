@@ -28,13 +28,40 @@ const sampler = @import("macos/mach_sampler.zig");
 const dyld_images = @import("macos/dyld_images.zig");
 const unwinder = @import("unwinder.zig");
 const symbolizer = @import("symbolizer.zig");
-const heap_emit = @import("heap_emit.zig");
 const sismo_config = @import("sismo_config.zig");
 const perfetto_proto = @import("perfetto_proto.zig");
 
 const perfetto = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
+
+// rust-bridge/src/heap.rs — heap profile assembly + serialization. Given the
+// target images and aggregated sites, Rust interns/symbolizes/serializes and
+// hands back wrapped TracePacket bodies (freed via sismo_heap_free).
+const HeapImage = extern struct {
+    base_avma: u64,
+    path_ptr: [*]const u8,
+    path_len: usize,
+};
+const HeapSite = extern struct {
+    pcs: [*]const u64,
+    pc_count: usize,
+    count: u64,
+    total_size: u64,
+};
+extern fn sismo_heap_build_profile_packet(
+    pid: u32,
+    sampling_interval: u64,
+    timestamp_ns: u64,
+    symbolizer: *symbolizer.Symbolizer,
+    images: [*]const HeapImage,
+    images_len: usize,
+    sites: [*]const HeapSite,
+    sites_len: usize,
+    out_len: *usize,
+) ?[*]u8;
+extern fn sismo_heap_build_clock_snapshot_packet(timestamp_ns: u64, out_len: *usize) ?[*]u8;
+extern fn sismo_heap_free(ptr: [*]u8, len: usize) void;
 
 const DS_NAME = "sismo.heap";
 
@@ -478,6 +505,10 @@ fn processRecord(
     _ = self.bytes_alloc.fetchAdd(meta.sample_size, .monotonic);
 }
 
+/// Emit the heap profile snapshot. Flattens the aggregated sites + target
+/// images into flat FFI arrays and hands them to the Rust builder
+/// (rust-bridge/src/heap.rs), which interns/symbolizes/serializes and returns
+/// wrapped TracePacket bodies; we emit each via the C++ SDK shim and free it.
 fn emitProfile(
     self: *Capture,
     sizes_map: *const std.AutoHashMap(u64, AllocStats),
@@ -489,148 +520,54 @@ fn emitProfile(
         self.setup_config.sample_interval_bytes
     else
         self.config.sample_interval_bytes;
-    var owned = try buildTraceData(
-        self.allocator,
+
+    // Images are already base-sorted (see workerEntry) — pass them in order so
+    // frame mapping_iids line up with the Rust builder's iid = index + 1.
+    const images = try self.allocator.alloc(HeapImage, target_images.len);
+    defer self.allocator.free(images);
+    for (target_images, 0..) |img, i| {
+        images[i] = .{
+            .base_avma = img.base_avma,
+            .path_ptr = img.path.ptr,
+            .path_len = img.path.len,
+        };
+    }
+
+    const sites = try self.allocator.alloc(HeapSite, sizes_map.count());
+    defer self.allocator.free(sites);
+    var it = sizes_map.iterator();
+    var si: usize = 0;
+    while (it.next()) |entry| : (si += 1) {
+        const s = entry.value_ptr;
+        sites[si] = .{
+            .pcs = &s.pcs,
+            .pc_count = s.pc_count,
+            .count = s.count,
+            .total_size = s.total_size,
+        };
+    }
+
+    // Clock snapshot first: it registers the MONOTONIC_COARSE clock that the
+    // samples' timestamp is interpreted against.
+    var cs_len: usize = 0;
+    if (sismo_heap_build_clock_snapshot_packet(snapshot_ts_ns, &cs_len)) |ptr| {
+        perfetto.sismo_ds_emit(self.ds_slot, ptr, cs_len);
+        sismo_heap_free(ptr, cs_len);
+    }
+
+    var pp_len: usize = 0;
+    if (sismo_heap_build_profile_packet(
         @intCast(self.target_pid),
         sample_interval,
-        sizes_map,
-        target_images,
-        sym,
         snapshot_ts_ns,
-    );
-    defer owned.deinit(self.allocator);
-    owned.fillTd();
-    try heap_emit.emitToDataSource(self.allocator, self.ds_slot, owned.td);
-}
-
-// ---- TraceData construction ------------------------------------------------
-
-const TraceDataOwned = struct {
-    strings: [][]const u8,
-    mappings: []heap_emit.Mapping,
-    frames: []heap_emit.Frame,
-    callstacks: []heap_emit.Callstack,
-    samples: []heap_emit.HeapSample,
-    td: heap_emit.TraceData,
-
-    fn fillTd(self: *TraceDataOwned) void {
-        self.td.strings = self.strings;
-        self.td.mappings = self.mappings;
-        self.td.frames = self.frames;
-        self.td.callstacks = self.callstacks;
-        self.td.samples = self.samples;
+        sym,
+        images.ptr,
+        images.len,
+        sites.ptr,
+        sites.len,
+        &pp_len,
+    )) |ptr| {
+        perfetto.sismo_ds_emit(self.ds_slot, ptr, pp_len);
+        sismo_heap_free(ptr, pp_len);
     }
-
-    fn deinit(self: *TraceDataOwned, gpa: std.mem.Allocator) void {
-        for (self.strings) |s| gpa.free(s);
-        for (self.callstacks) |c| gpa.free(c.frame_iids);
-        gpa.free(self.strings);
-        gpa.free(self.mappings);
-        gpa.free(self.frames);
-        gpa.free(self.callstacks);
-        gpa.free(self.samples);
-    }
-};
-
-fn buildTraceData(
-    gpa: std.mem.Allocator,
-    pid: u32,
-    sampling_interval: u64,
-    sizes_map: *const std.AutoHashMap(u64, AllocStats),
-    target_images: []const dyld_images.Image,
-    sym: *symbolizer.Symbolizer,
-    snapshot_ts_ns: u64,
-) !TraceDataOwned {
-    var strings: std.ArrayList([]const u8) = .empty;
-    defer strings.deinit(gpa);
-    var mappings: std.ArrayList(heap_emit.Mapping) = .empty;
-    defer mappings.deinit(gpa);
-
-    for (target_images, 0..) |img, idx| {
-        const iid = idx + 1;
-        try strings.append(gpa, try gpa.dupe(u8, img.path));
-        try mappings.append(gpa, .{
-            .iid = iid,
-            .path_string_iid = iid,
-            .start = img.base_avma,
-            .end = img.base_avma,
-            .load_bias = 0,
-        });
-    }
-    var frames: std.ArrayList(heap_emit.Frame) = .empty;
-    defer frames.deinit(gpa);
-    var callstacks: std.ArrayList(heap_emit.Callstack) = .empty;
-    defer callstacks.deinit(gpa);
-    var samples: std.ArrayList(heap_emit.HeapSample) = .empty;
-    defer samples.deinit(gpa);
-
-    var frame_by_pc: std.AutoHashMap(u64, u64) = .init(gpa);
-    defer frame_by_pc.deinit();
-
-    var name_buf: [256]u8 = undefined;
-    var file_buf: [1024]u8 = undefined;
-    var next_callstack_iid: u64 = 1;
-    var it = sizes_map.iterator();
-    while (it.next()) |entry| {
-        const site = entry.value_ptr;
-
-        var frame_iids_buf: std.ArrayList(u64) = .empty;
-        defer frame_iids_buf.deinit(gpa);
-
-        for (site.pcs[0..site.pc_count]) |pc| {
-            const gop = try frame_by_pc.getOrPut(pc);
-            if (!gop.found_existing) {
-                const r = symbolizer.resolve(sym, pc, &name_buf, &file_buf);
-                const name_str = if (r.name_len > 0) name_buf[0..r.name_len] else "?";
-                const owned_name = try gpa.dupe(u8, name_str);
-                try strings.append(gpa, owned_name);
-                const fn_iid = strings.items.len;
-
-                var j: usize = 0;
-                while (j < target_images.len and target_images[j].base_avma <= pc) : (j += 1) {}
-                const map_iid: u64 = if (j > 0) j else 1;
-                const map_base = if (j > 0) target_images[j - 1].base_avma else 0;
-
-                const frame_iid = frames.items.len + 1;
-                try frames.append(gpa, .{
-                    .iid = frame_iid,
-                    .function_name_iid = fn_iid,
-                    .mapping_iid = map_iid,
-                    .rel_pc = pc - map_base,
-                });
-                gop.value_ptr.* = frame_iid;
-            }
-            try frame_iids_buf.append(gpa, gop.value_ptr.*);
-        }
-
-        const cs_iid = next_callstack_iid;
-        next_callstack_iid += 1;
-        try callstacks.append(gpa, .{
-            .iid = cs_iid,
-            .frame_iids = try gpa.dupe(u64, frame_iids_buf.items),
-        });
-        try samples.append(gpa, .{
-            .callstack_iid = cs_iid,
-            .self_allocated = site.total_size,
-            .alloc_count = site.count,
-        });
-    }
-
-    return .{
-        .strings = try strings.toOwnedSlice(gpa),
-        .mappings = try mappings.toOwnedSlice(gpa),
-        .frames = try frames.toOwnedSlice(gpa),
-        .callstacks = try callstacks.toOwnedSlice(gpa),
-        .samples = try samples.toOwnedSlice(gpa),
-        .td = .{
-            .pid = pid,
-            .sampling_interval_bytes = sampling_interval,
-            .timestamp_ns = snapshot_ts_ns,
-            .strings = &.{},
-            .mappings = &.{},
-            .frames = &.{},
-            .callstacks = &.{},
-            .samples = &.{},
-        },
-    };
 }

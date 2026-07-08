@@ -265,7 +265,7 @@ pub fn encodeTraceConfig(
 //
 // The TracePacket body wrapper (timestamp + sequence_flags + payload-as-field)
 // is encoded in rust-bridge/src/proto.rs (sismo_encode_trace_packet_body),
-// called from macos_cpu_samples_capture, macos_sched_capture, and heap_emit.
+// called from macos_cpu_samples_capture and macos_sched_capture.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
