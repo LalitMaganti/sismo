@@ -11,6 +11,9 @@ pub mod disasm;
 #[cfg(target_os = "macos")]
 pub mod dyld_images;
 pub mod heap;
+// macOS per-sample CPU capture (Mach thread ops + unwind + encode).
+#[cfg(target_os = "macos")]
+pub mod mach_sampler;
 // macOS libproc bindings (proc_pidinfo/proc_pidpath are Darwin symbols).
 #[cfg(target_os = "macos")]
 pub mod proc_info;

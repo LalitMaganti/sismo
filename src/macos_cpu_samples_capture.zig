@@ -20,37 +20,26 @@ const builtin = @import("builtin");
 const sampler = @import("macos/mach_sampler.zig");
 const unwinder = @import("unwinder.zig");
 const sismo_config = @import("sismo_config.zig");
-const perfetto_proto = @import("perfetto_proto.zig");
 
 const perfetto = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
 
-// rust-bridge/src/proto.rs — see rust-bridge/include/bridge.h.
-extern fn sismo_encode_perf_sample(
-    cpu: u32,
+// rust-bridge/src/mach_sampler.rs — sample one thread: reads CPU time (to skip
+// idle threads), and for an active thread suspends it, reads arm64 regs,
+// unwinds (reading target stack via mach_vm_read), resumes, and builds a
+// PerfSample TracePacket body into `out_packet` for us to emit.
+extern fn sismo_cpu_sample_thread(
+    task: sampler.task_t,
+    thread: sampler.thread_t,
+    unwinder_h: *unwinder.Unwinder,
     pid: u32,
-    tid: u32,
-    callstack_iid: u64,
-    timebase_count: u64,
-    follower_counts: ?[*]const u64,
-    follower_count: usize,
-    data_address: u64,
-    data_symbol: ?[*]const u8,
-    data_symbol_len: usize,
-    out: [*]u8,
-    cap: usize,
-) usize;
-
-// rust-bridge/src/proto.rs — wraps an encoded payload in a TracePacket body.
-extern fn sismo_encode_trace_packet_body(
-    timestamp_ns: u64,
-    sequence_flags: u32,
-    payload_field_tag: u32,
-    payload: ?[*]const u8,
-    payload_len: usize,
-    out: [*]u8,
-    cap: usize,
+    tid: u64,
+    last_cpu_us: u64,
+    out_new_cpu_us: *u64,
+    out_active: *bool,
+    out_packet: [*]u8,
+    out_packet_cap: usize,
 ) usize;
 
 // rust-bridge/src/dyld_images.rs — enumerate + read + register the target's
@@ -87,14 +76,6 @@ comptime {
     if (builtin.os.tag != .macos) @compileError("cpu_sampler is macOS-only");
 }
 
-fn nowMonotonicNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
-const MAX_FRAMES = 32;
-
 pub const Config = struct {
     /// Producer-side default sampling period. on_setup may override
     /// via SismoMacosCpuSamplesConfig.interval_us. 1 kHz matches samply.
@@ -111,15 +92,6 @@ const ThreadState = struct {
     tid: u64,
     last_cpu_us: u64,
 };
-
-const ReadCtx = struct { task: sampler.task_t };
-
-fn readStackCb(addr: u64, out: *u64, user_data: ?*anyopaque) callconv(.c) c_int {
-    const ctx: *const ReadCtx = @ptrCast(@alignCast(user_data.?));
-    const got = sampler.vmReadInto(ctx.task, addr, std.mem.asBytes(out)) catch return 1;
-    if (got < @sizeOf(u64)) return 1;
-    return 0;
-}
 
 pub const Capture = struct {
     allocator: std.mem.Allocator,
@@ -317,7 +289,6 @@ fn workerEntry(self: *Capture) void {
 
     var thread_states = std.AutoHashMap(sampler.thread_t, ThreadState).init(self.allocator);
     defer thread_states.deinit();
-    var read_ctx = ReadCtx{ .task = task };
     // De-spam threadList failures — when the target exits the worker
     // keeps trying every interval until on_stop arrives, which is
     // hundreds of failed calls per shutdown. Print only on edge
@@ -345,7 +316,7 @@ fn workerEntry(self: *Capture) void {
                 }
                 for (thr) |t| {
                     const ts = getOrInit(&thread_states, t) catch continue;
-                    sampleOnce(self, ts, u, &read_ctx);
+                    sampleOnce(self, ts, u, task);
                 }
                 sampler.freeThreadList(task, thr);
             }
@@ -403,60 +374,29 @@ fn getOrInit(
     return gop.value_ptr;
 }
 
-fn sampleOnce(self: *Capture, state: *ThreadState, u: *unwinder.Unwinder, ctx: *ReadCtx) void {
+fn sampleOnce(self: *Capture, state: *ThreadState, u: *unwinder.Unwinder, task: sampler.task_t) void {
     _ = self.samples.fetchAdd(1, .monotonic);
 
-    const cpu_now = sampler.threadCpuTimeUs(state.thread) catch return;
-    const delta = cpu_now -% state.last_cpu_us;
-    state.last_cpu_us = cpu_now;
-    if (delta == 0) return; // idle — no point unwinding the same stack
-
-    _ = self.active_samples.fetchAdd(1, .monotonic);
-
-    sampler.threadSuspend(state.thread) catch return;
-    const reg = sampler.threadStateArm64(state.thread) catch {
-        sampler.threadResume(state.thread) catch {};
-        return;
-    };
-    var pcs: [MAX_FRAMES]u64 = undefined;
-    const n = unwinder.walk(u, .{
-        .pc = reg.cleanPC(),
-        .fp = reg.cleanFP(),
-        .lr = reg.cleanLR(),
-        .sp = reg.cleanSP(),
-    }, readStackCb, ctx, &pcs);
-    sampler.threadResume(state.thread) catch {};
-    _ = n; // callstack interning is a follow-up; emit leaf-only sample for now
-
-    // Build PerfSample → wrap in TracePacket body → emit.
-    var sample_buf: [4096]u8 = undefined;
-    const sample_len = sismo_encode_perf_sample(
-        0, // cpu — core not tracked
-        @intCast(self.target_pid),
-        @intCast(state.tid),
-        0, // callstack_iid — interning is a follow-up
-        0, // timebase_count
-        null,
-        0,
-        0, // data_address
-        null,
-        0,
-        &sample_buf,
-        sample_buf.len,
-    );
-    if (sample_len == 0) return;
-    // Wrap the PerfSample body in a TracePacket body. Stack buffer: sample_len
-    // ≤ 4096 plus the timestamp/tag overhead.
+    // The per-sample hot path — CPU-time delta check, suspend, register read,
+    // unwind, resume, and PerfSample encode — lives in Rust
+    // (rust-bridge/src/mach_sampler.rs). We just track the CPU-time baseline,
+    // count active samples, and emit the packet it builds.
+    var new_cpu_us: u64 = state.last_cpu_us; // unchanged if the read fails
+    var active: bool = false;
     var packet_buf: [4160]u8 = undefined;
-    const packet_len = sismo_encode_trace_packet_body(
-        nowMonotonicNs(),
-        0,
-        perfetto_proto.TP_FIELD_PERF_SAMPLE,
-        &sample_buf,
-        sample_len,
+    const packet_len = sismo_cpu_sample_thread(
+        task,
+        state.thread,
+        u,
+        @intCast(self.target_pid),
+        state.tid,
+        state.last_cpu_us,
+        &new_cpu_us,
+        &active,
         &packet_buf,
         packet_buf.len,
     );
-    if (packet_len == 0) return;
-    perfetto.sismo_ds_emit(self.ds_slot, &packet_buf, packet_len);
+    state.last_cpu_us = new_cpu_us;
+    if (active) _ = self.active_samples.fetchAdd(1, .monotonic);
+    if (packet_len != 0) perfetto.sismo_ds_emit(self.ds_slot, &packet_buf, packet_len);
 }
