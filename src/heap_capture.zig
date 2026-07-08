@@ -368,11 +368,14 @@ fn workerEntry(self: *Capture) void {
             perfetto.sismo_flush_done(@ptrFromInt(flusher_addr));
         }
 
-        // Stop: detach from the target so it stops producing, do a
-        // final drain to clear the ring (records here are NOT
-        // emitted — the preceding flush already covered the visible
-        // window; the few records between flush and detach are
-        // microseconds of noise). Ack the postponed stopper.
+        // Stop: detach from the target so it stops producing, do a final
+        // drain, and emit the complete accumulated snapshot. macOS perfetto
+        // fires on_flush only once (there is no guaranteed flush-before-stop
+        // here), and heap attaches after the session starts, so that single
+        // flush can land before any allocation is captured — leaving all the
+        // real data in the ring at stop. Emitting here makes heap output
+        // deterministic regardless of when (or whether) a flush fired. Then
+        // ack the postponed stopper.
         const stopper_addr = self.pending_stopper.swap(0, .acq_rel);
         if (stopper_addr != 0) {
             if (ctrl_fd_open) {
@@ -384,6 +387,11 @@ fn workerEntry(self: *Capture) void {
                 } }) catch {};
             }
             drainShmInto(self, &rb, u, &sizes_by_top_pc);
+            const snapshot_ts = nowNs();
+            self.sites_observed.store(@intCast(sizes_by_top_pc.count()), .release);
+            emitProfile(self, &sizes_by_top_pc, target_images, sym, snapshot_ts) catch |err| {
+                std.debug.print("heap_capture: stop emit failed: {s}\n", .{@errorName(err)});
+            };
             perfetto.sismo_stop_done(@ptrFromInt(stopper_addr));
             self.running.store(false, .release);
         }
