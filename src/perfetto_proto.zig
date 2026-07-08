@@ -261,45 +261,12 @@ pub fn encodeTraceConfig(
 //
 // `sismo_ds_emit(slot, packet_bytes, len)` accepts the *body* of a
 // TracePacket (the field-tagged contents inside a NewTracePacket()
-// handle). The C++ glue wraps it; these builders take a payload +
-// timestamp and emit the body bytes.
+// handle). The C++ glue wraps it.
+//
+// The TracePacket body wrapper (timestamp + sequence_flags + payload-as-field)
+// is encoded in rust-bridge/src/proto.rs (sismo_encode_trace_packet_body),
+// called from macos_cpu_samples_capture, macos_sched_capture, and heap_emit.
 // ---------------------------------------------------------------------------
-
-const TP_FIELD_TIMESTAMP: u32 = 8;
-const TP_FIELD_SEQUENCE_FLAGS: u32 = 13;
-
-/// Build a TracePacket body containing (timestamp, sequence_flags?,
-/// payload-as-field). `payload_field_tag` is the field number inside
-/// TracePacket where the payload sits (e.g. 66 for perf_sample, 117 for
-/// generic_kernel_task_state_event). `payload_bytes` is the already-
-/// encoded sub-message body. Pass `sequence_flags = 0` to omit the field.
-pub fn encodeTracePacketBody(
-    gpa: std.mem.Allocator,
-    timestamp_ns: u64,
-    sequence_flags: u32,
-    payload_field_tag: u32,
-    payload_bytes: []const u8,
-) ![]u8 {
-    var w = ProtoWriter.init(gpa);
-    errdefer w.deinit();
-    if (timestamp_ns != 0) try w.writeUint64(TP_FIELD_TIMESTAMP, timestamp_ns);
-    if (sequence_flags != 0) try w.writeUint32(TP_FIELD_SEQUENCE_FLAGS, sequence_flags);
-    try w.writeMessage(payload_field_tag, payload_bytes);
-    return w.buf.toOwnedSlice(gpa);
-}
-
-/// In-place variant of `encodeTracePacketBody` for hot-path callers
-/// that hold a persistent scratch `*ProtoWriter`. Caller is
-/// responsible for `clear()`-ing the writer before each use.
-pub fn encodeTracePacketBodyInto(
-    w: *ProtoWriter,
-    timestamp_ns: u64,
-    payload_field_tag: u32,
-    payload_bytes: []const u8,
-) !void {
-    if (timestamp_ns != 0) try w.writeUint64(TP_FIELD_TIMESTAMP, timestamp_ns);
-    try w.writeMessage(payload_field_tag, payload_bytes);
-}
 
 // ---------------------------------------------------------------------------
 // PerfSample (TracePacket field 17)
@@ -398,8 +365,8 @@ fn encodeThread(gpa: std.mem.Allocator, t: ThreadEntry) ![]u8 {
 }
 
 /// Build a `GenericKernelProcessTree` payload (the inner message that
-/// rides at TracePacket field 122). The caller wraps the returned
-/// bytes with `encodeTracePacketBody`.
+/// rides at TracePacket field 122). The caller wraps the returned bytes
+/// with `sismo_encode_trace_packet_body` (rust-bridge/src/proto.rs).
 pub fn encodeKernelProcessTree(
     gpa: std.mem.Allocator,
     processes: []const ProcessEntry,

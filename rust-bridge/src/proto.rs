@@ -279,6 +279,49 @@ pub unsafe extern "C" fn sismo_encode_kernel_task_state_event(
     b.len()
 }
 
+/// Encode a TracePacket body: optional timestamp (field 8, omitted when 0),
+/// optional sequence_flags (field 13, omitted when 0), then the already-encoded
+/// `payload` wrapped as length-delimited field `payload_field_tag` (e.g. 66 =
+/// perf_sample, 117 = generic_kernel_task_state_event). Writes into out[..cap];
+/// returns bytes written, or 0 if cap is too small.
+///
+/// # Safety
+/// `payload` must be valid for `payload_len` bytes or null; `out` must be
+/// writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sismo_encode_trace_packet_body(
+    timestamp_ns: u64,
+    sequence_flags: u32,
+    payload_field_tag: u32,
+    payload: *const u8,
+    payload_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    let mut w = ProtoWriter::new();
+    if timestamp_ns != 0 {
+        w.write_uint64(8, timestamp_ns);
+    }
+    if sequence_flags != 0 {
+        w.write_uint32(13, sequence_flags);
+    }
+    let payload_slice: &[u8] = if payload.is_null() {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(payload, payload_len) }
+    };
+    w.write_message(payload_field_tag, payload_slice);
+
+    let b = w.bytes();
+    if b.len() > cap {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
+    }
+    b.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +413,44 @@ mod tests {
         let got = &out[..n];
         // comm field 2 (tag 0x12) with length 64 (0x40).
         assert!(got.windows(2).any(|w| w == [0x12, 0x40]));
+    }
+
+    #[test]
+    fn trace_packet_body_wraps_payload_with_timestamp_and_flags() {
+        // timestamp=150, sequence_flags=1, payload=[0xAB] under field 66.
+        let mut out = [0u8; 64];
+        let n = unsafe {
+            sismo_encode_trace_packet_body(
+                150, 1, 66, [0xABu8].as_ptr(), 1, out.as_mut_ptr(), out.len(),
+            )
+        };
+        // timestamp(8)=150: 40 96 01; sequence_flags(13)=1: 68 01;
+        // payload(66) len 1: tag=66<<3|2=0x212 -> 92 04, len 01, byte AB.
+        assert_eq!(&out[..n], &[0x40, 0x96, 0x01, 0x68, 0x01, 0x92, 0x04, 0x01, 0xAB]);
+    }
+
+    #[test]
+    fn trace_packet_body_omits_zero_timestamp_and_flags() {
+        // timestamp=0 and sequence_flags=0 are both omitted (Into-variant case).
+        let mut out = [0u8; 64];
+        let n = unsafe {
+            sismo_encode_trace_packet_body(
+                0, 0, 117, [0x01u8, 0x02].as_ptr(), 2, out.as_mut_ptr(), out.len(),
+            )
+        };
+        // Only payload(117) len 2: tag=117<<3|2=0x3AA -> AA 07, len 02, 01 02.
+        assert_eq!(&out[..n], &[0xAA, 0x07, 0x02, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn trace_packet_body_returns_zero_when_cap_too_small() {
+        let mut out = [0u8; 4];
+        let n = unsafe {
+            sismo_encode_trace_packet_body(
+                150, 0, 66, [0xAAu8; 8].as_ptr(), 8, out.as_mut_ptr(), out.len(),
+            )
+        };
+        assert_eq!(n, 0);
     }
 
     #[test]

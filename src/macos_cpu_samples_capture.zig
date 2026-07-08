@@ -43,6 +43,17 @@ extern fn sismo_encode_perf_sample(
     cap: usize,
 ) usize;
 
+// rust-bridge/src/proto.rs — wraps an encoded payload in a TracePacket body.
+extern fn sismo_encode_trace_packet_body(
+    timestamp_ns: u64,
+    sequence_flags: u32,
+    payload_field_tag: u32,
+    payload: ?[*]const u8,
+    payload_len: usize,
+    out: [*]u8,
+    cap: usize,
+) usize;
+
 const DS_NAME = "sismo.macos_cpu_samples";
 
 comptime {
@@ -413,13 +424,18 @@ fn sampleOnce(self: *Capture, state: *ThreadState, u: *unwinder.Unwinder, ctx: *
         sample_buf.len,
     );
     if (sample_len == 0) return;
-    const body = perfetto_proto.encodeTracePacketBody(
-        self.allocator,
+    // Wrap the PerfSample body in a TracePacket body. Stack buffer: sample_len
+    // ≤ 4096 plus the timestamp/tag overhead.
+    var packet_buf: [4160]u8 = undefined;
+    const packet_len = sismo_encode_trace_packet_body(
         nowMonotonicNs(),
         0,
         perfetto_proto.TP_FIELD_PERF_SAMPLE,
-        sample_buf[0..sample_len],
-    ) catch return;
-    defer self.allocator.free(body);
-    perfetto.sismo_ds_emit(self.ds_slot, body.ptr, body.len);
+        &sample_buf,
+        sample_len,
+        &packet_buf,
+        packet_buf.len,
+    );
+    if (packet_len == 0) return;
+    perfetto.sismo_ds_emit(self.ds_slot, &packet_buf, packet_len);
 }

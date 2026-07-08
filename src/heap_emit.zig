@@ -222,7 +222,17 @@ fn encodeProfilePacket(gpa: std.mem.Allocator, td: TraceData) ![]u8 {
 const c = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
-const perfetto_proto = @import("perfetto_proto.zig");
+
+// rust-bridge/src/proto.rs — wraps an encoded payload in a TracePacket body.
+extern fn sismo_encode_trace_packet_body(
+    timestamp_ns: u64,
+    sequence_flags: u32,
+    payload_field_tag: u32,
+    payload: ?[*]const u8,
+    payload_len: usize,
+    out: [*]u8,
+    cap: usize,
+) usize;
 
 pub fn emitToDataSource(
     gpa: std.mem.Allocator,
@@ -242,15 +252,18 @@ pub fn emitToDataSource(
     // nanosecond timeline.
     const cs_payload = try encodeClockSnapshot(gpa, td.timestamp_ns);
     defer gpa.free(cs_payload);
-    const cs_body = try perfetto_proto.encodeTracePacketBody(
-        gpa,
+    const cs_body = try gpa.alloc(u8, cs_payload.len + 32);
+    defer gpa.free(cs_body);
+    const cs_len = sismo_encode_trace_packet_body(
         td.timestamp_ns,
         0,
         TP_CLOCK_SNAPSHOT,
-        cs_payload,
+        cs_payload.ptr,
+        cs_payload.len,
+        cs_body.ptr,
+        cs_body.len,
     );
-    defer gpa.free(cs_body);
-    c.sismo_ds_emit(ds_slot, cs_body.ptr, cs_body.len);
+    if (cs_len != 0) c.sismo_ds_emit(ds_slot, cs_body.ptr, cs_len);
 
     // Packet 2: ProfilePacket. Interned tables are embedded INSIDE
     // profile_packet (legacy Android-Q fields strings/mappings/frames/
@@ -258,15 +271,18 @@ pub fn emitToDataSource(
     // reads from there, not from TracePacket.interned_data.
     const profile_payload = try encodeProfilePacket(gpa, td);
     defer gpa.free(profile_payload);
-    const pp_body = try perfetto_proto.encodeTracePacketBody(
-        gpa,
+    const pp_body = try gpa.alloc(u8, profile_payload.len + 32);
+    defer gpa.free(pp_body);
+    const pp_len = sismo_encode_trace_packet_body(
         td.timestamp_ns,
         SEQ_INCREMENTAL_STATE_CLEARED,
         TP_PROFILE_PACKET,
-        profile_payload,
+        profile_payload.ptr,
+        profile_payload.len,
+        pp_body.ptr,
+        pp_body.len,
     );
-    defer gpa.free(pp_body);
-    c.sismo_ds_emit(ds_slot, pp_body.ptr, pp_body.len);
+    if (pp_len != 0) c.sismo_ds_emit(ds_slot, pp_body.ptr, pp_len);
 }
 
 fn encodeClockSnapshot(gpa: std.mem.Allocator, ts_ns: u64) ![]u8 {
