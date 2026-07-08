@@ -40,10 +40,10 @@ const c = @cImport({
 // on Windows) live in sibling modules once they're implemented. The
 // `else => struct {}` arm keeps the file compileable everywhere; the
 // runtime body below short-circuits with a clear error on non-macOS.
-const macos_sched_capture = switch (builtin.os.tag) {
-    .macos => @import("macos_sched_capture.zig"),
-    else => struct {},
-};
+// sched (kdebug) capture worker lives in Rust (rust-bridge/src/macos_sched_capture.rs).
+const SchedCapture = opaque {};
+extern fn sismo_sched_capture_init() ?*SchedCapture;
+extern fn sismo_sched_capture_shutdown(cap: *SchedCapture, out_events_emitted: *u64, out_drain_calls: *u64) void;
 // CPU-samples capture worker lives in Rust (rust-bridge/src/macos_cpu_capture.rs).
 const CpuCapture = opaque {};
 extern fn sismo_cpu_capture_init(default_interval_ns: u64) ?*CpuCapture;
@@ -157,7 +157,7 @@ pub fn runDatasource(init: std.process.Init) !void {
 /// applies, freed at shutdown.
 const Slot = struct {
     kind: Kind,
-    sched: ?*macos_sched_capture.Capture = null,
+    sched: ?*SchedCapture = null,
     cpu: ?*CpuCapture = null,
     heap: ?*heap_capture.Capture = null,
 };
@@ -188,7 +188,7 @@ fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
         var slot: Slot = .{ .kind = kind };
         switch (kind) {
             .sched => {
-                slot.sched = try macos_sched_capture.Capture.init(init.gpa, init.io, .{});
+                slot.sched = sismo_sched_capture_init() orelse return error.SchedCaptureInitFailed;
                 std.debug.print("sismo datasource: sismo.macos_sched registered\n", .{});
             },
             .cpu => {
@@ -222,10 +222,12 @@ fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
 fn shutdownSlot(slot: Slot) void {
     switch (slot.kind) {
         .sched => if (slot.sched) |s| {
-            const stats = s.shutdown();
+            var events: u64 = 0;
+            var drains: u64 = 0;
+            sismo_sched_capture_shutdown(s, &events, &drains);
             std.debug.print(
                 "sismo datasource: sismo.macos_sched stopped — {d} events / {d} drains\n",
-                .{ stats.events_emitted, stats.drain_calls },
+                .{ events, drains },
             );
         },
         .cpu => if (slot.cpu) |s| {

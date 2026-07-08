@@ -17,6 +17,9 @@ pub mod heap;
 // macOS CPU-samples capture worker (owns the worker thread + SDK lifecycle).
 #[cfg(target_os = "macos")]
 pub mod macos_cpu_capture;
+// macOS sched (kdebug) capture worker.
+#[cfg(target_os = "macos")]
+pub mod macos_sched_capture;
 // macOS per-sample CPU capture (Mach thread ops + unwind + encode).
 #[cfg(target_os = "macos")]
 pub mod mach_sampler;
@@ -26,6 +29,8 @@ pub mod proc_info;
 pub mod proc_maps;
 pub mod proto;
 pub mod sched_protos;
+// Shared capture-worker plumbing (producer C ABI + Event).
+pub mod worker_sdk;
 pub mod session_config;
 pub mod sismo_config;
 pub mod symbolizer;

@@ -16,7 +16,7 @@
 use crate::sismo_config::{sismo_config_cpu_decode, sismo_config_extract};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 const DS_NAME: &[u8] = b"sismo.macos_cpu_samples";
@@ -73,57 +73,10 @@ unsafe fn thread_kernel_tid(thread: MachPort) -> u64 {
     read_u64(&buf, 0) // thread_id
 }
 
-// ---- C++ producer shim (final binary) / test stubs -------------------------
-
-type OnSetup = extern "C" fn(*mut c_void, *const c_void, usize);
-type OnStart = extern "C" fn(*mut c_void);
-type OnStop = extern "C" fn(*mut c_void, *mut c_void);
-type OnFlush = extern "C" fn(*mut c_void, *mut c_void);
-
-#[cfg(not(test))]
-extern "C" {
-    fn sismo_ds_register(
-        desc_bytes: *const u8,
-        desc_len: usize,
-        on_setup: OnSetup,
-        on_start: OnStart,
-        on_stop: OnStop,
-        on_flush: OnFlush,
-        user_arg: *mut c_void,
-    ) -> u32;
-    fn sismo_ds_emit(slot: u32, packet_bytes: *const u8, packet_len: usize);
-    fn sismo_stop_done(handle: *mut c_void);
-    fn sismo_flush_done(handle: *mut c_void);
-}
-
-// Standalone `cargo test` doesn't link the C++ shim; these no-op stubs let the
-// lib-test binary resolve the symbols (no worker thread runs under test).
-#[cfg(test)]
-mod ffi_stubs {
-    use std::os::raw::c_void;
-    // `unsafe` to match the real extern declarations, so callers' `unsafe`
-    // blocks are needed in both the test and real builds.
-    #[no_mangle]
-    pub unsafe extern "C" fn sismo_ds_register(
-        _d: *const u8,
-        _dl: usize,
-        _s: super::OnSetup,
-        _st: super::OnStart,
-        _sp: super::OnStop,
-        _f: super::OnFlush,
-        _u: *mut c_void,
-    ) -> u32 {
-        u32::MAX
-    }
-    #[no_mangle]
-    pub unsafe extern "C" fn sismo_ds_emit(_slot: u32, _b: *const u8, _l: usize) {}
-    #[no_mangle]
-    pub unsafe extern "C" fn sismo_stop_done(_h: *mut c_void) {}
-    #[no_mangle]
-    pub unsafe extern "C" fn sismo_flush_done(_h: *mut c_void) {}
-}
-#[cfg(test)]
-use ffi_stubs::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
+// Producer C ABI + the worker Event live in the shared worker_sdk module.
+use crate::worker_sdk::{
+    sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done, Event,
+};
 
 // The rest of the pipeline is already Rust — call the sibling modules directly
 // (no FFI round-trip): descriptor encoding, unwinder lifecycle, module loading,
@@ -134,38 +87,6 @@ use crate::session_config::sismo_encode_data_source_descriptor;
 use crate::unwinder::{sismo_unwinder_create_arm64, sismo_unwinder_destroy, Unwinder};
 
 // ---- Worker ----------------------------------------------------------------
-
-/// A manual-reset event: `set` from the SDK trampolines wakes the worker; the
-/// worker `reset`s at the top of each loop and `wait`s/`wait_timeout`s at the
-/// bottom (a set between reset and wait is not lost). Mirrors std.Io.Event.
-struct Event {
-    signaled: Mutex<bool>,
-    cv: Condvar,
-}
-impl Event {
-    fn new() -> Self {
-        Event { signaled: Mutex::new(false), cv: Condvar::new() }
-    }
-    fn set(&self) {
-        *self.signaled.lock().unwrap() = true;
-        self.cv.notify_all();
-    }
-    fn reset(&self) {
-        *self.signaled.lock().unwrap() = false;
-    }
-    fn wait(&self) {
-        let mut g = self.signaled.lock().unwrap();
-        while !*g {
-            g = self.cv.wait(g).unwrap();
-        }
-    }
-    fn wait_timeout(&self, dur: Duration) {
-        let g = self.signaled.lock().unwrap();
-        if !*g {
-            let _ = self.cv.wait_timeout(g, dur).unwrap();
-        }
-    }
-}
 
 /// Shared worker state. All fields are Sync (atomics / Mutex) so the trampolines
 /// (SDK threads) and the worker thread can share `&CpuCapture` via a raw pointer.
@@ -535,15 +456,6 @@ pub unsafe extern "C" fn sismo_cpu_capture_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn event_set_before_wait_is_not_lost() {
-        let e = Event::new();
-        e.set();
-        // A set before wait must return immediately (manual-reset semantics).
-        e.wait();
-        e.reset();
-    }
 
     #[test]
     fn own_thread_cpu_time_and_tid_readable() {

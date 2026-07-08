@@ -59,10 +59,11 @@ const c = @cImport({
 // Windows needs ETW; both live in sibling modules once they're written.
 // On non-macOS builds these resolve to `struct {}` and runRecord
 // short-circuits before any reference to the missing types.
-const macos_sched_capture = switch (builtin.os.tag) {
-    .macos => @import("macos_sched_capture.zig"),
-    else => struct {},
-};
+// sched (kdebug) capture worker now lives in Rust
+// (rust-bridge/src/macos_sched_capture.rs).
+const SchedCapture = opaque {};
+extern fn sismo_sched_capture_init() ?*SchedCapture;
+extern fn sismo_sched_capture_shutdown(cap: *SchedCapture, out_events_emitted: *u64, out_drain_calls: *u64) void;
 // CPU-samples capture worker now lives in Rust (rust-bridge/src/
 // macos_cpu_capture.rs) — it owns its thread + the C++ SDK data-source
 // lifecycle. cmd_record just init/shutdowns it over the C ABI.
@@ -1039,12 +1040,11 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
     // attach). on_setup arrives when the consumer session starts — that's
     // where target_pid flows in, via SismoXxxConfig embedded at field 2000
     // of each DataSourceConfig.
-    const sched = blk: {
+    const sched: ?*SchedCapture = blk: {
         if (sched_mode != .in_process) break :blk null;
-        break :blk macos_sched_capture.Capture.init(gpa, io, .{}) catch |err| {
-            std.debug.print("sismo record: macos_sched_capture.init failed: {s}\n", .{@errorName(err)});
-            break :blk null;
-        };
+        const cap = sismo_sched_capture_init();
+        if (cap == null) std.debug.print("sismo record: sched capture init failed\n", .{});
+        break :blk cap;
     };
     const cpu: ?*CpuCapture = blk: {
         if (cpu_mode != .in_process) break :blk null;
@@ -1341,10 +1341,12 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         );
     }
     if (sched) |s| {
-        const stats = s.shutdown();
+        var events: u64 = 0;
+        var drains: u64 = 0;
+        sismo_sched_capture_shutdown(s, &events, &drains);
         std.debug.print(
             "sismo record: sched — {d} events emitted across {d} drains\n",
-            .{ stats.events_emitted, stats.drain_calls },
+            .{ events, drains },
         );
     }
 
