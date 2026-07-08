@@ -344,39 +344,9 @@ pub const TaskState = enum(u32) {
     destroyed = 8,
 };
 
-pub const KernelTaskStateEvent = struct {
-    cpu: i32,
-    comm: []const u8,
-    tid: i64,
-    state: TaskState,
-    prio: i32,
-};
-
-pub fn encodeKernelTaskStateEvent(
-    gpa: std.mem.Allocator,
-    e: KernelTaskStateEvent,
-) ![]u8 {
-    var w = ProtoWriter.init(gpa);
-    errdefer w.deinit();
-    try encodeKernelTaskStateEventInto(&w, e);
-    return w.buf.toOwnedSlice(gpa);
-}
-
-/// In-place variant for hot-path callers holding a persistent
-/// `*ProtoWriter`. Caller `clear()`s before each call.
-pub fn encodeKernelTaskStateEventInto(
-    w: *ProtoWriter,
-    e: KernelTaskStateEvent,
-) !void {
-    // Cap comm at 64 chars defensively (Mach thread name max in
-    // practice). The C-side did this; preserve.
-    const comm_capped = if (e.comm.len > 64) e.comm[0..64] else e.comm;
-    try w.writeInt32(1, e.cpu);
-    if (comm_capped.len > 0) try w.writeString(2, comm_capped);
-    try w.writeInt64(3, e.tid);
-    try w.writeEnum(4, e.state);
-    try w.writeInt32(5, e.prio);
-}
+// The GenericKernelTaskStateEvent body is encoded in
+// rust-bridge/src/proto.rs (sismo_encode_kernel_task_state_event), called
+// from macos_sched_capture's emitTaskState.
 
 // ---------------------------------------------------------------------------
 // GenericKernelProcessTree (TracePacket field 122)

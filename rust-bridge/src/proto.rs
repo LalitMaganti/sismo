@@ -47,6 +47,17 @@ impl ProtoWriter {
         self.write_varint(value as u64);
     }
 
+    /// proto `int32`: matches proto_writer.zig's writeInt32, which bit-casts
+    /// to u32 and varint-encodes that (so -1 is the 5-byte 0xFFFFFFFF, NOT the
+    /// 10-byte 64-bit sign-extension the proto spec nominally uses for int32).
+    pub fn write_int32(&mut self, field: u32, value: i32) {
+        self.write_uint32(field, value as u32);
+    }
+
+    pub fn write_int64(&mut self, field: u32, value: i64) {
+        self.write_uint64(field, value as u64);
+    }
+
     pub fn write_string(&mut self, field: u32, bytes: &[u8]) {
         self.write_tag(field, 2);
         self.write_varint(bytes.len() as u64);
@@ -227,6 +238,47 @@ pub unsafe extern "C" fn sismo_encode_perf_sample(
     b.len()
 }
 
+/// Encode a GenericKernelTaskStateEvent (TracePacket field 117 body). Fields:
+/// cpu=1 (int32, always written), comm=2 (string, capped at 64 bytes, omitted
+/// when empty), tid=3 (int64), state=4 (enum/uint32), prio=5 (int32). Writes
+/// into out[..cap]; returns bytes written, or 0 if cap is too small.
+///
+/// # Safety
+/// `comm` must be valid for `comm_len` bytes or null; `out` must be writable
+/// for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sismo_encode_kernel_task_state_event(
+    cpu: i32,
+    comm: *const u8,
+    comm_len: usize,
+    tid: i64,
+    state: u32,
+    prio: i32,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    let mut w = ProtoWriter::new();
+    w.write_int32(1, cpu);
+    if !comm.is_null() && comm_len > 0 {
+        // Cap comm at 64 bytes (Mach thread name max in practice), matching
+        // the prior Zig encoder.
+        let capped = comm_len.min(64);
+        w.write_string(2, unsafe { slice::from_raw_parts(comm, capped) });
+    }
+    w.write_int64(3, tid);
+    w.write_uint32(4, state);
+    w.write_int32(5, prio);
+
+    let b = w.bytes();
+    if b.len() > cap {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
+    }
+    b.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +321,55 @@ mod tests {
         assert!(got.windows(3).any(|w| w == [0x38, 0xC8, 0x01]));
         // data_symbol field 21 (tag 0xAA 0x01, len 6) = "[heap]".
         assert!(got.windows(3).any(|w| w == [0xAA, 0x01, 0x06]));
+    }
+
+    #[test]
+    fn kernel_task_state_event_bytes_are_exact() {
+        // cpu=3, comm="foo", tid=42, state=3 (running), prio=31.
+        let mut out = [0u8; 64];
+        let n = unsafe {
+            sismo_encode_kernel_task_state_event(
+                3, b"foo".as_ptr(), 3, 42, 3, 31, out.as_mut_ptr(), out.len(),
+            )
+        };
+        // cpu(1)=3: 08 03; comm(2)="foo": 12 03 66 6F 6F; tid(3)=42: 18 2A;
+        // state(4)=3: 20 03; prio(5)=31: 28 1F.
+        assert_eq!(
+            &out[..n],
+            &[0x08, 0x03, 0x12, 0x03, 0x66, 0x6F, 0x6F, 0x18, 0x2A, 0x20, 0x03, 0x28, 0x1F],
+        );
+    }
+
+    #[test]
+    fn kernel_task_state_event_negative_int32_is_bitcast_not_sign_extended() {
+        // cpu=-1 must encode as the 5-byte u32 bitcast (FF FF FF FF 0F), not
+        // the 10-byte 64-bit sign-extension — matching proto_writer.zig.
+        let mut out = [0u8; 64];
+        let n = unsafe {
+            sismo_encode_kernel_task_state_event(
+                -1, std::ptr::null(), 0, 0, 0, 0, out.as_mut_ptr(), out.len(),
+            )
+        };
+        // cpu(1)=-1: 08 FF FF FF FF 0F; comm omitted (null); tid(3)=0: 18 00;
+        // state(4)=0: 20 00; prio(5)=0: 28 00.
+        assert_eq!(
+            &out[..n],
+            &[0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x18, 0x00, 0x20, 0x00, 0x28, 0x00],
+        );
+    }
+
+    #[test]
+    fn kernel_task_state_event_comm_capped_at_64() {
+        let comm = [b'a'; 100];
+        let mut out = [0u8; 128];
+        let n = unsafe {
+            sismo_encode_kernel_task_state_event(
+                0, comm.as_ptr(), comm.len(), 0, 0, 0, out.as_mut_ptr(), out.len(),
+            )
+        };
+        let got = &out[..n];
+        // comm field 2 (tag 0x12) with length 64 (0x40).
+        assert!(got.windows(2).any(|w| w == [0x12, 0x40]));
     }
 
     #[test]

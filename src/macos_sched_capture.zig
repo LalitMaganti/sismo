@@ -27,6 +27,18 @@ const perfetto = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
 
+// rust-bridge/src/proto.rs — GenericKernelTaskStateEvent body encoder.
+extern fn sismo_encode_kernel_task_state_event(
+    cpu: i32,
+    comm: ?[*]const u8,
+    comm_len: usize,
+    tid: i64,
+    state: u32,
+    prio: i32,
+    out: [*]u8,
+    cap: usize,
+) usize;
+
 const DS_NAME = "sismo.macos_sched";
 
 // Per-tid cache entry. `pid` identifies the owning process when the cache
@@ -188,7 +200,6 @@ pub const Capture = struct {
     /// DebugAllocator's stack-trace tracking, the alloc churn alone
     /// was costing 200 µs per event and letting the kernel kdebug
     /// ring overflow.
-    event_scratch: ProtoWriter,
     packet_scratch: ProtoWriter,
 
     pub fn init(
@@ -226,7 +237,6 @@ pub const Capture = struct {
             .drain_calls = std.atomic.Value(u64).init(0),
             .pending_switches = [_]PendingSwitch{.{}} ** MAX_CPUS,
             .pt_cache = .init(),
-            .event_scratch = .init(allocator),
             .packet_scratch = .init(allocator),
         };
 
@@ -321,7 +331,6 @@ pub const Capture = struct {
         self.allocator.free(self.event_buf);
         self.allocator.free(self.thread_map_buf);
         self.pt_cache.deinit(self.allocator);
-        self.event_scratch.deinit();
         self.packet_scratch.deinit();
         self.allocator.destroy(self);
         return stats;
@@ -422,7 +431,6 @@ fn drainOnce(self: *Capture) void {
         thread_map,
         &self.pt_cache,
         self.ds_slot,
-        &self.event_scratch,
         &self.packet_scratch,
         self.tb_n,
         self.tb_d,
@@ -625,7 +633,6 @@ fn outgoingTaskState(state_bits: u32) perfetto_proto.TaskState {
 /// size and incur zero allocations per call.
 fn emitTaskState(
     slot: u32,
-    event_w: *ProtoWriter,
     packet_w: *ProtoWriter,
     timestamp_ns: u64,
     cpu: i32,
@@ -634,20 +641,27 @@ fn emitTaskState(
     state: perfetto_proto.TaskState,
     prio: i32,
 ) void {
-    event_w.clear();
-    perfetto_proto.encodeKernelTaskStateEventInto(event_w, .{
-        .cpu = cpu,
-        .comm = comm,
-        .tid = tid,
-        .state = state,
-        .prio = prio,
-    }) catch return;
+    // Event body: cpu(int32) + comm(≤64) + tid(int64) + enum + int32 — a few
+    // dozen bytes. Encode into a stack buffer (zero-alloc, like the packet
+    // scratch writer) via the Rust encoder in rust-bridge/src/proto.rs.
+    var event_buf: [128]u8 = undefined;
+    const event_len = sismo_encode_kernel_task_state_event(
+        cpu,
+        comm.ptr,
+        comm.len,
+        tid,
+        @intFromEnum(state),
+        prio,
+        &event_buf,
+        event_buf.len,
+    );
+    if (event_len == 0) return;
     packet_w.clear();
     perfetto_proto.encodeTracePacketBodyInto(
         packet_w,
         timestamp_ns,
         perfetto_proto.TP_FIELD_GENERIC_KERNEL_TASK_STATE,
-        event_w.bytes(),
+        event_buf[0..event_len],
     ) catch return;
     perfetto.sismo_ds_emit(slot, packet_w.bytes().ptr, packet_w.bytes().len);
 }
@@ -657,7 +671,6 @@ fn emitBatch(
     thread_map: []const kdebug.KdThreadMap,
     cache: *ProcessTreeCache,
     ds_slot: u32,
-    event_w: *ProtoWriter,
     packet_w: *ProtoWriter,
     tb_n: u64,
     tb_d: u64,
@@ -710,7 +723,6 @@ fn emitBatch(
                 const off_state = outgoingTaskState(args.outgoing_state);
                 emitTaskState(
                     ds_slot,
-                    event_w,
                     packet_w,
                     ts_ns,
                     @intCast(e.cpuid),
@@ -722,7 +734,6 @@ fn emitBatch(
                 const on_comm = lookupComm(thread_map, cache, slot.incoming_tid);
                 emitTaskState(
                     ds_slot,
-                    event_w,
                     packet_w,
                     ts_ns,
                     @intCast(e.cpuid),
