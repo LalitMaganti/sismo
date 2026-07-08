@@ -25,6 +25,7 @@ pub mod mach_sampler;
 pub mod proc_info;
 pub mod proc_maps;
 pub mod proto;
+pub mod sched_protos;
 pub mod session_config;
 pub mod sismo_config;
 pub mod symbolizer;
