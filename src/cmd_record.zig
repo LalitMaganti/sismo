@@ -60,7 +60,8 @@ extern fn sismo_append_privileged_marker(
     focus_precise: bool,
 ) bool;
 const focus_presets = @import("focus_presets.zig");
-const perf_symbolize = @import("perf_symbolize.zig");
+// Post-record symbolization now lives in Rust (rust-bridge/src/perf_symbolize.rs).
+extern fn sismo_symbolize_trace(trace_path_ptr: [*]const u8, trace_path_len: usize) void;
 const c = @cImport({
     @cInclude("src/c/perfetto_shim.h");
 });
@@ -1383,7 +1384,6 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
 // -----------------------------------------------------------------------------
 fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
     const gpa = init.gpa;
-    const io = init.io;
 
     // Read fields off `args` into local names. The Linux runner doesn't
     // yet honor sched_mode/cpu_mode/heap_mode beyond the shared-parser
@@ -1635,7 +1635,7 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         }
         // Resolve perf sample frames to function names. The BPF collector
         // records them unsymbolized; this appends ModuleSymbols for the UI to join.
-        if (bpf != null) perf_symbolize.symbolizeTrace(gpa, io, output_path);
+        if (bpf != null) sismo_symbolize_trace(output_path.ptr, output_path.len);
     }
 
     // Tear-down runs via defer LIFO (probes.destroy → traced.destroy):

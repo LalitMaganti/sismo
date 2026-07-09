@@ -37,6 +37,9 @@ pub mod mach_sampler;
 // macOS libproc bindings (proc_pidinfo/proc_pidpath are Darwin symbols).
 #[cfg(target_os = "macos")]
 pub mod proc_info;
+// Post-record symbolization + source/asm sidecar (Linux bpf path; POSIX-only).
+#[cfg(not(target_os = "windows"))]
+pub mod perf_symbolize;
 pub mod proc_maps;
 pub mod proto;
 pub mod sched_protos;

@@ -6,9 +6,8 @@
 //!
 //! Only OS-portable, link-light modules belong here: nothing that pulls in
 //! Perfetto C++ or the rust-bridge staticlib, so the test binary builds with
-//! no extra link wiring. perf_symbolize.zig is deliberately absent — it
-//! reaches into symbolizer/disasm (rust-bridge) and the perfetto query shim,
-//! and needs the full sismo link to test.
+//! no extra link wiring. perf_symbolize + source_asm_sidecar now live in Rust
+//! (rust-bridge/src/perf_symbolize.rs) — their tests run under `cargo test`.
 
 comptime {
     _ = @import("proto_writer.zig");
@@ -16,5 +15,4 @@ comptime {
     // sismo_config.zig is now a thin FFI facade over rust-bridge (its wire
     // codec + tests live in rust-bridge/src/sismo_config.rs), so it needs the
     // full sismo link — excluded from the link-light test binary.
-    _ = @import("source_asm_sidecar.zig");
 }
