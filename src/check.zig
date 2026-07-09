@@ -34,8 +34,7 @@ pub export fn sismo_check_cmds() void {
     if (comptime builtin.os.tag == .windows) return;
     const init: std.process.Init = undefined;
     @import("cmd_record.zig").runRecord(init) catch {};
-    @import("cmd_prepare.zig").runPrepare(init) catch {};
-    // cmd_snapshot now lives in Rust (rust-bridge/src/cmd_snapshot.rs).
+    // cmd_prepare + cmd_snapshot now live in Rust (rust-bridge/src/cmd_*.rs).
     @import("cmd_datasource.zig").runDatasource(init) catch {};
 }
 

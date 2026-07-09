@@ -119,14 +119,18 @@ fn read_pid_at(path: &str, out_pid: *mut c_int) -> c_int {
 /// `out` must be writable for `cap` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_heap_dylib_path(out: *mut u8, cap: usize) -> usize {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return 0,
-    };
-    let bin_dir = match exe.parent() {
-        Some(d) => d,
-        None => return 0,
-    };
+    match resolve_heap_dylib_path() {
+        Some(s) => write_path(&s, out, cap),
+        None => 0,
+    }
+}
+
+/// Resolve the heap-preload dylib path relative to the running binary. Tries the
+/// install / cargo-dev / legacy layouts and returns the first that exists, else
+/// the cargo-dev candidate as a best-effort. Shared with `cmd_prepare`.
+pub(crate) fn resolve_heap_dylib_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let bin_dir = exe.parent()?;
 
     // Most-specific first; index 1 (cargo dev tree) is the best-effort fallback.
     const LAYOUTS: [&str; 3] = [
@@ -141,16 +145,13 @@ pub unsafe extern "C" fn sismo_heap_dylib_path(out: *mut u8, cap: usize) -> usiz
         let candidate = bin_dir.join(rel);
         let s = candidate.to_string_lossy().into_owned();
         if candidate.exists() {
-            return write_path(&s, out, cap);
+            return Some(s);
         }
         if i == FALLBACK_INDEX {
             fallback = Some(s);
         }
     }
-    match fallback {
-        Some(s) => write_path(&s, out, cap),
-        None => 0,
-    }
+    fallback
 }
 
 fn write_path(s: &str, out: *mut u8, cap: usize) -> usize {
