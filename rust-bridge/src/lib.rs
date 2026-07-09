@@ -14,6 +14,9 @@ pub mod dyld_images;
 #[cfg(target_os = "macos")]
 pub mod kdebug;
 pub mod heap;
+// macOS heap shm ring (recorder side; shares the wire layout with the preload).
+#[cfg(target_os = "macos")]
+pub mod heap_ring;
 // Temporary privileged-pid marker (hack; appended to the trace file).
 pub mod privileged_marker;
 // macOS CPU-samples capture worker (owns the worker thread + SDK lifecycle).
