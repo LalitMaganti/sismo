@@ -38,6 +38,16 @@ pub const consumer_sock: [:0]const u8 = "/tmp/sismo-consumer.sock";
 /// exits (kernel drops it).
 pub const session_lock_path: [:0]const u8 = "/tmp/sismo.lock";
 
+// The session-lock, recorder-pid, and heap-dylib-path LOGIC now lives in Rust
+// (rust-bridge/src/sismo_paths.rs); this file is a thin facade so its 5 CLI
+// callers keep the same Zig API. The facade collapses as the cmd_* commands
+// migrate to Rust (P4). The socket-path constants above stay here (stable
+// literals, not logic).
+extern fn sismo_acquire_session_lock(pid: c_int) c_int;
+extern fn sismo_release_session_lock(fd: c_int) void;
+extern fn sismo_read_recorder_pid(out_pid: *c_int) c_int;
+extern fn sismo_heap_dylib_path(out: [*]u8, cap: usize) usize;
+
 pub const LockError = error{
     OpenFailed,
     AlreadyHeld,
@@ -49,28 +59,16 @@ pub const LockError = error{
 /// (kernel drops the lock when the fd is closed or the process exits).
 /// Caller closes via `releaseSessionLock`.
 pub fn acquireSessionLock(pid: c_int) LockError!c_int {
-    // std.c.open is declared variadic — Apple ARM64's ABI requires
-    // variadic args on the stack; a fixed-arg decl would put mode in
-    // x2 and the kernel would read garbage from the stack slot.
-    const fd = std.c.open(session_lock_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true }, @as(c_uint, 0o644));
-    if (fd < 0) return error.OpenFailed;
-    if (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
-        _ = std.c.close(fd);
-        return error.AlreadyHeld;
-    }
-    // Replace any prior contents with the pid as ASCII. Truncate first
-    // (a previous run could have left a longer pid string), then write
-    // at offset 0.
-    _ = std.c.ftruncate(fd, 0);
-    var pid_buf: [24]u8 = undefined;
-    const written = std.fmt.bufPrint(&pid_buf, "{d}\n", .{pid}) catch "";
-    _ = std.c.pwrite(fd, written.ptr, written.len, 0);
-    return fd;
+    const fd = sismo_acquire_session_lock(pid);
+    return switch (fd) {
+        -1 => error.OpenFailed,
+        -2 => error.AlreadyHeld,
+        else => fd,
+    };
 }
 
 pub fn releaseSessionLock(fd: c_int) void {
-    // Closing the fd releases the flock. No need to call LOCK_UN first.
-    _ = std.c.close(fd);
+    sismo_release_session_lock(fd);
 }
 
 pub const ReadPidError = error{
@@ -83,66 +81,24 @@ pub const ReadPidError = error{
 /// `sismo snapshot` (and future companion tools) to find a running
 /// recorder. Returns an error if the file is absent or empty.
 pub fn readRecorderPid() ReadPidError!c_int {
-    const fd = std.c.open(session_lock_path.ptr, .{ .ACCMODE = .RDONLY });
-    if (fd < 0) return error.NoLockFile;
-    defer _ = std.c.close(fd);
-    var buf: [24]u8 = undefined;
-    const n = std.c.pread(fd, &buf, buf.len, 0);
-    if (n <= 0) return error.NoRecorder;
-    const text = std.mem.trim(u8, buf[0..@intCast(n)], &std.ascii.whitespace);
-    if (text.len == 0) return error.NoRecorder;
-    return std.fmt.parseInt(c_int, text, 10) catch return error.InvalidPid;
-}
-
-/// Path to the heap preload dylib, relative to the running sismo
-/// binary's directory. Several layouts are possible depending on how
-/// sismo was built/installed, so we try each in order and return the
-/// first that exists:
-///
-///   1. Installed (homebrew libexec):
-///        `<bindir>/../libexec/sismo/libsismo_heap.dylib`
-///   2. Cargo dev tree: the binary is the cargo host-flip binary at
-///      `rust-host/target/{debug,release}/sismo`, three levels below the
-///      repo root; `zig build` installs the dylib into `zig-out/lib`.
-///        `<bindir>/../../../zig-out/lib/libsismo_heap.dylib`
-///   3. Legacy zig-exe dev tree (`zig-out/bin/sismo`):
-///        `<bindir>/../lib/libsismo_heap.dylib`
-///
-/// If none exist, the cargo dev-tree candidate (the current default) is
-/// returned as a best-effort so the caller surfaces a concrete path.
-///
-/// Caller frees the returned slice.
-pub fn heapDylibPath(io: std.Io, allocator: std.mem.Allocator) ![:0]u8 {
-    // std.process.executablePath dispatches per-OS: _NSGetExecutablePath
-    // on macOS, /proc/self/exe on Linux, ImagePathName on Windows.
-    var buf: [4096]u8 = undefined;
-    const n = try std.process.executablePath(io, &buf);
-    const exe_path = buf[0..n];
-    const bin_dir = std.fs.path.dirname(exe_path) orelse return error.NoBinDir;
-
-    // Most-specific first. Index 1 (cargo dev tree) is the best-effort
-    // fallback when nothing exists on disk.
-    const layouts = [_][]const u8{
-        "{s}/../libexec/sismo/libsismo_heap.dylib",
-        "{s}/../../../zig-out/lib/libsismo_heap.dylib",
-        "{s}/../lib/libsismo_heap.dylib",
+    var pid: c_int = 0;
+    return switch (sismo_read_recorder_pid(&pid)) {
+        0 => pid,
+        -1 => error.NoLockFile,
+        -2 => error.NoRecorder,
+        else => error.InvalidPid,
     };
-    const fallback_index = 1;
-
-    var fallback: [:0]u8 = undefined;
-    // inline for so each `fmt` is comptime-known (std.fmt requires it).
-    inline for (layouts, 0..) |fmt, i| {
-        const path = try std.fmt.allocPrintSentinel(allocator, fmt, .{bin_dir}, 0);
-        if (fileExists(path)) return path;
-        if (i == fallback_index) {
-            fallback = path;
-        } else {
-            allocator.free(path);
-        }
-    }
-    return fallback;
 }
 
-fn fileExists(path_z: [:0]const u8) bool {
-    return std.c.access(path_z.ptr, std.c.F_OK) == 0;
+/// Path to the heap preload dylib, relative to the running sismo binary's
+/// directory. Tries the install / cargo-dev / legacy-zig layouts and returns
+/// the first that exists, else the cargo-dev candidate as a best-effort. Caller
+/// frees the returned slice. (`io` is unused now — the Rust side reads the
+/// executable path itself — but kept for call-site stability.)
+pub fn heapDylibPath(io: std.Io, allocator: std.mem.Allocator) ![:0]u8 {
+    _ = io;
+    var buf: [4096]u8 = undefined;
+    const n = sismo_heap_dylib_path(&buf, buf.len);
+    if (n == 0 or n >= buf.len) return error.NoBinDir;
+    return allocator.dupeZ(u8, buf[0..n]);
 }

@@ -47,5 +47,9 @@ pub mod sched_protos;
 pub mod worker_sdk;
 pub mod session_config;
 pub mod sismo_config;
+// Well-known paths + session lock / recorder-pid / heap-dylib resolution (the
+// logic behind the sismo_paths.zig facade). POSIX-only.
+#[cfg(not(target_os = "windows"))]
+pub mod sismo_paths;
 pub mod symbolizer;
 pub mod unwinder;
