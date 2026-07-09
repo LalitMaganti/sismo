@@ -94,9 +94,380 @@ pub unsafe extern "C" fn sismo_parse_duration_seconds(s: *const u8, s_len: usize
     }
 }
 
+// ===========================================================================
+// Full `sismo record` argument parser (macOS flag set).
+//
+// Mirrors cmd_record.zig::parseRecordArgs for the macOS platform (--pid
+// supported; --focus / --sample-density are Linux-only and rejected here). The
+// Linux parser stays in Zig until P5. Produces a `#[repr(C)] RecordArgsC` the
+// Zig `runRecordMacos` consumes — a transitional boundary that collapses when
+// the runner itself moves to Rust. The workload command is the argv tail from
+// `workload_start`; output_path points into argv (or the static default).
+// ===========================================================================
+
+// SourceMode wire values (match cmd_record.zig SourceMode ordering).
+const MODE_IN_PROCESS: u8 = 0;
+const MODE_EXTERNAL: u8 = 1;
+const MODE_OFF: u8 = 2;
+
+const DEFAULT_OUTPUT: &str = "./sismo.pftrace";
+const DEFAULT_BUFFER_KB: u32 = 128 * 1024;
+
+/// Fully-parsed `sismo record` arguments, C-ABI for the Zig macOS runner.
+/// Layout: 8-byte fields first, then 4-byte, then 1-byte — identical to the
+/// Zig `extern struct RecordArgsC`.
+#[repr(C)]
+pub struct RecordArgsC {
+    /// Into argv (from `--output`) or the static default. Not NUL-terminated.
+    pub output_path_ptr: *const u8,
+    pub output_path_len: usize,
+    /// argv index where the workload command begins; == argc if none.
+    pub workload_start: usize,
+    pub attach_pid: i32,
+    pub duration_secs: u32,
+    pub buffer_kb: u32,
+    pub sched_mode: u8,
+    pub cpu_mode: u8,
+    pub heap_mode: u8,
+    pub has_attach_pid: bool,
+    pub has_duration: bool,
+    pub flight_recorder: bool,
+    pub buffer_set: bool,
+    pub no_instrumentation: bool,
+}
+
+impl Default for RecordArgsC {
+    fn default() -> Self {
+        RecordArgsC {
+            output_path_ptr: DEFAULT_OUTPUT.as_ptr(),
+            output_path_len: DEFAULT_OUTPUT.len(),
+            workload_start: 0,
+            attach_pid: 0,
+            duration_secs: 0,
+            buffer_kb: DEFAULT_BUFFER_KB,
+            sched_mode: MODE_IN_PROCESS,
+            cpu_mode: MODE_IN_PROCESS,
+            heap_mode: MODE_IN_PROCESS,
+            has_attach_pid: false,
+            has_duration: false,
+            flight_recorder: false,
+            buffer_set: false,
+            no_instrumentation: false,
+        }
+    }
+}
+
+/// Set a data source's mode, rejecting a conflicting second flag (e.g.
+/// `--no-cpu --external-cpu`). Returns false (and prints) on conflict.
+fn set_source_mode(slot: &mut u8, slot_name: &str, flag_name: &str, want: u8) -> bool {
+    if *slot != MODE_IN_PROCESS && *slot != want {
+        let cur = match *slot {
+            MODE_EXTERNAL => "external",
+            MODE_OFF => "off",
+            _ => "in_process",
+        };
+        eprintln!("sismo record: conflicting flags for '{slot_name}' ({flag_name} vs already-set {cur})");
+        return false;
+    }
+    *slot = want;
+    true
+}
+
+/// The macOS `sismo record` help text (mirrors printRecordHelp with macOS caps).
+fn print_record_help() {
+    print!(
+        "usage: sismo record [--output <path>] [--duration <dur>]\n\
+         \x20                   [--flight-recorder [--buffer <size>]]\n\
+         \x20                   [--no-instrumentation]\n\
+         \x20                   [--no-sched | --external-sched]\n\
+         \x20                   [--no-cpu | --external-cpu]\n\
+         \x20                   [--no-heap | --external-heap]\n\
+         \x20                   [--all-external]\n\
+         \x20                   (--pid <pid> | <command> [args...])\n\n  \
+         --no-X         disable data source X entirely.\n  \
+         --external-X   data source X comes from a sidecar\n  \
+         \x20              `sudo sismo datasource X` (no sudo on this process).\n  \
+         --all-external shorthand for --external for every privileged source.\n"
+    );
+}
+
+/// A value-taking flag reads args[i+1], advancing `i`. Prints `missing` and
+/// returns None if the value is absent.
+fn next_value<'a>(args: &[&'a str], i: &mut usize, missing: &str) -> Option<&'a str> {
+    if *i + 1 >= args.len() {
+        eprintln!("{missing}");
+        return None;
+    }
+    *i += 1;
+    Some(args[*i])
+}
+
+/// Parse `sismo record` args (macOS). `args` is argv[2..] (after exe +
+/// "record"); `base` is the absolute argv index of args[0] (i.e. 2). Fills
+/// `out` and returns true to proceed, or false if help / an error was printed.
+fn parse_record_args(args: &[&str], base: usize, out: &mut RecordArgsC) -> bool {
+    *out = RecordArgsC::default();
+    out.workload_start = base + args.len(); // none, unless a workload is found
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i];
+
+        // `--` ends option parsing; the rest is the workload command.
+        if arg == "--" {
+            out.workload_start = base + i + 1;
+            break;
+        }
+        // A non-`--` token is the workload command; the rest is its args.
+        if !arg.starts_with("--") {
+            out.workload_start = base + i;
+            break;
+        }
+
+        match arg {
+            "--output" => {
+                match next_value(args, &mut i, "sismo record: --output needs a value") {
+                    Some(v) => {
+                        out.output_path_ptr = v.as_ptr();
+                        out.output_path_len = v.len();
+                    }
+                    None => return false,
+                }
+            }
+            "--flight-recorder" => out.flight_recorder = true,
+            "--buffer" => {
+                let v = match next_value(args, &mut i, "sismo record: --buffer needs a value (e.g. 256MB)") {
+                    Some(v) => v,
+                    None => return false,
+                };
+                match parse_buffer_kb(v.as_bytes()) {
+                    Some(kb) => {
+                        out.buffer_kb = kb;
+                        out.buffer_set = true;
+                    }
+                    None => {
+                        eprintln!("sismo record: invalid --buffer '{v}' (use 256MB / 1GB / 512KB)");
+                        return false;
+                    }
+                }
+            }
+            "--pid" => {
+                let v = match next_value(args, &mut i, "sismo record: --pid needs a value") {
+                    Some(v) => v,
+                    None => return false,
+                };
+                match v.parse::<i32>() {
+                    Ok(p) => {
+                        out.attach_pid = p;
+                        out.has_attach_pid = true;
+                    }
+                    Err(_) => {
+                        eprintln!("sismo record: --pid '{v}' is not a number");
+                        return false;
+                    }
+                }
+            }
+            "--duration" => {
+                let v = match next_value(args, &mut i, "sismo record: --duration needs a value (e.g. 30s, 5m, 1h)") {
+                    Some(v) => v,
+                    None => return false,
+                };
+                match parse_duration_seconds(v.as_bytes()) {
+                    Some(s) => {
+                        out.duration_secs = s;
+                        out.has_duration = true;
+                    }
+                    None => {
+                        eprintln!("sismo record: invalid --duration '{v}' (use 30s / 5m / 1h)");
+                        return false;
+                    }
+                }
+            }
+            "--no-sched" => {
+                if !set_source_mode(&mut out.sched_mode, "sched", "--no-sched", MODE_OFF) {
+                    return false;
+                }
+            }
+            "--no-cpu" => {
+                if !set_source_mode(&mut out.cpu_mode, "cpu", "--no-cpu", MODE_OFF) {
+                    return false;
+                }
+            }
+            "--no-heap" => {
+                if !set_source_mode(&mut out.heap_mode, "heap", "--no-heap", MODE_OFF) {
+                    return false;
+                }
+            }
+            "--external-sched" => {
+                if !set_source_mode(&mut out.sched_mode, "sched", "--external-sched", MODE_EXTERNAL) {
+                    return false;
+                }
+            }
+            "--external-cpu" => {
+                if !set_source_mode(&mut out.cpu_mode, "cpu", "--external-cpu", MODE_EXTERNAL) {
+                    return false;
+                }
+            }
+            "--external-heap" => {
+                if !set_source_mode(&mut out.heap_mode, "heap", "--external-heap", MODE_EXTERNAL) {
+                    return false;
+                }
+            }
+            "--all-external" => {
+                for m in [&mut out.sched_mode, &mut out.cpu_mode, &mut out.heap_mode] {
+                    if *m == MODE_IN_PROCESS {
+                        *m = MODE_EXTERNAL;
+                    }
+                }
+            }
+            "--no-instrumentation" => out.no_instrumentation = true,
+            "--focus" => {
+                eprintln!("sismo record: --focus needs the Linux BPF/PEBS path (not supported on macos)");
+                return false;
+            }
+            "--sample-density" => {
+                // Parsed for parity, but macOS has no focus path so it always
+                // fails the "only applies with --focus" validation below.
+                match next_value(args, &mut i, "sismo record: --sample-density needs a value (e.g. 8 for 8x the samples)") {
+                    Some(_) => {
+                        eprintln!("sismo record: --sample-density only applies with --focus");
+                        return false;
+                    }
+                    None => return false,
+                }
+            }
+            "--help" => {
+                print_record_help();
+                return false;
+            }
+            other => {
+                eprintln!("sismo record: unknown flag '{other}'");
+                return false;
+            }
+        }
+        i += 1;
+    }
+
+    // Cross-cutting validation: exactly one workload-acquisition mode.
+    let have_pid = out.has_attach_pid;
+    let have_cmd = out.workload_start < base + args.len();
+    if have_pid && have_cmd {
+        eprintln!("sismo record: --pid and <command> are mutually exclusive");
+        return false;
+    }
+    if !have_pid && !have_cmd {
+        eprintln!("sismo record: need either --pid <pid> or a workload <command>");
+        return false;
+    }
+
+    // FILE mode default buffer is 128 MB; flight-recorder bumps to 256 MB
+    // unless the user set --buffer explicitly.
+    if out.flight_recorder && !out.buffer_set {
+        out.buffer_kb = 256 * 1024;
+    }
+    true
+}
+
+/// C ABI: parse `argv[0..argc]` (macOS) into `*out`. Returns true to proceed,
+/// false if help / an error was already printed (caller should exit).
+///
+/// # Safety
+/// `argv` must point to `argc` valid NUL-terminated C strings; `out` writable.
+/// `out.output_path_ptr` borrows either argv or a static — valid for the
+/// process lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sismo_parse_record_args(
+    argc: usize,
+    argv: *const *const std::os::raw::c_char,
+    out: *mut RecordArgsC,
+) -> bool {
+    let all: Vec<&str> = (0..argc)
+        .map(|i| unsafe { std::ffi::CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
+        .collect();
+    // Skip argv[0] (exe) + argv[1] ("record"); base index is 2.
+    let (args, base): (&[&str], usize) = if all.len() > 2 { (&all[2..], 2) } else { (&[], all.len()) };
+    parse_record_args(args, base, unsafe { &mut *out })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Helper: parse args (argv[2..]) with base=2 into a fresh RecordArgsC.
+    fn parse(args: &[&str]) -> Option<RecordArgsC> {
+        let mut out = RecordArgsC::default();
+        if parse_record_args(args, 2, &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn defaults_with_just_a_command() {
+        let a = parse(&["./app"]).unwrap();
+        assert_eq!(a.workload_start, 2); // args[0] is the command → abs index 2
+        assert!(!a.has_attach_pid);
+        assert_eq!(a.buffer_kb, DEFAULT_BUFFER_KB);
+        assert_eq!(a.sched_mode, MODE_IN_PROCESS);
+        assert_eq!(a.output_path_len, DEFAULT_OUTPUT.len());
+    }
+
+    #[test]
+    fn pid_attach_and_flags() {
+        let a = parse(&["--pid", "4242", "--no-heap", "--external-cpu"]).unwrap();
+        assert!(a.has_attach_pid);
+        assert_eq!(a.attach_pid, 4242);
+        assert_eq!(a.heap_mode, MODE_OFF);
+        assert_eq!(a.cpu_mode, MODE_EXTERNAL);
+        assert_eq!(a.workload_start, 2 + 4); // no workload → base+len
+    }
+
+    #[test]
+    fn all_external_only_promotes_in_process() {
+        let a = parse(&["--no-sched", "--all-external", "--pid", "1"]).unwrap();
+        assert_eq!(a.sched_mode, MODE_OFF); // stays off, not promoted
+        assert_eq!(a.cpu_mode, MODE_EXTERNAL);
+        assert_eq!(a.heap_mode, MODE_EXTERNAL);
+    }
+
+    #[test]
+    fn double_dash_starts_workload() {
+        // `--` at args index 0 → workload starts at abs index 2+0+1 = 3, so the
+        // command can carry its own --flags. (No --pid: it's mutually exclusive
+        // with a workload, even via `--`, matching the Zig parser.)
+        let a = parse(&["--", "./app", "--weird-workload-flag"]).unwrap();
+        assert_eq!(a.workload_start, 3);
+        assert!(!a.has_attach_pid);
+    }
+
+    #[test]
+    fn flight_recorder_bumps_buffer() {
+        let a = parse(&["--flight-recorder", "--pid", "1"]).unwrap();
+        assert_eq!(a.buffer_kb, 256 * 1024);
+        // explicit --buffer wins.
+        let b = parse(&["--flight-recorder", "--buffer", "512MB", "--pid", "1"]).unwrap();
+        assert_eq!(b.buffer_kb, 512 * 1024);
+    }
+
+    #[test]
+    fn rejections() {
+        assert!(parse(&["--pid", "1", "./app"]).is_none()); // pid + cmd exclusive
+        assert!(parse(&[]).is_none()); // neither pid nor cmd
+        assert!(parse(&["--no-cpu", "--external-cpu", "--pid", "1"]).is_none()); // conflict
+        assert!(parse(&["--pid", "notanum"]).is_none());
+        assert!(parse(&["--focus", "cache", "--pid", "1"]).is_none()); // macOS rejects focus
+        assert!(parse(&["--sample-density", "8", "--pid", "1"]).is_none());
+        assert!(parse(&["--bogus", "--pid", "1"]).is_none());
+        assert!(parse(&["--output"]).is_none()); // missing value
+    }
+
+    #[test]
+    fn output_path_override() {
+        let a = parse(&["--output", "/tmp/x.pftrace", "--pid", "1"]).unwrap();
+        let s = unsafe { std::slice::from_raw_parts(a.output_path_ptr, a.output_path_len) };
+        assert_eq!(s, b"/tmp/x.pftrace");
+    }
 
     #[test]
     fn buffer_kb_suffixes() {
