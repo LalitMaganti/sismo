@@ -5,6 +5,9 @@
 //! wholesym symbolizer) to Zig over a cargo→staticlib→Zig link.
 
 pub mod cli;
+// `sismo datasource` subcommand (daemonized privileged producer). POSIX-only.
+#[cfg(not(target_os = "windows"))]
+pub mod cmd_datasource;
 // `sismo prepare` subcommand (DYLD-insert the heap client + exec). POSIX-only.
 #[cfg(not(target_os = "windows"))]
 pub mod cmd_prepare;
