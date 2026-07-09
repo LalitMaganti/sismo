@@ -48,10 +48,10 @@ extern fn sismo_sched_capture_shutdown(cap: *SchedCapture, out_events_emitted: *
 const CpuCapture = opaque {};
 extern fn sismo_cpu_capture_init(default_interval_ns: u64) ?*CpuCapture;
 extern fn sismo_cpu_capture_shutdown(cap: *CpuCapture, out_samples: *u64, out_active_samples: *u64) void;
-const heap_capture = switch (builtin.os.tag) {
-    .macos => @import("heap_capture.zig"),
-    else => struct {},
-};
+// Heap capture worker lives in Rust (rust-bridge/src/macos_heap_capture.rs).
+const HeapCapture = opaque {};
+extern fn sismo_heap_capture_init() ?*HeapCapture;
+extern fn sismo_heap_capture_shutdown(cap: *HeapCapture, out_records: *u64, out_bytes_alloc: *u64, out_sites: *u32) void;
 
 // Set by SIGINT/SIGTERM handlers to break the run loop. Async-signal-safe
 // (atomic store), so the handler touches no locks.
@@ -145,7 +145,7 @@ pub fn runDatasource(init: std.process.Init) !void {
     }
 
     if (comptime builtin.os.tag == .macos) {
-        return runDatasourceMacos(init, kinds_buf[0..n_kinds]);
+        return runDatasourceMacos(kinds_buf[0..n_kinds]);
     }
     std.debug.print(
         "sismo datasource: not yet implemented on {s}\n",
@@ -159,10 +159,10 @@ const Slot = struct {
     kind: Kind,
     sched: ?*SchedCapture = null,
     cpu: ?*CpuCapture = null,
-    heap: ?*heap_capture.Capture = null,
+    heap: ?*HeapCapture = null,
 };
 
-fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
+fn runDatasourceMacos(kinds: []const Kind) !void {
     // Connect to the producer socket via the public C++ SDK; each
     // Capture.init builds + registers its own DataSourceDescriptor.
     const paths = @import("sismo_paths.zig");
@@ -196,7 +196,7 @@ fn runDatasourceMacos(init: std.process.Init, kinds: []const Kind) !void {
                 std.debug.print("sismo datasource: sismo.macos_cpu_samples registered\n", .{});
             },
             .heap => {
-                slot.heap = try heap_capture.Capture.init(init.gpa, init.io, .{});
+                slot.heap = sismo_heap_capture_init() orelse return error.HeapCaptureInitFailed;
                 std.debug.print("sismo datasource: sismo.heap registered\n", .{});
             },
         }
@@ -240,10 +240,13 @@ fn shutdownSlot(slot: Slot) void {
             );
         },
         .heap => if (slot.heap) |s| {
-            const stats = s.shutdown();
+            var records: u64 = 0;
+            var bytes_alloc: u64 = 0;
+            var sites: u32 = 0;
+            sismo_heap_capture_shutdown(s, &records, &bytes_alloc, &sites);
             std.debug.print(
                 "sismo datasource: sismo.heap stopped — {d} records / ~{d} bytes / {d} sites\n",
-                .{ stats.records, stats.bytes_alloc_estimated, stats.sites },
+                .{ records, bytes_alloc, sites },
             );
         },
     }

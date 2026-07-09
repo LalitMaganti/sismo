@@ -80,10 +80,10 @@ extern fn sismo_sched_capture_shutdown(cap: *SchedCapture, out_events_emitted: *
 const CpuCapture = opaque {};
 extern fn sismo_cpu_capture_init(default_interval_ns: u64) ?*CpuCapture;
 extern fn sismo_cpu_capture_shutdown(cap: *CpuCapture, out_samples: *u64, out_active_samples: *u64) void;
-const heap_capture = switch (builtin.os.tag) {
-    .macos => @import("heap_capture.zig"),
-    else => struct {},
-};
+// Heap capture worker now lives in Rust (rust-bridge/src/macos_heap_capture.rs).
+const HeapCapture = opaque {};
+extern fn sismo_heap_capture_init() ?*HeapCapture;
+extern fn sismo_heap_capture_shutdown(cap: *HeapCapture, out_records: *u64, out_bytes_alloc: *u64, out_sites: *u32) void;
 
 // Linux uses upstream Perfetto's traced_probes (ftrace + procfs) embedded as
 // an in-process worker thread — same pattern as `sismo_traced` for the
@@ -1081,10 +1081,9 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
                 break :blk null;
             }
         }
-        break :blk heap_capture.Capture.init(gpa, io, .{}) catch |err| {
-            std.debug.print("sismo record: heap_capture.init failed: {s}\n", .{@errorName(err)});
-            break :blk null;
-        };
+        const cap = sismo_heap_capture_init();
+        if (cap == null) std.debug.print("sismo record: heap capture init failed\n", .{});
+        break :blk cap;
     };
 
     // Build the per-DS sismo configs (field 2000 of each
@@ -1336,10 +1335,13 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
 
     // Shut down captures (signals EXIT, joins worker, frees state).
     if (heap) |s| {
-        const stats = s.shutdown();
+        var records: u64 = 0;
+        var bytes_alloc: u64 = 0;
+        var sites: u32 = 0;
+        sismo_heap_capture_shutdown(s, &records, &bytes_alloc, &sites);
         std.debug.print(
             "sismo record: heap — {d} records, ~{d} bytes, {d} sites\n",
-            .{ stats.records, stats.bytes_alloc_estimated, stats.sites },
+            .{ records, bytes_alloc, sites },
         );
     }
     if (cpu) |s| {

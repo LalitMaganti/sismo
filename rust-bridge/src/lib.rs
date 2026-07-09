@@ -25,6 +25,9 @@ pub mod privileged_marker;
 // macOS CPU-samples capture worker (owns the worker thread + SDK lifecycle).
 #[cfg(target_os = "macos")]
 pub mod macos_cpu_capture;
+// macOS heap capture worker (drain loop + flush/stop emit via the heap builder).
+#[cfg(target_os = "macos")]
+pub mod macos_heap_capture;
 // macOS sched (kdebug) capture worker.
 #[cfg(target_os = "macos")]
 pub mod macos_sched_capture;
