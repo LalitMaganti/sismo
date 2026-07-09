@@ -51,6 +51,8 @@ pub mod proc_info;
 pub mod perf_symbolize;
 pub mod proc_maps;
 pub mod proto;
+// `sismo record` arg value-parsers (seed of the eventual full record parser).
+pub mod record_args;
 pub mod sched_protos;
 // Shared capture-worker plumbing (producer C ABI + Event).
 pub mod worker_sdk;

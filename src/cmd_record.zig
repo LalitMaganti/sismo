@@ -460,53 +460,21 @@ const SpawnedChild = struct {
     pid: c_int,
 };
 
-/// Parse `num_part` as a base-10 integer, scale by `multiplier`, and fit
-/// into `T`. Rejects zero, overflow, and anything exceeding `T`.
-fn parseScaled(comptime T: type, num_part: []const u8, multiplier: u64) ?T {
-    const n = std.fmt.parseInt(u64, num_part, 10) catch return null;
-    const total = std.math.mul(u64, n, multiplier) catch return null;
-    if (total == 0 or total > std.math.maxInt(T)) return null;
-    return @intCast(total);
-}
+// The `--buffer` / `--duration` value parsing now lives in Rust
+// (rust-bridge/src/record_args.rs) with byte-exact tests; these thin wrappers
+// keep the `?u32` / `?c_uint` shape so the parser call sites are unchanged. They
+// fold away when the whole record parser migrates.
+extern fn sismo_parse_buffer_kb(s: [*]const u8, s_len: usize, out: *u32) bool;
+extern fn sismo_parse_duration_seconds(s: [*]const u8, s_len: usize, out: *u32) bool;
 
-/// Parse a buffer-size argument like "256MB" / "1GB" / "512KB" into KB
-/// (build_config takes uint32_t buffer_size_kb). Suffix is required —
-/// bare integers are rejected to avoid ambiguity (bytes vs. KB?).
 fn parseBufferKb(s: []const u8) ?u32 {
-    if (s.len < 3) return null;
-    const last2 = s[s.len - 2 ..];
-    const multiplier_kb: u64 = if (std.ascii.eqlIgnoreCase(last2, "kb"))
-        1
-    else if (std.ascii.eqlIgnoreCase(last2, "mb"))
-        1024
-    else if (std.ascii.eqlIgnoreCase(last2, "gb"))
-        1024 * 1024
-    else
-        return null;
-    return parseScaled(u32, s[0 .. s.len - 2], multiplier_kb);
+    var out: u32 = 0;
+    return if (sismo_parse_buffer_kb(s.ptr, s.len, &out)) out else null;
 }
 
-/// Parse a duration argument. Accepts a bare integer (interpreted as
-/// seconds) or an integer with a single-letter suffix: 's', 'm', 'h'.
-/// Returns total seconds clamped to u32 (libc `sleep` takes c_uint).
 fn parseDurationSeconds(s: []const u8) ?c_uint {
-    if (s.len == 0) return null;
-    var num_part = s;
-    var multiplier: u64 = 1;
-    switch (s[s.len - 1]) {
-        's' => num_part = s[0 .. s.len - 1],
-        'm' => {
-            num_part = s[0 .. s.len - 1];
-            multiplier = 60;
-        },
-        'h' => {
-            num_part = s[0 .. s.len - 1];
-            multiplier = 3600;
-        },
-        '0'...'9' => {},
-        else => return null,
-    }
-    return parseScaled(c_uint, num_part, multiplier);
+    var out: u32 = 0;
+    return if (sismo_parse_duration_seconds(s.ptr, s.len, &out)) @as(c_uint, out) else null;
 }
 
 fn maybeSpawn(
