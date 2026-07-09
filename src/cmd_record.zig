@@ -48,7 +48,17 @@ const traced = @import("sismo_traced.zig");
 const heap_protocol = @import("heap_protocol.zig");
 const sismo_config = @import("sismo_config.zig");
 const paths = @import("sismo_paths.zig");
-const privileged_marker = @import("sismo_privileged_marker.zig");
+// Privileged-pid marker encoder + file-append now lives in Rust
+// (rust-bridge/src/privileged_marker.rs).
+extern fn sismo_append_privileged_marker(
+    path: [*]const u8,
+    path_len: usize,
+    pids: [*]const i32,
+    n_pids: usize,
+    focus_preset: ?[*]const u8,
+    focus_preset_len: usize,
+    focus_precise: bool,
+) bool;
 const focus_presets = @import("focus_presets.zig");
 const perf_symbolize = @import("perf_symbolize.zig");
 const c = @cImport({
@@ -1316,11 +1326,12 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
         std.debug.print("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)\n", .{});
     } else {
         std.debug.print("sismo record: trace saved to {s}\n", .{output_path});
-        // TODO: replace with JSON-in-zip sidecar. See sismo_privileged_marker.zig.
-        // macOS has no focus path, so the focus annotation is always null here.
-        privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}, null, false) catch |err| {
-            std.debug.print("sismo record: failed to write privileged marker: {s}\n", .{@errorName(err)});
-        };
+        // TODO: replace with JSON-in-zip sidecar. macOS has no focus path, so
+        // the focus annotation is always null here.
+        const pids = [_]i32{@intCast(target.pid)};
+        if (!sismo_append_privileged_marker(output_path.ptr, output_path.len, &pids, pids.len, null, 0, false)) {
+            std.debug.print("sismo record: failed to write privileged marker\n", .{});
+        }
     }
 
     // Shut down captures (signals EXIT, joins worker, frees state).
@@ -1609,14 +1620,17 @@ fn runRecordLinux(init: std.process.Init, args: *RecordArgs) !void {
         std.debug.print("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)\n", .{});
     } else {
         std.debug.print("sismo record: trace saved to {s}\n", .{output_path});
-        // TODO: replace with JSON-in-zip sidecar. See sismo_privileged_marker.zig.
+        // TODO: replace with JSON-in-zip sidecar.
         const focus_name: ?[]const u8 =
             if (args.focus_preset) |p| focus_presets.presetName(p) else null;
         // Honest precision: only claim PEBS if the sampler actually got it.
         const focus_precise = if (bpf) |b| b.sampler_precise_ip >= 2 else false;
-        privileged_marker.appendPrivilegedMarker(gpa, io, output_path, &.{target.pid}, focus_name, focus_precise) catch |err| {
-            std.debug.print("sismo record: failed to write privileged marker: {s}\n", .{@errorName(err)});
-        };
+        const pids = [_]i32{@intCast(target.pid)};
+        const fp_ptr: ?[*]const u8 = if (focus_name) |f| f.ptr else null;
+        const fp_len: usize = if (focus_name) |f| f.len else 0;
+        if (!sismo_append_privileged_marker(output_path.ptr, output_path.len, &pids, pids.len, fp_ptr, fp_len, focus_precise)) {
+            std.debug.print("sismo record: failed to write privileged marker\n", .{});
+        }
         // Resolve perf sample frames to function names. The BPF collector
         // records them unsymbolized; this appends ModuleSymbols for the UI to join.
         if (bpf != null) perf_symbolize.symbolizeTrace(gpa, io, output_path);

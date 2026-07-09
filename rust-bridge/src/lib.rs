@@ -14,6 +14,8 @@ pub mod dyld_images;
 #[cfg(target_os = "macos")]
 pub mod kdebug;
 pub mod heap;
+// Temporary privileged-pid marker (hack; appended to the trace file).
+pub mod privileged_marker;
 // macOS CPU-samples capture worker (owns the worker thread + SDK lifecycle).
 #[cfg(target_os = "macos")]
 pub mod macos_cpu_capture;

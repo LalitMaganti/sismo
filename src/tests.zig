@@ -17,5 +17,4 @@ comptime {
     // codec + tests live in rust-bridge/src/sismo_config.rs), so it needs the
     // full sismo link — excluded from the link-light test binary.
     _ = @import("source_asm_sidecar.zig");
-    _ = @import("sismo_privileged_marker.zig");
 }
