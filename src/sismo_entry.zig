@@ -22,8 +22,11 @@
 const std = @import("std");
 const record = @import("cmd_record.zig");
 const prepare = @import("cmd_prepare.zig");
-const snapshot = @import("cmd_snapshot.zig");
 const datasource = @import("cmd_datasource.zig");
+
+// `sismo snapshot` now lives in Rust (rust-bridge/src/cmd_snapshot.rs); it owns
+// its own arg parsing + exit code, so dispatch calls it directly with argv.
+extern fn sismo_cmd_snapshot(argc: usize, argv: [*]const [*:0]const u8) c_int;
 
 // rust-bridge/src/cli.rs — see rust-bridge/include/bridge.h for the contract.
 const cli_handled: i32 = 0;
@@ -89,13 +92,18 @@ fn dispatch(init: std.process.Init) c_int {
         &exit_code,
     );
 
+    // snapshot is fully in Rust — hand it the raw argv and return its exit code.
+    if (decision == cli_snapshot) {
+        const v = init.minimal.args.vector;
+        return sismo_cmd_snapshot(v.len, @ptrCast(v.ptr));
+    }
+
     const result = switch (decision) {
         // Bridge already printed help or the unknown-subcommand error; exit
         // with the code it chose (0 for help, 2 for unknown).
         cli_handled => return exit_code,
         cli_record => record.runRecord(init),
         cli_prepare => prepare.runPrepare(init),
-        cli_snapshot => snapshot.runSnapshot(init),
         cli_datasource => datasource.runDatasource(init),
         else => unreachable,
     };

@@ -5,6 +5,9 @@
 //! wholesym symbolizer) to Zig over a cargo→staticlib→Zig link.
 
 pub mod cli;
+// `sismo snapshot` subcommand (flight-recorder clone client). POSIX-only.
+#[cfg(not(target_os = "windows"))]
+pub mod cmd_snapshot;
 pub mod data_regions;
 pub mod disasm;
 // macOS Mach-based module enumeration + mach-o reading.

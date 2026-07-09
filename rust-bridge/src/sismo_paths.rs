@@ -19,6 +19,12 @@ use std::os::unix::io::{AsRawFd, IntoRawFd};
 
 const SESSION_LOCK_PATH: &str = "/tmp/sismo.lock";
 
+// Well-known sockets the embedded `traced` hosts. Mirror the Zig
+// `sismo_paths.zig` literals during the CLI migration; the Zig copies retire
+// when the last Zig caller does.
+pub const PRODUCER_SOCK: &str = "/tmp/sismo-producer.sock";
+pub const CONSUMER_SOCK: &str = "/tmp/sismo-consumer.sock";
+
 // BSD flock operations (identical on macOS + Linux).
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
