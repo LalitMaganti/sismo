@@ -86,6 +86,31 @@ const HeapCapture = opaque {};
 extern fn sismo_heap_capture_init() ?*HeapCapture;
 extern fn sismo_heap_capture_shutdown(cap: *HeapCapture, out_records: *u64, out_bytes_alloc: *u64, out_sites: *u32) void;
 
+// The macOS `sismo record` argument parser now lives in Rust
+// (rust-bridge/src/record_args.rs), producing this C-ABI struct. Layout mirrors
+// the Rust `#[repr(C)] RecordArgsC` exactly (guarded by the size assert below);
+// runRecordMacos consumes it. The Linux path keeps the Zig parser until P5.
+const RecordArgsC = extern struct {
+    output_path_ptr: [*]const u8, // NUL-terminated at [output_path_len]
+    output_path_len: usize,
+    workload_start: usize, // absolute argv index of the workload cmd; == argc if none
+    attach_pid: i32,
+    duration_secs: u32,
+    buffer_kb: u32,
+    sched_mode: u8, // 0 in_process, 1 external, 2 off (matches SourceMode)
+    cpu_mode: u8,
+    heap_mode: u8,
+    has_attach_pid: bool,
+    has_duration: bool,
+    flight_recorder: bool,
+    buffer_set: bool,
+    no_instrumentation: bool,
+};
+comptime {
+    if (@sizeOf(RecordArgsC) != 48) @compileError("RecordArgsC must match the Rust layout (48 bytes)");
+}
+extern fn sismo_parse_record_args(argc: usize, argv: [*]const [*:0]const u8, out: *RecordArgsC) bool;
+
 // Linux uses upstream Perfetto's traced_probes (ftrace + procfs) embedded as
 // an in-process worker thread — same pattern as `sismo_traced` for the
 // service. It self-registers its data source when the consumer's TraceConfig
@@ -856,38 +881,44 @@ fn rejectUnsupported(flag_name: []const u8, ds_name: []const u8) ?RecordArgs {
 /// Parses arguments once into a platform-independent RecordArgs and
 /// hands them to the per-platform runner.
 pub fn runRecord(init: std.process.Init) !void {
-    var iter = init.minimal.args.iterate();
-    _ = iter.next(); // exe path
-    _ = iter.next(); // "record" subcommand token
-
-    var args = parseRecordArgs(init.gpa, &iter) orelse return;
-    defer args.deinit(init.gpa);
-
-    if (comptime builtin.os.tag == .macos) return runRecordMacos(init, &args);
-    if (comptime builtin.os.tag == .linux) return runRecordLinux(init, &args);
-
+    // macOS: parse in Rust (rust-bridge/src/record_args.rs) into RecordArgsC.
+    if (comptime builtin.os.tag == .macos) {
+        const v = init.minimal.args.vector;
+        var rc: RecordArgsC = undefined;
+        if (!sismo_parse_record_args(v.len, @ptrCast(v.ptr), &rc)) return; // help/error printed
+        return runRecordMacos(init, &rc);
+    }
+    // Linux keeps the Zig parser (coupled to focus_presets / linux_bpf; P5).
+    if (comptime builtin.os.tag == .linux) {
+        var iter = init.minimal.args.iterate();
+        _ = iter.next(); // exe path
+        _ = iter.next(); // "record" subcommand token
+        var args = parseRecordArgs(init.gpa, &iter) orelse return;
+        defer args.deinit(init.gpa);
+        return runRecordLinux(init, &args);
+    }
     std.debug.print(
         "sismo record: not yet implemented on {s}\n",
         .{@tagName(builtin.os.tag)},
     );
 }
 
-fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
+fn runRecordMacos(init: std.process.Init, rc: *const RecordArgsC) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    // Read fields off `args` into shorter local names; the per-platform
-    // path uses these heavily and keeping the prefix everywhere is noisy.
-    const output_path = args.output_path;
-    const attach_pid = args.attach_pid;
-    const duration_secs = args.duration_secs;
-    const flight_recorder = args.flight_recorder;
-    const buffer_kb = args.buffer_kb;
-    const sched_mode = args.sched_mode;
-    const cpu_mode = args.cpu_mode;
-    const heap_mode = args.heap_mode;
-    const no_instrumentation = args.no_instrumentation;
-    const workload_argv = &args.workload_argv;
+    // Unpack RecordArgsC (parsed in Rust) into the local names this runner uses.
+    const output_path: []const u8 = rc.output_path_ptr[0..rc.output_path_len];
+    const attach_pid: ?c_int = if (rc.has_attach_pid) rc.attach_pid else null;
+    const duration_secs: ?c_uint = if (rc.has_duration) @as(c_uint, rc.duration_secs) else null;
+    const flight_recorder = rc.flight_recorder;
+    const buffer_kb = rc.buffer_kb;
+    const sched_mode: SourceMode = @enumFromInt(rc.sched_mode);
+    const cpu_mode: SourceMode = @enumFromInt(rc.cpu_mode);
+    const heap_mode: SourceMode = @enumFromInt(rc.heap_mode);
+    const no_instrumentation = rc.no_instrumentation;
+    // Workload command = the argv tail from workload_start (empty in --pid mode).
+    const argv_vec = init.minimal.args.vector;
 
     if (attach_pid) |pid| {
         // Quick sanity check before setup. kill(pid, 0) returns 0 if the
@@ -996,8 +1027,13 @@ fn runRecordMacos(init: std.process.Init, args: *RecordArgs) !void {
             return;
         };
         defer gpa.free(heap_dylib);
-        const workload_cmd = workload_argv.items[0];
-        const workload_args = workload_argv.items[1..];
+        // Reconstruct the workload command + args from the argv tail. Reached
+        // only when attach_pid is null, so workload_start points at a real cmd.
+        const workload_cmd = std.mem.span(argv_vec[rc.workload_start]);
+        const n_wargs = argv_vec.len - rc.workload_start - 1;
+        const workload_args = try gpa.alloc([]const u8, n_wargs);
+        defer gpa.free(workload_args);
+        for (0..n_wargs) |k| workload_args[k] = std.mem.span(argv_vec[rc.workload_start + 1 + k]);
 
         const t = maybeSpawn(gpa, workload_cmd, workload_args, &.{
             "PERFETTO_PRODUCER_SOCK_NAME", prod_sock,

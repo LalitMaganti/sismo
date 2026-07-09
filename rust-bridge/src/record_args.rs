@@ -110,7 +110,11 @@ const MODE_IN_PROCESS: u8 = 0;
 const MODE_EXTERNAL: u8 = 1;
 const MODE_OFF: u8 = 2;
 
-const DEFAULT_OUTPUT: &str = "./sismo.pftrace";
+// NUL-terminated so `output_path_ptr` is usable as a C string (the Zig runner
+// passes it to unlink()); `output_path_len` excludes the NUL. argv-derived
+// paths are already NUL-terminated (they come from CStr).
+const DEFAULT_OUTPUT: &[u8] = b"./sismo.pftrace\0";
+const DEFAULT_OUTPUT_LEN: usize = DEFAULT_OUTPUT.len() - 1;
 const DEFAULT_BUFFER_KB: u32 = 128 * 1024;
 
 /// Fully-parsed `sismo record` arguments, C-ABI for the Zig macOS runner.
@@ -140,7 +144,7 @@ impl Default for RecordArgsC {
     fn default() -> Self {
         RecordArgsC {
             output_path_ptr: DEFAULT_OUTPUT.as_ptr(),
-            output_path_len: DEFAULT_OUTPUT.len(),
+            output_path_len: DEFAULT_OUTPUT_LEN,
             workload_start: 0,
             attach_pid: 0,
             duration_secs: 0,
@@ -410,7 +414,17 @@ mod tests {
         assert!(!a.has_attach_pid);
         assert_eq!(a.buffer_kb, DEFAULT_BUFFER_KB);
         assert_eq!(a.sched_mode, MODE_IN_PROCESS);
-        assert_eq!(a.output_path_len, DEFAULT_OUTPUT.len());
+        assert_eq!(a.output_path_len, DEFAULT_OUTPUT_LEN);
+        // default path ptr is NUL-terminated at [len] for C-string use.
+        let s = unsafe { std::slice::from_raw_parts(a.output_path_ptr, a.output_path_len + 1) };
+        assert_eq!(s, b"./sismo.pftrace\0");
+    }
+
+    #[test]
+    fn record_args_c_layout_is_48_bytes() {
+        // Must match the Zig `extern struct RecordArgsC` (guarded there too).
+        assert_eq!(std::mem::size_of::<RecordArgsC>(), 48);
+        assert_eq!(std::mem::align_of::<RecordArgsC>(), 8);
     }
 
     #[test]
