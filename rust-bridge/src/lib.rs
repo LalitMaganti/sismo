@@ -17,6 +17,9 @@ pub mod heap;
 // macOS heap shm ring (recorder side; shares the wire layout with the preload).
 #[cfg(target_os = "macos")]
 pub mod heap_ring;
+// macOS heap control channel (recorder side; connect + SCM_RIGHTS fd pass).
+#[cfg(target_os = "macos")]
+pub mod heap_protocol;
 // Temporary privileged-pid marker (hack; appended to the trace file).
 pub mod privileged_marker;
 // macOS CPU-samples capture worker (owns the worker thread + SDK lifecycle).
