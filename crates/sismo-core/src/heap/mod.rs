@@ -211,9 +211,7 @@ unsafe fn build_trace_data(
     let mut frame_by_pc: HashMap<u64, u64> = HashMap::new();
     let mut callstacks: Vec<Callstack> = Vec::new();
     let mut samples: Vec<Sample> = Vec::new();
-    let mut next_callstack_iid: u64 = 1;
-
-    for site in sites {
+    for (site_idx, site) in sites.iter().enumerate() {
         let pcs: &[u64] = if site.pcs.is_null() {
             &[]
         } else {
@@ -252,8 +250,7 @@ unsafe fn build_trace_data(
             frame_iids.push(frame_iid);
         }
 
-        let cs_iid = next_callstack_iid;
-        next_callstack_iid += 1;
+        let cs_iid = (site_idx + 1) as u64;
         callstacks.push(Callstack {
             iid: cs_iid,
             frame_iids,

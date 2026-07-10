@@ -164,13 +164,13 @@ fn decode_x86(bytes: &[u8], func_start: u64, cb: InsnCb, ctx: *mut c_void) {
     let decoder = yaxpeax_x86::amd64::InstDecoder::default();
     let mut reader = U8Reader::new(bytes);
     loop {
-        let before = u64::from(<U8Reader as Reader<u64, u8>>::total_offset(&mut reader)) as usize;
+        let before = <U8Reader as Reader<u64, u8>>::total_offset(&mut reader) as usize;
         if before >= bytes.len() {
             break;
         }
         match decoder.decode(&mut reader) {
             Ok(inst) => {
-                let after = u64::from(<U8Reader as Reader<u64, u8>>::total_offset(&mut reader)) as usize;
+                let after = <U8Reader as Reader<u64, u8>>::total_offset(&mut reader) as usize;
                 if after <= before {
                     break;
                 }
@@ -186,13 +186,13 @@ fn decode_arm(bytes: &[u8], func_start: u64, cb: InsnCb, ctx: *mut c_void) {
     let decoder = yaxpeax_arm::armv8::a64::InstDecoder::default();
     let mut reader = U8Reader::new(bytes);
     loop {
-        let before = u64::from(<U8Reader as Reader<u64, yaxpeax_arch::U32le>>::total_offset(&mut reader)) as usize;
+        let before = <U8Reader as Reader<u64, yaxpeax_arch::U32le>>::total_offset(&mut reader) as usize;
         if before >= bytes.len() {
             break;
         }
         match decoder.decode(&mut reader) {
             Ok(inst) => {
-                let after = u64::from(<U8Reader as Reader<u64, yaxpeax_arch::U32le>>::total_offset(&mut reader)) as usize;
+                let after = <U8Reader as Reader<u64, yaxpeax_arch::U32le>>::total_offset(&mut reader) as usize;
                 if after <= before {
                     break;
                 }

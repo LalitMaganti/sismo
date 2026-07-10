@@ -89,9 +89,8 @@ const MODE_RING: u32 = 0;
 const MODE_CAPPED: u32 = 1;
 const MODE_FILE: u32 = 2;
 
-/// DataSourceEntry kind tags.
+/// DataSourceEntry kind tags. Vendor (1) is the `_` fallback in `add_entry`.
 const KIND_TRACK_EVENT: u32 = 0;
-const KIND_SISMO_VENDOR: u32 = 1;
 const KIND_LINUX_FTRACE: u32 = 2;
 
 /// Flattened `data_sources[*]` entry passed across FFI. `kind` selects which
@@ -145,7 +144,7 @@ fn encode_data_source_config(entry: &DataSourceEntryC) -> Vec<u8> {
             w.write_string(DSC_NAME, b"linux.ftrace");
             w.write_message(DSC_FTRACE_CONFIG, &encode_ftrace_config());
         }
-        KIND_SISMO_VENDOR | _ => {
+        _ => {
             // sismo_vendor (any unrecognized kind is treated as vendor).
             w.write_string(DSC_NAME, ffi_slice(entry.name, entry.name_len));
             let cfg = ffi_slice(entry.sismo_config, entry.sismo_config_len);
@@ -339,7 +338,7 @@ mod tests {
     fn trace_config_file_mode_and_sismo_vendor_with_protovm() {
         let cfg = [0x08u8, 0x2A]; // a stand-in sismo_config payload
         let entries = [DataSourceEntryC {
-            kind: KIND_SISMO_VENDOR,
+            kind: 1, // KIND_SISMO_VENDOR
             name: b"sismo.macos_sched".as_ptr(),
             name_len: b"sismo.macos_sched".len(),
             sismo_config: cfg.as_ptr(),

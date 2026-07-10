@@ -35,6 +35,7 @@ fn acquire_at(path: &str, pid: c_int) -> c_int {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o644)
         .open(path)
     {
@@ -48,7 +49,7 @@ fn acquire_at(path: &str, pid: c_int) -> c_int {
     // Replace any prior contents with the pid as ASCII: truncate then write.
     let _ = file.set_len(0);
     let mut file = file;
-    let _ = write!(file, "{pid}\n");
+    let _ = writeln!(file, "{pid}");
     // Leak the fd so the lock persists past this call; the caller owns it.
     file.into_raw_fd()
 }

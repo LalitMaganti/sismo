@@ -583,7 +583,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
     let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
     SIGINT_PIPE_FD.store(wr, Ordering::Release);
-    unsafe { signal(SIGINT, handle_sigint as libc::sighandler_t) };
+    unsafe { signal(SIGINT, handle_sigint as extern "C" fn(c_int) as libc::sighandler_t) };
 
     let is_attach = attach_pid.is_some();
     let watch = std::thread::spawn(move || {
@@ -928,7 +928,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     }
     let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
     SIGINT_PIPE_FD.store(wr, Ordering::Release);
-    unsafe { signal(SIGINT, handle_sigint as libc::sighandler_t) };
+    unsafe { signal(SIGINT, handle_sigint as extern "C" fn(c_int) as libc::sighandler_t) };
 
     let watch = std::thread::spawn(move || waitpid_exit_watch(target_pid, wr));
     if let Some(secs) = duration_secs {

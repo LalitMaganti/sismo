@@ -70,7 +70,7 @@ fn parse_line(line: &str) -> Option<(u64, u64, &str)> {
 
     let label = match path {
         None => "[anon]",
-        Some(p) if p.is_empty() => "[anon]",
+        Some("") => "[anon]",
         Some(p) if p.starts_with('[') => p, // [heap]/[stack]/[vdso]/…
         Some(p) if !p.starts_with('/') => p, // "anon_inode:…" — verbatim
         Some(p) => p.rsplit_once('/').map(|(_, base)| base).unwrap_or(p),

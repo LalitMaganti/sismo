@@ -101,8 +101,8 @@ use libc::{signal, SIGINT, SIGTERM};
 
 fn install_stop_handlers() {
     unsafe {
-        signal(SIGINT, handle_stop as libc::sighandler_t);
-        signal(SIGTERM, handle_stop as libc::sighandler_t);
+        signal(SIGINT, handle_stop as extern "C" fn(std::os::raw::c_int) as libc::sighandler_t);
+        signal(SIGTERM, handle_stop as extern "C" fn(std::os::raw::c_int) as libc::sighandler_t);
     }
 }
 

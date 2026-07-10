@@ -216,7 +216,7 @@ fn cpuinfo_field(text: &str, key: &str) -> Option<u64> {
         if lhs.trim() != key {
             continue;
         }
-        return rhs.trim().split_whitespace().next()?.parse().ok();
+        return rhs.split_whitespace().next()?.parse().ok();
     }
     None
 }
@@ -225,7 +225,7 @@ fn cpuinfo_field(text: &str, key: &str) -> Option<u64> {
 // with fixed-counter-3 in the ECX support bitmap). Same signal perf uses.
 #[cfg(target_arch = "x86_64")]
 fn topdown_enumerated() -> bool {
-    let r = unsafe { std::arch::x86_64::__cpuid_count(0x0A, 0) };
+    let r = std::arch::x86_64::__cpuid_count(0x0A, 0);
     let version = r.eax & 0xff;
     version >= 5 && (r.ecx & (1 << 3)) != 0
 }
@@ -253,7 +253,7 @@ fn vm_slots_hack_counters() -> Option<&'static [Counter]> {
     if id.family != 6 || id.model != 134 || id.stepping != 0 {
         return None;
     }
-    let hyp = unsafe { std::arch::x86_64::__cpuid_count(1, 0) };
+    let hyp = std::arch::x86_64::__cpuid_count(1, 0);
     if (hyp.ecx & (1 << 31)) == 0 {
         return None; // hypervisor bit
     }
@@ -473,11 +473,11 @@ fn open_sampler(cpu: u32, cfg: &SamplerCfg, tick_prog: *mut BpfProgram) -> Optio
         attr.set_precise_ip(want as u64);
         // bpf_get_stack on a PEBS event needs the callchain sample (else -EPROTO).
         if want > 0 {
-            attr.sample_type |= sys::bindings::PERF_SAMPLE_CALLCHAIN as u64;
+            attr.sample_type |= sys::bindings::PERF_SAMPLE_CALLCHAIN;
         }
         // Data_LA only resolves on a precise event.
         if cfg.sample_data_addr && want > 0 {
-            attr.sample_type |= sys::bindings::PERF_SAMPLE_ADDR as u64;
+            attr.sample_type |= sys::bindings::PERF_SAMPLE_ADDR;
         }
         let rc = unsafe { sys::perf_event_open(&mut attr, -1, cpu as i32, -1, 0) };
         if rc >= 0 {
@@ -577,6 +577,7 @@ impl Interner {
 
     /// InternedData.mappings (19): Mapping{iid=1, build_id=2, start=4, end=5,
     /// load_bias=6, exact_offset=8, path_string_ids=7}. load_bias = base avma.
+    #[allow(clippy::too_many_arguments)]
     fn intern_mapping(
         &mut self,
         start: u64,

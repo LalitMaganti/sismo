@@ -640,7 +640,7 @@ fn strip_offset(name: &[u8]) -> &[u8] {
 /// Decode a hex string into `buf`, returning the filled prefix. Odd-length or
 /// non-hex input yields an empty slice (build_id then omitted, not corrupted).
 fn hex_to_bytes<'a>(hex: &[u8], buf: &'a mut [u8]) -> &'a [u8] {
-    if hex.is_empty() || hex.len() % 2 != 0 || hex.len() / 2 > buf.len() {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) || hex.len() / 2 > buf.len() {
         return &[];
     }
     let mut i = 0;
@@ -692,7 +692,7 @@ const DA_FIELD_STRING_VALUE: u32 = 6;
 const DA_FIELD_NAME: u32 = 10;
 
 const TRACK_NAME: &[u8] = b"sismo_temporary_source_asm_sidecar";
-const TRACK_UUID: u64 = 0xC0DECAFE_5350_2020;
+const TRACK_UUID: u64 = 0xC0DE_CAFE_5350_2020;
 const SEQUENCE_ID: u32 = 0xC0DECAFF;
 const SRC_EVENT_NAME: &[u8] = b"sismo_src";
 const ASM_EVENT_NAME: &[u8] = b"sismo_asm";
@@ -799,7 +799,7 @@ fn write_chunked(
         write_event(out, timestamp_ns, event_name, key_name, key_val, payload, None, 0);
         return;
     }
-    let nchunks = ((payload.len() + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES) as u32;
+    let nchunks = payload.len().div_ceil(MAX_CHUNK_BYTES) as u32;
     let mut i: u32 = 0;
     let mut off = 0usize;
     while off < payload.len() {
