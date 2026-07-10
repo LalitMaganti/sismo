@@ -118,3 +118,212 @@ extern "C" {
     pub fn ring_buffer__free(rb: *mut RingBuffer);
     pub fn libbpf_num_possible_cpus() -> c_int;
 }
+
+// ---- PMU counter selection (port of the Zig selectCounters + helpers) ------
+
+use crate::pmu_events::{Model, Role, MODELS};
+
+// perf_event PERF_COUNT_HW_* (config values under PERF_TYPE_HARDWARE).
+const HW_CPU_CYCLES: u32 = 0;
+const HW_INSTRUCTIONS: u32 = 1;
+const HW_CACHE_MISSES: u32 = 3;
+const HW_BRANCH_MISSES: u32 = 5;
+const HW_STALLED_FRONTEND: u32 = 7;
+const HW_STALLED_BACKEND: u32 = 8;
+
+#[derive(Clone, Copy)]
+enum Src {
+    Hw(u32),  // PERF_TYPE_HARDWARE, config = PERF_COUNT_HW_*
+    Raw(u32), // PERF_TYPE_RAW, config = raw event encoding
+}
+
+#[derive(Clone, Copy)]
+struct Counter {
+    group: u8,
+    src: Src,
+    name: &'static str,
+}
+
+// x86 fallback set (when the CPU model isn't in the perfmon table). aarch64 uses
+// the architectural slot/op events; kept minimal here (primary target is x86).
+#[cfg(target_arch = "x86_64")]
+const COUNTERS_FALLBACK: &[Counter] = &[
+    Counter { group: 0, src: Src::Hw(HW_CPU_CYCLES), name: "cpu-cycles" },
+    Counter { group: 0, src: Src::Hw(HW_INSTRUCTIONS), name: "instructions" },
+    Counter { group: 0, src: Src::Hw(HW_STALLED_FRONTEND), name: "stalled-cycles-frontend" },
+    Counter { group: 0, src: Src::Hw(HW_STALLED_BACKEND), name: "stalled-cycles-backend" },
+    Counter { group: 1, src: Src::Hw(HW_CACHE_MISSES), name: "cache-misses" },
+    Counter { group: 1, src: Src::Hw(HW_BRANCH_MISSES), name: "branch-misses" },
+];
+#[cfg(not(target_arch = "x86_64"))]
+const COUNTERS_FALLBACK: &[Counter] = &[
+    Counter { group: 0, src: Src::Hw(HW_CPU_CYCLES), name: "cpu-cycles" },
+    Counter { group: 0, src: Src::Hw(HW_INSTRUCTIONS), name: "instructions" },
+    Counter { group: 1, src: Src::Hw(HW_CACHE_MISSES), name: "cache-misses" },
+    Counter { group: 1, src: Src::Hw(HW_BRANCH_MISSES), name: "branch-misses" },
+];
+
+// STABLE sismo counter name per role (the UI's counter catalog keys on these).
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::cycles => "cpu-cycles",
+        Role::instructions => "instructions",
+        Role::slots => "slots",
+        Role::retired => "topdown-slots-retired",
+        Role::fetch_bubbles => "topdown-fetch-bubbles",
+        Role::cache_miss => "cache-misses",
+        Role::branch_miss => "branch-misses",
+        Role::l3_miss_load => "mem-load-l3-miss",
+    }
+}
+
+fn role_group(role: Role) -> u8 {
+    match role {
+        Role::cache_miss | Role::branch_miss => 1,
+        _ => 0,
+    }
+}
+
+// Leader-only roles (a focus sampler's leader, never a survey follower).
+fn is_leader_only_role(role: Role) -> bool {
+    matches!(role, Role::l3_miss_load)
+}
+
+// The slot-based Top-Down set — only meaningful with the `slots` fixed counter.
+fn is_topdown_role(role: Role) -> bool {
+    matches!(role, Role::slots | Role::retired | Role::fetch_bubbles)
+}
+
+struct CpuId {
+    family: u16,
+    model: u16,
+    stepping: u8,
+}
+
+/// Read vendor/family/model/stepping from /proc/cpuinfo. None on non-Intel.
+fn read_cpu_id() -> Option<CpuId> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    if !text.contains("GenuineIntel") {
+        return None;
+    }
+    Some(CpuId {
+        family: cpuinfo_field(&text, "cpu family")? as u16,
+        model: cpuinfo_field(&text, "model")? as u16,
+        stepping: cpuinfo_field(&text, "stepping").unwrap_or(0) as u8,
+    })
+}
+
+// First "<key> : <int>" line, exact key match (so "model" != "model name").
+fn cpuinfo_field(text: &str, key: &str) -> Option<u64> {
+    for line in text.lines() {
+        let (lhs, rhs) = line.split_once(':')?;
+        if lhs.trim() != key {
+            continue;
+        }
+        return rhs.trim().split_whitespace().next()?.parse().ok();
+    }
+    None
+}
+
+// slots fixed counter + PERF_METRICS Top-Down present (CPUID leaf 0x0A, v>=5
+// with fixed-counter-3 in the ECX support bitmap). Same signal perf uses.
+#[cfg(target_arch = "x86_64")]
+fn topdown_enumerated() -> bool {
+    let r = unsafe { std::arch::x86_64::__cpuid_count(0x0A, 0) };
+    let version = r.eax & 0xff;
+    version >= 5 && (r.ecx & (1 << 3)) != 0
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn topdown_enumerated() -> bool {
+    false
+}
+
+// vvvvv TEMPORARY HACK — see linux_bpf_capture.zig; delete once TMA is validated
+// on real ICL+ silicon. Forces slot-based counters for one spoofed dev VM
+// (family 6 / model 134 / stepping 0 under a hypervisor). A lie about the PMU.
+#[cfg(target_arch = "x86_64")]
+const VM_HACK_COUNTERS: &[Counter] = &[
+    Counter { group: 0, src: Src::Raw(0x3c), name: "cpu-cycles" },
+    Counter { group: 0, src: Src::Raw(0xc0), name: "instructions" },
+    Counter { group: 0, src: Src::Raw(0x400), name: "slots" },
+    Counter { group: 0, src: Src::Raw(0x2c2), name: "topdown-slots-retired" },
+    Counter { group: 0, src: Src::Raw(0x19c), name: "topdown-fetch-bubbles" },
+    Counter { group: 1, src: Src::Raw(0x412e), name: "cache-misses" },
+    Counter { group: 1, src: Src::Raw(0xc5), name: "branch-misses" },
+];
+#[cfg(target_arch = "x86_64")]
+fn vm_slots_hack_counters() -> Option<&'static [Counter]> {
+    let id = read_cpu_id()?;
+    if id.family != 6 || id.model != 134 || id.stepping != 0 {
+        return None;
+    }
+    let hyp = unsafe { std::arch::x86_64::__cpuid_count(1, 0) };
+    if (hyp.ecx & (1 << 31)) == 0 {
+        return None; // hypervisor bit
+    }
+    Some(VM_HACK_COUNTERS)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn vm_slots_hack_counters() -> Option<&'static [Counter]> {
+    None
+}
+// ^^^^^ TEMPORARY HACK ^^^^^
+
+// This host's perfmon-table row (matched by CPUID). Prefers the non-Atom row.
+fn match_model() -> Option<&'static Model> {
+    let id = read_cpu_id()?;
+    let mut best: Option<&'static Model> = None;
+    for m in MODELS {
+        if m.family != id.family || m.model != id.model {
+            continue;
+        }
+        if !m.steppings.is_empty() && !m.steppings.contains(&id.stepping) {
+            continue;
+        }
+        best = Some(m);
+        if m.core != "Atom" {
+            break; // prefer P-core / non-hybrid
+        }
+    }
+    best
+}
+
+// Raw PMU config for a role on this host (the focus sampler's leader event).
+fn config_for_role(role: Role) -> Option<u64> {
+    let m = match_model()?;
+    m.events.iter().find(|ev| ev.role == role).map(|ev| ev.config)
+}
+
+// Build the counter list from the perfmon table (role → name + group + config).
+fn counters_from_table() -> Option<Vec<Counter>> {
+    let m = match_model()?;
+    let td = topdown_enumerated();
+    let mut out = Vec::new();
+    for ev in m.events {
+        if out.len() >= SISMO_MAX_COUNTERS {
+            break;
+        }
+        if is_leader_only_role(ev.role) || (is_topdown_role(ev.role) && !td) {
+            continue;
+        }
+        out.push(Counter {
+            group: role_group(ev.role),
+            src: Src::Raw(ev.config as u32),
+            name: role_name(ev.role),
+        });
+    }
+    Some(out)
+}
+
+/// The active candidate counters for this host: the VM hack, else the perfmon
+/// table by CPUID (x86), else the arch fallback.
+fn select_counters() -> Vec<Counter> {
+    if let Some(list) = vm_slots_hack_counters() {
+        return list.to_vec();
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(list) = counters_from_table() {
+        return list;
+    }
+    COUNTERS_FALLBACK.to_vec()
+}
