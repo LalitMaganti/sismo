@@ -681,7 +681,7 @@ impl Interner {
 
 use crate::data_regions::DataRegions;
 use crate::proc_maps::ProcMaps;
-use crate::proto::{sismo_encode_perf_defaults_packet, sismo_encode_perf_sample, SismoStr};
+use crate::proto::sismo_encode_perf_sample;
 use crate::worker_sdk::sismo_ds_emit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -848,34 +848,23 @@ impl Capture {
     }
 
     fn emit_defaults(&mut self) {
-        let mut followers: Vec<SismoStr> = Vec::new();
+        let mut followers: Vec<&[u8]> = Vec::new();
         let mut timebase_name: &[u8] = b"cpu-clock";
         if !self.active_slots.is_empty() {
             timebase_name = self.counters[self.active_slots[0] as usize].name.as_bytes();
             for &slot in &self.active_slots[1..] {
-                let n = self.counters[slot as usize].name.as_bytes();
-                followers.push(SismoStr { ptr: n.as_ptr(), len: n.len() });
+                followers.push(self.counters[slot as usize].name.as_bytes());
             }
         }
-        let mut buf = [0u8; 8192];
-        let n = unsafe {
-            sismo_encode_perf_defaults_packet(
-                timebase_name.as_ptr(),
-                timebase_name.len(),
-                0,
-                followers.as_ptr(),
-                followers.len(),
-                SAMPLE_SCOPE_THREAD,
-                BUILTIN_CLOCK_MONOTONIC,
-                SEQ_INCREMENTAL_STATE_CLEARED,
-                buf.as_mut_ptr(),
-                buf.len(),
-            )
-        };
-        if n == 0 {
-            return;
-        }
-        unsafe { sismo_ds_emit(self.ds_slot, buf.as_ptr(), n) };
+        let packet = crate::proto::encode_perf_defaults_packet(
+            timebase_name,
+            0,
+            &followers,
+            SAMPLE_SCOPE_THREAD,
+            BUILTIN_CLOCK_MONOTONIC,
+            SEQ_INCREMENTAL_STATE_CLEARED,
+        );
+        unsafe { sismo_ds_emit(self.ds_slot, packet.as_ptr(), packet.len()) };
     }
 
     fn emit_sample(&mut self, rec: &SismoSampleRec) {

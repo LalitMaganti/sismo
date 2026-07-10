@@ -192,30 +192,6 @@ mod reader_tests {
     }
 }
 
-/// A borrowed byte string passed across FFI (e.g. a follower counter name).
-#[repr(C)]
-pub struct SismoStr {
-    pub ptr: *const u8,
-    pub len: usize,
-}
-
-impl SismoStr {
-    unsafe fn as_slice(&self) -> &[u8] {
-        if self.ptr.is_null() {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(self.ptr, self.len) }
-        }
-    }
-}
-
-unsafe fn opt_slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
-    if ptr.is_null() {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(ptr, len) }
-    }
-}
 
 /// Build a TracePacket carrying PerfSampleDefaults, ready to hand to
 /// sismo_ds_emit. Replaces the encodePerfSampleDefaults + encodeTracePacket
@@ -234,41 +210,27 @@ unsafe fn opt_slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
 ///     },
 ///   }
 ///
-/// Writes into out[..cap]; returns bytes written, or 0 if cap is too small.
-///
-/// # Safety
-/// `timebase_name`/`followers` must be valid for their lengths (or null);
-/// `out` must be writable for `cap` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_encode_perf_defaults_packet(
-    timebase_name: *const u8,
-    timebase_name_len: usize,
+/// Returns the encoded TracePacket bytes.
+pub fn encode_perf_defaults_packet(
+    timebase_name: &[u8],
     timebase_freq: u64,
-    followers: *const SismoStr,
-    followers_count: usize,
+    followers: &[&[u8]],
     sample_scope: u32,
     timestamp_clock_id: u32,
     sequence_flags: u32,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
+) -> Vec<u8> {
     let mut psd = ProtoWriter::new();
     {
         let mut tb = ProtoWriter::new();
         if timebase_freq != 0 {
             tb.write_uint64(2, timebase_freq);
         }
-        tb.write_string(10, unsafe { opt_slice(timebase_name, timebase_name_len) });
+        tb.write_string(10, timebase_name);
         psd.write_message(1, tb.bytes());
     }
-    let follower_slice = if followers.is_null() {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(followers, followers_count) }
-    };
-    for f in follower_slice {
+    for f in followers {
         let mut fe = ProtoWriter::new();
-        fe.write_string(4, unsafe { f.as_slice() });
+        fe.write_string(4, f);
         psd.write_message(4, fe.bytes());
     }
     if sample_scope != 0 {
@@ -286,15 +248,7 @@ pub unsafe extern "C" fn sismo_encode_perf_defaults_packet(
         body.write_uint32(13, sequence_flags);
     }
     body.write_message(59, tpd.bytes());
-
-    let b = body.bytes();
-    if b.len() > cap {
-        return 0;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
-    }
-    b.len()
+    body.bytes().to_vec()
 }
 
 /// Encode a PerfSample (TracePacket field 66 body). Fields: cpu=1, pid=2,
@@ -572,21 +526,7 @@ mod tests {
     fn perf_defaults_packet_bytes_are_exact() {
         // timebase name "x", no freq, no followers, scope=thread(2),
         // clock=MONOTONIC(3), seq=INCREMENTAL_STATE_CLEARED(1).
-        let mut out = [0u8; 256];
-        let n = unsafe {
-            sismo_encode_perf_defaults_packet(
-                b"x".as_ptr(),
-                1,
-                0,
-                std::ptr::null(),
-                0,
-                2,
-                3,
-                1,
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
+        let got = encode_perf_defaults_packet(b"x", 0, &[], 2, 3, 1);
         // Hand-computed wire bytes (see the layout doc above):
         //   seq_flags(13,varint)=1                -> 68 01
         //   trace_packet_defaults(59,len=12)      -> DA 03 0C
@@ -599,45 +539,16 @@ mod tests {
             0x68, 0x01, 0xDA, 0x03, 0x0C, 0xD0, 0x03, 0x03, 0x62, 0x07, 0x0A, 0x03, 0x52, 0x01,
             0x78, 0x28, 0x02,
         ];
-        assert_eq!(&out[..n], expected);
+        assert_eq!(got, expected);
     }
 
     #[test]
     fn perf_defaults_packet_with_followers() {
-        let followers = [
-            SismoStr { ptr: b"a".as_ptr(), len: 1 },
-            SismoStr { ptr: b"bb".as_ptr(), len: 2 },
-        ];
-        let mut out = [0u8; 256];
-        let n = unsafe {
-            sismo_encode_perf_defaults_packet(
-                b"tb".as_ptr(),
-                2,
-                0,
-                followers.as_ptr(),
-                followers.len(),
-                2,
-                3,
-                1,
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
+        let followers: [&[u8]; 2] = [b"a", b"bb"];
+        let got = encode_perf_defaults_packet(b"tb", 0, &followers, 2, 3, 1);
         // Each follower is FollowerEvent{name(4)}: "a" -> 22 03 22 01 61,
         // "bb" -> 22 04 22 02 62 62 (field 4 = 0x22).
-        let got = &out[..n];
         assert!(got.windows(5).any(|w| w == [0x22, 0x03, 0x22, 0x01, 0x61]));
         assert!(got.windows(6).any(|w| w == [0x22, 0x04, 0x22, 0x02, 0x62, 0x62]));
-    }
-
-    #[test]
-    fn returns_zero_when_buffer_too_small() {
-        let mut out = [0u8; 4];
-        let n = unsafe {
-            sismo_encode_perf_defaults_packet(
-                b"x".as_ptr(), 1, 0, std::ptr::null(), 0, 2, 3, 1, out.as_mut_ptr(), out.len(),
-            )
-        };
-        assert_eq!(n, 0);
     }
 }
