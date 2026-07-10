@@ -1,0 +1,19 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
+# The sismo command layer: argument parsing and the record/datasource/prepare/
+# snapshot runners. A library so it stays cross-checkable (cargo-zigbuild) and
+# tests without the Perfetto link; the `sismo` binary is a thin wrapper over it.
+[package]
+name = "sismo-cli"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+sismo-core = { path = "../sismo-core" }
+libc = "0.2"
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }

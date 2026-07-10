@@ -121,7 +121,7 @@ pub unsafe extern "C" fn sismo_heap_dylib_path(out: *mut u8, cap: usize) -> usiz
 /// Resolve the heap-preload dylib path relative to the running binary. Tries the
 /// install / cargo-dev / legacy layouts and returns the first that exists, else
 /// the cargo-dev candidate as a best-effort. Shared with `cmd_prepare`.
-pub(crate) fn resolve_heap_dylib_path() -> Option<String> {
+pub fn resolve_heap_dylib_path() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let bin_dir = exe.parent()?;
 

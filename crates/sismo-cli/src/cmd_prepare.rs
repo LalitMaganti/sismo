@@ -23,7 +23,7 @@
 //!
 //! POSIX (execvp); cfg-gated off Windows like the rest of the CLI cluster.
 
-use crate::sismo_paths::{resolve_heap_dylib_path, PRODUCER_SOCK};
+use sismo_core::sismo_paths::{resolve_heap_dylib_path, PRODUCER_SOCK};
 use std::ffi::CString;
 use libc::{c_char, execvp};
 

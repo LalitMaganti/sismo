@@ -25,12 +25,12 @@
 //! The C++ clone shim is provided in the final binary; `#[cfg(test)]` stubs it
 //! so the pure helpers (arg parse, default-path formatting) test standalone.
 
-use crate::sismo_paths::{CONSUMER_SOCK, PRODUCER_SOCK};
+use sismo_core::sismo_paths::{CONSUMER_SOCK, PRODUCER_SOCK};
 use std::io::Write;
 use std::os::raw::{c_char, c_void};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ffi::sismo_consumer_clone_and_stream;
+use sismo_core::ffi::sismo_consumer_clone_and_stream;
 
 // ---- Snapshot streaming ----------------------------------------------------
 

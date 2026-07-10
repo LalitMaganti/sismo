@@ -150,11 +150,11 @@ pub fn run(args: DatasourceArgs) -> i32 {
 #[cfg(target_os = "macos")]
 mod macos_run {
     use super::{block_until_stopped, install_stop_handlers, Kind};
-    use crate::cpu::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
-    use crate::heap::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
-    use crate::sched::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
-    use crate::ffi::sismo_init;
-    use crate::sismo_paths::PRODUCER_SOCK;
+    use sismo_core::cpu::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
+    use sismo_core::heap::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
+    use sismo_core::sched::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
+    use sismo_core::ffi::sismo_init;
+    use sismo_core::sismo_paths::PRODUCER_SOCK;
     use std::ffi::CString;
     use std::os::raw::c_int;
 

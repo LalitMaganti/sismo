@@ -10,7 +10,7 @@
 //! and optional focus-preset metadata) to an already-written trace file. The
 //! Sismo UI matches on the deliberately-ugly event name below.
 
-use crate::proto::ProtoWriter;
+use sismo_core::proto::ProtoWriter;
 use std::io::Write;
 use std::slice;
 

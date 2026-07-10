@@ -1,8 +1,10 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! The `sismo` subcommands: argument parsing and the record/datasource/prepare/
-//! snapshot runners, plus the temporary privileged-pid marker.
+//! The sismo command layer: argument parsing and the record/datasource/prepare/
+//! snapshot runners, plus the temporary privileged-pid marker. Built on the
+//! `sismo-core` library; the `sismo` binary is a thin wrapper that calls
+//! [`cli::run`].
 
 pub mod cli;
 // `sismo record` runners (traced + session + watch threads). macOS + Linux

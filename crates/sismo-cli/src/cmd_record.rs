@@ -19,27 +19,27 @@
 //!
 //! macOS-only; gated in lib.rs. Validated by `sudo tools/e2e-all-sources`.
 
-use crate::proto::{ProtoReader, WireValue};
-use crate::command::record_args::{RecordArgs, RecordConfig, SourceMode};
-use crate::proto::session_config::{sismo_encode_trace_config, DataSourceEntryC};
+use sismo_core::proto::{ProtoReader, WireValue};
+use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
+use sismo_core::proto::session_config::{sismo_encode_trace_config, DataSourceEntryC};
 #[cfg(target_os = "macos")]
-use crate::proto::sismo_config::{sismo_config_cpu_encode, sismo_config_heap_encode, sismo_config_sched_encode};
-use crate::sismo_paths::{sismo_acquire_session_lock, sismo_release_session_lock, CONSUMER_SOCK, PRODUCER_SOCK};
+use sismo_core::proto::sismo_config::{sismo_config_cpu_encode, sismo_config_heap_encode, sismo_config_sched_encode};
+use sismo_core::sismo_paths::{sismo_acquire_session_lock, sismo_release_session_lock, CONSUMER_SOCK, PRODUCER_SOCK};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 // Capture workers (Rust siblings, macOS in-process sources).
 #[cfg(target_os = "macos")]
-use crate::cpu::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
+use sismo_core::cpu::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
 #[cfg(target_os = "macos")]
-use crate::heap::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
+use sismo_core::heap::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
 #[cfg(target_os = "macos")]
-use crate::sched::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
+use sismo_core::sched::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
 
 // ---- C++ shim (traced service + consumer session + producer init) ----------
 
-use crate::ffi::{
+use sismo_core::ffi::{
     sismo_consumer_query_service_state, sismo_consumer_session_create,
     sismo_consumer_session_destroy, sismo_consumer_session_setup,
     sismo_consumer_session_start_blocking, sismo_consumer_session_stop_blocking, sismo_init,
@@ -375,7 +375,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
             pid
         }
         None => {
-            let heap_dylib = match crate::sismo_paths::resolve_heap_dylib_path() {
+            let heap_dylib = match sismo_core::sismo_paths::resolve_heap_dylib_path() {
                 Some(p) => p,
                 None => {
                     eprintln!("sismo record: failed to resolve heap dylib path");
@@ -432,7 +432,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         let ok = match attach_pid {
             Some(pid) => {
                 let mut sock_buf = [0u8; 128];
-                let has_socket = match crate::heap::heap_protocol::socket_path(pid, &mut sock_buf) {
+                let has_socket = match sismo_core::heap::heap_protocol::socket_path(pid, &mut sock_buf) {
                     Some(len) => {
                         sock_buf[len] = 0;
                         unsafe { libc::access(sock_buf.as_ptr() as *const c_char, 0) == 0 } // F_OK
@@ -706,10 +706,10 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
 // ---- Linux record runner (P5: was runRecordLinux in cmd_record.zig) --------
 
 #[cfg(target_os = "linux")]
-use crate::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, sismo_traced_probes_stop};
+use sismo_core::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, sismo_traced_probes_stop};
 
 #[cfg(target_os = "linux")]
-use crate::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
+use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
 
 #[cfg(target_os = "linux")]
 fn ds_linux_ftrace() -> DataSourceEntryC {
@@ -989,7 +989,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
         }
         // Resolve BPF perf-sample frames to function names (appended offline).
         if had_bpf {
-            crate::symbolize::perf_symbolize::symbolize_trace(output_path_str);
+            sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str);
         }
     }
 

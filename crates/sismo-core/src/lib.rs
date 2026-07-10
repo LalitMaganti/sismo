@@ -4,12 +4,11 @@
 //! extern "C" facade exposing the Rust-side helpers (framehop unwinder,
 //! wholesym symbolizer) to Zig over a cargo→staticlib→Zig link.
 //!
-//! Modules are grouped by feature: `command` (the CLI subcommands), `cpu`,
-//! `heap`, `sched` (the capture data sources), `proto` (wire encoding +
-//! configs), and `symbolize`. `ffi`, `worker_sdk`, and `sismo_paths` are the
-//! shared plumbing the groups build on.
+//! Modules are grouped by feature: `cpu`, `heap`, `sched` (the capture data
+//! sources), `proto` (wire encoding + configs), and `symbolize`. `ffi`,
+//! `worker_sdk`, and `sismo_paths` are the shared plumbing the groups build on.
+//! The CLI/command layer lives in the separate `sismo-cli` crate.
 
-pub mod command;
 pub mod cpu;
 pub mod heap;
 pub mod proto;

@@ -22,6 +22,8 @@ path = "src/bin/sample_target.rs"
 
 [dependencies]
 sismo-core = { path = "../sismo-core" }
+# The command layer (arg parsing + record/datasource/prepare/snapshot runners).
+sismo-cli = { path = "../sismo-cli" }
 # Pulls in the Perfetto C++ SDK + C/C++ shim compile + link via its build.rs.
 # This is the crate that produces the final binaries, so it owns that link.
 sismo-sys = { path = "../sismo-sys", features = ["perfetto-shim"] }
