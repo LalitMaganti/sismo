@@ -223,7 +223,6 @@ mod tests {
         fn pipe(fds: *mut c_int) -> c_int;
         fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
         fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
-        fn nanosleep(req: *const [i64; 2], rem: *mut c_void) -> c_int;
     }
 
     #[test]
@@ -233,8 +232,7 @@ mod tests {
 
         let sender = std::thread::spawn(move || {
             // Give the main thread a beat to reach accept().
-            let ts = [0i64, 20_000_000];
-            unsafe { nanosleep(&ts, std::ptr::null_mut()) };
+            std::thread::sleep(std::time::Duration::from_millis(20));
             // A pipe whose READ end we hand over; we keep the write end.
             let mut fds = [0 as c_int; 2];
             assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);

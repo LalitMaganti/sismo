@@ -20,4 +20,7 @@
 pub mod protocol;
 pub mod ring;
 pub mod sampler;
+// The malloc interposer + listener (macOS/arm64 only — the injected core).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod shim;
 pub mod wire;
