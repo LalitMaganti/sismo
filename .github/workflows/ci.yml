@@ -44,3 +44,11 @@ jobs:
 
       - name: Build sismo-core
         run: python3 tools/cargo --hermetic build --manifest-path crates/sismo-core/Cargo.toml --profile dev
+
+      # sismo-cli is the command layer (a library over sismo-core); it needs no
+      # Perfetto, so its arg-parsing tests fit this fast gate too.
+      - name: Unit tests (sismo-cli)
+        run: python3 tools/cargo --hermetic test --manifest-path crates/sismo-cli/Cargo.toml
+
+      - name: Build sismo-cli
+        run: python3 tools/cargo --hermetic build --manifest-path crates/sismo-cli/Cargo.toml --profile dev
