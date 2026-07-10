@@ -1,0 +1,26 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
+# The macOS heap preload: a DYLD_INSERT_LIBRARIES dylib that interposes malloc
+# and streams sampled allocations to the recorder over a shm ring. It is
+# injected into arbitrary target processes, so it links NOTHING heavy (no
+# rust-bridge) and carries its own tiny copies of the wire layout + ring
+# (attach/write side) + control protocol (listen/accept side). Migrated from
+# src/heap_preload_macos.zig (P6).
+
+[package]
+name = "sismo-heap-preload"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+# cdylib = the injected libsismo_heap.dylib; rlib = so the pure logic
+# (sampler, wire) unit-tests standalone.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+[profile.release]
+panic = "abort"    # never unwind into the injected target
+opt-level = 2
