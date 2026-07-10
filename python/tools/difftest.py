@@ -31,11 +31,11 @@ import tempfile
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN: str = os.path.join(ROOT_DIR, "zig-out", "bin")
-# `sismo` is the cargo-built binary (rust-host/); sample-target/sismo-run are
-# the Zig-built auxiliaries in zig-out/bin.
+# `sismo` and `sample-target` are cargo-built (rust-host/); sismo-run is the
+# Zig-built cap launcher in zig-out/bin.
 SISMO: str = os.path.join(ROOT_DIR, "rust-host", "target", "debug", "sismo")
 SISMO_RUN: str = os.path.join(BIN, "sismo-run")
-SAMPLE_TARGET: str = os.path.join(BIN, "sample-target")
+SAMPLE_TARGET: str = os.path.join(ROOT_DIR, "rust-host", "target", "debug", "sample-target")
 TP_SHELL: str = os.path.join(
     ROOT_DIR, "third_party", "src", "perfetto", "out", "sismo", "trace_processor_shell"
 )
@@ -99,7 +99,7 @@ def cpu_symbolize_actual() -> str:
             "SELECT count(*) FROM stack_profile_symbol s "
             "JOIN stack_profile_frame f USING(symbol_set_id) "
             "JOIN stack_profile_mapping m ON f.mapping = m.id "
-            "WHERE m.name LIKE '%sample-target%' AND s.name LIKE '%busyWorker%';",
+            "WHERE m.name LIKE '%sample-target%' AND s.name LIKE '%busy_worker%';",
         )
         return (
             f"sample_target_mapping_present: {mapping >= 1}\n"

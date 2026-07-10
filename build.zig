@@ -65,19 +65,13 @@ pub fn build(b: *std.Build) void {
     }
 
     // -------------------------------------------------------------------------
-    // Per-OS pipelines. The `sismo` binary itself is produced by cargo (the
-    // rust-host crate) linking libsismo_zig.a — see `zig build sismo-staticlib`
-    // and rust-host/. build.zig here builds the auxiliary Zig binaries.
-    //
-    // macOS:   sample-target + heap-preload
-    // Linux:   sample-target + sismo-run (BPF cap launcher)
-    // Windows: sample-target only — the orchestrator's POSIX bits
-    //          (sismo_paths' flock-based session lock, posix_spawnp,
-    //          POSIX Args.iterate) need Windows analogs first.
+    // The `sismo` binary and the sample-target workload are produced by cargo
+    // (the rust-host crate); see rust-host/build.rs. This Zig build only emits
+    // the compiler_rt shim archive (all OSes) and the Linux sismo-run cap
+    // launcher.
     // -------------------------------------------------------------------------
     switch (os_tag) {
         .macos, .linux => addUnixPipeline(b, target, optimize),
-        .windows => addWindowsPipeline(b, target, optimize),
         else => {},
     }
 }
@@ -88,94 +82,11 @@ fn addUnixPipeline(
     optimize: std.builtin.OptimizeMode,
 ) void {
     const os_tag = target.result.os.tag;
-    const is_macos = os_tag == .macos;
     const is_linux = os_tag == .linux;
 
-    // Perfetto out dir per target. Cross-compiled targets live in
-    // sibling dirs so a macOS host can keep both `out/sismo` (native)
-    // and `out/sismo_linux_x64` (cross via zig cc) populated. The
-    // names match what tools/setup-perfetto derives from
-    // SISMO_TARGET; build.zig and the script have to agree.
-    const sismo_target = perfettoTargetTriple(target);
-    const perfetto_out_name = if (sismo_target == null)
-        "sismo"
-    else switch (target.result.cpu.arch) {
-        .x86_64 => switch (os_tag) {
-            .linux => "sismo_linux_x64",
-            .windows => "sismo_windows_x64",
-            else => "sismo",
-        },
-        .aarch64 => switch (os_tag) {
-            .linux => "sismo_linux_arm64",
-            .windows => "sismo_windows_arm64",
-            else => "sismo",
-        },
-        else => "sismo",
-    };
-
-    // -------------------------------------------------------------------------
-    // libsismo_libperfetto.a — comprehensive Perfetto C++ SDK static
-    // archive built from sismo's own GN target //sismo:sismo_libperfetto
-    // (defined in infra/perfetto-build/sismo/BUILD.gn, symlinked into
-    // the Perfetto checkout at //sismo by tools/setup-perfetto).
-    // sismo's producer-side glue is `src/c/perfetto_ds.cc` (templated
-    // DataSource slots over the public C++ SDK) and consumer-side is
-    // `src/c/sismo_consumer.cc`. Both compile directly into the sismo
-    // binary, not as a separate static library.
-    //
-    // Build pipeline:
-    //   1. tools/build-perfetto runs ninja to produce
-    //      libsismo_libperfetto.a in
-    //      third_party/src/perfetto/out/<perfetto_out_name>/.
-    //      Cross-compile uses zig cc as a clang drop-in.
-    //   2. Each consumer addCSourceFile()s the relevant .cc shims +
-    //      addObjectFile(libsismo_libperfetto.a) + OS-specific
-    //      frameworks/libs.
-    // -------------------------------------------------------------------------
-    const perfetto_build = b.addSystemCommand(&.{b.pathFromRoot("tools/build-perfetto")});
-    if (sismo_target) |trip| perfetto_build.setEnvironmentVariable("SISMO_TARGET", trip);
-    const perfetto_root = b.path("third_party/src/perfetto");
-    const perfetto_out = b.path(b.fmt("third_party/src/perfetto/out/{s}", .{perfetto_out_name}));
-
-    // Includes for our own headers are root-qualified (e.g.
-    // `#include "src/c/perfetto_shim.h"`), so the include root is the
-    // repo root.
-    const repo_root_include = b.path(".");
-    const lib_a = perfetto_out.path(b, "libsismo_libperfetto.a");
-
-    // Workload binary — uses the Perfetto C SDK directly via
-    // src/c/sample_target_sdk.c. Cross-platform; the SDK headers are
-    // identical on every OS Perfetto supports.
-    {
-        const target_mod = b.createModule(.{
-            .root_source_file = b.path("src/sample_target.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-            .omit_frame_pointer = false,
-        });
-        addComponentSources(b, target_mod, .sample_target, is_macos);
-        target_mod.addIncludePath(perfetto_root.path(b, "include"));
-
-        const target_exe = b.addExecutable(.{
-            .name = "sample-target",
-            .root_module = target_mod,
-        });
-        // Emit a GNU build-id so CPU-sample stacks into this binary can be
-        // symbolized: trace_processor's symbolization query drops mappings
-        // with no build-id.
-        target_exe.build_id = .fast;
-        linkPerfetto(target_mod, &target_exe.step, repo_root_include, lib_a, &perfetto_build.step, os_tag);
-        b.installArtifact(target_exe);
-
-        const target_step = b.step("sample-target", "Build the sample-target workload binary");
-        target_step.dependOn(&b.addInstallArtifact(target_exe, .{}).step);
-    }
-
-    // Heap preload dylib (macOS) is now the Rust cdylib heap-preload/,
-    // installed to zig-out/lib/libsismo_heap.dylib by rust-host/build.rs.
-    // The Linux analog (LD_PRELOAD + GLIBC malloc hooks) is a later pillar.
+    // Perfetto's C++ SDK and the sample-target workload are built by cargo
+    // (rust-host/build.rs). This Zig build now only produces the compiler_rt
+    // shim archive and the sismo-run cap launcher.
 
     // -------------------------------------------------------------------------
     // libsismo_zig.a — compiler_rt for the cargo-linked binary. The `sismo`
@@ -220,122 +131,6 @@ fn addUnixPipeline(
         const run_step = b.step("sismo-run", "Build the capability-stable BPF launcher");
         run_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     }
-}
-
-fn addComponentSources(
-    b: *std.Build,
-    mod: *std.Build.Module,
-    component: Component,
-    is_macos: bool,
-) void {
-    for (c_sources) |src| {
-        if (src.component != component) continue;
-        mod.addCSourceFile(.{
-            .file = b.path(src.path),
-            .flags = flagsFor(src.language, is_macos),
-            .language = if (src.language == .c) .c else .cpp,
-        });
-    }
-}
-
-/// SISMO_TARGET value to pass to tools/setup-perfetto + build-perfetto
-/// when cross-compiling. Returns null when targeting the build host
-/// (use the default out/sismo dir + Perfetto's hermetic clang).
-fn perfettoTargetTriple(target: std.Build.ResolvedTarget) ?[]const u8 {
-    const host_tag = @import("builtin").os.tag;
-    const host_arch = @import("builtin").cpu.arch;
-    if (target.result.os.tag == host_tag and target.result.cpu.arch == host_arch) return null;
-    return switch (target.result.cpu.arch) {
-        .x86_64 => switch (target.result.os.tag) {
-            .linux => "x86_64-linux-gnu",
-            .windows => "x86_64-windows-gnu",
-            else => null,
-        },
-        .aarch64 => switch (target.result.os.tag) {
-            .linux => "aarch64-linux-gnu",
-            .windows => "aarch64-windows-gnu",
-            else => null,
-        },
-        else => null,
-    };
-}
-
-fn linkPerfetto(
-    mod: *std.Build.Module,
-    step: *std.Build.Step,
-    inc: std.Build.LazyPath,
-    lib_a: std.Build.LazyPath,
-    build_step: *std.Build.Step,
-    os_tag: std.Target.Os.Tag,
-) void {
-    mod.addIncludePath(inc);
-    // libperfetto.a is comprehensive: service code (traced) +
-    // client API (shared_lib + tracing/client_api + backends).
-    // Single archive — see sismo-local additions in
-    // third_party/src/perfetto/BUILD.gn.
-    mod.addObjectFile(lib_a);
-    switch (os_tag) {
-        .macos => {
-            mod.linkFramework("CoreFoundation", .{});
-            mod.linkSystemLibrary("dl", .{});
-        },
-        .linux => {
-            mod.linkSystemLibrary("dl", .{});
-            mod.linkSystemLibrary("pthread", .{});
-            mod.linkSystemLibrary("rt", .{});
-        },
-        else => {},
-    }
-    step.dependOn(build_step);
-}
-
-fn addWindowsPipeline(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) void {
-    // Windows: sample-target only for now. Builds the same Zig source
-    // and the same Perfetto C SDK shim; the only Windows-specific bit
-    // is the link surface (no CoreFoundation, no libdl — Winsock2 +
-    // ntdll come from the Perfetto archive itself).
-    //
-    // Requires `tools/setup-perfetto` to have produced a Windows
-    // libperfetto.a. The setup script doesn't gen for Windows yet
-    // (`uname -s` only knows Darwin/Linux), so this branch is wired up
-    // for the day that's fixed — running it before then will fail at
-    // the perfetto build step.
-    const perfetto_build = b.addSystemCommand(&.{b.pathFromRoot("tools/build-perfetto")});
-    const perfetto_root = b.path("third_party/src/perfetto");
-    const perfetto_out = b.path("third_party/src/perfetto/out/sismo");
-
-    const target_mod = b.createModule(.{
-        .root_source_file = b.path("src/sample_target.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .link_libcpp = true,
-        .omit_frame_pointer = false,
-    });
-    // Windows uses the same `c_flags_macos` (no -D_GNU_SOURCE) — the
-    // value isn't macos-specific, just "non-Linux".
-    target_mod.addCSourceFile(.{
-        .file = b.path("src/c/sample_target_sdk.c"),
-        .flags = c_flags_macos,
-        .language = .c,
-    });
-    target_mod.addIncludePath(perfetto_root.path(b, "include"));
-    target_mod.addIncludePath(b.path("."));
-    target_mod.addObjectFile(perfetto_out.path(b, "libperfetto.a"));
-
-    const target_exe = b.addExecutable(.{
-        .name = "sample-target",
-        .root_module = target_mod,
-    });
-    target_exe.step.dependOn(&perfetto_build.step);
-    b.installArtifact(target_exe);
-
-    const target_step = b.step("sample-target", "Build the sample-target workload binary");
-    target_step.dependOn(&b.addInstallArtifact(target_exe, .{}).step);
 }
 
 // ---- compile_commands.json emitter ---------------------------------------

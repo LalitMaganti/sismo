@@ -21,18 +21,22 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // Drive the Zig build so `cargo build` alone produces everything: the
-    // static archive we link (+ its Perfetto dependency) and the auxiliary
-    // Zig binaries (sample-target, sismo-run). Zig caches, so this is cheap
-    // when nothing changed. Reruns when any Zig source or build.zig changes.
+    // compiler_rt archive we link and the sismo-run cap launcher. Zig caches,
+    // so this is cheap when nothing changed. Reruns when any Zig source or
+    // build.zig changes.
     zig_build(&root, &["sismo-staticlib"]);
     zig_build(&root, &[]);
     println!("cargo:rerun-if-changed={}", root.join("src").display());
     println!("cargo:rerun-if-changed={}", root.join("build.zig").display());
 
-    // The Perfetto C/C++ glue (producer/consumer/traced shims). Compiled here
-    // with `zig c++` — matching the libc++ Perfetto was built with — rather than
-    // by build.zig, so the C/C++ no longer depends on the Zig build. Runs after
-    // zig_build so Perfetto's generated headers exist.
+    // Perfetto's C++ SDK archive + generated headers. Built directly (ninja is
+    // incremental, so this is cheap once built) rather than as a side effect of
+    // the Zig build. compile_cc_shims + the final link both need it.
+    build_perfetto(&root);
+
+    // The Perfetto C/C++ glue (producer/consumer/traced shims + the sample-
+    // target TrackEvent shim). Compiled with `zig c++` — matching the libc++
+    // Perfetto was built with — rather than by build.zig.
     compile_cc_shims(&root, &out);
 
     // libsismo_zig.a (Zig code + compiler_rt).
@@ -158,6 +162,25 @@ fn compile_cc_shims(root: &PathBuf, out: &PathBuf) {
         println!("cargo:rerun-if-changed={}", src.display());
     }
 
+    // The sample-target TrackEvent shim is C (C11 atomics), so compile it with
+    // `zig cc`; it lands in the same archive and links into the sample-target bin.
+    {
+        let src = root.join("src/c/sample_target_sdk.c");
+        let obj = out.join("sample_target_sdk.c.o");
+        let mut cmd = zig_cmd(root, "cc");
+        cmd.args(["-target", &zig_target, "-c"]).arg(&src).arg("-o").arg(&obj);
+        cmd.args(["-std=c11", "-DNDEBUG", "-fno-omit-frame-pointer", "-fno-sanitize=undefined"]);
+        if !is_macos {
+            cmd.arg("-D_GNU_SOURCE");
+        }
+        for inc in &includes {
+            cmd.arg("-I").arg(inc);
+        }
+        assert!(cmd.status().expect("run zig cc").success(), "compile sample_target_sdk.c failed");
+        objs.push(obj);
+        println!("cargo:rerun-if-changed={}", src.display());
+    }
+
     let lib = out.join("libsismo_cc_shims.a");
     let _ = std::fs::remove_file(&lib);
     let mut ar = zig_cmd(root, "ar");
@@ -183,6 +206,16 @@ fn zig_cmd(root: &PathBuf, sub: &str) -> Command {
     let mut cmd = Command::new("python3");
     cmd.arg(root.join("tools/zig")).arg("--hermetic").arg(sub);
     cmd
+}
+
+/// Build Perfetto's C++ SDK archive + generated headers via tools/build-perfetto.
+fn build_perfetto(root: &PathBuf) {
+    let status = Command::new("python3")
+        .arg(root.join("tools/build-perfetto"))
+        .current_dir(root)
+        .status()
+        .expect("run tools/build-perfetto");
+    assert!(status.success(), "perfetto build failed");
 }
 
 /// Run `zig build <steps>` via the pinned hermetic toolchain.
