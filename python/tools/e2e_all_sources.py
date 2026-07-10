@@ -33,7 +33,7 @@ import sys
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SISMO_BIN: str = os.path.join(ROOT_DIR, "rust-host", "target", "debug", "sismo")
+SISMO_BIN: str = os.path.join(ROOT_DIR, "crates", "sismo", "target", "debug", "sismo")
 SAMPLE_TARGET_BIN: str = os.path.join(ROOT_DIR, "zig-out", "bin", "sample-target")
 TRACE_PATH: str = "/tmp/sismo-e2e.pftrace"
 RUN_LOG: str = "/tmp/sismo-e2e-run.log"
@@ -138,7 +138,7 @@ def main() -> int:
     # cargo drives the whole build (build.rs invokes the Zig staticlib + aux).
     subprocess.check_call(
         [sys.executable, os.path.join(ROOT_DIR, "tools", "cargo"), "--hermetic",
-         "build", "--manifest-path", os.path.join(ROOT_DIR, "rust-host", "Cargo.toml")],
+         "build", "--manifest-path", os.path.join(ROOT_DIR, "crates", "sismo", "Cargo.toml")],
         cwd=ROOT_DIR, stdout=subprocess.DEVNULL,
     )
 

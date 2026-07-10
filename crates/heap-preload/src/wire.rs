@@ -3,7 +3,7 @@
 
 //! Wire-format record types for the heap IPC (port of heap_wire.zig). The
 //! layout is the ABI contract between this preload (producer) and the recorder
-//! (consumer, rust-bridge/src/macos_heap_capture.rs) — it must stay byte-exact.
+//! (consumer, sismo-core/src/macos_heap_capture.rs) — it must stay byte-exact.
 
 /// Max register-block size across architectures, padded (arm64: 33×u64=264 →
 /// 272) to absorb future archs without an ABI break.

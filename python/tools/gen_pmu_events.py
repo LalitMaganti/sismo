@@ -25,7 +25,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PERFMON = os.path.join(ROOT, "third_party", "perfmon")
-OUT = os.path.join(ROOT, "rust-bridge", "src", "pmu_events.rs")
+OUT = os.path.join(ROOT, "crates", "sismo-core", "src", "pmu_events.rs")
 
 # sismo role -> candidate perfmon event names, most-preferred first. The first
 # candidate present in a model's event list wins. A role absent from a model is

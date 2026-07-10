@@ -30,11 +30,11 @@ import sys
 import tempfile
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# `sismo` and `sample-target` are cargo-built (rust-host/); sismo-run is the
+# `sismo` and `sample-target` are cargo-built (sismo/); sismo-run is the
 # cargo-built cap launcher (its own crate, so its file caps survive rebuilds).
-SISMO: str = os.path.join(ROOT_DIR, "crates", "rust-host", "target", "debug", "sismo")
+SISMO: str = os.path.join(ROOT_DIR, "crates", "sismo", "target", "debug", "sismo")
 SISMO_RUN: str = os.path.join(ROOT_DIR, "crates", "sismo-run", "target", "debug", "sismo-run")
-SAMPLE_TARGET: str = os.path.join(ROOT_DIR, "crates", "rust-host", "target", "debug", "sample-target")
+SAMPLE_TARGET: str = os.path.join(ROOT_DIR, "crates", "sismo", "target", "debug", "sample-target")
 TP_SHELL: str = os.path.join(
     ROOT_DIR, "third_party", "src", "perfetto", "out", "sismo", "trace_processor_shell"
 )

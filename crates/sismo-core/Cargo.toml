@@ -2,17 +2,14 @@
 # Licensed under the MIT License.
 
 [package]
-name = "rust-bridge"
+name = "sismo-core"
 version = "0.0.0"
 edition = "2021"
 publish = false
 
 [lib]
-# staticlib for the Zig staticlib link; rlib so the host-flip binary crate
-# (rust-host) can depend on this crate and pull its #[no_mangle] exports in.
-crate-type = ["staticlib", "rlib"]
-# No runnable doc examples; the rlib crate-type otherwise makes `cargo test`
-# invoke rustdoc, which isn't wired to the pinned toolchain.
+# No runnable doc examples; testing otherwise invokes rustdoc, which isn't
+# wired to the pinned toolchain.
 doctest = false
 
 [profile.release]

@@ -3,7 +3,7 @@
 
 //! Shared-memory ring buffer — **preload (writer) side**. Port of the write
 //! half of heap_ring_posix.zig; the layout + algorithm are byte-identical to
-//! the recorder's `rust-bridge/src/heap_ring.rs` (they share this shm), so the
+//! the recorder's `sismo-core/src/heap_ring.rs` (they share this shm), so the
 //! two stay wire-compatible. Transitional duplication — a shared crate can
 //! unify them in P7.
 //!

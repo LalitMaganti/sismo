@@ -11,9 +11,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Fast Linux gate: pinned toolchains, the rust-bridge unit tests, and the
-  # rust-bridge staticlib build. Nothing here needs Perfetto, so it stays
-  # quick and dependency-light.
+  # Fast Linux gate: pinned toolchains, the sismo-core unit tests, and the
+  # sismo-core build. Nothing here needs Perfetto, so it stays quick and
+  # dependency-light.
   #
   # The full sismo build + the CLI `--help` golden need libperfetto.a; that
   # heavier job lands alongside the dispatch port it exists to validate.
@@ -34,13 +34,13 @@ jobs:
       - name: Install pinned zig + rust
         run: python3 tools/install-build-deps --no-source all --no-patches
 
-      # Building rust-bridge compiles the kernel BPF object (sismo-sys), which
+      # Building sismo-core compiles the kernel BPF object (sismo-sys), which
       # #include's <bpf/bpf_helpers.h> and needs clang with the bpf target.
       - name: Install BPF build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev clang
 
-      - name: Unit tests (rust-bridge)
-        run: python3 tools/cargo --hermetic test --manifest-path crates/rust-bridge/Cargo.toml
+      - name: Unit tests (sismo-core)
+        run: python3 tools/cargo --hermetic test --manifest-path crates/sismo-core/Cargo.toml
 
-      - name: Build rust-bridge staticlib
-        run: python3 tools/cargo --hermetic build --manifest-path crates/rust-bridge/Cargo.toml --profile dev
+      - name: Build sismo-core
+        run: python3 tools/cargo --hermetic build --manifest-path crates/sismo-core/Cargo.toml --profile dev

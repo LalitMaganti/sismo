@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 //! Host entry: Rust owns `main`, routing, and every subcommand. `main` collects
-//! argv and hands it to [`rust_bridge::cli::run`], which dispatches to the
+//! argv and hands it to [`sismo_core::cli::run`], which dispatches to the
 //! matching Rust command.
 
 fn main() {
@@ -10,5 +10,5 @@ fn main() {
     let args: Vec<String> = std::env::args_os()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    std::process::exit(rust_bridge::cli::run(&args));
+    std::process::exit(sismo_core::cli::run(&args));
 }

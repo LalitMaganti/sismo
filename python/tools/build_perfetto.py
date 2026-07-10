@@ -3,7 +3,7 @@
 
 """Incremental build of the Perfetto targets sismo links against.
 
-Driven by crates/rust-host/build.rs, but standalone-runnable for debugging the GN side.
+Driven by crates/sismo/build.rs, but standalone-runnable for debugging the GN side.
 
 By default builds the host out dir (out/sismo). For cross-compile pass
 --target / SISMO_TARGET — must match what tools/setup-perfetto was called

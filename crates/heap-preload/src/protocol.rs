@@ -8,7 +8,7 @@
 //! SCM_RIGHTS. Detach = the recorder closes the connection (EOF on `conn_fd`).
 //!
 //! Wire-compatible with the recorder's connect side
-//! (rust-bridge/src/heap_protocol.rs). macOS constants.
+//! (sismo-core/src/heap_protocol.rs). macOS constants.
 
 use std::os::raw::{c_int, c_void};
 

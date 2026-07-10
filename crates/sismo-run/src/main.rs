@@ -92,12 +92,12 @@ fn raise_caps() {
 fn main() {
     raise_caps();
 
-    // `sismo` is the cargo-built binary (rust-host/). This launcher lives at
-    // sismo-run/target/debug/sismo-run, so sismo is three dirs up then into
-    // rust-host/target/debug. execve resolves the `..` components.
+    // `sismo` is the cargo-built binary (crates/sismo/). This launcher lives at
+    // crates/sismo-run/target/debug/sismo-run, so sismo is three dirs up then
+    // into sismo/target/debug. execve resolves the `..` components.
     let exe = std::fs::read_link("/proc/self/exe").expect("readlink /proc/self/exe");
     let dir = exe.parent().expect("exe has no parent dir");
-    let sismo = dir.join("../../../rust-host/target/debug/sismo");
+    let sismo = dir.join("../../../sismo/target/debug/sismo");
     let sismo_c = CString::new(sismo.as_os_str().as_bytes()).expect("sismo path has interior NUL");
 
     // Forward our argv to sismo, replacing argv[0] with sismo's own path.

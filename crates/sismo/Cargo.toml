@@ -1,11 +1,11 @@
 # Copyright 2026 The Sismo Authors. All rights reserved.
 # Licensed under the MIT License.
 
-# Host-flip binary crate: Rust owns `main`, the Zig code is linked in as
-# libsismo_zig.a. Depends on rust-bridge (rlib) so std is shared and the
-# bridge's #[no_mangle] exports the Zig staticlib calls are pulled in.
+# The `sismo` binary crate: owns `main`, the build.rs that compiles + links the
+# Perfetto C/C++ shims, and the sample-target workload. All logic lives in the
+# sismo-core library it depends on.
 [package]
-name = "sismo-host"
+name = "sismo"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -21,7 +21,7 @@ name = "sample-target"
 path = "src/bin/sample_target.rs"
 
 [dependencies]
-rust-bridge = { path = "../rust-bridge" }
+sismo-core = { path = "../sismo-core" }
 
 [profile.release]
 opt-level = 3
