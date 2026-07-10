@@ -19,7 +19,7 @@ use crate::proto::sched_protos::{
     sismo_encode_kernel_process_tree, sismo_macos_sched_vm_program, ProcessC, ThreadC,
 };
 use crate::proto::session_config::sismo_encode_data_source_descriptor;
-use crate::proto::sismo_config::{sismo_config_extract, sismo_config_sched_decode};
+use crate::proto::sismo_config::{config_extract, sched_decode};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use crate::worker_sdk::Event;
 use std::collections::HashMap;
@@ -171,14 +171,9 @@ fn as_ref<'a>(p: *mut c_void) -> &'a SchedCapture {
 
 extern "C" fn on_setup(user_arg: *mut c_void, dsc_bytes: *const c_void, dsc_size: usize) {
     let self_ = as_ref(user_arg);
-    let mut off = 0usize;
-    let mut len = 0usize;
-    if !dsc_bytes.is_null()
-        && unsafe { sismo_config_extract(dsc_bytes as *const u8, dsc_size, &mut off, &mut len) }
-    {
-        let inner = unsafe { (dsc_bytes as *const u8).add(off) };
-        let mut kbe = 0i32;
-        if unsafe { sismo_config_sched_decode(inner, len, &mut kbe) } {
+    if !dsc_bytes.is_null() {
+        let dsc = unsafe { std::slice::from_raw_parts(dsc_bytes as *const u8, dsc_size) };
+        if let Some(kbe) = config_extract(dsc).and_then(sched_decode) {
             self_.setup_kernel_buffer_events.store(kbe, Ordering::Release);
         }
     }

@@ -22,7 +22,7 @@ use sismo_core::proto::{ProtoReader, WireValue};
 use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
 use sismo_core::proto::session_config::{sismo_encode_trace_config, DataSourceEntryC};
 #[cfg(target_os = "macos")]
-use sismo_core::proto::sismo_config::{sismo_config_cpu_encode, sismo_config_heap_encode, sismo_config_sched_encode};
+use sismo_core::proto::sismo_config;
 use sismo_core::sismo_paths::{
     acquire_session_lock, release_session_lock, LockError, CONSUMER_SOCK, PRODUCER_SOCK,
 };
@@ -467,15 +467,9 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     };
 
     // Per-DS sismo configs (field 2000 of each DataSourceConfig).
-    let mut cpu_buf = [0u8; 256];
-    let cpu_len = unsafe { sismo_config_cpu_encode(target_pid as u32, 0, cpu_buf.as_mut_ptr(), cpu_buf.len()) };
-    let cpu_cfg = &cpu_buf[..cpu_len];
-    let mut heap_buf = [0u8; 256];
-    let heap_len = unsafe { sismo_config_heap_encode(target_pid as u32, 0, 0, heap_buf.as_mut_ptr(), heap_buf.len()) };
-    let heap_cfg = &heap_buf[..heap_len];
-    let mut sched_buf = [0u8; 256];
-    let sched_len = unsafe { sismo_config_sched_encode(0, sched_buf.as_mut_ptr(), sched_buf.len()) };
-    let sched_cfg = &sched_buf[..sched_len];
+    let cpu_cfg = sismo_config::cpu_encode(target_pid as u32, 0);
+    let heap_cfg = sismo_config::heap_encode(target_pid as u32, 0, 0);
+    let sched_cfg = sismo_config::sched_encode(0);
 
     // Build the entries + external-name list.
     let mut entries: Vec<DataSourceEntryC> = Vec::new();
@@ -484,20 +478,20 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         entries.push(ds_track_event());
     }
     if !heap.is_null() || heap_mode == SourceMode::External {
-        entries.push(ds_sismo_vendor(b"sismo.heap", heap_cfg, 0));
+        entries.push(ds_sismo_vendor(b"sismo.heap", &heap_cfg, 0));
         if heap_mode == SourceMode::External {
             external_names.push("sismo.heap");
         }
     }
     if !cpu.is_null() || cpu_mode == SourceMode::External {
-        entries.push(ds_sismo_vendor(b"sismo.macos_cpu_samples", cpu_cfg, 0));
+        entries.push(ds_sismo_vendor(b"sismo.macos_cpu_samples", &cpu_cfg, 0));
         if cpu_mode == SourceMode::External {
             external_names.push("sismo.macos_cpu_samples");
         }
     }
     if !sched.is_null() || sched_mode == SourceMode::External {
         // ProtoVM DST for GenericKernelProcessTree.
-        entries.push(ds_sismo_vendor(b"sismo.macos_sched", sched_cfg, 4 * 1024));
+        entries.push(ds_sismo_vendor(b"sismo.macos_sched", &sched_cfg, 4 * 1024));
         if sched_mode == SourceMode::External {
             external_names.push("sismo.macos_sched");
         }

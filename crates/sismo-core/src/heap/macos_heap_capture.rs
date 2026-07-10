@@ -26,7 +26,7 @@
 use crate::heap::{HeapImage, HeapSite};
 use crate::heap::heap_protocol::{connect_and_attach, AttachConfig};
 use crate::heap::heap_ring::RingBuffer;
-use crate::proto::sismo_config::{sismo_config_extract, sismo_config_heap_decode};
+use crate::proto::sismo_config::{config_extract, heap_decode};
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -151,14 +151,9 @@ fn as_ref<'a>(p: *mut c_void) -> &'a HeapCapture {
 extern "C" fn on_setup(user_arg: *mut c_void, dsc_bytes: *const c_void, dsc_size: usize) {
     let self_ = as_ref(user_arg);
     // Extract sismo_config (field 2000) then decode target_pid + ring + interval.
-    let mut off = 0usize;
-    let mut len = 0usize;
-    if !dsc_bytes.is_null()
-        && unsafe { sismo_config_extract(dsc_bytes as *const u8, dsc_size, &mut off, &mut len) }
-    {
-        let inner = unsafe { (dsc_bytes as *const u8).add(off) };
-        let (mut pid, mut ring, mut interval) = (0u32, 0u64, 0u64);
-        if unsafe { sismo_config_heap_decode(inner, len, &mut pid, &mut ring, &mut interval) } {
+    if !dsc_bytes.is_null() {
+        let dsc = unsafe { std::slice::from_raw_parts(dsc_bytes as *const u8, dsc_size) };
+        if let Some((pid, ring, interval)) = config_extract(dsc).and_then(heap_decode) {
             self_.setup_target_pid.store(pid, Ordering::Release);
             self_.setup_ring_size.store(ring, Ordering::Release);
             self_.setup_sample_interval.store(interval, Ordering::Release);
