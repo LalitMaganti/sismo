@@ -16,7 +16,7 @@ Groups:
            stdout/stderr/exit surface. Deterministic, no privileges.
   trace  — records sample-target through the BPF sampler and queries the
            trace; goldens stable structural facts (not raw sample counts).
-           Needs zig-out/bin/sismo-run with BPF caps + the Perfetto build, so
+           Needs a setcap'd sismo-run with BPF caps + the Perfetto build, so
            it's hardware-only and not part of the fast CI gate.
 """
 
@@ -30,7 +30,6 @@ import sys
 import tempfile
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BIN: str = os.path.join(ROOT_DIR, "zig-out", "bin")
 # `sismo` and `sample-target` are cargo-built (rust-host/); sismo-run is the
 # cargo-built cap launcher (its own crate, so its file caps survive rebuilds).
 SISMO: str = os.path.join(ROOT_DIR, "rust-host", "target", "debug", "sismo")

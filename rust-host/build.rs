@@ -1,14 +1,15 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Link the Zig half (libsismo_zig.a, built by `zig build sismo-staticlib`),
-//! the Perfetto C++ archive, and the C++ runtime.
+//! Build + link the C/C++ half of `sismo`: the Perfetto C++ archive and the
+//! C/C++ shims, plus the C++ runtime.
 //!
-//! The whole C++ world here — perfetto and the Zig staticlib's C/C++ shims —
-//! was compiled with Zig's bundled libc++, and there is no system libc++. So
-//! rather than guess, we ask `zig c++ -v` which libc++/libc++abi/libunwind
-//! archives it links for this target (the correct variant for the mode/target)
-//! and hand those exact paths to the linker.
+//! The whole C++ world here — perfetto and its C/C++ shims — is compiled with
+//! Zig's bundled libc++ (`zig c++`), and there is no system libc++. So rather
+//! than guess, we ask `zig c++ -v` which libc++/libc++abi/libunwind archives it
+//! links for this target and hand those exact paths to the linker. Those Zig
+//! runtime archives also carry the compiler_rt builtins the shims need, so no
+//! separate Zig staticlib is required.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,28 +21,17 @@ fn main() {
         .to_path_buf();
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    // Drive the Zig build so `cargo build` alone produces everything: the
-    // compiler_rt archive we link and the sismo-run cap launcher. Zig caches,
-    // so this is cheap when nothing changed. Reruns when any Zig source or
-    // build.zig changes.
-    zig_build(&root, &["sismo-staticlib"]);
-    zig_build(&root, &[]);
-    println!("cargo:rerun-if-changed={}", root.join("src").display());
-    println!("cargo:rerun-if-changed={}", root.join("build.zig").display());
+    println!("cargo:rerun-if-changed={}", root.join("src/c").display());
 
     // Perfetto's C++ SDK archive + generated headers. Built directly (ninja is
-    // incremental, so this is cheap once built) rather than as a side effect of
-    // the Zig build. compile_cc_shims + the final link both need it.
+    // incremental, so this is cheap once built). compile_cc_shims + the final
+    // link both need it.
     build_perfetto(&root);
 
     // The Perfetto C/C++ glue (producer/consumer/traced shims + the sample-
-    // target TrackEvent shim). Compiled with `zig c++` — matching the libc++
-    // Perfetto was built with — rather than by build.zig.
+    // target TrackEvent shim). Compiled with `zig c++`, matching the libc++
+    // Perfetto was built with.
     compile_cc_shims(&root, &out);
-
-    // libsismo_zig.a (Zig code + compiler_rt).
-    println!("cargo:rustc-link-search=native={}", root.join("zig-out/lib").display());
-    println!("cargo:rustc-link-lib=static=sismo_zig");
 
     // Perfetto C++ SDK archive.
     let pf = root.join("third_party/src/perfetto/out/sismo");
@@ -114,9 +104,9 @@ fn build_heap_preload(root: &PathBuf) {
 }
 
 /// Compile the Perfetto C/C++ glue shims with `zig c++` and archive them into
-/// libsismo_cc_shims.a. Uses Zig's libc++ (what Perfetto was built with);
-/// compiler_rt refs (__zig_probe_stack, …) resolve against libsismo_zig.a at
-/// the final link. ubsan is off so there's no __ubsan_handle_* runtime dep.
+/// libsismo_cc_shims.a. Uses Zig's libc++ (what Perfetto was built with); its
+/// runtime archives (linked via discover_cxx_runtime) carry the compiler_rt
+/// builtins. ubsan is off so there's no __ubsan_handle_* runtime dep.
 fn compile_cc_shims(root: &PathBuf, out: &PathBuf) {
     let target = std::env::var("TARGET").unwrap();
     let is_macos = target.contains("apple-darwin");
@@ -216,18 +206,6 @@ fn build_perfetto(root: &PathBuf) {
         .status()
         .expect("run tools/build-perfetto");
     assert!(status.success(), "perfetto build failed");
-}
-
-/// Run `zig build <steps>` via the pinned hermetic toolchain.
-fn zig_build(root: &PathBuf, steps: &[&str]) {
-    let mut cmd = Command::new("python3");
-    cmd.current_dir(root) // build.zig lives at the repo root
-        .arg(root.join("tools/zig"))
-        .arg("--hermetic")
-        .arg("build");
-    cmd.args(steps);
-    let status = cmd.status().expect("run zig build");
-    assert!(status.success(), "zig build {steps:?} failed");
 }
 
 /// Compile+link a tiny libc++-using program with `zig c++ -v` and scrape the
