@@ -227,10 +227,9 @@ fn addUnixPipeline(
         target_step.dependOn(&b.addInstallArtifact(target_exe, .{}).step);
     }
 
-    // Heap preload dylib — macOS only. Now built from the Rust cdylib
-    // (heap-preload/) and installed to zig-out/lib/libsismo_heap.dylib by
-    // rust-host/build.rs; see src/heap_preload_macos.zig (retired). The Linux
-    // analog (LD_PRELOAD + GLIBC malloc hooks) is P5.
+    // Heap preload dylib (macOS) is now the Rust cdylib heap-preload/,
+    // installed to zig-out/lib/libsismo_heap.dylib by rust-host/build.rs.
+    // The Linux analog (LD_PRELOAD + GLIBC malloc hooks) is a later pillar.
 
     // -------------------------------------------------------------------------
     // libsismo_zig.a — the Zig + C/C++ half of sismo as a static archive. The
