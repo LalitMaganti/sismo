@@ -23,7 +23,9 @@ use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
 use sismo_core::proto::session_config::{sismo_encode_trace_config, DataSourceEntryC};
 #[cfg(target_os = "macos")]
 use sismo_core::proto::sismo_config::{sismo_config_cpu_encode, sismo_config_heap_encode, sismo_config_sched_encode};
-use sismo_core::sismo_paths::{sismo_acquire_session_lock, sismo_release_session_lock, CONSUMER_SOCK, PRODUCER_SOCK};
+use sismo_core::sismo_paths::{
+    acquire_session_lock, release_session_lock, LockError, CONSUMER_SOCK, PRODUCER_SOCK,
+};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -343,15 +345,17 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
 
     // Single-session lock (held for the recording's lifetime).
-    let lock_fd = sismo_acquire_session_lock(unsafe { getpid() });
-    if lock_fd == -2 {
-        eprintln!("sismo record: another sismo session is already running (lock held on /tmp/sismo.lock)");
-        return 0;
-    }
-    if lock_fd < 0 {
-        eprintln!("sismo record: failed to open session lock at /tmp/sismo.lock");
-        return 0;
-    }
+    let lock_fd = match acquire_session_lock(unsafe { getpid() }) {
+        Ok(fd) => fd,
+        Err(LockError::Held) => {
+            eprintln!("sismo record: another sismo session is already running (lock held on /tmp/sismo.lock)");
+            return 0;
+        }
+        Err(LockError::Open) => {
+            eprintln!("sismo record: failed to open session lock at /tmp/sismo.lock");
+            return 0;
+        }
+    };
 
     let my_pid = unsafe { getpid() };
     eprintln!(
@@ -366,7 +370,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     let svc = unsafe { sismo_traced_create(prod_c.as_ptr(), cons_c.as_ptr()) };
     if svc.is_null() {
         eprintln!("sismo record: traced_create failed");
-        sismo_release_session_lock(lock_fd);
+        release_session_lock(lock_fd);
         return 0;
     }
     unsafe { sismo_init(prod_c.as_ptr()) };
@@ -673,7 +677,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
     unsafe { sismo_traced_stop(svc) };
     unsafe { sismo_traced_destroy(svc) };
-    sismo_release_session_lock(lock_fd);
+    release_session_lock(lock_fd);
     0
 }
 
@@ -703,7 +707,7 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
         sismo_traced_stop(svc);
         sismo_traced_destroy(svc);
     }
-    sismo_release_session_lock(lock_fd);
+    release_session_lock(lock_fd);
 }
 
 // ---- Linux record runner ---------------------------------------------------
@@ -748,15 +752,17 @@ fn run_linux(config: &RecordConfig) -> c_int {
         }
     };
 
-    let lock_fd = sismo_acquire_session_lock(unsafe { getpid() });
-    if lock_fd == -2 {
-        eprintln!("sismo record: another sismo session is already running (lock held on /tmp/sismo.lock)");
-        return 0;
-    }
-    if lock_fd < 0 {
-        eprintln!("sismo record: failed to open session lock at /tmp/sismo.lock");
-        return 0;
-    }
+    let lock_fd = match acquire_session_lock(unsafe { getpid() }) {
+        Ok(fd) => fd,
+        Err(LockError::Held) => {
+            eprintln!("sismo record: another sismo session is already running (lock held on /tmp/sismo.lock)");
+            return 0;
+        }
+        Err(LockError::Open) => {
+            eprintln!("sismo record: failed to open session lock at /tmp/sismo.lock");
+            return 0;
+        }
+    };
 
     eprintln!(
         "sismo record: pid={} output={output_path_str}\n  producer sock: {PRODUCER_SOCK}\n  consumer sock: {CONSUMER_SOCK}",
@@ -771,7 +777,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     let svc = unsafe { sismo_traced_create(prod_c.as_ptr(), cons_c.as_ptr()) };
     if svc.is_null() {
         eprintln!("sismo record: traced_create failed");
-        sismo_release_session_lock(lock_fd);
+        release_session_lock(lock_fd);
         return 0;
     }
     unsafe { sismo_init(prod_c.as_ptr()) };
@@ -1004,6 +1010,6 @@ fn run_linux(config: &RecordConfig) -> c_int {
     unsafe { sismo_consumer_session_destroy(session) };
     stop_probes(probes);
     unsafe { sismo_traced_stop(svc) };
-    sismo_release_session_lock(lock_fd);
+    release_session_lock(lock_fd);
     0
 }
