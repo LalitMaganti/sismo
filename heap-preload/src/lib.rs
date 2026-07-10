@@ -17,5 +17,7 @@
 //! first with tests; the ring/protocol server side, the interposer, and the
 //! build swap follow.
 
+pub mod protocol;
+pub mod ring;
 pub mod sampler;
 pub mod wire;
