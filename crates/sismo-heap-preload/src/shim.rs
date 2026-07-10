@@ -256,7 +256,7 @@ extern "C" fn sismo_malloc_shim(size: usize) -> *mut c_void {
                 let snapshot_dst = slot.add(std::mem::size_of::<AllocMetadata>());
                 std::ptr::copy_nonoverlapping(user_sp as *const u8, snapshot_dst, STACK_SNAPSHOT_BYTES);
             }
-            rb.end_write(slot, payload_size);
+            unsafe { rb.end_write(slot, payload_size) };
             G_EMITTED.fetch_add(1, Ordering::Relaxed);
         } else {
             G_DROPPED.fetch_add(1, Ordering::Relaxed);

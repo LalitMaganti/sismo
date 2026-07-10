@@ -190,7 +190,11 @@ impl RingBuffer {
     }
 
     /// Publish the record (release-store of the size header).
-    pub fn end_write(&self, payload: *mut u8, payload_size: usize) {
+    ///
+    /// # Safety
+    /// `payload` must be a pointer returned by `begin_write` on this ring that
+    /// has not yet been published, and `payload_size` must match that call.
+    pub unsafe fn end_write(&self, payload: *mut u8, payload_size: usize) {
         let size_field = unsafe { payload.sub(HEADER_BYTES as usize) as *const AtomicU32 };
         unsafe { &*size_field }.store(payload_size as u32, Ordering::Release);
     }
@@ -280,7 +284,7 @@ mod tests {
         let slot = rb.begin_write(payload.len());
         assert!(!slot.is_null());
         unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), slot, payload.len()) };
-        rb.end_write(slot, payload.len());
+        unsafe { rb.end_write(slot, payload.len()) };
 
         let (ptr, len) = rb.begin_read().expect("a record");
         assert_eq!(len, payload.len());
