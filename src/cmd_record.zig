@@ -45,8 +45,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const traced = @import("sismo_traced.zig");
-const heap_protocol = @import("heap_protocol.zig");
-const sismo_config = @import("sismo_config.zig");
 const paths = @import("sismo_paths.zig");
 // Privileged-pid marker encoder + file-append now lives in Rust
 // (rust-bridge/src/privileged_marker.rs).
