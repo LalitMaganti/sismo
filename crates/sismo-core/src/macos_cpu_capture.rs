@@ -73,10 +73,9 @@ unsafe fn thread_kernel_tid(thread: MachPort) -> u64 {
     read_u64(&buf, 0) // thread_id
 }
 
-// Producer C ABI + the worker Event live in the shared worker_sdk module.
-use crate::worker_sdk::{
-    sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done, Event,
-};
+// Producer C ABI lives in ffi; the worker Event in worker_sdk.
+use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
+use crate::worker_sdk::Event;
 
 // The rest of the pipeline is already Rust — call the sibling modules directly
 // (no FFI round-trip): descriptor encoding, unwinder lifecycle, module loading,

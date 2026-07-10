@@ -6,11 +6,12 @@
 //! init, the in-process `traced` + `traced_probes` services, and the consumer
 //! session.
 //!
-//! The data-plane producer ABI (`sismo_ds_*`, the per-packet emit path) lives
-//! in [`crate::worker_sdk`] alongside the data-source trampolines it belongs
-//! with; the snapshot clone ABI lives in [`crate::cmd_snapshot`]. Both keep
-//! their own `#[cfg(test)]` stubs so the standalone test binary links without
-//! the shim.
+//! The data-plane producer ABI (`sismo_ds_*`, the per-packet emit path) and its
+//! data-source callback types live below; the snapshot clone ABI lives in
+//! [`crate::cmd_snapshot`], which keeps its own `#[cfg(test)]` stub. The
+//! `#[cfg(test)]` stubs here let the standalone test binary link without the
+//! C++ shim. [`crate::worker_sdk`] holds the `Event` primitive the workers pair
+//! with this ABI.
 
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -58,3 +59,55 @@ extern "C" {
         written: *mut usize,
     ) -> c_int;
 }
+
+// ---- Data-plane producer ABI (per data-source emit path) -------------------
+
+/// Data-source lifecycle callbacks (invoked by the SDK on its IO thread).
+pub type OnSetup = extern "C" fn(*mut c_void, *const c_void, usize);
+pub type OnStart = extern "C" fn(*mut c_void);
+pub type OnStop = extern "C" fn(*mut c_void, *mut c_void);
+pub type OnFlush = extern "C" fn(*mut c_void, *mut c_void);
+
+#[cfg(not(test))]
+extern "C" {
+    pub fn sismo_ds_register(
+        desc_bytes: *const u8,
+        desc_len: usize,
+        on_setup: OnSetup,
+        on_start: OnStart,
+        on_stop: OnStop,
+        on_flush: OnFlush,
+        user_arg: *mut c_void,
+    ) -> u32;
+    pub fn sismo_ds_emit(slot: u32, packet_bytes: *const u8, packet_len: usize);
+    pub fn sismo_stop_done(handle: *mut c_void);
+    pub fn sismo_flush_done(handle: *mut c_void);
+}
+
+// cargo test links the rlib standalone with no C++ shim; stub the producer ABI
+// (once, here) so the test binary resolves these #[no_mangle] symbols.
+#[cfg(test)]
+mod stubs {
+    use super::{OnFlush, OnSetup, OnStart, OnStop};
+    use std::os::raw::c_void;
+    #[no_mangle]
+    pub unsafe extern "C" fn sismo_ds_register(
+        _d: *const u8,
+        _dl: usize,
+        _s: OnSetup,
+        _st: OnStart,
+        _sp: OnStop,
+        _f: OnFlush,
+        _u: *mut c_void,
+    ) -> u32 {
+        u32::MAX
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn sismo_ds_emit(_slot: u32, _b: *const u8, _l: usize) {}
+    #[no_mangle]
+    pub unsafe extern "C" fn sismo_stop_done(_h: *mut c_void) {}
+    #[no_mangle]
+    pub unsafe extern "C" fn sismo_flush_done(_h: *mut c_void) {}
+}
+#[cfg(test)]
+pub use stubs::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};

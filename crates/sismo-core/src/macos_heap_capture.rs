@@ -46,9 +46,8 @@ use crate::symbolizer::{sismo_symbolizer_create, sismo_symbolizer_destroy, Symbo
 use crate::unwinder::{
     sismo_unwinder_create_arm64, sismo_unwinder_destroy, sismo_unwinder_walk_snapshot, Unwinder,
 };
-use crate::worker_sdk::{
-    sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done, Event,
-};
+use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
+use crate::worker_sdk::Event;
 
 const DS_NAME: &[u8] = b"sismo.heap";
 const U32_MAX: u32 = u32::MAX;

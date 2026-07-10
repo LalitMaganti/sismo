@@ -679,7 +679,7 @@ impl Interner {
 use crate::data_regions::DataRegions;
 use crate::proc_maps::ProcMaps;
 use crate::proto::{write_perf_defaults_packet, write_perf_sample};
-use crate::worker_sdk::sismo_ds_emit;
+use crate::ffi::sismo_ds_emit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // TracePacket / defaults field tags + constants (perfetto_proto.zig).
@@ -953,7 +953,7 @@ impl Capture {
 
 // ---- init / worker / DS lifecycle / C ABI ----------------------------------
 
-use crate::worker_sdk::{sismo_ds_register, sismo_flush_done, sismo_stop_done};
+use crate::ffi::{sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use std::ptr;
 use std::time::Duration;
 

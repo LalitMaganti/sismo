@@ -21,9 +21,8 @@ use crate::sched_protos::{
 };
 use crate::session_config::sismo_encode_data_source_descriptor;
 use crate::sismo_config::{sismo_config_extract, sismo_config_sched_decode};
-use crate::worker_sdk::{
-    sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done, Event,
-};
+use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
+use crate::worker_sdk::Event;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
