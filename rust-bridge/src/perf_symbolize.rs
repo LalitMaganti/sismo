@@ -128,26 +128,7 @@ extern "C" fn on_row(
 /// `ModuleSymbols` packets + the source/asm sidecar to the same file.
 /// Best-effort: any failure is logged and swallowed so a symbolization problem
 /// never loses a recording.
-///
-/// # Safety
-/// `trace_path_ptr` must be valid for `trace_path_len` UTF-8 bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_symbolize_trace(trace_path_ptr: *const u8, trace_path_len: usize) {
-    if trace_path_ptr.is_null() {
-        return;
-    }
-    let path_bytes = unsafe { std::slice::from_raw_parts(trace_path_ptr, trace_path_len) };
-    let trace_path = match std::str::from_utf8(path_bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            eprintln!("sismo record: symbolization skipped (non-utf8 path)");
-            return;
-        }
-    };
-    symbolize_trace_impl(&trace_path);
-}
-
-fn symbolize_trace_impl(trace_path: &str) {
+pub fn symbolize_trace(trace_path: &str) {
     let mut path_z: Vec<u8> = trace_path.as_bytes().to_vec();
     path_z.push(0);
 

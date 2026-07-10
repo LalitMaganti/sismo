@@ -765,8 +765,6 @@ extern "C" {
     fn sismo_traced_probes_create(producer_socket: *const c_char) -> *mut c_void;
     fn sismo_traced_probes_stop(svc: *mut c_void);
     fn sismo_traced_probes_destroy(svc: *mut c_void);
-
-    fn sismo_symbolize_trace(path: *const u8, path_len: usize);
 }
 
 #[cfg(target_os = "linux")]
@@ -1050,7 +1048,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
         }
         // Resolve BPF perf-sample frames to function names (appended offline).
         if had_bpf {
-            unsafe { sismo_symbolize_trace(output_path_str.as_ptr(), output_path_str.len()) };
+            crate::perf_symbolize::symbolize_trace(output_path_str);
         }
     }
 
