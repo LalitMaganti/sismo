@@ -17,9 +17,9 @@
 //! to the C++ shim; the symbolizer, disassembler, and proto writer are Rust
 //! siblings (direct calls, no FFI round-trip). POSIX-only (file append).
 
-use crate::symbolize::disasm::sismo_disasm_module;
-use crate::proto::ProtoWriter;
-use crate::symbolize::symbolizer::{
+use crate::disasm::sismo_disasm_module;
+use sismo_proto::ProtoWriter;
+use crate::symbolizer::{
     sismo_symbolizer_add_module, sismo_symbolizer_create, sismo_symbolizer_destroy,
     sismo_symbolizer_resolve, Symbolizer,
 };
@@ -39,7 +39,7 @@ const LINE_FIELD_FUNCTION_NAME: u32 = 1;
 const LINE_FIELD_SOURCE_FILE_NAME: u32 = 2;
 const LINE_FIELD_LINE_NUMBER: u32 = 3;
 
-// disasm arch tags (crate::symbolize::disasm).
+// disasm arch tags (crate::disasm).
 const ARCH_X86_64: u32 = 0;
 const ARCH_AARCH64: u32 = 1;
 

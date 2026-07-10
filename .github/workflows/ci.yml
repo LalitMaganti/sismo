@@ -44,6 +44,10 @@ jobs:
       - name: Unit tests (sismo-proto)
         run: python3 tools/cargo --hermetic test --manifest-path crates/sismo-proto/Cargo.toml
 
+      # sismo-symbolize is the framehop/wholesym/yaxpeax symbolization stack.
+      - name: Unit tests (sismo-symbolize)
+        run: python3 tools/cargo --hermetic test --manifest-path crates/sismo-symbolize/Cargo.toml
+
       - name: Unit tests (sismo-core)
         run: python3 tools/cargo --hermetic test --manifest-path crates/sismo-core/Cargo.toml
 

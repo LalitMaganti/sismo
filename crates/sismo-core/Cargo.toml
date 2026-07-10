@@ -19,19 +19,9 @@ codegen-units = 1
 
 [dependencies]
 sismo-proto = { path = "../sismo-proto" }
-framehop = { version = "0.16.0", default-features = false, features = ["macho"] }
-object = { version = "0.39.1", default-features = false, features = ["std", "read", "macho", "elf"] }
-tokio = { version = "1.52.1", features = ["rt"] }
-uuid = "1.23.1"
-clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
+sismo-symbolize = { path = "../sismo-symbolize" }
 # POSIX/libc bindings, so the callouts aren't hand-declared per file.
 libc = "0.2"
-wholesym = "0.8.1"
-# Disassembly for the source/asm view. Pure-Rust decoders so they link into the
-# staticlib with no C dependency (capstone would need extra link wiring).
-yaxpeax-arch = "0.3"
-yaxpeax-x86 = "2"
-yaxpeax-arm = "0.3"
 
 # perf_event_open ABI (structs + syscall) for the Linux BPF CPU collector.
 [target.'cfg(target_os = "linux")'.dependencies]
