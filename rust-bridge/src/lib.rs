@@ -5,6 +5,9 @@
 //! wholesym symbolizer) to Zig over a cargo→staticlib→Zig link.
 
 pub mod cli;
+// `sismo record` macOS runner (spawn/attach + traced + session + watch threads).
+#[cfg(target_os = "macos")]
+pub mod cmd_record;
 // `sismo datasource` subcommand (daemonized privileged producer). POSIX-only.
 #[cfg(not(target_os = "windows"))]
 pub mod cmd_datasource;

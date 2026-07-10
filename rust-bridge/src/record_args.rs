@@ -106,8 +106,8 @@ pub unsafe extern "C" fn sismo_parse_duration_seconds(s: *const u8, s_len: usize
 // ===========================================================================
 
 // SourceMode wire values (match cmd_record.zig SourceMode ordering).
-const MODE_IN_PROCESS: u8 = 0;
-const MODE_EXTERNAL: u8 = 1;
+pub(crate) const MODE_IN_PROCESS: u8 = 0;
+pub(crate) const MODE_EXTERNAL: u8 = 1;
 const MODE_OFF: u8 = 2;
 
 // NUL-terminated so `output_path_ptr` is usable as a C string (the Zig runner
@@ -209,7 +209,7 @@ fn next_value<'a>(args: &[&'a str], i: &mut usize, missing: &str) -> Option<&'a 
 /// Parse `sismo record` args (macOS). `args` is argv[2..] (after exe +
 /// "record"); `base` is the absolute argv index of args[0] (i.e. 2). Fills
 /// `out` and returns true to proceed, or false if help / an error was printed.
-fn parse_record_args(args: &[&str], base: usize, out: &mut RecordArgsC) -> bool {
+pub(crate) fn parse_record_args(args: &[&str], base: usize, out: &mut RecordArgsC) -> bool {
     *out = RecordArgsC::default();
     out.workload_start = base + args.len(); // none, unless a workload is found
 

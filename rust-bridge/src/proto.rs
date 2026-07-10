@@ -77,6 +77,121 @@ impl Default for ProtoWriter {
     }
 }
 
+/// The value of a single protobuf field, borrowed from the source buffer.
+pub enum WireValue<'a> {
+    Varint(u64),
+    Fixed64([u8; 8]),
+    Len(&'a [u8]),
+    Fixed32([u8; 4]),
+}
+
+/// Iterator over the fields of a protobuf message: yields `(field_number,
+/// WireValue)` for each field in order. Malformed/truncated input simply ends
+/// iteration (no panic). Nest by calling `ProtoReader::new` on a `Len` payload.
+pub struct ProtoReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ProtoReader<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn read_varint(&mut self) -> Option<u64> {
+        let mut value: u64 = 0;
+        let mut shift: u32 = 0;
+        while self.pos < self.buf.len() {
+            let b = self.buf[self.pos];
+            self.pos += 1;
+            value |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+            if shift >= 64 {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
+        Some(s)
+    }
+}
+
+impl<'a> Iterator for ProtoReader<'a> {
+    type Item = (u32, WireValue<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let tag = self.read_varint()?;
+        let field = (tag >> 3) as u32;
+        let value = match tag & 0x07 {
+            0 => WireValue::Varint(self.read_varint()?),
+            1 => WireValue::Fixed64(self.take(8)?.try_into().ok()?),
+            2 => {
+                let len = self.read_varint()? as usize;
+                WireValue::Len(self.take(len)?)
+            }
+            5 => WireValue::Fixed32(self.take(4)?.try_into().ok()?),
+            _ => return None, // unknown wire type — stop
+        };
+        Some((field, value))
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    #[test]
+    fn reads_back_what_the_writer_wrote() {
+        let mut w = ProtoWriter::new();
+        w.write_uint64(1, 150);
+        w.write_string(2, b"hi");
+        w.write_uint32(3, 7);
+        let mut seen = vec![];
+        for (f, v) in ProtoReader::new(w.bytes()) {
+            match (f, v) {
+                (1, WireValue::Varint(n)) => seen.push(format!("v1={n}")),
+                (2, WireValue::Len(s)) => seen.push(format!("s2={}", std::str::from_utf8(s).unwrap())),
+                (3, WireValue::Varint(n)) => seen.push(format!("v3={n}")),
+                _ => panic!("unexpected field"),
+            }
+        }
+        assert_eq!(seen, vec!["v1=150", "s2=hi", "v3=7"]);
+    }
+
+    #[test]
+    fn nested_messages_and_truncation() {
+        let mut inner = ProtoWriter::new();
+        inner.write_string(1, b"name");
+        let mut outer = ProtoWriter::new();
+        outer.write_message(2, inner.bytes());
+        let mut names = vec![];
+        for (f, v) in ProtoReader::new(outer.bytes()) {
+            if let (2, WireValue::Len(msg)) = (f, v) {
+                for (f2, v2) in ProtoReader::new(msg) {
+                    if let (1, WireValue::Len(s)) = (f2, v2) {
+                        names.push(s.to_vec());
+                    }
+                }
+            }
+        }
+        assert_eq!(names, vec![b"name".to_vec()]);
+        // Truncated input ends iteration without panicking.
+        let count = ProtoReader::new(&[0x0a, 0x05, 0x01]).count(); // len=5 but only 1 byte
+        assert_eq!(count, 0);
+    }
+}
+
 /// A borrowed byte string passed across FFI (e.g. a follower counter name).
 #[repr(C)]
 pub struct SismoStr {
