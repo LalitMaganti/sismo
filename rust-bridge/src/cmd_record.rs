@@ -334,10 +334,10 @@ pub unsafe extern "C" fn sismo_run_record_macos(argc: usize, argv: *const *const
     let all: Vec<&str> = (0..argc)
         .map(|i| unsafe { CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
         .collect();
-    let (args, base): (&[&str], usize) = if all.len() > 2 { (&all[2..], 2) } else { (&[], all.len()) };
+    let args: &[&str] = if all.len() > 2 { &all[2..] } else { &[] };
 
     let mut rc = RecordArgsC::default();
-    if !parse_record_args(args, base, &mut rc) {
+    if !parse_record_args(args, all.len(), &mut rc) {
         return 0; // help / error already printed
     }
     run(&all, &rc)
