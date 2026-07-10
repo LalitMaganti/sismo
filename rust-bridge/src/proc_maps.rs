@@ -5,18 +5,15 @@
 //! (module, file-offset). Only executable, file-backed mappings are kept —
 //! those are the ones a PC can land in and that a symbolizer can resolve.
 //!
-//! Port of the former src/linux_proc_maps.zig. The file-offset convention is
-//! unchanged: for a PC inside mapping `m`, `pc - m.start + m.offset` is the
-//! byte offset into the backing file, and `base_avma` is the avma of the
-//! file's lowest mapping (the image base), so `pc - base_avma` is the
-//! image-relative address symbol lookup wants for PIE and non-PIE alike.
+//! The file-offset convention: for a PC inside mapping `m`, `pc - m.start +
+//! m.offset` is the byte offset into the backing file, and `base_avma` is the
+//! avma of the file's lowest mapping (the image base), so `pc - base_avma` is
+//! the image-relative address symbol lookup wants for PIE and non-PIE alike.
 //!
-//! C ABI: `sismo_proc_maps_parse(pid)` -> opaque handle; `..._find(addr)`
-//! fills a [`SismoMapping`] whose `path`/`build_id` pointers borrow the
-//! handle and stay valid until `..._destroy`.
+//! [`ProcMaps::parse`] returns an owned handle; [`ProcMaps::find`] borrows a
+//! [`Mapping`] out of it.
 
 use std::collections::HashMap;
-use std::os::raw::c_int;
 use std::os::unix::fs::FileExt;
 
 /// One parsed maps line. Non-exec lines are retained (flagged) because a
@@ -30,26 +27,31 @@ struct Line<'a> {
 }
 
 /// A kept (executable, file-backed) mapping with its file's resolved
-/// build-id and base avma. Owns its `path`/`build_id` so the handle can hand
-/// out borrowed pointers over FFI.
-struct Mapping {
-    start: u64,
-    end: u64,
-    offset: u64,
-    base_avma: u64,
-    path: String,
-    build_id: Vec<u8>,
+/// build-id and base avma.
+pub struct Mapping {
+    pub start: u64,
+    pub end: u64,
+    pub offset: u64,
+    pub base_avma: u64,
+    pub path: String,
+    pub build_id: Vec<u8>,
 }
 
-/// Opaque handle. `mappings` stays in ascending `start` order (the kernel
-/// emits /proc/maps sorted, and the parse preserves that order), so [`find`]
-/// can binary-search.
+/// Parsed `/proc/<pid>/maps`. `mappings` stays in ascending `start` order (the
+/// kernel emits /proc/maps sorted, and the parse preserves that order), so
+/// [`ProcMaps::find`] can binary-search.
 pub struct ProcMaps {
     mappings: Vec<Mapping>,
 }
 
 impl ProcMaps {
-    fn find(&self, addr: u64) -> Option<&Mapping> {
+    /// Parse `/proc/<pid>/maps`, or None on failure.
+    pub fn parse(pid: u32) -> Option<ProcMaps> {
+        from_pid(pid)
+    }
+
+    /// The executable file-backed mapping containing `addr`, if any.
+    pub fn find(&self, addr: u64) -> Option<&Mapping> {
         let mut lo = 0usize;
         let mut hi = self.mappings.len();
         while lo < hi {
@@ -259,72 +261,6 @@ fn fnv1a64(bytes: &[u8], basis: u64) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
-}
-
-/// Mapping view handed across FFI. `path`/`build_id` borrow the handle and
-/// are valid until `sismo_proc_maps_destroy`.
-#[repr(C)]
-pub struct SismoMapping {
-    pub start: u64,
-    pub end: u64,
-    pub offset: u64,
-    pub base_avma: u64,
-    pub path: *const u8,
-    pub path_len: usize,
-    pub build_id: *const u8,
-    pub build_id_len: usize,
-}
-
-/// Parse `/proc/<pid>/maps`. Returns an opaque handle, or null on failure.
-#[unsafe(no_mangle)]
-pub extern "C" fn sismo_proc_maps_parse(pid: u32) -> *mut ProcMaps {
-    match from_pid(pid) {
-        Some(m) => Box::into_raw(Box::new(m)),
-        None => std::ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_proc_maps_destroy(p: *mut ProcMaps) {
-    if p.is_null() {
-        return;
-    }
-    drop(unsafe { Box::from_raw(p) });
-}
-
-/// Fill `*out` with the executable file-backed mapping containing `addr`.
-/// Returns 1 if found, 0 otherwise (`*out` untouched on 0).
-///
-/// # Safety
-/// `p` must be a handle from `sismo_proc_maps_parse`; `out` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_proc_maps_find(
-    p: *const ProcMaps,
-    addr: u64,
-    out: *mut SismoMapping,
-) -> c_int {
-    if p.is_null() || out.is_null() {
-        return 0;
-    }
-    let maps = unsafe { &*p };
-    match maps.find(addr) {
-        Some(m) => {
-            unsafe {
-                *out = SismoMapping {
-                    start: m.start,
-                    end: m.end,
-                    offset: m.offset,
-                    base_avma: m.base_avma,
-                    path: m.path.as_ptr(),
-                    path_len: m.path.len(),
-                    build_id: m.build_id.as_ptr(),
-                    build_id_len: m.build_id.len(),
-                };
-            }
-            1
-        }
-        None => 0,
-    }
 }
 
 #[cfg(test)]

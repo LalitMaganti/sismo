@@ -4,31 +4,36 @@
 //! `/proc/<pid>/maps` reader for turning a sampled *data* address into the
 //! memory region it landed in — the cache focus's data-side attribution.
 //!
-//! Port of the former src/data_regions.zig. Unlike proc_maps (which keeps only
-//! executable file-backed mappings), this keeps *every* mapping and labels it:
+//! Unlike proc_maps (which keeps only executable file-backed mappings), this
+//! keeps *every* mapping and labels it:
 //!   - file-backed → the file's basename ("libc.so.6")
 //!   - "[heap]"/"[stack]"/"[vdso]"/… → kept verbatim
 //!   - anonymous → "[anon]"
 //!
-//! C ABI: `sismo_data_regions_parse(pid)` -> opaque handle; `..._find(addr)`
-//! fills a [`SismoRegion`] whose `label` borrows the handle until `..._destroy`.
+//! [`DataRegions::parse`] returns an owned handle; [`DataRegions::find`]
+//! borrows a [`Region`] out of it.
 
-use std::os::raw::c_int;
-
-struct Region {
-    start: u64,
-    end: u64,
-    label: String,
+pub struct Region {
+    pub start: u64,
+    pub end: u64,
+    pub label: String,
 }
 
-/// Opaque handle. `regions` stays in ascending `start` order (kernel emits
-/// /proc/maps sorted; the parse preserves it), so [`find`] can binary-search.
+/// Parsed `/proc/<pid>/maps`. `regions` stays in ascending `start` order
+/// (kernel emits /proc/maps sorted; the parse preserves it), so
+/// [`DataRegions::find`] can binary-search.
 pub struct DataRegions {
     regions: Vec<Region>,
 }
 
 impl DataRegions {
-    fn find(&self, addr: u64) -> Option<&Region> {
+    /// Parse `/proc/<pid>/maps`, or None on failure.
+    pub fn parse(pid: u32) -> Option<DataRegions> {
+        from_pid(pid)
+    }
+
+    /// The region containing `addr`, if any.
+    pub fn find(&self, addr: u64) -> Option<&Region> {
         let mut lo = 0usize;
         let mut hi = self.regions.len();
         while lo < hi {
@@ -87,64 +92,6 @@ fn from_pid(pid: u32) -> Option<DataRegions> {
     let raw = std::fs::read(format!("/proc/{pid}/maps")).ok()?;
     let raw = String::from_utf8_lossy(&raw);
     Some(DataRegions { regions: parse_text(&raw) })
-}
-
-/// Region view handed across FFI. `label` borrows the handle and is valid
-/// until `sismo_data_regions_destroy`.
-#[repr(C)]
-pub struct SismoRegion {
-    pub start: u64,
-    pub end: u64,
-    pub label: *const u8,
-    pub label_len: usize,
-}
-
-/// Parse `/proc/<pid>/maps`. Returns an opaque handle, or null on failure.
-#[unsafe(no_mangle)]
-pub extern "C" fn sismo_data_regions_parse(pid: u32) -> *mut DataRegions {
-    match from_pid(pid) {
-        Some(r) => Box::into_raw(Box::new(r)),
-        None => std::ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_data_regions_destroy(p: *mut DataRegions) {
-    if p.is_null() {
-        return;
-    }
-    drop(unsafe { Box::from_raw(p) });
-}
-
-/// Fill `*out` with the region containing `addr`. Returns 1 if found, 0
-/// otherwise (`*out` untouched on 0).
-///
-/// # Safety
-/// `p` must be a handle from `sismo_data_regions_parse`; `out` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_data_regions_find(
-    p: *const DataRegions,
-    addr: u64,
-    out: *mut SismoRegion,
-) -> c_int {
-    if p.is_null() || out.is_null() {
-        return 0;
-    }
-    let regions = unsafe { &*p };
-    match regions.find(addr) {
-        Some(r) => {
-            unsafe {
-                *out = SismoRegion {
-                    start: r.start,
-                    end: r.end,
-                    label: r.label.as_ptr(),
-                    label_len: r.label.len(),
-                };
-            }
-            1
-        }
-        None => 0,
-    }
 }
 
 #[cfg(test)]

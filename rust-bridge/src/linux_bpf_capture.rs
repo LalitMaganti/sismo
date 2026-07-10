@@ -679,13 +679,8 @@ impl Interner {
 
 // ---- Capture: the collector object (output half) ---------------------------
 
-use crate::data_regions::{
-    sismo_data_regions_destroy, sismo_data_regions_find, sismo_data_regions_parse, DataRegions,
-    SismoRegion,
-};
-use crate::proc_maps::{
-    sismo_proc_maps_destroy, sismo_proc_maps_find, sismo_proc_maps_parse, ProcMaps, SismoMapping,
-};
+use crate::data_regions::DataRegions;
+use crate::proc_maps::ProcMaps;
 use crate::proto::{sismo_encode_perf_defaults_packet, sismo_encode_perf_sample, SismoStr};
 use crate::worker_sdk::sismo_ds_emit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -709,7 +704,7 @@ pub struct Capture {
     acc: HashMap<u32, u64>, // tid -> latest cumulative cpu-cycles
     samples: u64,
     target_pid: u32,
-    maps: *mut ProcMaps, // null = not parsed
+    maps: Option<ProcMaps>, // None = not parsed
     maps_tried: bool,
     last_maps_ns: u64,
     interner: Interner,
@@ -717,7 +712,7 @@ pub struct Capture {
     counters: Vec<Counter>,
     active_slots: Vec<u8>, // indices into `counters`; [0] is the timebase
     focus: Option<FocusPreset>,
-    data_regions: *mut DataRegions,
+    data_regions: Option<DataRegions>,
     last_data_parse_ns: u64,
     data_frames: u64,
     sampler_precise_ip: u8,
@@ -734,7 +729,7 @@ impl Capture {
             return;
         }
         self.maps_tried = true;
-        self.maps = unsafe { sismo_proc_maps_parse(self.target_pid) };
+        self.maps = ProcMaps::parse(self.target_pid);
         self.last_maps_ns = now_ns;
     }
 
@@ -743,14 +738,9 @@ impl Capture {
             return;
         }
         self.last_maps_ns = now_ns;
-        let fresh = unsafe { sismo_proc_maps_parse(self.target_pid) };
-        if fresh.is_null() {
-            return;
+        if let Some(fresh) = ProcMaps::parse(self.target_pid) {
+            self.maps = Some(fresh);
         }
-        if !self.maps.is_null() {
-            unsafe { sismo_proc_maps_destroy(self.maps) };
-        }
-        self.maps = fresh;
     }
 
     /// Resolve a data address to its memory-region label (owned copy).
@@ -758,26 +748,22 @@ impl Capture {
         if addr > USER_ADDR_MAX {
             return b"[kernel]".to_vec();
         }
-        if self.data_regions.is_null() {
-            self.data_regions = unsafe { sismo_data_regions_parse(self.target_pid) };
-            if self.data_regions.is_null() {
+        if self.data_regions.is_none() {
+            self.data_regions = DataRegions::parse(self.target_pid);
+            if self.data_regions.is_none() {
                 return b"[unmapped]".to_vec();
             }
             self.last_data_parse_ns = now_ns;
         }
-        let mut region: SismoRegion = unsafe { std::mem::zeroed() };
-        if unsafe { sismo_data_regions_find(self.data_regions, addr, &mut region) } != 0 {
-            return unsafe { std::slice::from_raw_parts(region.label, region.label_len) }.to_vec();
+        if let Some(r) = self.data_regions.as_ref().and_then(|dr| dr.find(addr)) {
+            return r.label.as_bytes().to_vec();
         }
         if now_ns.wrapping_sub(self.last_data_parse_ns) > 100_000_000 {
             self.last_data_parse_ns = now_ns;
-            let fresh = unsafe { sismo_data_regions_parse(self.target_pid) };
-            if !fresh.is_null() {
-                unsafe { sismo_data_regions_destroy(self.data_regions) };
-                self.data_regions = fresh;
-                if unsafe { sismo_data_regions_find(self.data_regions, addr, &mut region) } != 0 {
-                    return unsafe { std::slice::from_raw_parts(region.label, region.label_len) }
-                        .to_vec();
+            if let Some(fresh) = DataRegions::parse(self.target_pid) {
+                self.data_regions = Some(fresh);
+                if let Some(r) = self.data_regions.as_ref().and_then(|dr| dr.find(addr)) {
+                    return r.label.as_bytes().to_vec();
                 }
             }
         }
@@ -790,7 +776,7 @@ impl Capture {
         let mut combined: Vec<u64> = Vec::new();
 
         self.ensure_maps(rec.hdr.ts);
-        if !self.maps.is_null() {
+        if self.maps.is_some() {
             let nr = (rec.hdr.nr_frames as usize).min(SISMO_MAX_STACK);
             let mut fids: Vec<u64> = Vec::new();
             let mut reparsed = false;
@@ -799,21 +785,25 @@ impl Capture {
                 if pc == 0 {
                     continue;
                 }
-                let mut mm: SismoMapping = unsafe { std::mem::zeroed() };
-                let mut found = unsafe { sismo_proc_maps_find(self.maps, pc, &mut mm) } != 0;
-                if !found && !reparsed {
+                // First lookup; on a miss, reparse once (the binary may have
+                // dlopen'd since) and retry. The reparse needs `&mut self.maps`,
+                // so this probe must not hold a borrow of it.
+                if self.maps.as_ref().and_then(|m| m.find(pc)).is_none() && !reparsed {
                     reparsed = true;
                     self.reparse_maps(rec.hdr.ts);
-                    found = unsafe { sismo_proc_maps_find(self.maps, pc, &mut mm) } != 0;
                 }
-                if !found {
+                let Some(m) = self.maps.as_ref().and_then(|mp| mp.find(pc)) else {
                     continue;
-                }
-                let path = unsafe { std::slice::from_raw_parts(mm.path, mm.path_len) };
-                let build_id = unsafe { std::slice::from_raw_parts(mm.build_id, mm.build_id_len) };
-                let mapping_iid = self
-                    .interner
-                    .intern_mapping(mm.start, mm.end, mm.offset, mm.base_avma, path, build_id, idw);
+                };
+                let mapping_iid = self.interner.intern_mapping(
+                    m.start,
+                    m.end,
+                    m.offset,
+                    m.base_avma,
+                    m.path.as_bytes(),
+                    &m.build_id,
+                    idw,
+                );
                 let frame_iid = self.interner.intern_frame(
                     FrameKey { mapping_iid, rel_pc: pc, name_iid: 0 },
                     idw,
@@ -1097,7 +1087,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         acc: HashMap::new(),
         samples: 0,
         target_pid: pid,
-        maps: ptr::null_mut(),
+        maps: None,
         maps_tried: false,
         last_maps_ns: 0,
         interner: Interner::new(),
@@ -1105,7 +1095,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         counters: Vec::new(),
         active_slots: Vec::new(),
         focus,
-        data_regions: ptr::null_mut(),
+        data_regions: None,
         last_data_parse_ns: 0,
         data_frames: 0,
         sampler_precise_ip: 0,
@@ -1340,12 +1330,7 @@ pub unsafe extern "C" fn sismo_linux_bpf_capture_shutdown(cap: *mut c_void, out:
     if !boxed.obj.is_null() {
         bpf_object__close(boxed.obj);
     }
-    if !boxed.maps.is_null() {
-        sismo_proc_maps_destroy(boxed.maps);
-    }
-    if !boxed.data_regions.is_null() {
-        sismo_data_regions_destroy(boxed.data_regions);
-    }
+    // maps / data_regions are owned Options — dropped with `boxed`.
 }
 
 #[no_mangle]
