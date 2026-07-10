@@ -1,14 +1,13 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Heap-profiler control channel, recorder side (migrated from
-//! heap_protocol_posix.zig). sismo connects to the target's per-PID Unix
-//! socket (`/tmp/sismo-heap-{pid}.sock`), which the heap-preload listener
-//! thread binds, and sends the shm ring fd (via SCM_RIGHTS) plus a fixed
-//! `AttachConfig` header. Detach = close the returned control fd (the preload
-//! sees EOF and goes dormant).
+//! Heap-profiler control channel, recorder side. sismo connects to the target's
+//! per-PID Unix socket (`/tmp/sismo-heap-{pid}.sock`), which the heap-preload
+//! listener thread binds, and sends the shm ring fd (via SCM_RIGHTS) plus a
+//! fixed `AttachConfig` header. Detach = close the returned control fd (the
+//! preload sees EOF and goes dormant).
 //!
-//! This is the recorder half; the target's Zig preload is the listener half,
+//! This is the recorder half; the target's heap-preload is the listener half,
 //! sharing this fixed wire (AttachConfig layout + the SCM_RIGHTS framing).
 //! macOS constants; the module is macOS-gated in lib.rs.
 
@@ -64,7 +63,7 @@ extern "C" {
 }
 
 /// First message sismo sends to the dormant client. Fixed 32 bytes, matching
-/// the Zig `AttachConfig` ABI.
+/// the `AttachConfig` ABI.
 #[repr(C)]
 pub struct AttachConfig {
     pub version: u32,

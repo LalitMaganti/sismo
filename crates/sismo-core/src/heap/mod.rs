@@ -1,8 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Heap profile assembly + serialization, migrated from heap_capture.zig's
-//! `buildTraceData` and heap_emit.zig.
+//! Heap profile assembly + serialization.
 //!
 //! Given the target's loaded images and the aggregated allocation sites (each a
 //! callstack of PCs plus its byte/count totals), this builds the Perfetto
@@ -13,7 +12,7 @@
 //! (timestamp + optional sequence_flags + payload field), as a heap buffer the
 //! caller emits via the C++ SDK shim and then frees with `sismo_heap_free`.
 //!
-//! Building the bytes here (rather than emitting) keeps rust-bridge free of the
+//! Building the bytes here (rather than emitting) keeps this module free of the
 //! C++ `sismo_ds_emit` symbol, so `cargo test` still links standalone.
 
 #[cfg(target_os = "macos")]
@@ -28,7 +27,7 @@ use crate::symbolize::symbolizer::{sismo_symbolizer_resolve, Symbolizer};
 use std::collections::HashMap;
 use std::slice;
 
-// ---- Field number constants (from heap_emit.zig / the vendored protos) ----
+// ---- Field number constants (from the vendored protos) --------------------
 
 // TracePacket
 const TP_CLOCK_SNAPSHOT: u32 = 6;
@@ -176,8 +175,7 @@ unsafe fn resolve_name(symbolizer: *mut Symbolizer, pc: u64) -> Vec<u8> {
     }
 }
 
-/// Build the interned tables from images + sites. Mirrors
-/// heap_capture.zig::buildTraceData exactly, including iid ordering (image
+/// Build the interned tables from images + sites, including iid ordering (image
 /// paths first in the string pool, then function names as unique PCs resolve).
 ///
 /// # Safety
@@ -277,8 +275,8 @@ unsafe fn build_trace_data(
 }
 
 /// Serialize a ProfilePacket payload from the interned tables. Field emission
-/// order matches heap_emit.zig (strings → mappings → frames → callstacks →
-/// process_dumps) so the wire bytes are identical.
+/// order is fixed (strings → mappings → frames → callstacks →
+/// process_dumps) so the wire bytes are deterministic.
 fn encode_profile_packet(
     pid: u32,
     sampling_interval: u64,

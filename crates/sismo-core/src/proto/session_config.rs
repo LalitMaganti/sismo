@@ -1,7 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Session-setup proto encoders, migrated from perfetto_proto.zig.
+//! Session-setup proto encoders.
 //!
 //! Two messages:
 //!   - `DataSourceDescriptor` (common/data_source_descriptor.proto) — each

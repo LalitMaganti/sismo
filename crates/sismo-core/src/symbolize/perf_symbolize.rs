@@ -1,8 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Post-record symbolization for `sismo record` (migrated whole from
-//! perf_symbolize.zig + source_asm_sidecar.zig).
+//! Post-record symbolization for `sismo record`.
 //!
 //! Reads the unsymbolized frames out of a finished trace (via the C++
 //! trace_processor shim `sismo_trace_query_unsymbolized`), resolves each
@@ -40,7 +39,7 @@ const LINE_FIELD_FUNCTION_NAME: u32 = 1;
 const LINE_FIELD_SOURCE_FILE_NAME: u32 = 2;
 const LINE_FIELD_LINE_NUMBER: u32 = 3;
 
-// disasm arch tags (rust-bridge/src/disasm.rs).
+// disasm arch tags (crate::symbolize::disasm).
 const ARCH_X86_64: u32 = 0;
 const ARCH_AARCH64: u32 = 1;
 
@@ -255,8 +254,7 @@ fn resolve(sym: *mut Symbolizer, avma: u64) -> Resolved {
 // ---- ModuleSymbols building ------------------------------------------------
 
 /// Build one ModuleSymbols message for `m`, or return an empty vec if no address
-/// resolved. Mirrors perf_symbolize.zig::buildModuleSymbols, including field
-/// order (path, build_id, then the repeated AddressSymbols).
+/// resolved. Field order (path, build_id, then the repeated AddressSymbols).
 fn build_module_symbols(
     sym: *mut Symbolizer,
     m: &Module,
@@ -662,7 +660,7 @@ fn hex_to_bytes<'a>(hex: &[u8], buf: &'a mut [u8]) -> &'a [u8] {
 }
 
 // ===========================================================================
-// Source-and-disassembly sidecar (migrated from source_asm_sidecar.zig).
+// Source-and-disassembly sidecar.
 //
 // THIS IS A HACK, in the same vein as sismo_privileged_marker. It bundles the
 // source-file text (and, via AsmRecord, a disassembly listing) for the sampled

@@ -1,10 +1,9 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! `sismo record` — the macOS unified recorder (migrated whole from
-//! cmd_record.zig::runRecordMacos + its helpers).
+//! `sismo record` — the unified recorder (macOS + Linux runners).
 //!
-//! Parses args (rust-bridge/src/record_args.rs), acquires the workload (spawn
+//! Parses args (record_args), acquires the workload (spawn
 //! with the heap-preload DYLD-inserted, or attach to a prepared pid), embeds
 //! the Perfetto `traced` service, registers the in-process capture workers
 //! (already-Rust sched/cpu/heap), builds + starts a consumer session, then
@@ -14,8 +13,7 @@
 //! marker, and tears everything down.
 //!
 //! The service + consumer session are the C++ shim (permanent); the captures,
-//! configs, session lock, and marker are Rust siblings (direct calls). The Zig
-//! runRecordLinux keeps its own copies of the shared helpers until P5.
+//! configs, session lock, and marker are Rust siblings (direct calls).
 //!
 //! macOS-only; gated in lib.rs. Validated by `sudo tools/e2e-all-sources`.
 
@@ -489,7 +487,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         }
     }
     if !sched.is_null() || sched_mode == SourceMode::External {
-        // ProtoVM DST for GenericKernelProcessTree (see the Zig comment).
+        // ProtoVM DST for GenericKernelProcessTree.
         entries.push(ds_sismo_vendor(b"sismo.macos_sched", sched_cfg, 4 * 1024));
         if sched_mode == SourceMode::External {
             external_names.push("sismo.macos_sched");
@@ -703,7 +701,7 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
     sismo_release_session_lock(lock_fd);
 }
 
-// ---- Linux record runner (P5: was runRecordLinux in cmd_record.zig) --------
+// ---- Linux record runner ---------------------------------------------------
 
 #[cfg(target_os = "linux")]
 use sismo_core::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, sismo_traced_probes_stop};

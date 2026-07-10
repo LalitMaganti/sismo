@@ -2,8 +2,7 @@
 // Licensed under the MIT License.
 
 //! `sismo datasource <id> [<id>...]` — daemonized producer hosting one or more
-//! sismo data sources in this single process (migrated whole from
-//! cmd_datasource.zig).
+//! sismo data sources in this single process.
 //!
 //! Connects to PERFETTO_PRODUCER_SOCK_NAME (set by whoever hosts traced —
 //! typically `sismo record` in privsep mode), registers each requested data

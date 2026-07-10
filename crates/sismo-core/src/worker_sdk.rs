@@ -2,16 +2,15 @@
 // Licensed under the MIT License.
 
 //! The `Event` primitive the in-process capture workers (cpu, sched, heap) use:
-//! a Condvar-backed manual-reset event mirroring Zig's std.Io.Event. The
-//! producer C ABI these workers emit through (`sismo_ds_*`) and its callback
-//! types live in [`crate::ffi`].
+//! a Condvar-backed manual-reset event. The producer C ABI these workers emit
+//! through (`sismo_ds_*`) and its callback types live in [`crate::ffi`].
 
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 /// Manual-reset event. Trampolines `set` to wake the worker; the worker
 /// `reset`s at the top of each loop and `wait`s/`wait_timeout`s at the bottom,
-/// so a `set` between reset and wait is not lost (mirrors std.Io.Event usage).
+/// so a `set` between reset and wait is not lost.
 pub struct Event {
     signaled: Mutex<bool>,
     cv: Condvar,

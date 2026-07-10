@@ -1,9 +1,9 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Shared-memory ring buffer — **preload (writer) side**. Port of the write
-//! half of heap_ring_posix.zig; the layout + algorithm are byte-identical to
-//! the recorder's `sismo-core/src/heap_ring.rs` (they share this shm), so the
+//! Shared-memory ring buffer — **preload (writer) side**. The layout +
+//! algorithm are byte-identical to the recorder's `heap::heap_ring` (they share
+//! this shm), so the
 //! two stay wire-compatible. Transitional duplication — a shared crate can
 //! unify them in P7.
 //!

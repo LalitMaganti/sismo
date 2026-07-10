@@ -1,9 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Shared-memory ring buffer for the heap profiler IPC (recorder side),
-//! migrated from heap_ring_posix.zig. Layout + algorithm follow heapprofd's
-//! `shared_ring_buffer`:
+//! Shared-memory ring buffer for the heap profiler IPC (recorder side). Layout
+//! + algorithm follow heapprofd's `shared_ring_buffer`:
 //!
 //!   [ MetadataPage (1 page) ][ data (ring_size) ][ data MIRROR (ring_size) ]
 //!
@@ -13,9 +12,8 @@
 //! publishes `size` last (release), the reader loads it (acquire); size 0 means
 //! "reserved, not yet published".
 //!
-//! This is the RECORDER side (create + read); the target's Zig heap-preload is
-//! the writer (attach + write). Both agree on this fixed shm layout, so the two
-//! stay wire-compatible while the preload remains Zig (P6). macOS-only.
+//! This is the RECORDER side (create + read); the target's heap-preload is the
+//! writer (attach + write). Both agree on this fixed shm layout. macOS-only.
 
 use std::os::raw::{c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -63,7 +61,7 @@ fn align_up(n: u64, a: u64) -> u64 {
 }
 
 /// Metadata page at offset 0 of the shm. Atomic fields are accessed from both
-/// processes; layout is ABI-stable (matches the Zig `MetadataPage`).
+/// processes; layout is ABI-stable (matches the preload's `MetadataPage`).
 #[repr(C)]
 struct MetadataPage {
     spinlock: AtomicU32,

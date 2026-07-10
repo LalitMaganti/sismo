@@ -1,15 +1,9 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Well-known filesystem paths + binary-relative resolution (migrated from the
-//! logic half of sismo_paths.zig). Session-lock acquire/release (flock), the
-//! recorder-pid read, and heap-dylib path resolution. The socket-path string
-//! constants stay in the Zig facade for now; those are stable literals, not
-//! logic. POSIX-only (flock + /tmp); the module is not built on Windows.
-//!
-//! Exposed over a small C ABI so the Zig `sismo_paths.zig` facade (which its 5
-//! CLI callers still use unchanged) forwards to it; that facade collapses as the
-//! cmd_* commands migrate to Rust (P4).
+//! Well-known filesystem paths + binary-relative resolution: session-lock
+//! acquire/release (flock), the recorder-pid read, and heap-dylib path
+//! resolution. POSIX-only (flock + /tmp); the module is not built on Windows.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -20,9 +14,7 @@ use std::os::unix::io::{AsRawFd, IntoRawFd};
 
 const SESSION_LOCK_PATH: &str = "/tmp/sismo.lock";
 
-// Well-known sockets the embedded `traced` hosts. Mirror the Zig
-// `sismo_paths.zig` literals during the CLI migration; the Zig copies retire
-// when the last Zig caller does.
+// Well-known sockets the embedded `traced` hosts.
 pub const PRODUCER_SOCK: &str = "/tmp/sismo-producer.sock";
 pub const CONSUMER_SOCK: &str = "/tmp/sismo-consumer.sock";
 
@@ -38,7 +30,7 @@ pub extern "C" fn sismo_acquire_session_lock(pid: c_int) -> c_int {
 
 fn acquire_at(path: &str, pid: c_int) -> c_int {
     // std handles the (variadic) open() ABI correctly, sidestepping the ARM64
-    // Darwin variadic-mode footgun the Zig version documents.
+    // Darwin variadic-mode footgun.
     let file = match OpenOptions::new()
         .read(true)
         .write(true)

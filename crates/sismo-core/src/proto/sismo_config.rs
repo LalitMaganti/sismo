@@ -1,14 +1,12 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Sismo data-source config wire format (migrated whole from
-//! src/sismo_config.zig). One encode + decode per producer
+//! Sismo data-source config wire format. One encode + decode per producer
 //! (macos_cpu_samples, heap, macos_sched), plus extraction of the config
 //! bytes from Perfetto's `DataSourceConfig`.
 //!
 //! All configs ride at vendor-extension field 2000 of `DataSourceConfig`.
-//! The Zig side (src/sismo_config.zig) is now a thin typed facade over these
-//! externs; every byte of wire logic lives here. See protos/sismo_config.proto.
+//! See protos/sismo_config.proto.
 
 use crate::proto::ProtoWriter;
 use std::slice;
@@ -112,8 +110,7 @@ pub unsafe extern "C" fn sismo_config_extract(
 // ---- Generic single-message varint decode ----------------------------------
 
 /// Walk a config message, invoking `f(field_num, value)` for each varint field
-/// and skipping others. Returns false on malformed input (matching the Zig
-/// decoder's `error.MalformedConfig`).
+/// and skipping others. Returns false on malformed input.
 fn decode_varint_fields(bytes: &[u8], mut f: impl FnMut(u64, u64)) -> bool {
     let mut i = 0usize;
     while i < bytes.len() {
@@ -259,8 +256,8 @@ pub unsafe extern "C" fn sismo_config_heap_decode(
 }
 
 // ---- sismo.macos_sched -----------------------------------------------------
-// Field: kernel_buffer_events = 1 (int32, encoded as the i64 sign-extension —
-// matching proto_writer semantics for a negative-capable int).
+// Field: kernel_buffer_events = 1 (int32, encoded as the i64 sign-extension so
+// negatives round-trip).
 
 /// # Safety
 /// `out` writable for `cap`.
@@ -272,8 +269,7 @@ pub unsafe extern "C" fn sismo_config_sched_encode(
 ) -> usize {
     let mut w = ProtoWriter::new();
     if kernel_buffer_events != 0 {
-        // int32 sign-extended to i64 then bit-cast to u64 (the Zig encoder's
-        // `@bitCast(@as(i64, value))`), so negatives round-trip.
+        // int32 sign-extended to i64 then bit-cast to u64, so negatives round-trip.
         w.write_uint64(1, (kernel_buffer_events as i64) as u64);
     }
     unsafe { emit(w.bytes(), out, cap) }

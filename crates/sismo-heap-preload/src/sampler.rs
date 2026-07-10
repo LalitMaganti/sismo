@@ -1,8 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Per-thread Poisson allocation sampler (port of heapprofd's `sampler.h`,
-//! from heap_preload_macos.zig).
+//! Per-thread Poisson allocation sampler (port of heapprofd's `sampler.h`).
 //!
 //! A per-thread countdown drawn from Exponential(1/interval) is decremented by
 //! each allocation's size; on crossing ≤ 0 the alloc is sampled with weight =

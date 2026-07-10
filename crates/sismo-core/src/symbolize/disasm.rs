@@ -3,9 +3,9 @@
 
 //! Disassembly FFI for the source/asm view. Given a binary path and the set of
 //! sampled addresses, finds each containing function in the ELF symbol table,
-//! reads its code bytes, and streams decoded instructions back to Zig via a
-//! callback — one call per instruction, tagged with the function's start address
-//! so the caller can group them.
+//! reads its code bytes, and streams decoded instructions back to the caller via
+//! a callback — one call per instruction, tagged with the function's start
+//! address so the caller can group them.
 //!
 //! The sampled `rel_pc`s arrive as absolute runtime virtual addresses (the same
 //! convention the wholesym symbolizer is fed). ELF symbol/section addresses, by
@@ -16,8 +16,8 @@
 //! avma to its link-time address before the lookup, then map decoded addresses
 //! back to avma so the caller's addresses still match the trace's `rel_pc`.
 //!
-//! Pure-Rust decoders (the yaxpeax family) so this links into the staticlib with
-//! no C dependency. The decode loop reads a `U8Reader` whose `total_offset()`
+//! Pure-Rust decoders (the yaxpeax family) so this links with no C dependency.
+//! The decode loop reads a `U8Reader` whose `total_offset()`
 //! delta gives each instruction's length.
 
 use std::collections::HashSet;

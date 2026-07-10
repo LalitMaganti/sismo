@@ -1,12 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Linux BPF CPU collector — the Rust port of src/linux_bpf_capture.zig (P5,
-//! the last big Zig piece). Per-thread PMU counters + timer-tick stack sampling,
+//! Linux BPF CPU collector. Per-thread PMU counters + timer-tick stack sampling,
 //! scoped to the workload, emitted as thread-scoped Perfetto PerfSamples.
-//!
-//! WORK IN PROGRESS: built up across iterations against the Zig as spec, wired
-//! in (and the Zig deleted) only once it passes the difftest trace case.
 
 #![allow(dead_code)]
 
@@ -56,7 +52,7 @@ pub struct SismoKsymRec {
     pub name: [c_char; SISMO_KSYM_NAME_MAX],
 }
 
-// ---- libbpf (system -lbpf, matching the Zig @cImport of bpf/libbpf.h) ------
+// ---- libbpf (system -lbpf, from bpf/libbpf.h) -----------------------------
 
 // Opaque libbpf handles.
 #[repr(C)]
@@ -119,7 +115,7 @@ extern "C" {
     pub fn libbpf_num_possible_cpus() -> c_int;
 }
 
-// ---- PMU counter selection (port of the Zig selectCounters + helpers) ------
+// ---- PMU counter selection ------------------------------------------------
 
 use crate::cpu::pmu_events::{Model, Role, MODELS};
 
@@ -238,7 +234,7 @@ fn topdown_enumerated() -> bool {
     false
 }
 
-// vvvvv TEMPORARY HACK — see linux_bpf_capture.zig; delete once TMA is validated
+// vvvvv TEMPORARY HACK — delete once TMA is validated
 // on real ICL+ silicon. Forces slot-based counters for one spoofed dev VM
 // (family 6 / model 134 / stepping 0 under a hypervisor). A lie about the PMU.
 #[cfg(target_arch = "x86_64")]
@@ -328,7 +324,7 @@ fn select_counters() -> Vec<Counter> {
     COUNTERS_FALLBACK.to_vec()
 }
 
-// ---- focus presets (port of src/focus_presets.zig) -------------------------
+// ---- focus presets ---------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum FocusPreset {
@@ -499,7 +495,7 @@ fn open_sampler(cpu: u32, cfg: &SamplerCfg, tick_prog: *mut BpfProgram) -> Optio
     }
 }
 
-// ---- InternedData interner (port of the Zig Interner + intern* methods) -----
+// ---- InternedData interner -------------------------------------------------
 
 use crate::proto::ProtoWriter;
 use std::collections::HashMap;
@@ -682,7 +678,7 @@ use crate::proto::{write_perf_defaults_packet, write_perf_sample};
 use crate::ffi::sismo_ds_emit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// TracePacket / defaults field tags + constants (perfetto_proto.zig).
+// TracePacket / defaults field tags + constants.
 const TP_FIELD_PERF_SAMPLE: u32 = 66;
 const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
 const SEQ_NEEDS_INCREMENTAL_STATE: u32 = 2;

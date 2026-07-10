@@ -1,10 +1,9 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! macOS kdebug → `sismo.macos_sched` capture worker, migrated whole from
-//! macos_sched_capture.zig. Owns the worker thread and the C++ SDK data-source
-//! lifecycle; the kdebug ring, proc-info lookups, and all proto encoding are
-//! the already-migrated Rust paths.
+//! macOS kdebug → `sismo.macos_sched` capture worker. Owns the worker thread
+//! and the C++ SDK data-source lifecycle; the kdebug ring, proc-info lookups,
+//! and all proto encoding live in the Rust paths it calls.
 //!
 //! Per switch, xnu emits two kdebug events on the same CPU: MACH_SCHED /
 //! MACH_STACK_HANDOFF (timestamps + both TIDs + priorities) then MACH_DISPATCH
@@ -43,18 +42,18 @@ const TS_INTERRUPTIBLE_SLEEP: u32 = 4;
 const TS_UNINTERRUPTIBLE_SLEEP: u32 = 5;
 const TS_STOPPED: u32 = 6;
 
-// Config defaults (from the Zig Config).
+// Config defaults.
 const DEFAULT_KERNEL_BUFFER_EVENTS: i32 = 256 * 1024;
 const DRAIN_INTERVAL_NS: u64 = 100 * 1_000_000;
 const DRAIN_CAPACITY_EVENTS: usize = 256 * 1024;
 const THREAD_MAP_CAPACITY: usize = 16 * 1024;
 
-// Staging caps per drain (mirrors the Zig fixed buffers).
+// Staging caps per drain.
 const MAX_NEW_THREADS: usize = 256;
 const MAX_NEW_PROCESSES: usize = 128;
 const PROVM_PROGRAM_MAX: usize = 512;
 
-// ---- kdebug ring (rust-bridge/src/kdebug.rs) + timebase --------------------
+// ---- kdebug ring (crate::sched::kdebug) + timebase -------------------------
 
 extern "C" {
     fn sismo_kdebug_start(buffer_events: i32) -> i32;

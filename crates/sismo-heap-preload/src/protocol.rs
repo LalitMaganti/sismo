@@ -1,8 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Heap control channel — **preload (server) side**. Port of the listen/accept
-//! half of heap_protocol_posix.zig. The preload binds the per-PID socket
+//! Heap control channel — **preload (server) side**. The preload binds the
+//! per-PID socket
 //! (`/tmp/sismo-heap-{pid}.sock`) at load time and blocks on `accept`; when the
 //! recorder connects it sends a 32-byte `AttachConfig` + the shm ring fd via
 //! SCM_RIGHTS. Detach = the recorder closes the connection (EOF on `conn_fd`).

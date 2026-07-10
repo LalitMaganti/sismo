@@ -1,8 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! The malloc interposer + control-plane listener (port of the data/control
-//! planes of heap_preload_macos.zig). This is the delicate runtime core:
+//! The malloc interposer + control-plane listener. This is the delicate
+//! runtime core:
 //!
 //! - `__DATA,__mod_init_func` runs `module_init` at dyld load → spawns the
 //!   listener thread (dormant; the malloc hot path is one atomic load + branch).
@@ -195,8 +195,7 @@ static SISMO_HEAP_CTOR: extern "C" fn() = module_init;
 /// Read the caller's arm64 frame: x29 = our frame pointer, pointing at
 /// `[saved_caller_fp, saved_lr]`. So caller_fp = fp[0], the return address into
 /// the caller (pc) = fp[1], and the caller's sp at the call site = fp + 16.
-/// Mirrors heap_preload_macos.zig's captureUserSnapshot exactly. MUST run
-/// directly in the interposed function so x29 is the user→shim frame.
+/// MUST run directly in the interposed function so x29 is the user→shim frame.
 #[inline(always)]
 fn capture_user_frame() -> (u64, RegBlockArm64) {
     let our_fp: u64;

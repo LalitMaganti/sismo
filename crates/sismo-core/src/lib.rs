@@ -1,8 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! extern "C" facade exposing the Rust-side helpers (framehop unwinder,
-//! wholesym symbolizer) to Zig over a cargo→staticlib→Zig link.
+//! The sismo core library: the capture data sources, wire encoding, and
+//! symbolization the `sismo-cli` commands build on.
 //!
 //! Modules are grouped by feature: `cpu`, `heap`, `sched` (the capture data
 //! sources), `proto` (wire encoding + configs), and `symbolize`. `ffi`,

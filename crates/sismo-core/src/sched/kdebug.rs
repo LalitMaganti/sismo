@@ -1,14 +1,13 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! macOS kdebug ring control (migrated from src/macos/kdebug.zig): the
-//! `KERN_KDEBUG` sysctl calls that configure, drain, and tear down the
-//! kernel's `DBG_MACH_SCHED` trace stream. Requires root (the sysctls return
-//! EPERM otherwise).
+//! macOS kdebug ring control: the `KERN_KDEBUG` sysctl calls that configure,
+//! drain, and tear down the kernel's `DBG_MACH_SCHED` trace stream. Requires
+//! root (the sysctls return EPERM otherwise).
 //!
 //! Only the sysctl syscalls live here; the wire struct layouts (KdBuf,
-//! KdThreadMap) and the sched-event decoding stay on the Zig side (the sched
-//! worker's hot loop) — this module reads raw bytes into caller buffers.
+//! KdThreadMap) and sched-event decoding live in the sched capture worker —
+//! this module reads raw bytes into caller buffers.
 //!
 //! Constants are taken from the macOS SDK headers (sys/sysctl.h, sys/kdebug.h)
 //! — stable kernel ABI. macOS-only; gated in lib.rs.
@@ -34,7 +33,7 @@ const KDBG_SUBCLSTYPE: u32 = 0x0002_0000;
 const KD_BUF_SIZE: usize = 64; // sizeof(kd_buf) on arm64
 const KD_THREADMAP_ENTRY_SIZE: usize = 32; // sizeof(kd_threadmap): u64 + i32 + [20]u8, 8-aligned
 
-// sismo_kdebug_start return codes (mapped to KdebugError by the Zig facade).
+// sismo_kdebug_start return codes.
 const START_OK: i32 = 0;
 const START_SETUP_FAILED: i32 = 1;
 const START_SETREG_FAILED: i32 = 2;

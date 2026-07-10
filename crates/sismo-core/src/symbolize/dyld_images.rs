@@ -1,8 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Module enumeration + in-memory mach-o reading (migrated from
-//! src/macos/dyld_images.zig). Walks a task's `dyld_all_image_infos` to yield
+//! Module enumeration + in-memory mach-o reading. Walks a task's
+//! `dyld_all_image_infos` to yield
 //! (base_avma, path) tuples, and reads each image's `__TEXT` segment + UUID —
 //! the inputs framehop (unwinder) and wholesym (symbolizer) consume.
 //!
@@ -30,8 +30,7 @@ const LC_UUID: u32 = 0x1b;
 // dyld_image_info entry (64-bit): imageLoadAddress, imageFilePath, modDate.
 const IMAGE_INFO_SIZE: usize = 24;
 
-// Enumerate error codes surfaced to the Zig facade (which maps them back to
-// its error set; only EMPTY drives the retry loop).
+// Enumerate error codes; only EMPTY drives the retry loop.
 const ERR_OK: u32 = 0;
 const ERR_TASK_INFO: u32 = 1;
 const ERR_EMPTY: u32 = 2;
@@ -84,7 +83,7 @@ fn read_u64(b: &[u8], off: usize) -> u64 {
 }
 
 /// Read a NUL-terminated path from `addr` in `task`. "" for a null address,
-/// "?" on read failure (matching the prior Zig behavior).
+/// "?" on read failure.
 unsafe fn read_cstring(task: MachPort, addr: u64) -> Vec<u8> {
     if addr == 0 {
         return Vec::new();
@@ -100,7 +99,7 @@ unsafe fn read_cstring(task: MachPort, addr: u64) -> Vec<u8> {
     }
 }
 
-/// Owned image list handed to the Zig facade via index accessors.
+/// Owned image list, accessed by index.
 pub struct ImageList {
     images: Vec<(u64, Vec<u8>)>, // (base_avma, path)
 }
@@ -481,8 +480,7 @@ mod tests {
     #[test]
     fn load_own_modules_into_symbolizer_and_unwinder() {
         // End-to-end: enumerate own images, read each mach-o, and register into
-        // a real symbolizer + unwinder — the whole loop that replaced the Zig
-        // setup code, exercised without root.
+        // a real symbolizer + unwinder, exercised without root.
         let task = unsafe { mach_task_self_ };
         let sym = crate::symbolize::symbolizer::sismo_symbolizer_create();
         let unw = crate::symbolize::unwinder::sismo_unwinder_create_arm64();

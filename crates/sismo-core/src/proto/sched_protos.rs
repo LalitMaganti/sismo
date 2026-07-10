@@ -1,8 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! sched-producer proto encoders, migrated from perfetto_proto.zig — the last
-//! encoders on the Zig side:
+//! sched-producer proto encoders:
 //!   - GenericKernelProcessTree (TracePacket field 122): process/thread names.
 //!   - The ProtoVM `VmProgram` bytecode that mirrors those process-tree packets
 //!     into traced's per-buffer DST (so long-lived thread names survive ring
@@ -10,8 +9,8 @@
 //!
 //! The VmProgram is built once from a fixed structure (no runtime inputs);
 //! `sismo_macos_sched_vm_program` writes it into a caller buffer. The process
-//! tree is built per-drain from flattened FFI arrays. Both are byte-for-byte
-//! identical to the prior Zig encoders (see the tests).
+//! tree is built per-drain from flattened FFI arrays. Both are covered by
+//! byte-exact tests.
 
 use crate::proto::ProtoWriter;
 use std::slice;
@@ -250,8 +249,7 @@ fn encode_vm_program(version: u32, instructions: &[Instruction]) -> Vec<u8> {
 }
 
 /// Build the fixed macos_sched ProtoVM program bytes (mirrors
-/// GenericKernelProcessTree packets into traced's DST). See the fn-level doc in
-/// the prior Zig `macosSchedVmProgram` for why the DST is keyed under field 122.
+/// GenericKernelProcessTree packets into traced's DST, keyed under field 122).
 fn build_macos_sched_vm_program() -> Vec<u8> {
     const TP_TREE: u32 = 122; // TracePacket.generic_kernel_process_tree
     const F_PROCESSES: u32 = 1;
@@ -366,8 +364,7 @@ mod tests {
     #[test]
     fn vm_program_matches_reference_serialization() {
         // Reference bytes from a protos::gen::VmProgram of the same structure,
-        // SerializeAsString()'d + hex-dumped — the byte-exact contract the
-        // prior Zig encoder was tested against.
+        // SerializeAsString()'d + hex-dumped — the byte-exact contract.
         let expected_hex = concat!(
             "126e0a041202087a3a320a0612040801280130013a0c0a04120208013a041",
             "20210003a180a1208021202087a1202080112041801300018013a021a003",

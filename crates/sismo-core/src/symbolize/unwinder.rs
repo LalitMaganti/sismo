@@ -1,7 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Framehop FFI surface — the Rust unwinder samply uses, exposed for Zig.
+//! Framehop FFI surface — the Rust unwinder samply uses, exposed over a C ABI.
 //!
 //! Lifecycle: `sismo_unwinder_create_arm64()` returns an opaque handle;
 //! callers register one or more loaded mach-o images with
@@ -10,7 +10,7 @@
 //! everything.
 //!
 //! The opaque `*mut Unwinder` is a `Box<Unwinder>::into_raw()` — never
-//! deref'd outside Rust. The Zig side treats it as opaque.
+//! deref'd outside Rust. Callers treat it as opaque.
 //!
 //! Mach-o data passed to `add_module` is expected to be the in-memory
 //! image as seen in the target process — i.e. a contiguous slab read via

@@ -1,15 +1,14 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! macOS per-sample CPU capture, folded out of macos_cpu_samples_capture.zig's
-//! `sampleOnce`. Given a thread, this reads its accumulated CPU time (to skip
-//! idle threads), and for an active thread suspends it, reads its arm64
-//! register state, unwinds via the Rust unwinder (reading the target's stack
-//! directly through `mach_vm_read`), resumes it, and encodes a PerfSample
+//! macOS per-sample CPU capture. Given a thread, this reads its accumulated CPU
+//! time (to skip idle threads), and for an active thread suspends it, reads its
+//! arm64 register state, unwinds via the Rust unwinder (reading the target's
+//! stack directly through `mach_vm_read`), resumes it, and encodes a PerfSample
 //! wrapped in a TracePacket body.
 //!
 //! It builds the packet bytes rather than emitting — the caller emits via the
-//! C++ SDK shim — so rust-bridge keeps no dependency on `sismo_ds_emit` and
+//! C++ SDK shim — so this module keeps no dependency on `sismo_ds_emit` and
 //! `cargo test` still links. macOS/arm64 only; gated in lib.rs.
 
 use crate::proto::{write_perf_sample, ProtoWriter};
@@ -72,7 +71,7 @@ fn read_i32(b: &[u8], off: usize) -> i32 {
 }
 
 /// Strip arm64 PAC bits (conservative 40-bit mask) before handing an address to
-/// the unwinder — matches the Zig `stripPAC`.
+/// the unwinder.
 fn strip_pac(v: u64) -> u64 {
     v & 0x0000_00FF_FFFF_FFFF
 }
@@ -103,7 +102,7 @@ struct ReadCtx {
 }
 
 /// Unwinder stack-read callback: read one u64 from the target's stack at `addr`.
-/// Returns 0 on success, 1 on failure (matching the prior Zig `readStackCb`).
+/// Returns 0 on success, 1 on failure.
 unsafe extern "C" fn read_stack_cb(addr: u64, out_value: *mut u64, user_data: *mut c_void) -> c_int {
     let ctx = unsafe { &*(user_data as *const ReadCtx) };
     let mut got: u64 = 0;

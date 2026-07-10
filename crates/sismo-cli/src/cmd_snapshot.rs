@@ -1,8 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! `sismo snapshot` — flight-recorder snapshot client (migrated whole from
-//! cmd_snapshot.zig).
+//! `sismo snapshot` — flight-recorder snapshot client.
 //!
 //! Doesn't talk to the recorder process. Connects independently to the
 //! in-process tracing service the recorder hosts (its ServiceIPCHost) as a

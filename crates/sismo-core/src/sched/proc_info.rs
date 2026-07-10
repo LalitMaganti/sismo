@@ -1,8 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! macOS libproc bindings (migrated from src/macos/process_tree.zig), used by
-//! the sched producer to attach process / thread names to scheduler events.
+//! macOS libproc bindings, used by the sched producer to attach process /
+//! thread names to scheduler events.
 //!
 //! `proc_pidinfo` / `proc_pidpath` are libSystem symbols, so this links in the
 //! final binary and in standalone `cargo test` — the tests below exercise the

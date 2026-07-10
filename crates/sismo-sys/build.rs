@@ -100,14 +100,14 @@ fn build_perfetto_shim(target_os: &str) {
         // Zig's C++ runtime archives, discovered from `zig c++ -v`.
         link_cxx_runtime(&root, &out);
 
-        // System libs the Zig/perfetto code needs.
+        // System libs the perfetto + shim code needs.
         for lib in ["bpf", "dl", "pthread", "rt", "m"] {
             println!("cargo:rustc-link-lib=dylib={lib}");
         }
     }
 }
 
-/// macOS link surface. Mirrors what the deleted Zig `sismo` executable linked:
+/// macOS link surface:
 /// the system libc++ (pthread/m live in libSystem, no separate -lpthread/-lm),
 /// libdl (perfetto + wholesym), CoreFoundation (perfetto), and the frameworks
 /// wholesym pulls in via core-foundation-rs — Foundation/Security — plus

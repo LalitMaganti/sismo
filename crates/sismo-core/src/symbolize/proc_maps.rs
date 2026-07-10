@@ -70,8 +70,8 @@ impl ProcMaps {
 }
 
 /// Parse one maps line: `start-end perms offset dev inode  pathname`. Keeps
-/// only absolute-path-backed mappings (skips `[vdso]`/`[heap]`/anon). Like
-/// the Zig original, the pathname is the single whitespace-delimited token
+/// only absolute-path-backed mappings (skips `[vdso]`/`[heap]`/anon). The
+/// pathname is the single whitespace-delimited token
 /// after the inode (paths with embedded spaces are truncated — unchanged).
 fn parse_line(line: &str) -> Option<Line<'_>> {
     let mut it = line.split([' ', '\t']).filter(|t| !t.is_empty());

@@ -1,12 +1,11 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! macOS CPU-samples capture worker, migrated whole from
-//! macos_cpu_samples_capture.zig. Owns its worker thread and the C++ SDK
+//! macOS CPU-samples capture worker. Owns its worker thread and the C++ SDK
 //! data-source lifecycle (on_setup/start/stop/flush trampolines); the
-//! per-sample work, module registration, config decode, and unwinding are the
-//! already-migrated Rust paths. cmd_record (Zig) drives it via
-//! `sismo_cpu_capture_init` / `sismo_cpu_capture_shutdown`.
+//! per-sample work, module registration, config decode, and unwinding live in
+//! the Rust paths it calls. cmd_record drives it via `sismo_cpu_capture_init` /
+//! `sismo_cpu_capture_shutdown`.
 //!
 //! The producer C ABI (`sismo_ds_*`) is provided by the C++ shim in the final
 //! binary; `#[cfg(test)]` stubs stand in so `cargo test` links standalone.

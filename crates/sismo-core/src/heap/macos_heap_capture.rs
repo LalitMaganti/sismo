@@ -1,7 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! macOS heap capture worker, migrated whole from heap_capture.zig. Owns its
+//! macOS heap capture worker. Owns its
 //! worker thread and the C++ SDK data-source lifecycle (on_setup/start/stop/
 //! flush trampolines). The heavy setup — task_for_pid, module enumeration,
 //! framehop + wholesym, the shm ring + heap-protocol attach — runs once at
@@ -69,7 +69,7 @@ const STACK_SNAPSHOT_BYTES: usize = 8192;
 const MAX_FRAMES: usize = 32;
 const ALLOC_METADATA_BYTES: usize = 328;
 
-// AllocMetadata field offsets (heap_wire.zig; 8-byte aligned extern struct).
+// AllocMetadata field offsets (8-byte aligned extern struct).
 const OFF_SAMPLE_SIZE: usize = 16;
 const OFF_ALLOC_ADDRESS: usize = 24;
 const OFF_STACK_POINTER: usize = 32;
@@ -78,7 +78,7 @@ const OFF_REG_PC: usize = 48;
 const OFF_REG_LR: usize = 56;
 const OFF_REG_FP: usize = 64;
 
-// CLOCK_MONOTONIC (Darwin value 6); matches heap_capture.zig's nowNs().
+// CLOCK_MONOTONIC (Darwin value 6).
 const CLOCK_MONOTONIC: i32 = 6;
 type MachPort = u32;
 const KERN_SUCCESS: i32 = 0;

@@ -1,8 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Temporary privileged-pid marker for `sismo record`, migrated from
-//! sismo_privileged_marker.zig.
+//! Temporary privileged-pid marker for `sismo record`.
 //!
 //! THIS IS A HACK bridging the gap until a proper JSON-in-zip sidecar lands;
 //! this whole file + its cmd_record caller should die together then. It appends
@@ -120,7 +119,7 @@ pub unsafe extern "C" fn sismo_append_privileged_marker(
     focus_precise: bool,
 ) -> bool {
     if n_pids == 0 {
-        return true; // nothing to mark — success (matches the Zig no-op)
+        return true; // nothing to mark — success
     }
     let pids = unsafe { slice::from_raw_parts(pids, n_pids) };
     let focus = if focus_preset.is_null() || focus_preset_len == 0 {

@@ -1,9 +1,8 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Minimal protobuf wire-format encoder (Rust port of proto_writer.zig) plus
-//! the trace-packet encoders migrated off perfetto_proto.zig. Field tags come
-//! from the Perfetto protos; see the Zig comments in perfetto_proto.zig.
+//! Minimal protobuf wire-format encoder plus the trace-packet encoders. Field
+//! tags come from the Perfetto protos.
 //!
 //! wire types: 0 = VARINT, 2 = LEN (length-delimited).
 
@@ -49,9 +48,9 @@ impl ProtoWriter {
         self.write_varint(value as u64);
     }
 
-    /// proto `int32`: matches proto_writer.zig's writeInt32, which bit-casts
-    /// to u32 and varint-encodes that (so -1 is the 5-byte 0xFFFFFFFF, NOT the
-    /// 10-byte 64-bit sign-extension the proto spec nominally uses for int32).
+    /// proto `int32`: bit-casts to u32 and varint-encodes that (so -1 is the
+    /// 5-byte 0xFFFFFFFF, NOT the 10-byte 64-bit sign-extension the proto spec
+    /// nominally uses for int32).
     pub fn write_int32(&mut self, field: u32, value: i32) {
         self.write_uint32(field, value as u32);
     }

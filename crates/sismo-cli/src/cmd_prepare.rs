@@ -3,7 +3,7 @@
 
 //! `sismo prepare` — launch a workload with the sismo dormant heap client (and
 //! the well-known producer-socket env) wired in, then `execvp` into the user's
-//! command (migrated whole from cmd_prepare.zig). The workload then runs as a
+//! command. The workload then runs as a
 //! normal process; you record it later via `sismo record --pid <pid>`.
 //!
 //!     sismo prepare ./myapp arg1 arg2 &      # dormant client loaded
@@ -15,7 +15,7 @@
 //! Perfetto-SDK workload at the well-known producer socket. execvp inherits the
 //! env into the user's command.
 //!
-//! Hardened-runtime caveat (unchanged from the Zig version): macOS strips
+//! Hardened-runtime caveat: macOS strips
 //! DYLD_INSERT_LIBRARIES on exec for hardened-runtime / library-validation
 //! binaries. Unsigned dev binaries (the audience) are fine; for signed apps heap
 //! injection silently fails and the user notices when `sismo record` reports the
