@@ -131,14 +131,6 @@ impl RingBuffer {
         Self::map_into(fd, ring_size, page_size, file_size)
     }
 
-    /// Attach to an existing shm fd (SCM_RIGHTS-received). Caller owns `fd`.
-    #[allow(dead_code)]
-    pub fn attach(fd: c_int, ring_size: u64) -> Result<RingBuffer, RingError> {
-        let page_size = unsafe { getpagesize() } as u64;
-        let file_size = page_size + ring_size;
-        Self::map_into(fd, ring_size, page_size, file_size)
-    }
-
     fn map_into(fd: c_int, ring_size: u64, page_size: u64, file_size: u64) -> Result<RingBuffer, RingError> {
         let region_bytes = (file_size + ring_size) as usize;
         // Reserve the address range with PROT_NONE so the two MAP_FIXED maps land.
@@ -170,7 +162,7 @@ impl RingBuffer {
         }
 
         let meta = region as *mut MetadataPage;
-        // Zero the metadata page (create path — attach relies on the creator).
+        // Zero the metadata page (the creator owns it).
         unsafe { std::ptr::write_bytes(region, 0, page_size as usize) };
 
         Ok(RingBuffer {
@@ -274,11 +266,6 @@ impl RingBuffer {
         let rd = m.read_pos.load(Ordering::Relaxed);
         m.read_pos.store(rd + total, Ordering::Release);
         m.num_reads_succeeded.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[allow(dead_code)]
-    pub fn signal_shutdown(&self) {
-        self.meta().shutting_down.store(1, Ordering::Release);
     }
 }
 
