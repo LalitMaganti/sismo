@@ -18,7 +18,7 @@ use crate::proto::{write_kernel_task_state_event, ProtoWriter};
 use crate::proto::sched_protos::{
     sismo_encode_kernel_process_tree, sismo_macos_sched_vm_program, ProcessC, ThreadC,
 };
-use crate::proto::session_config::sismo_encode_data_source_descriptor;
+use crate::proto::session_config::encode_data_source_descriptor;
 use crate::proto::sismo_config::{config_extract, sched_decode};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use crate::worker_sdk::Event;
@@ -568,21 +568,9 @@ pub unsafe extern "C" fn sismo_sched_capture_init() -> *mut SchedCapture {
     // traced's DST for ring/flight mode).
     let mut prog = [0u8; PROVM_PROGRAM_MAX];
     let prog_len = unsafe { sismo_macos_sched_vm_program(prog.as_mut_ptr(), prog.len()) };
-    let mut desc = [0u8; PROVM_PROGRAM_MAX + 256];
-    let desc_len = unsafe {
-        sismo_encode_data_source_descriptor(
-            DS_NAME.as_ptr(),
-            DS_NAME.len(),
-            true,
-            false,
-            prog.as_ptr(),
-            prog_len,
-            desc.as_mut_ptr(),
-            desc.len(),
-        )
-    };
+    let desc = encode_data_source_descriptor(DS_NAME, true, false, &prog[..prog_len]);
     let slot = unsafe {
-        sismo_ds_register(desc.as_ptr(), desc_len, on_setup, on_start, on_stop, on_flush, cap as *mut c_void)
+        sismo_ds_register(desc.as_ptr(), desc.len(), on_setup, on_start, on_stop, on_flush, cap as *mut c_void)
     };
     if slot == u32::MAX {
         drop(unsafe { Box::from_raw(cap) });

@@ -1082,27 +1082,11 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
     let c = unsafe { &mut *cap };
     c.counters = select_counters();
 
-    let mut desc = [0u8; 2048];
-    let desc_len = unsafe {
-        crate::proto::session_config::sismo_encode_data_source_descriptor(
-            DS_NAME.as_ptr(),
-            DS_NAME.len(),
-            false,
-            false,
-            ptr::null(),
-            0,
-            desc.as_mut_ptr(),
-            desc.len(),
-        )
-    };
-    if desc_len == 0 {
-        drop(unsafe { Box::from_raw(cap) });
-        return ptr::null_mut();
-    }
+    let desc = crate::proto::session_config::encode_data_source_descriptor(DS_NAME, false, false, &[]);
     let slot = unsafe {
         sismo_ds_register(
             desc.as_ptr(),
-            desc_len,
+            desc.len(),
             on_setup,
             on_start,
             on_stop,

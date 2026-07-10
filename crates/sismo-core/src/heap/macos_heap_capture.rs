@@ -41,7 +41,7 @@ use crate::symbolize::dyld_images::{
 use crate::heap::{
     sismo_heap_build_clock_snapshot_packet, sismo_heap_build_profile_packet, sismo_heap_free,
 };
-use crate::proto::session_config::sismo_encode_data_source_descriptor;
+use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::symbolizer::{sismo_symbolizer_create, sismo_symbolizer_destroy, Symbolizer};
 use crate::symbolize::unwinder::{
     sismo_unwinder_create_arm64, sismo_unwinder_destroy, sismo_unwinder_walk_snapshot, Unwinder,
@@ -559,25 +559,9 @@ pub unsafe extern "C" fn sismo_heap_capture_init() -> *mut HeapCapture {
     }));
 
     // Register the data source (descriptor built via the Rust encoder).
-    let mut desc = [0u8; 2048];
-    let desc_len = unsafe {
-        sismo_encode_data_source_descriptor(
-            DS_NAME.as_ptr(),
-            DS_NAME.len(),
-            true,
-            false,
-            std::ptr::null(),
-            0,
-            desc.as_mut_ptr(),
-            desc.len(),
-        )
-    };
-    if desc_len == 0 {
-        drop(unsafe { Box::from_raw(cap) });
-        return std::ptr::null_mut();
-    }
+    let desc = encode_data_source_descriptor(DS_NAME, true, false, &[]);
     let slot = unsafe {
-        sismo_ds_register(desc.as_ptr(), desc_len, on_setup, on_start, on_stop, on_flush, cap as *mut c_void)
+        sismo_ds_register(desc.as_ptr(), desc.len(), on_setup, on_start, on_stop, on_flush, cap as *mut c_void)
     };
     if slot == U32_MAX {
         drop(unsafe { Box::from_raw(cap) });

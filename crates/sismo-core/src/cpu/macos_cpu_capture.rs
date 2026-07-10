@@ -81,7 +81,7 @@ use crate::worker_sdk::Event;
 // and per-sample capture.
 use crate::symbolize::dyld_images::{sismo_dyld_list_free, sismo_load_target_modules};
 use crate::cpu::mach_sampler::sismo_cpu_sample_thread;
-use crate::proto::session_config::sismo_encode_data_source_descriptor;
+use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::unwinder::{sismo_unwinder_create_arm64, sismo_unwinder_destroy, Unwinder};
 
 // ---- Worker ----------------------------------------------------------------
@@ -378,23 +378,11 @@ pub unsafe extern "C" fn sismo_cpu_capture_init(default_interval_ns: u64) -> *mu
     }));
 
     // Register the data source (descriptor built via the Rust encoder).
-    let mut desc = [0u8; 2048];
-    let desc_len = unsafe {
-        sismo_encode_data_source_descriptor(
-            DS_NAME.as_ptr(),
-            DS_NAME.len(),
-            true,
-            false,
-            std::ptr::null(),
-            0,
-            desc.as_mut_ptr(),
-            desc.len(),
-        )
-    };
+    let desc = encode_data_source_descriptor(DS_NAME, true, false, &[]);
     let slot = unsafe {
         sismo_ds_register(
             desc.as_ptr(),
-            desc_len,
+            desc.len(),
             on_setup,
             on_start,
             on_stop,

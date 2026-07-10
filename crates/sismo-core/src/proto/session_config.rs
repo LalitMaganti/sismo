@@ -49,37 +49,26 @@ unsafe fn emit(bytes: &[u8], out: *mut u8, cap: usize) -> usize {
 // ---- DataSourceDescriptor --------------------------------------------------
 
 /// Encode a DataSourceDescriptor: name (1), will_notify_on_stop (2),
-/// will_notify_on_start (3), and — when `protovm_program_len > 0` — the
-/// serialized VmProgram at field 10. Writes into out[..cap]; returns bytes
-/// written or 0 if too small.
-///
-/// # Safety
-/// `name`/`protovm_program` valid for their lengths or null; `out` writable
-/// for `cap`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_encode_data_source_descriptor(
-    name: *const u8,
-    name_len: usize,
+/// will_notify_on_start (3), and — when `protovm_program` is non-empty — the
+/// serialized VmProgram at field 10.
+pub fn encode_data_source_descriptor(
+    name: &[u8],
     will_notify_on_stop: bool,
     will_notify_on_start: bool,
-    protovm_program: *const u8,
-    protovm_program_len: usize,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
+    protovm_program: &[u8],
+) -> Vec<u8> {
     let mut w = ProtoWriter::new();
-    w.write_string(1, ffi_slice(name, name_len));
+    w.write_string(1, name);
     if will_notify_on_stop {
         w.write_uint32(2, 1);
     }
     if will_notify_on_start {
         w.write_uint32(3, 1);
     }
-    let program = ffi_slice(protovm_program, protovm_program_len);
-    if !program.is_empty() {
-        w.write_message(10, program);
+    if !protovm_program.is_empty() {
+        w.write_message(10, protovm_program);
     }
-    unsafe { emit(w.bytes(), out, cap) }
+    w.bytes().to_vec()
 }
 
 // ---- TraceConfig -----------------------------------------------------------
@@ -240,41 +229,16 @@ mod tests {
     #[test]
     fn descriptor_bytes_are_exact() {
         // name="x", will_notify_on_stop=true.
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_data_source_descriptor(
-                b"x".as_ptr(),
-                1,
-                true,
-                false,
-                std::ptr::null(),
-                0,
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
+        let out = encode_data_source_descriptor(b"x", true, false, &[]);
         // name(1) len 1 "x": 0A 01 78; will_notify_on_stop(2)=1: 10 01.
-        assert_eq!(&out[..n], &[0x0A, 0x01, 0x78, 0x10, 0x01]);
+        assert_eq!(out, &[0x0A, 0x01, 0x78, 0x10, 0x01]);
     }
 
     #[test]
     fn descriptor_with_protovm_program() {
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_data_source_descriptor(
-                b"s".as_ptr(),
-                1,
-                true,
-                false,
-                [0xDEu8, 0xAD].as_ptr(),
-                2,
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
-        // ...protovm_program(10) len 2: tag=10<<3|2=0x52, 02, DE AD.
-        let got = &out[..n];
-        assert!(got.windows(4).any(|w| w == [0x52, 0x02, 0xDE, 0xAD]));
+        let out = encode_data_source_descriptor(b"s", true, false, &[0xDE, 0xAD]);
+        // protovm_program(10) len 2: tag=10<<3|2=0x52, 02, DE AD.
+        assert!(out.windows(4).any(|w| w == [0x52, 0x02, 0xDE, 0xAD]));
     }
 
     #[test]
