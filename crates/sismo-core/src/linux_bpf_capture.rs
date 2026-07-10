@@ -368,11 +368,8 @@ fn focus_spec(p: FocusPreset) -> FocusSpec {
 
 // ---- perf_event_open (port of openCounter / resolveSampler / openSampler) ---
 
+use libc::close;
 use perf_event_open_sys as sys;
-
-extern "C" {
-    fn close(fd: c_int) -> c_int;
-}
 
 /// Open a counting perf event as part of `group_fd`'s group (-1 = new leader),
 /// per-CPU. Returns the fd, or None if the PMU can't schedule it.

@@ -13,6 +13,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use libc::{close, flock, LOCK_EX, LOCK_NB};
 use std::os::raw::c_int;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd};
@@ -25,14 +26,6 @@ const SESSION_LOCK_PATH: &str = "/tmp/sismo.lock";
 pub const PRODUCER_SOCK: &str = "/tmp/sismo-producer.sock";
 pub const CONSUMER_SOCK: &str = "/tmp/sismo-consumer.sock";
 
-// BSD flock operations (identical on macOS + Linux).
-const LOCK_EX: c_int = 2;
-const LOCK_NB: c_int = 4;
-
-extern "C" {
-    fn flock(fd: c_int, operation: c_int) -> c_int;
-    fn close(fd: c_int) -> c_int;
-}
 
 /// Acquire the session lock, writing `pid` (ASCII) into the file so `sismo
 /// snapshot` can find the recorder. Returns the held fd (>= 0) — the caller must

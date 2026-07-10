@@ -98,17 +98,12 @@ extern "C" fn handle_stop(_sig: std::os::raw::c_int) {
     SHOULD_STOP.store(true, Ordering::Release);
 }
 
-extern "C" {
-    fn signal(sig: std::os::raw::c_int, handler: extern "C" fn(std::os::raw::c_int)) -> usize;
-}
-
-const SIGINT: std::os::raw::c_int = 2;
-const SIGTERM: std::os::raw::c_int = 15;
+use libc::{signal, SIGINT, SIGTERM};
 
 fn install_stop_handlers() {
     unsafe {
-        signal(SIGINT, handle_stop);
-        signal(SIGTERM, handle_stop);
+        signal(SIGINT, handle_stop as libc::sighandler_t);
+        signal(SIGTERM, handle_stop as libc::sighandler_t);
     }
 }
 

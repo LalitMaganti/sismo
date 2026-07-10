@@ -40,26 +40,12 @@ const MARKER_NAME: &[u8] = b"sismo_temporary_privileged_pid_marker";
 const MARKER_TRACK_UUID: u64 = 0xC0DE_CAFE_5151_1010;
 const MARKER_SEQUENCE_ID: u32 = 0xC0DE_CAFE;
 
-// CLOCK_MONOTONIC differs per OS (macOS 6, Linux 1). sismo labels the value as
-// BOOTTIME to line up with the rest of the trace (heap registers a 1:1
-// MONOTONIC↔BOOTTIME snapshot).
-#[cfg(target_os = "macos")]
-const CLOCK_MONOTONIC: i32 = 6;
-#[cfg(not(target_os = "macos"))]
-const CLOCK_MONOTONIC: i32 = 1;
-
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-extern "C" {
-    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
-}
-
+// sismo labels this MONOTONIC value as BOOTTIME to line up with the rest of the
+// trace (heap registers a 1:1 MONOTONIC↔BOOTTIME snapshot). libc::CLOCK_MONOTONIC
+// already carries the right per-OS id (1 on Linux, 6 on macOS).
 fn now_monotonic_ns() -> u64 {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 

@@ -61,62 +61,17 @@ extern "C" {
 
 // ---- libc ------------------------------------------------------------------
 
+use libc::timespec as Timespec;
+use libc::{
+    close, getpid, kill, nanosleep, pipe, posix_spawnp, read, signal, unlink, waitpid, write,
+    SIGINT, SIGTERM,
+};
+
+// posix_spawnp inherits the current environment. The libc crate does not export
+// `environ`, so declare it directly.
 extern "C" {
-    fn geteuid() -> c_uint;
-    fn getpid() -> c_int;
-    fn kill(pid: c_int, sig: c_int) -> c_int;
-    fn unlink(path: *const c_char) -> c_int;
-    fn pipe(fds: *mut c_int) -> c_int;
-    fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
-    fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
-    fn close(fd: c_int) -> c_int;
-    fn access(path: *const u8, mode: c_int) -> c_int;
-    fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int;
-    fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
-    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
-    fn kqueue() -> c_int;
-    fn kevent(
-        kq: c_int,
-        changelist: *const Kevent,
-        nchanges: c_int,
-        eventlist: *mut Kevent,
-        nevents: c_int,
-        timeout: *const Timespec,
-    ) -> c_int;
-    fn posix_spawnp(
-        pid: *mut c_int,
-        path: *const c_char,
-        file_actions: *const c_void,
-        attrp: *const c_void,
-        argv: *const *const c_char,
-        envp: *const *const c_char,
-    ) -> c_int;
     static environ: *const *const c_char;
 }
-
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
-// macOS kevent(2).
-#[repr(C)]
-struct Kevent {
-    ident: usize,
-    filter: i16,
-    flags: u16,
-    fflags: u32,
-    data: isize,
-    udata: *mut c_void,
-}
-const EVFILT_PROC: i16 = -5;
-const EV_ADD: u16 = 0x0001;
-const EV_ONESHOT: u16 = 0x0010;
-const NOTE_EXIT: u32 = 0x8000_0000;
-
-const SIGINT: c_int = 2;
-const SIGTERM: c_int = 15;
 
 // ---- Self-pipe (SIGINT handler → main loop) --------------------------------
 
@@ -153,7 +108,14 @@ fn maybe_spawn(path: &str, args: &[&str], env: &[(&str, &str)]) -> Option<i32> {
 
     let mut pid: c_int = 0;
     let rc = unsafe {
-        posix_spawnp(&mut pid, path_c.as_ptr(), std::ptr::null(), std::ptr::null(), argv.as_ptr(), environ)
+        posix_spawnp(
+            &mut pid,
+            path_c.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            argv.as_ptr() as *const *mut c_char,
+            environ as *const *mut c_char,
+        )
     };
     if rc != 0 {
         eprintln!("sismo record: posix_spawnp({path}) rc={rc}");
@@ -178,11 +140,12 @@ fn waitpid_exit_watch(pid: c_int, write_fd: c_int) {
 /// Attach-mode: kqueue EVFILT_PROC/NOTE_EXIT on a non-child pid, then fire 'X'.
 #[cfg(target_os = "macos")]
 fn kqueue_exit_watch(pid: c_int, write_fd: c_int) {
+    use libc::{kevent, kqueue, EVFILT_PROC, EV_ADD, EV_ONESHOT, NOTE_EXIT};
     let kq = unsafe { kqueue() };
     if kq < 0 {
         return; // no kqueue — loop only stops on SIGINT / --duration
     }
-    let mut change = Kevent {
+    let mut change = libc::kevent {
         ident: pid as usize,
         filter: EVFILT_PROC,
         flags: EV_ADD | EV_ONESHOT,
@@ -190,7 +153,7 @@ fn kqueue_exit_watch(pid: c_int, write_fd: c_int) {
         data: 0,
         udata: std::ptr::null_mut(),
     };
-    let mut ev = Kevent {
+    let mut ev = libc::kevent {
         ident: 0,
         filter: 0,
         flags: 0,
@@ -354,7 +317,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
 
     // Privilege warning for in-process privileged sources.
-    if unsafe { geteuid() } != 0 {
+    if unsafe { libc::geteuid() } != 0 {
         let mut unmet: Vec<&str> = Vec::new();
         if sched_mode == SourceMode::InProcess {
             unmet.push("sched");
@@ -472,7 +435,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
                 let has_socket = match crate::heap_protocol::socket_path(pid, &mut sock_buf) {
                     Some(len) => {
                         sock_buf[len] = 0;
-                        unsafe { access(sock_buf.as_ptr(), 0) == 0 } // F_OK
+                        unsafe { libc::access(sock_buf.as_ptr() as *const c_char, 0) == 0 } // F_OK
                     }
                     None => false,
                 };
@@ -622,7 +585,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
     let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
     SIGINT_PIPE_FD.store(wr, Ordering::Release);
-    unsafe { signal(SIGINT, handle_sigint) };
+    unsafe { signal(SIGINT, handle_sigint as libc::sighandler_t) };
 
     let is_attach = attach_pid.is_some();
     let watch = std::thread::spawn(move || {
@@ -967,7 +930,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     }
     let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
     SIGINT_PIPE_FD.store(wr, Ordering::Release);
-    unsafe { signal(SIGINT, handle_sigint) };
+    unsafe { signal(SIGINT, handle_sigint as libc::sighandler_t) };
 
     let watch = std::thread::spawn(move || waitpid_exit_watch(target_pid, wr));
     if let Some(secs) = duration_secs {

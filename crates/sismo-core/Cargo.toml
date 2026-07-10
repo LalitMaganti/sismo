@@ -23,6 +23,8 @@ object = { version = "0.39.1", default-features = false, features = ["std", "rea
 tokio = { version = "1.52.1", features = ["rt"] }
 uuid = "1.23.1"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
+# POSIX/libc bindings, so the callouts aren't hand-declared per file.
+libc = "0.2"
 wholesym = "0.8.1"
 # Disassembly for the source/asm view. Pure-Rust decoders so they link into the
 # staticlib with no C dependency (capstone would need extra link wiring).

@@ -25,11 +25,7 @@
 
 use crate::sismo_paths::{resolve_heap_dylib_path, PRODUCER_SOCK};
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int};
-
-extern "C" {
-    fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
-}
+use libc::{c_char, execvp};
 
 #[derive(clap::Args)]
 pub struct PrepareArgs {
