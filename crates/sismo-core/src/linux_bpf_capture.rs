@@ -565,10 +565,10 @@ impl Interner {
         let iid = *next;
         *next += 1;
         map.insert(bytes.to_vec(), iid);
-        let mut s = ProtoWriter::new();
-        s.write_uint64(1, iid);
-        s.write_string(2, bytes);
-        idw.write_message(field, s.bytes());
+        idw.message(field, |s| {
+            s.write_uint64(1, iid);
+            s.write_string(2, bytes);
+        });
         iid
     }
 
@@ -606,17 +606,17 @@ impl Interner {
         } else {
             0
         };
-        let mut mp = ProtoWriter::new();
-        mp.write_uint64(1, iid);
-        if build_id_iid != 0 {
-            mp.write_uint64(2, build_id_iid);
-        }
-        mp.write_uint64(4, start);
-        mp.write_uint64(5, end);
-        mp.write_uint64(6, base_avma);
-        mp.write_uint64(8, offset);
-        mp.write_uint64(7, path_iid);
-        idw.write_message(19, mp.bytes());
+        idw.message(19, |mp| {
+            mp.write_uint64(1, iid);
+            if build_id_iid != 0 {
+                mp.write_uint64(2, build_id_iid);
+            }
+            mp.write_uint64(4, start);
+            mp.write_uint64(5, end);
+            mp.write_uint64(6, base_avma);
+            mp.write_uint64(8, offset);
+            mp.write_uint64(7, path_iid);
+        });
         iid
     }
 
@@ -630,10 +630,10 @@ impl Interner {
         self.next_mapping += 1;
         self.mappings.insert(0, iid);
         let path_iid = self.intern_path(b"[kernel.kallsyms]", idw);
-        let mut mp = ProtoWriter::new();
-        mp.write_uint64(1, iid);
-        mp.write_uint64(7, path_iid);
-        idw.write_message(19, mp.bytes());
+        idw.message(19, |mp| {
+            mp.write_uint64(1, iid);
+            mp.write_uint64(7, path_iid);
+        });
         iid
     }
 
@@ -646,14 +646,14 @@ impl Interner {
         let iid = self.next_frame;
         self.next_frame += 1;
         self.frames.insert(key, iid);
-        let mut f = ProtoWriter::new();
-        f.write_uint64(1, iid);
-        if key.name_iid != 0 {
-            f.write_uint64(2, key.name_iid);
-        }
-        f.write_uint64(3, key.mapping_iid);
-        f.write_uint64(4, key.rel_pc);
-        idw.write_message(6, f.bytes());
+        idw.message(6, |f| {
+            f.write_uint64(1, iid);
+            if key.name_iid != 0 {
+                f.write_uint64(2, key.name_iid);
+            }
+            f.write_uint64(3, key.mapping_iid);
+            f.write_uint64(4, key.rel_pc);
+        });
         iid
     }
 
@@ -667,12 +667,12 @@ impl Interner {
         let iid = self.next_callstack;
         self.next_callstack += 1;
         self.callstacks.insert(key, iid);
-        let mut cs = ProtoWriter::new();
-        cs.write_uint64(1, iid);
-        for &fid in fids {
-            cs.write_uint64(2, fid);
-        }
-        idw.write_message(7, cs.bytes());
+        idw.message(7, |cs| {
+            cs.write_uint64(1, iid);
+            for &fid in fids {
+                cs.write_uint64(2, fid);
+            }
+        });
         iid
     }
 }
@@ -681,7 +681,7 @@ impl Interner {
 
 use crate::data_regions::DataRegions;
 use crate::proc_maps::ProcMaps;
-use crate::proto::encode_perf_sample;
+use crate::proto::{write_perf_defaults_packet, write_perf_sample};
 use crate::worker_sdk::sismo_ds_emit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -856,7 +856,9 @@ impl Capture {
                 followers.push(self.counters[slot as usize].name.as_bytes());
             }
         }
-        let packet = crate::proto::encode_perf_defaults_packet(
+        let mut w = ProtoWriter::new();
+        write_perf_defaults_packet(
+            &mut w,
             timebase_name,
             0,
             &followers,
@@ -864,7 +866,7 @@ impl Capture {
             BUILTIN_CLOCK_MONOTONIC,
             SEQ_INCREMENTAL_STATE_CLEARED,
         );
-        unsafe { sismo_ds_emit(self.ds_slot, packet.as_ptr(), packet.len()) };
+        unsafe { sismo_ds_emit(self.ds_slot, w.bytes().as_ptr(), w.bytes().len()) };
     }
 
     fn emit_sample(&mut self, rec: &SismoSampleRec) {
@@ -892,7 +894,16 @@ impl Capture {
             self.data_frames += 1;
         }
 
-        let ps = encode_perf_sample(
+        // TracePacket { timestamp, sequence_flags, interned_data?, perf_sample }.
+        let mut tp = ProtoWriter::new();
+        tp.write_uint64(8, rec.hdr.ts);
+        tp.write_uint32(13, SEQ_NEEDS_INCREMENTAL_STATE);
+        if !idw.bytes().is_empty() {
+            tp.write_message(12, idw.bytes());
+        }
+        write_perf_sample(
+            &mut tp,
+            TP_FIELD_PERF_SAMPLE,
             rec.hdr.cpu,
             rec.hdr.pid,
             rec.hdr.tid,
@@ -902,15 +913,6 @@ impl Capture {
             data_address,
             data_symbol.as_deref(),
         );
-
-        // TracePacket { timestamp, sequence_flags, interned_data?, perf_sample }.
-        let mut tp = ProtoWriter::new();
-        tp.write_uint64(8, rec.hdr.ts);
-        tp.write_uint32(13, SEQ_NEEDS_INCREMENTAL_STATE);
-        if !idw.bytes().is_empty() {
-            tp.write_message(12, idw.bytes());
-        }
-        tp.write_message(TP_FIELD_PERF_SAMPLE, &ps);
         unsafe { sismo_ds_emit(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
     }
 

@@ -343,8 +343,8 @@ fn encode_clock_snapshot(ts_ns: u64) -> Vec<u8> {
     w.bytes().to_vec()
 }
 
-/// Wrap a payload in a TracePacket body (timestamp + optional sequence_flags +
-/// payload-as-field), matching encode_trace_packet_body.
+/// Wrap a payload in a TracePacket body: timestamp + optional sequence_flags +
+/// payload as length-delimited field `payload_field_tag`.
 fn wrap_trace_packet(
     timestamp_ns: u64,
     sequence_flags: u32,

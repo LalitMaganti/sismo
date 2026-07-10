@@ -68,7 +68,44 @@ impl ProtoWriter {
         self.write_varint(msg.len() as u64);
         self.buf.extend_from_slice(msg);
     }
+
+    /// Write a length-delimited sub-message built in place by `f`, with no
+    /// intermediate buffer. See [`ProtoWriter::begin_message`] for how the
+    /// length prefix is handled.
+    pub fn message(&mut self, field: u32, f: impl FnOnce(&mut ProtoWriter)) {
+        let marker = self.begin_message(field);
+        f(self);
+        self.end_message(marker);
+    }
+
+    /// Open a length-delimited sub-message: write the tag and reserve a fixed
+    /// [`RESERVED_LEN`]-byte length slot. The body is written straight into this
+    /// buffer; [`ProtoWriter::end_message`] backfills the length. Reserving a
+    /// fixed width means the length can be patched in place with no memmove —
+    /// at the cost of a non-minimal (redundant) varint, which protobuf readers
+    /// accept. Returns a marker to pass to `end_message`.
+    pub fn begin_message(&mut self, field: u32) -> usize {
+        self.write_tag(field, 2);
+        let marker = self.buf.len();
+        self.buf.extend_from_slice(&[0u8; RESERVED_LEN]);
+        marker
+    }
+
+    /// Close a sub-message opened by [`ProtoWriter::begin_message`], backfilling
+    /// its content length as a fixed-width redundant varint.
+    pub fn end_message(&mut self, marker: usize) {
+        let len = (self.buf.len() - marker - RESERVED_LEN) as u64;
+        debug_assert!(len < (1 << (7 * RESERVED_LEN)), "sub-message too large for the reserved length");
+        for i in 0..RESERVED_LEN - 1 {
+            self.buf[marker + i] = (((len >> (7 * i)) & 0x7f) as u8) | 0x80;
+        }
+        self.buf[marker + RESERVED_LEN - 1] = ((len >> (7 * (RESERVED_LEN - 1))) & 0x7f) as u8;
+    }
 }
+
+/// Fixed width reserved for a sub-message length prefix. 5 bytes = 35 bits,
+/// covering any packet-sized message (up to 32 GiB) as a redundant varint.
+const RESERVED_LEN: usize = 5;
 
 impl Default for ProtoWriter {
     fn default() -> Self {
@@ -192,7 +229,7 @@ mod reader_tests {
 }
 
 
-/// Build a TracePacket carrying PerfSampleDefaults, ready to hand to
+/// Write a TracePacket carrying PerfSampleDefaults into `w`, ready to hand to
 /// sismo_ds_emit. Replaces the encodePerfSampleDefaults + encodeTracePacket
 /// Defaults + encodeTracePacketBody chain in linux_bpf_capture's emitDefaults.
 ///
@@ -208,53 +245,47 @@ mod reader_tests {
 ///       },
 ///     },
 ///   }
-///
-/// Returns the encoded TracePacket bytes.
-pub fn encode_perf_defaults_packet(
+pub fn write_perf_defaults_packet(
+    w: &mut ProtoWriter,
     timebase_name: &[u8],
     timebase_freq: u64,
     followers: &[&[u8]],
     sample_scope: u32,
     timestamp_clock_id: u32,
     sequence_flags: u32,
-) -> Vec<u8> {
-    let mut psd = ProtoWriter::new();
-    {
-        let mut tb = ProtoWriter::new();
-        if timebase_freq != 0 {
-            tb.write_uint64(2, timebase_freq);
-        }
-        tb.write_string(10, timebase_name);
-        psd.write_message(1, tb.bytes());
-    }
-    for f in followers {
-        let mut fe = ProtoWriter::new();
-        fe.write_string(4, f);
-        psd.write_message(4, fe.bytes());
-    }
-    if sample_scope != 0 {
-        psd.write_uint32(5, sample_scope);
-    }
-
-    let mut tpd = ProtoWriter::new();
-    if timestamp_clock_id != 0 {
-        tpd.write_uint32(58, timestamp_clock_id);
-    }
-    tpd.write_message(12, psd.bytes());
-
-    let mut body = ProtoWriter::new();
+) {
     if sequence_flags != 0 {
-        body.write_uint32(13, sequence_flags);
+        w.write_uint32(13, sequence_flags);
     }
-    body.write_message(59, tpd.bytes());
-    body.bytes().to_vec()
+    w.message(59, |tpd| {
+        if timestamp_clock_id != 0 {
+            tpd.write_uint32(58, timestamp_clock_id);
+        }
+        tpd.message(12, |psd| {
+            psd.message(1, |tb| {
+                if timebase_freq != 0 {
+                    tb.write_uint64(2, timebase_freq);
+                }
+                tb.write_string(10, timebase_name);
+            });
+            for f in followers {
+                psd.message(4, |fe| fe.write_string(4, f));
+            }
+            if sample_scope != 0 {
+                psd.write_uint32(5, sample_scope);
+            }
+        });
+    });
 }
 
-/// Encode a PerfSample (TracePacket field 66 body). Fields: cpu=1, pid=2,
-/// tid=3, callstack_iid=4, timebase_count=6, follower_counts=7 (repeated),
-/// data_address=20, data_symbol=21 (the last two are sismo extensions).
-/// Fields are omitted when 0 / absent. Returns the encoded PerfSample bytes.
-pub fn encode_perf_sample(
+/// Write a PerfSample as length-delimited field `field` of the current message.
+/// PerfSample fields: cpu=1, pid=2, tid=3, callstack_iid=4, timebase_count=6,
+/// follower_counts=7 (repeated), data_address=20, data_symbol=21 (the last two
+/// are sismo extensions). Fields are omitted when 0 / absent.
+#[allow(clippy::too_many_arguments)]
+pub fn write_perf_sample(
+    w: &mut ProtoWriter,
+    field: u32,
     cpu: u32,
     pid: u32,
     tid: u32,
@@ -263,71 +294,53 @@ pub fn encode_perf_sample(
     follower_counts: &[u64],
     data_address: u64,
     data_symbol: Option<&[u8]>,
-) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    w.write_uint32(1, cpu);
-    w.write_uint32(2, pid);
-    w.write_uint32(3, tid);
-    if callstack_iid != 0 {
-        w.write_uint64(4, callstack_iid);
-    }
-    if timebase_count != 0 {
-        w.write_uint64(6, timebase_count);
-    }
-    for &fc in follower_counts {
-        w.write_uint64(7, fc);
-    }
-    if data_address != 0 {
-        w.write_uint64(20, data_address);
-    }
-    if let Some(sym) = data_symbol {
-        w.write_string(21, sym);
-    }
-    w.bytes().to_vec()
+) {
+    w.message(field, |m| {
+        m.write_uint32(1, cpu);
+        m.write_uint32(2, pid);
+        m.write_uint32(3, tid);
+        if callstack_iid != 0 {
+            m.write_uint64(4, callstack_iid);
+        }
+        if timebase_count != 0 {
+            m.write_uint64(6, timebase_count);
+        }
+        for &fc in follower_counts {
+            m.write_uint64(7, fc);
+        }
+        if data_address != 0 {
+            m.write_uint64(20, data_address);
+        }
+        if let Some(sym) = data_symbol {
+            m.write_string(21, sym);
+        }
+    });
 }
 
-/// Encode a GenericKernelTaskStateEvent (TracePacket field 117 body). Fields:
-/// cpu=1 (int32, always written), comm=2 (string, capped at 64 bytes, omitted
-/// when empty), tid=3 (int64), state=4 (enum/uint32), prio=5 (int32).
-pub fn encode_kernel_task_state_event(
+/// Write a GenericKernelTaskStateEvent as length-delimited field `field` of the
+/// current message. Event fields: cpu=1 (int32, always written), comm=2 (string,
+/// capped at 64 bytes, omitted when empty), tid=3 (int64), state=4 (enum/uint32),
+/// prio=5 (int32).
+pub fn write_kernel_task_state_event(
+    w: &mut ProtoWriter,
+    field: u32,
     cpu: i32,
     comm: &[u8],
     tid: i64,
     state: u32,
     prio: i32,
-) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    w.write_int32(1, cpu);
-    if !comm.is_empty() {
-        // Cap comm at 64 bytes (Mach thread name max in practice).
-        let capped = comm.len().min(64);
-        w.write_string(2, &comm[..capped]);
-    }
-    w.write_int64(3, tid);
-    w.write_uint32(4, state);
-    w.write_int32(5, prio);
-    w.bytes().to_vec()
-}
-
-/// Encode a TracePacket body: optional timestamp (field 8, omitted when 0),
-/// optional sequence_flags (field 13, omitted when 0), then the already-encoded
-/// `payload` wrapped as length-delimited field `payload_field_tag` (e.g. 66 =
-/// perf_sample, 117 = generic_kernel_task_state_event).
-pub fn encode_trace_packet_body(
-    timestamp_ns: u64,
-    sequence_flags: u32,
-    payload_field_tag: u32,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    if timestamp_ns != 0 {
-        w.write_uint64(8, timestamp_ns);
-    }
-    if sequence_flags != 0 {
-        w.write_uint32(13, sequence_flags);
-    }
-    w.write_message(payload_field_tag, payload);
-    w.bytes().to_vec()
+) {
+    w.message(field, |m| {
+        m.write_int32(1, cpu);
+        if !comm.is_empty() {
+            // Cap comm at 64 bytes (Mach thread name max in practice).
+            let capped = comm.len().min(64);
+            m.write_string(2, &comm[..capped]);
+        }
+        m.write_int64(3, tid);
+        m.write_uint32(4, state);
+        m.write_int32(5, prio);
+    });
 }
 
 #[cfg(test)]
@@ -342,100 +355,127 @@ mod tests {
         assert_eq!(w.bytes(), &[0x08, 0x96, 0x01]);
     }
 
+    /// Collect all `(field, WireValue)` pairs of a message into a Vec.
+    fn fields(buf: &[u8]) -> Vec<(u32, WireValue<'_>)> {
+        ProtoReader::new(buf).collect()
+    }
+
+    /// Return the payload of the first LEN-typed field `field`, or panic.
+    fn sub<'a>(buf: &'a [u8], field: u32) -> &'a [u8] {
+        for (f, v) in ProtoReader::new(buf) {
+            if f == field {
+                if let WireValue::Len(s) = v {
+                    return s;
+                }
+            }
+        }
+        panic!("no LEN field {field}");
+    }
+
+    /// Return the varint of the first VARINT-typed field `field`, or panic.
+    fn varint(buf: &[u8], field: u32) -> u64 {
+        for (f, v) in ProtoReader::new(buf) {
+            if f == field {
+                if let WireValue::Varint(n) = v {
+                    return n;
+                }
+            }
+        }
+        panic!("no VARINT field {field}");
+    }
+
     #[test]
-    fn perf_sample_bytes_are_exact() {
+    fn perf_sample_fields_round_trip() {
         // cpu=1, pid=2, tid=3, callstack_iid=5; no timebase/followers/data.
-        let got = encode_perf_sample(1, 2, 3, 5, 0, &[], 0, None);
-        // cpu(1)=1: 08 01; pid(2)=2: 10 02; tid(3)=3: 18 03; callstack(4)=5: 20 05
-        assert_eq!(got, [0x08, 0x01, 0x10, 0x02, 0x18, 0x03, 0x20, 0x05]);
+        let mut w = ProtoWriter::new();
+        write_perf_sample(&mut w, 66, 1, 2, 3, 5, 0, &[], 0, None);
+        let ps = sub(w.bytes(), 66);
+        assert_eq!(varint(ps, 1), 1);
+        assert_eq!(varint(ps, 2), 2);
+        assert_eq!(varint(ps, 3), 3);
+        assert_eq!(varint(ps, 4), 5);
+        // callstack_iid=0 / timebase_count=0 / data are omitted.
+        assert!(!fields(ps).iter().any(|(f, _)| *f == 6 || *f == 20 || *f == 21));
     }
 
     #[test]
     fn perf_sample_followers_and_data_symbol() {
-        let got = encode_perf_sample(0, 0, 0, 0, 0, &[100, 200], 0xdead, Some(b"[heap]"));
-        // follower_counts field 7 (tag 0x38): 38 64 (100), 38 C8 01 (200).
-        assert!(got.windows(2).any(|w| w == [0x38, 0x64]));
-        assert!(got.windows(3).any(|w| w == [0x38, 0xC8, 0x01]));
-        // data_symbol field 21 (tag 0xAA 0x01, len 6) = "[heap]".
-        assert!(got.windows(3).any(|w| w == [0xAA, 0x01, 0x06]));
+        let mut w = ProtoWriter::new();
+        write_perf_sample(&mut w, 66, 0, 0, 0, 0, 0, &[100, 200], 0xdead, Some(b"[heap]"));
+        let ps = sub(w.bytes(), 66);
+        let follower_counts: Vec<u64> = ProtoReader::new(ps)
+            .filter_map(|(f, v)| match (f, v) {
+                (7, WireValue::Varint(n)) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(follower_counts, vec![100, 200]);
+        assert_eq!(varint(ps, 20), 0xdead);
+        assert_eq!(sub(ps, 21), b"[heap]");
     }
 
     #[test]
-    fn kernel_task_state_event_bytes_are_exact() {
+    fn kernel_task_state_event_fields_round_trip() {
         // cpu=3, comm="foo", tid=42, state=3 (running), prio=31.
-        let got = encode_kernel_task_state_event(3, b"foo", 42, 3, 31);
-        // cpu(1)=3: 08 03; comm(2)="foo": 12 03 66 6F 6F; tid(3)=42: 18 2A;
-        // state(4)=3: 20 03; prio(5)=31: 28 1F.
-        assert_eq!(
-            got,
-            [0x08, 0x03, 0x12, 0x03, 0x66, 0x6F, 0x6F, 0x18, 0x2A, 0x20, 0x03, 0x28, 0x1F],
-        );
+        let mut w = ProtoWriter::new();
+        write_kernel_task_state_event(&mut w, 117, 3, b"foo", 42, 3, 31);
+        let ev = sub(w.bytes(), 117);
+        assert_eq!(varint(ev, 1), 3);
+        assert_eq!(sub(ev, 2), b"foo");
+        assert_eq!(varint(ev, 3), 42);
+        assert_eq!(varint(ev, 4), 3);
+        assert_eq!(varint(ev, 5), 31);
     }
 
     #[test]
     fn kernel_task_state_event_negative_int32_is_bitcast_not_sign_extended() {
         // cpu=-1 must encode as the 5-byte u32 bitcast (FF FF FF FF 0F), not
-        // the 10-byte 64-bit sign-extension.
-        let got = encode_kernel_task_state_event(-1, b"", 0, 0, 0);
-        // cpu(1)=-1: 08 FF FF FF FF 0F; comm omitted; tid(3)=0: 18 00;
-        // state(4)=0: 20 00; prio(5)=0: 28 00.
-        assert_eq!(
-            got,
-            [0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x18, 0x00, 0x20, 0x00, 0x28, 0x00],
-        );
+        // the 10-byte 64-bit sign-extension. comm empty -> field 2 omitted.
+        let mut w = ProtoWriter::new();
+        write_kernel_task_state_event(&mut w, 117, -1, b"", 0, 0, 0);
+        let ev = sub(w.bytes(), 117);
+        // cpu(1)=-1: 08 FF FF FF FF 0F (5-byte varint), then tid/state/prio=0.
+        assert_eq!(&ev[..6], [0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(!fields(ev).iter().any(|(f, _)| *f == 2));
+        assert_eq!(varint(ev, 1) as u32, u32::MAX);
     }
 
     #[test]
     fn kernel_task_state_event_comm_capped_at_64() {
-        let got = encode_kernel_task_state_event(0, &[b'a'; 100], 0, 0, 0);
-        // comm field 2 (tag 0x12) with length 64 (0x40).
-        assert!(got.windows(2).any(|w| w == [0x12, 0x40]));
+        let mut w = ProtoWriter::new();
+        write_kernel_task_state_event(&mut w, 117, 0, &[b'a'; 100], 0, 0, 0);
+        assert_eq!(sub(sub(w.bytes(), 117), 2).len(), 64);
     }
 
     #[test]
-    fn trace_packet_body_wraps_payload_with_timestamp_and_flags() {
-        // timestamp=150, sequence_flags=1, payload=[0xAB] under field 66.
-        let got = encode_trace_packet_body(150, 1, 66, &[0xAB]);
-        // timestamp(8)=150: 40 96 01; sequence_flags(13)=1: 68 01;
-        // payload(66) len 1: tag=66<<3|2=0x212 -> 92 04, len 01, byte AB.
-        assert_eq!(got, [0x40, 0x96, 0x01, 0x68, 0x01, 0x92, 0x04, 0x01, 0xAB]);
-    }
-
-    #[test]
-    fn trace_packet_body_omits_zero_timestamp_and_flags() {
-        // timestamp=0 and sequence_flags=0 are both omitted.
-        let got = encode_trace_packet_body(0, 0, 117, &[0x01, 0x02]);
-        // Only payload(117) len 2: tag=117<<3|2=0x3AA -> AA 07, len 02, 01 02.
-        assert_eq!(got, [0xAA, 0x07, 0x02, 0x01, 0x02]);
-    }
-
-    #[test]
-    fn perf_defaults_packet_bytes_are_exact() {
+    fn perf_defaults_packet_round_trips() {
         // timebase name "x", no freq, no followers, scope=thread(2),
         // clock=MONOTONIC(3), seq=INCREMENTAL_STATE_CLEARED(1).
-        let got = encode_perf_defaults_packet(b"x", 0, &[], 2, 3, 1);
-        // Hand-computed wire bytes (see the layout doc above):
-        //   seq_flags(13,varint)=1                -> 68 01
-        //   trace_packet_defaults(59,len=12)      -> DA 03 0C
-        //     timestamp_clock_id(58,varint)=3     -> D0 03 03
-        //     perf_sample_defaults(12,len=7)      -> 62 07
-        //       timebase(1,len=3)                 -> 0A 03
-        //         name(10,len=1)="x"              -> 52 01 78
-        //       sample_scope(5,varint)=2          -> 28 02
-        let expected: &[u8] = &[
-            0x68, 0x01, 0xDA, 0x03, 0x0C, 0xD0, 0x03, 0x03, 0x62, 0x07, 0x0A, 0x03, 0x52, 0x01,
-            0x78, 0x28, 0x02,
-        ];
-        assert_eq!(got, expected);
+        let mut w = ProtoWriter::new();
+        write_perf_defaults_packet(&mut w, b"x", 0, &[], 2, 3, 1);
+        assert_eq!(varint(w.bytes(), 13), 1); // sequence_flags
+        let tpd = sub(w.bytes(), 59);
+        assert_eq!(varint(tpd, 58), 3); // timestamp_clock_id
+        let psd = sub(tpd, 12);
+        assert_eq!(varint(psd, 5), 2); // sample_scope
+        let tb = sub(psd, 1);
+        assert_eq!(sub(tb, 10), b"x"); // timebase name
+        assert!(!fields(tb).iter().any(|(f, _)| *f == 2)); // freq=0 omitted
+        assert!(!fields(psd).iter().any(|(f, _)| *f == 4)); // no followers
     }
 
     #[test]
     fn perf_defaults_packet_with_followers() {
         let followers: [&[u8]; 2] = [b"a", b"bb"];
-        let got = encode_perf_defaults_packet(b"tb", 0, &followers, 2, 3, 1);
-        // Each follower is FollowerEvent{name(4)}: "a" -> 22 03 22 01 61,
-        // "bb" -> 22 04 22 02 62 62 (field 4 = 0x22).
-        assert!(got.windows(5).any(|w| w == [0x22, 0x03, 0x22, 0x01, 0x61]));
-        assert!(got.windows(6).any(|w| w == [0x22, 0x04, 0x22, 0x02, 0x62, 0x62]));
+        let mut w = ProtoWriter::new();
+        write_perf_defaults_packet(&mut w, b"tb", 0, &followers, 2, 3, 1);
+        let psd = sub(sub(w.bytes(), 59), 12);
+        let names: Vec<Vec<u8>> = ProtoReader::new(psd)
+            .filter_map(|(f, v)| match (f, v) {
+                (4, WireValue::Len(fe)) => Some(sub(fe, 4).to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec![b"a".to_vec(), b"bb".to_vec()]);
     }
 }

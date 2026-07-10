@@ -15,7 +15,7 @@
 //! macOS only; gated in lib.rs.
 
 use crate::proc_info::{sismo_proc_parent_pid, sismo_proc_pid_path, sismo_proc_thread_name};
-use crate::proto::{encode_kernel_task_state_event, encode_trace_packet_body};
+use crate::proto::{write_kernel_task_state_event, ProtoWriter};
 use crate::sched_protos::{
     sismo_encode_kernel_process_tree, sismo_macos_sched_vm_program, ProcessC, ThreadC,
 };
@@ -433,9 +433,9 @@ impl SchedCapture {
 
         // Wrap in a TracePacket body (no timestamp — tree entries are
         // time-independent metadata) and emit.
-        let body =
-            encode_trace_packet_body(0, 0, TP_FIELD_GENERIC_KERNEL_PROCESS_TREE, &tree[..tree_len]);
-        unsafe { sismo_ds_emit(slot, body.as_ptr(), body.len()) };
+        let mut w = ProtoWriter::new();
+        w.write_message(TP_FIELD_GENERIC_KERNEL_PROCESS_TREE, &tree[..tree_len]);
+        unsafe { sismo_ds_emit(slot, w.bytes().as_ptr(), w.bytes().len()) };
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -534,9 +534,20 @@ fn lookup_comm<'a>(threads: &'a [KdThreadMap], cache: &'a PtCache, tid: u64) -> 
 }
 
 fn emit_task_state(slot: u32, ts_ns: u64, cpu: i32, comm: &[u8], tid: i64, state: u32, prio: i32) {
-    let event = encode_kernel_task_state_event(cpu, comm, tid, state, prio);
-    let packet = encode_trace_packet_body(ts_ns, 0, TP_FIELD_GENERIC_KERNEL_TASK_STATE, &event);
-    unsafe { sismo_ds_emit(slot, packet.as_ptr(), packet.len()) };
+    let mut w = ProtoWriter::new();
+    if ts_ns != 0 {
+        w.write_uint64(8, ts_ns);
+    }
+    write_kernel_task_state_event(
+        &mut w,
+        TP_FIELD_GENERIC_KERNEL_TASK_STATE,
+        cpu,
+        comm,
+        tid,
+        state,
+        prio,
+    );
+    unsafe { sismo_ds_emit(slot, w.bytes().as_ptr(), w.bytes().len()) };
 }
 
 /// Create the sched capture: register the data source (with the ProtoVM

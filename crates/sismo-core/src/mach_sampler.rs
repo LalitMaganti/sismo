@@ -12,7 +12,7 @@
 //! C++ SDK shim — so rust-bridge keeps no dependency on `sismo_ds_emit` and
 //! `cargo test` still links. macOS/arm64 only; gated in lib.rs.
 
-use crate::proto::{encode_perf_sample, encode_trace_packet_body};
+use crate::proto::{write_perf_sample, ProtoWriter};
 use crate::unwinder::{sismo_unwinder_walk, Unwinder};
 use std::os::raw::{c_int, c_void};
 
@@ -187,8 +187,12 @@ pub unsafe extern "C" fn sismo_cpu_sample_thread(
 
     unsafe { thread_resume(thread) };
 
-    // PerfSample (leaf-only: callstack_iid = 0) → TracePacket body.
-    let sample = encode_perf_sample(
+    // TracePacket body: timestamp + PerfSample (leaf-only: callstack_iid = 0).
+    let mut w = ProtoWriter::new();
+    w.write_uint64(8, now_monotonic_ns());
+    write_perf_sample(
+        &mut w,
+        TP_FIELD_PERF_SAMPLE,
         0,        // cpu — core not tracked
         pid,
         tid as u32,
@@ -198,7 +202,7 @@ pub unsafe extern "C" fn sismo_cpu_sample_thread(
         0,        // data_address
         None,     // data_symbol
     );
-    let packet = encode_trace_packet_body(now_monotonic_ns(), 0, TP_FIELD_PERF_SAMPLE, &sample);
+    let packet = w.bytes();
     if packet.len() > out_packet_cap {
         return 0;
     }
