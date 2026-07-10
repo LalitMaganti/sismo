@@ -25,7 +25,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PERFMON = os.path.join(ROOT, "third_party", "perfmon")
-OUT = os.path.join(ROOT, "src", "gen", "pmu_events.zig")
+OUT = os.path.join(ROOT, "rust-bridge", "src", "pmu_events.rs")
 
 # sismo role -> candidate perfmon event names, most-preferred first. The first
 # candidate present in a model's event list wins. A role absent from a model is
@@ -159,39 +159,46 @@ def main() -> int:
         "// parts) and opens these as PERF_TYPE_RAW `config` values — no hardcoded",
         "// encodings, and per-model event-name differences are handled at codegen.",
         "",
-        "pub const Role = enum {",
+        "#![allow(non_camel_case_types, dead_code)]",
+        "",
+        "#[derive(Clone, Copy, PartialEq, Eq)]",
+        "pub enum Role {",
     ]
     for role in ROLES:
         lines.append(f"    {role},")
     lines += [
-        "};",
+        "}",
         "",
-        "pub const Event = struct { role: Role, config: u64, name: []const u8 };",
-        "pub const Model = struct {",
-        "    family: u16,",
-        "    model: u16,",
-        "    // CPUID steppings this row applies to; empty matches any stepping.",
-        "    steppings: []const u8,",
-        "    // Hybrid core role: \"\" (non-hybrid), \"Core\" (P-core), \"Atom\" (E-core).",
-        "    core: []const u8,",
-        "    events: []const Event,",
-        "};",
+        "pub struct Event {",
+        "    pub role: Role,",
+        "    pub config: u64,",
+        "    pub name: &'static str,",
+        "}",
+        "pub struct Model {",
+        "    pub family: u16,",
+        "    pub model: u16,",
+        "    /// CPUID steppings this row applies to; empty matches any stepping.",
+        "    pub steppings: &'static [u8],",
+        "    /// Hybrid core role: \"\" (non-hybrid), \"Core\" (P-core), \"Atom\" (E-core).",
+        "    pub core: &'static str,",
+        "    pub events: &'static [Event],",
+        "}",
         "",
-        "pub const MODELS = [_]Model{",
+        "pub static MODELS: &[Model] = &[",
     ]
     for family, model, steppings, core, resolved in models:
-        st = "".join(f"{s}, " for s in steppings).rstrip()
+        st = ", ".join(str(s) for s in steppings)
         lines.append(
-            f"    .{{ .family = {family}, .model = {model}, "
-            f".steppings = &[_]u8{{{st}}}, .core = \"{core}\", .events = &.{{"
+            f"    Model {{ family: {family}, model: {model}, "
+            f"steppings: &[{st}], core: \"{core}\", events: &["
         )
         for role, name, cfg in resolved:
             lines.append(
-                f"        .{{ .role = .{role}, .config = 0x{cfg:x}, "
-                f'.name = "{name}" }},'
+                f"        Event {{ role: Role::{role}, config: 0x{cfg:x}, "
+                f'name: "{name}" }},'
             )
-        lines.append("    } },")
-    lines += ["};", ""]
+        lines.append("    ] },")
+    lines += ["];", ""]
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w") as f:

@@ -56,6 +56,8 @@ pub mod perf_symbolize;
 pub mod proc_maps;
 pub mod proto;
 #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+pub mod pmu_events;
 pub mod linux_bpf_capture;
 // `sismo record` arg value-parsers (seed of the eventual full record parser).
 pub mod record_args;
