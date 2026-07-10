@@ -972,8 +972,8 @@ use crate::worker_sdk::{sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use std::ptr;
 use std::time::Duration;
 
-/// Kernel-side BPF object, compiled by build.rs (Linux only).
-const BPF_OBJ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sched.bpf.o"));
+/// Kernel-side BPF object, compiled by the sismo-sys crate (Linux only).
+use sismo_sys::BPF_OBJ;
 const DS_NAME: &[u8] = b"sismo.linux_cpu_samples";
 
 /// Recording stats handed back to the record runner (matches cmd_record).

@@ -1,9 +1,9 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Compile the kernel-side BPF object (src/c/sismo_bpf/sched.bpf.c) so the
-//! Linux CPU collector (src/linux_bpf_capture.rs) can include_bytes! it. Linux
-//! only; needs clang with the bpf target (same invocation build.zig used).
+//! Compile the kernel-side BPF object (csrc/sismo_bpf/sched.bpf.c) so the Linux
+//! CPU collector can include_bytes! it via [`sismo_sys::BPF_OBJ`]. Linux only;
+//! needs clang with the bpf target.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -13,15 +13,8 @@ fn main() {
     if target_os != "linux" {
         return;
     }
-    // crates/rust-bridge -> repo root is two levels up.
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let bpf_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("csrc/sismo_bpf");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let bpf_dir = root.join("src/c/sismo_bpf");
     let src = bpf_dir.join("sched.bpf.c");
     let obj = out.join("sched.bpf.o");
 

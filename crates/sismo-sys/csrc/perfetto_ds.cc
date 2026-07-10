@@ -20,7 +20,7 @@
 // source-specific logic in C++.** All proto encoding (descriptor,
 // per-DS config, payloads, VmProgram) lives in Zig.
 
-#include "src/c/perfetto_shim.h"
+#include "perfetto_shim.h"
 
 #include <array>
 #include <atomic>

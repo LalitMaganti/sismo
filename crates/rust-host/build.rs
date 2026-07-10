@@ -24,7 +24,7 @@ fn main() {
         .to_path_buf();
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    println!("cargo:rerun-if-changed={}", root.join("src/c").display());
+    println!("cargo:rerun-if-changed={}", root.join("crates/sismo-sys/csrc").display());
 
     // Perfetto's C++ SDK archive + generated headers. Built directly (ninja is
     // incremental, so this is cheap once built). compile_cc_shims + the final
@@ -117,8 +117,9 @@ fn compile_cc_shims(root: &PathBuf, out: &PathBuf) {
 
     let pf = root.join("third_party/src/perfetto");
     let pf_out = pf.join("out/sismo");
+    let csrc = root.join("crates/sismo-sys/csrc");
     let includes = [
-        root.clone(), // repo root, for "src/c/…"-qualified includes
+        csrc.clone(), // the C shim sources + headers
         pf.join("include"),
         pf.clone(),
         pf.join("buildtools/android-unwinding/libunwindstack/include"),
@@ -138,7 +139,7 @@ fn compile_cc_shims(root: &PathBuf, out: &PathBuf) {
 
     let mut objs = Vec::new();
     for f in &files {
-        let src = root.join("src/c").join(f);
+        let src = csrc.join(f);
         let obj = out.join(format!("{f}.o"));
         let mut cmd = zig_cmd(root, "c++");
         cmd.args(["-target", &zig_target, "-c"]).arg(&src).arg("-o").arg(&obj);
@@ -158,7 +159,7 @@ fn compile_cc_shims(root: &PathBuf, out: &PathBuf) {
     // The sample-target TrackEvent shim is C (C11 atomics), so compile it with
     // `zig cc`; it lands in the same archive and links into the sample-target bin.
     {
-        let src = root.join("src/c/sample_target_sdk.c");
+        let src = csrc.join("sample_target_sdk.c");
         let obj = out.join("sample_target_sdk.c.o");
         let mut cmd = zig_cmd(root, "cc");
         cmd.args(["-target", &zig_target, "-c"]).arg(&src).arg("-o").arg(&obj);

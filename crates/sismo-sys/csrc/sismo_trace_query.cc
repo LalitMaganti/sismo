@@ -1,7 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-#include "src/c/sismo_trace_query.h"
+#include "sismo_trace_query.h"
 
 #include <cstdio>
 #include <memory>

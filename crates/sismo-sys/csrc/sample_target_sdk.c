@@ -5,7 +5,7 @@
 // the why; the macros below are the standard Perfetto C SDK setup
 // distilled to a single category named `app`.
 
-#include "src/c/sample_target_sdk.h"
+#include "sample_target_sdk.h"
 
 #include <stdatomic.h>
 

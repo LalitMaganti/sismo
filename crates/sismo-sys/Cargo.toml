@@ -1,0 +1,14 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
+# Native C/C++ dependencies for sismo: the Perfetto C++ SDK shims (compiled in
+# build.rs) and the kernel-side BPF object. Owns csrc/ and exposes the compiled
+# BPF object bytes to the Rust crates that link it.
+[package]
+name = "sismo-sys"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

@@ -9,7 +9,7 @@
 // been issued, and let the runner block on Run() until Quit() is called
 // from the orchestrator.
 
-#include "src/c/sismo_traced_probes.h"
+#include "sismo_traced_probes.h"
 
 #include <atomic>
 #include <memory>

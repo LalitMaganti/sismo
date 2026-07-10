@@ -9,7 +9,7 @@
 // thread spawned by create(), wait for "ready", then return control to
 // the caller. stop() sets Quit() (safe cross-thread); destroy() joins.
 
-#include "src/c/sismo_traced.h"
+#include "sismo_traced.h"
 
 #include <atomic>
 #include <list>

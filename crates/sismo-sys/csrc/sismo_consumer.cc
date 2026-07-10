@@ -11,7 +11,7 @@
 //   - clone_to_file is used by `sismo snapshot` — snapshotting is
 //     exclusively user-driven via `sismo snapshot`.
 
-#include "src/c/perfetto_shim.h"
+#include "perfetto_shim.h"
 
 #include <chrono>
 #include <condition_variable>
