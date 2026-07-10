@@ -19,6 +19,7 @@
 //! producer-socket connection is the C++ shim. macOS-only runtime (the Linux
 //! producers aren't wired in this binary yet); POSIX, cfg-gated off Windows.
 
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Platform-independent data-source identifier.
@@ -91,14 +92,18 @@ fn collect_kinds(rest: &[&str]) -> Result<Vec<Kind>, ()> {
 
 // ---- Signal-driven stop ----------------------------------------------------
 
+#[cfg(target_os = "macos")]
 static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "macos")]
 extern "C" fn handle_stop(_sig: std::os::raw::c_int) {
     SHOULD_STOP.store(true, Ordering::Release);
 }
 
+#[cfg(target_os = "macos")]
 use libc::{signal, SIGINT, SIGTERM};
 
+#[cfg(target_os = "macos")]
 fn install_stop_handlers() {
     unsafe {
         signal(SIGINT, handle_stop as extern "C" fn(std::os::raw::c_int) as libc::sighandler_t);
@@ -106,6 +111,7 @@ fn install_stop_handlers() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn block_until_stopped() {
     // Coarse poll — the handler can't safely touch a condvar, so check the
     // atomic on a short interval (100 ms latency, fine for SIGTERM).

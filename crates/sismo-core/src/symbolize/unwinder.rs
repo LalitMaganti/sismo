@@ -52,6 +52,11 @@ pub extern "C" fn sismo_unwinder_create_arm64() -> *mut Unwinder {
     Box::into_raw(u)
 }
 
+/// Free an unwinder from `sismo_unwinder_create_arm64`.
+///
+/// # Safety
+/// `p` must be a pointer returned by `sismo_unwinder_create_arm64` and not yet
+/// destroyed, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_unwinder_destroy(p: *mut Unwinder) {
     if p.is_null() {
@@ -64,6 +69,10 @@ pub unsafe extern "C" fn sismo_unwinder_destroy(p: *mut Unwinder) {
 ///   `0` on success,
 ///  `-1` if the bytes don't parse as a 64-bit mach-o,
 ///  `-2` if the parse succeeded but no usable unwind sections were found.
+///
+/// # Safety
+/// `p` must be a valid unwinder pointer; `mach_o_data` must be valid for
+/// `mach_o_len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_unwinder_add_module(
     p: *mut Unwinder,
@@ -232,6 +241,10 @@ pub unsafe extern "C" fn sismo_unwinder_add_module(
 /// into `out_pcs`. The first slot is always the snapshot `pc`; subsequent
 /// slots are return addresses recovered by framehop. Returns the number
 /// of slots written. Stops on first iter error (best-effort partial walk).
+///
+/// # Safety
+/// `p` must be a valid unwinder pointer; `read_stack_cb` must be safe to call
+/// with `user_data`; `out_pcs` must be writable for `max_pcs` u64s.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_unwinder_walk(
     p: *mut Unwinder,
@@ -299,6 +312,10 @@ pub unsafe extern "C" fn sismo_unwinder_walk(
 /// `snapshot_bytes` is the contents of [snapshot_sp .. snapshot_sp+len)
 /// captured at that moment. Reads outside the buffer return Err to
 /// framehop, which terminates the walk gracefully (samply pattern).
+///
+/// # Safety
+/// `p` must be a valid unwinder pointer; `snapshot_bytes` must be valid for
+/// `snapshot_len` bytes; `out_pcs` must be writable for `max_pcs` u64s.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_unwinder_walk_snapshot(
     p: *mut Unwinder,

@@ -101,6 +101,11 @@ unsafe fn write_cstr(out: *mut u8, cap: usize, msg: &str) {
     dst[n] = 0;
 }
 
+/// Free a symbolizer from `sismo_symbolizer_create`.
+///
+/// # Safety
+/// `s` must be a pointer returned by `sismo_symbolizer_create` and not yet
+/// destroyed, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_symbolizer_destroy(s: *mut Symbolizer) {
     if s.is_null() {
@@ -124,6 +129,11 @@ pub unsafe extern "C" fn sismo_symbolizer_destroy(s: *mut Symbolizer) {
 ///   `err_out`/`err_cap` on failure (rc 1), the wholesym error rendered
 ///                       as a NUL-terminated string. This is the reason a
 ///                       module didn't symbolize — surface it to the user.
+///
+/// # Safety
+/// `s` must be a valid symbolizer pointer; the `*_utf8`/`uuid_bytes` pointers
+/// must be valid for their stated lengths (null where marked optional); the
+/// `*_out` pointers must be writable for their capacities (or null to skip).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_symbolizer_add_module(
     s: *mut Symbolizer,
@@ -219,6 +229,11 @@ pub unsafe extern "C" fn sismo_symbolizer_add_module(
 /// any of `file_out`/`file_len_out`/`line_out` to skip it. The line info is
 /// taken from the outermost (non-inlined) frame, so it stays consistent with
 /// the function name reported above.
+///
+/// # Safety
+/// `s` must be a valid symbolizer pointer; `out_utf8`/`file_out` must be
+/// writable for their capacities (or null); `file_len_out`/`line_out` must be
+/// writable or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_symbolizer_resolve(
     s: *mut Symbolizer,

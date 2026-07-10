@@ -17,6 +17,7 @@
 //!
 //! macOS-only; gated in lib.rs. Validated by `sudo tools/e2e-all-sources`.
 
+#[cfg(target_os = "macos")]
 use sismo_core::proto::{ProtoReader, WireValue};
 use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
 use sismo_core::proto::session_config::{sismo_encode_trace_config, DataSourceEntryC};
@@ -38,11 +39,13 @@ use sismo_core::sched::macos_sched_capture::{sismo_sched_capture_init, sismo_sch
 // ---- C++ shim (traced service + consumer session + producer init) ----------
 
 use sismo_core::ffi::{
-    sismo_consumer_query_service_state, sismo_consumer_session_create,
-    sismo_consumer_session_destroy, sismo_consumer_session_setup,
+    sismo_consumer_session_create, sismo_consumer_session_destroy, sismo_consumer_session_setup,
     sismo_consumer_session_start_blocking, sismo_consumer_session_stop_blocking, sismo_init,
-    sismo_traced_create, sismo_traced_destroy, sismo_traced_stop, ConsumerSession, TracedSvc,
+    sismo_traced_create, sismo_traced_destroy, sismo_traced_stop, TracedSvc,
 };
+// Only the macOS runner queries service state (waiting on external sources).
+#[cfg(target_os = "macos")]
+use sismo_core::ffi::{sismo_consumer_query_service_state, ConsumerSession};
 
 extern "C" {
     // The privileged-pid marker (Rust, but called via its C ABI for uniformity).
@@ -190,6 +193,7 @@ fn duration_timer(seconds: c_uint, write_fd: c_int) {
 /// TracingServiceState proto. Schema path: field 2 (DataSource) → field 1
 /// (DataSourceDescriptor) → field 1 (name). Uses the reusable ProtoReader, so
 /// it's a declarative walk rather than hand-rolled varint parsing.
+#[cfg(target_os = "macos")]
 fn for_each_registered_data_source(bytes: &[u8], mut cb: impl FnMut(&[u8])) {
     for (field, val) in ProtoReader::new(bytes) {
         let WireValue::Len(ds) = val else { continue };
@@ -212,6 +216,7 @@ fn for_each_registered_data_source(bytes: &[u8], mut cb: impl FnMut(&[u8])) {
 
 /// Poll QueryServiceState until every `expected` name is registered, or
 /// `timeout_ms` elapses. Polls every 100 ms.
+#[cfg(target_os = "macos")]
 fn wait_for_external_data_sources(session: *mut ConsumerSession, expected: &[&str], timeout_ms: u64) -> bool {
     if expected.is_empty() {
         return true;
