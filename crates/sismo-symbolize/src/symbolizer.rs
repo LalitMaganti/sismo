@@ -4,10 +4,10 @@
 //! wholesym FFI surface — resolves AVMA → demangled function name +
 //! offset (and inline frame info where debug info is available).
 //!
-//! Lifecycle: `sismo_symbolizer_create()` returns an opaque handle that
-//! bundles a current-thread tokio runtime and a wholesym `SymbolManager`.
-//! Callers register modules by `(base_avma, end_avma, path)` then resolve
-//! AVMAs into a caller-provided UTF-8 buffer.
+//! Lifecycle: [`Symbolizer::new`] bundles a current-thread tokio runtime and a
+//! wholesym `SymbolManager`. Callers register modules by `(base_avma, end_avma,
+//! path)` via [`Symbolizer::add_module`], then [`Symbolizer::resolve`] an AVMA
+//! to a demangled name + source location.
 //!
 //! All symbol-map loads are synchronous from the caller's perspective —
 //! the runtime `block_on`'s wholesym's async API internally. This is the
@@ -15,9 +15,7 @@
 //! single thread; for higher concurrency we'd switch to a multi-thread
 //! runtime, but that's overkill for v0.
 
-use std::os::raw::c_int;
-use std::path::PathBuf;
-use std::slice;
+use std::path::{Path, PathBuf};
 
 use wholesym::{
     debugid::DebugId, LookupAddress, MultiArchDisambiguator, SymbolManager, SymbolManagerConfig,
@@ -28,6 +26,23 @@ pub struct Symbolizer {
     rt: tokio::runtime::Runtime,
     manager: SymbolManager,
     modules: Vec<SymModule>,
+}
+
+/// Outcome of [`Symbolizer::add_module`]. `symbol_count` is 0 when the symbol
+/// map failed to load; `error` then carries the wholesym render. The avma range
+/// is registered either way, so a failed load makes `resolve` return `None` for
+/// that range instead of matching a neighbor module.
+pub struct ModuleLoad {
+    pub symbol_count: u64,
+    pub error: Option<String>,
+}
+
+/// A resolved address: the demangled `<name> +<offset>`, plus source location
+/// when debug info is available (`line` 0 = unknown).
+pub struct Resolved {
+    pub name: String,
+    pub file: Option<String>,
+    pub line: u32,
 }
 
 struct SymModule {
@@ -69,298 +84,123 @@ fn cache_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn sismo_symbolizer_create() -> *mut Symbolizer {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let manager = SymbolManager::with_config(build_config());
-    Box::into_raw(Box::new(Symbolizer {
-        rt,
-        manager,
-        modules: Vec::new(),
-    }))
-}
+impl Symbolizer {
+    /// Build a symbolizer: a current-thread tokio runtime plus a wholesym
+    /// `SymbolManager`. `None` if the runtime can't be built.
+    pub fn new() -> Option<Symbolizer> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        let manager = SymbolManager::with_config(build_config());
+        Some(Symbolizer {
+            rt,
+            manager,
+            modules: Vec::new(),
+        })
+    }
 
-/// Write `msg` into `out[..cap]` as a NUL-terminated, UTF-8-safe string,
-/// truncating on a char boundary. No-op if `out` is null or `cap == 0`.
-unsafe fn write_cstr(out: *mut u8, cap: usize, msg: &str) {
-    if out.is_null() || cap == 0 {
-        return;
-    }
-    let mut n = msg.len().min(cap - 1);
-    while n > 0 && !msg.is_char_boundary(n) {
-        n -= 1;
-    }
-    let dst = unsafe { slice::from_raw_parts_mut(out, cap) };
-    dst[..n].copy_from_slice(&msg.as_bytes()[..n]);
-    dst[n] = 0;
-}
+    /// Register a module by path so AVMAs in `[base_avma, end_avma)` resolve to
+    /// symbols within it. `uuid` (when non-zero) is the preferred disambiguator;
+    /// `arch` is the fallback when a UUID isn't available.
+    ///
+    /// The avma range is registered even when the symbol map fails to load (the
+    /// returned `error` says why) — a load failure is sometimes expected
+    /// (dyld_shared_cache-only macOS system dylibs) and sometimes actionable (a
+    /// stripped Linux binary with no debug info); keeping the range means
+    /// `resolve` returns `None` here instead of matching a neighbor module.
+    pub fn add_module(
+        &mut self,
+        base_avma: u64,
+        end_avma: u64,
+        path: &Path,
+        uuid: Option<[u8; 16]>,
+        arch: Option<&str>,
+    ) -> ModuleLoad {
+        // Prefer UUID-based disambiguation. samply-symbols' fat-archive `arch`
+        // field reports both arm64 and arm64e entries as "arm64", so an
+        // Arch("arm64e") disambiguator never matches arm64e slices; UUID
+        // matching is exact and bypasses the issue.
+        let disambiguator = uuid
+            .filter(|u| *u != [0u8; 16])
+            // debugid takes the `uuid::Uuid` type, not raw bytes, and doesn't
+            // re-export it — pull `uuid` in directly.
+            .map(|u| MultiArchDisambiguator::DebugId(DebugId::from_uuid(uuid::Uuid::from_bytes(u))))
+            .or_else(|| arch.map(|a| MultiArchDisambiguator::Arch(a.to_string())));
 
-/// Free a symbolizer from `sismo_symbolizer_create`.
-///
-/// # Safety
-/// `s` must be a pointer returned by `sismo_symbolizer_create` and not yet
-/// destroyed, or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_symbolizer_destroy(s: *mut Symbolizer) {
-    if s.is_null() {
-        return;
-    }
-    drop(unsafe { Box::from_raw(s) });
-}
-
-/// Register a module by path so AVMAs in [base_avma, end_avma) resolve
-/// to symbols within it. Returns:
-///    0  success (path opened, symbol map loaded)
-///    1  partial — avma range registered, but symbol load failed (e.g.
-///       wholesym couldn't find the binary on disk). resolve() returns
-///       0 for AVMAs in this range.
-///   -1  bad arguments.
-/// `uuid_bytes` (optional, 16 bytes) is the preferred disambiguator.
-/// `arch_utf8` / `arch_len` is a fallback when UUID isn't available.
-///
-/// Diagnostics (all optional — pass null to skip):
-///   `symbol_count_out`  on success, the number of symbols in the map.
-///   `err_out`/`err_cap` on failure (rc 1), the wholesym error rendered
-///                       as a NUL-terminated string. This is the reason a
-///                       module didn't symbolize — surface it to the user.
-///
-/// # Safety
-/// `s` must be a valid symbolizer pointer; the `*_utf8`/`uuid_bytes` pointers
-/// must be valid for their stated lengths (null where marked optional); the
-/// `*_out` pointers must be writable for their capacities (or null to skip).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_symbolizer_add_module(
-    s: *mut Symbolizer,
-    base_avma: u64,
-    end_avma: u64,
-    path_utf8: *const u8,
-    path_len: usize,
-    uuid_bytes: *const u8,
-    arch_utf8: *const u8,
-    arch_len: usize,
-    symbol_count_out: *mut u64,
-    err_out: *mut u8,
-    err_cap: usize,
-) -> c_int {
-    if s.is_null() || path_utf8.is_null() || path_len == 0 || end_avma <= base_avma {
-        return -1;
-    }
-    let symbolizer = unsafe { &mut *s };
-    let path_bytes = unsafe { slice::from_raw_parts(path_utf8, path_len) };
-    let path_str = match std::str::from_utf8(path_bytes) {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    let path = PathBuf::from(path_str);
-
-    // Prefer UUID-based disambiguator. samply-symbols' fat-archive
-    // `arch` field reports both arm64 and arm64e entries as "arm64", so
-    // an Arch("arm64e") disambiguator never matches arm64e slices. UUID
-    // matching is exact and bypasses the issue entirely.
-    let disambiguator: Option<MultiArchDisambiguator> = if !uuid_bytes.is_null() {
-        let uuid_arr: [u8; 16] = unsafe { *(uuid_bytes as *const [u8; 16]) };
-        if uuid_arr != [0u8; 16] {
-            // debugid takes the `uuid::Uuid` type (not raw bytes), and
-            // doesn't re-export it publicly — pull `uuid` in directly.
-            let uuid = uuid::Uuid::from_bytes(uuid_arr);
-            Some(MultiArchDisambiguator::DebugId(DebugId::from_uuid(uuid)))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-    .or_else(|| {
-        if arch_utf8.is_null() || arch_len == 0 {
-            None
-        } else {
-            let arch_bytes = unsafe { slice::from_raw_parts(arch_utf8, arch_len) };
-            std::str::from_utf8(arch_bytes)
-                .ok()
-                .map(|a| MultiArchDisambiguator::Arch(a.to_string()))
-        }
-    });
-    let load_result = symbolizer.rt.block_on(
-        symbolizer
-            .manager
-            .load_symbol_map_for_binary_at_path(&path, disambiguator),
-    );
-    let (map, rc) = match load_result {
-        Ok(m) => {
-            if !symbol_count_out.is_null() {
-                unsafe { *symbol_count_out = m.symbol_count() as u64 };
+        let load = self.rt.block_on(
+            self.manager
+                .load_symbol_map_for_binary_at_path(path, disambiguator),
+        );
+        let (map, result) = match load {
+            Ok(m) => {
+                let symbol_count = m.symbol_count() as u64;
+                (Some(m), ModuleLoad { symbol_count, error: None })
             }
-            (Some(m), 0)
-        }
-        // A load failure is sometimes expected (dyld_shared_cache-only
-        // macOS system dylibs) and sometimes actionable (a stripped Linux
-        // binary with no debug info installed). The bridge can't tell the
-        // two apart, so it hands the rendered error back to the caller and
-        // still registers the avma range so resolve() returns 0 here.
-        Err(e) => {
-            unsafe { write_cstr(err_out, err_cap, &format!("{e}")) };
-            (None, 1)
-        }
-    };
-    symbolizer.modules.push(SymModule {
-        base_avma,
-        end_avma,
-        map,
-    });
-    rc
-}
+            Err(e) => (None, ModuleLoad { symbol_count: 0, error: Some(format!("{e}")) }),
+        };
+        self.modules.push(SymModule { base_avma, end_avma, map });
+        result
+    }
 
-/// Resolve `avma` to `<demangled_name> +<byte_offset>`, written as UTF-8
-/// into `out_utf8[..cap]`. Returns the number of bytes written (truncated
-/// to `cap` without a NUL terminator), or 0 if no match is found in any
-/// registered module.
-///
-/// Source line info (filename + line number) is written to the optional
-/// out-params when DWARF / debug info is available for the address; it is
-/// absent for symbol-table-only modules. `file_out`/`file_cap` receive the
-/// source file path (UTF-8, no NUL) with its length in `*file_len_out`, and
-/// `*line_out` receives the 1-based line number (0 = unknown). Pass null for
-/// any of `file_out`/`file_len_out`/`line_out` to skip it. The line info is
-/// taken from the outermost (non-inlined) frame, so it stays consistent with
-/// the function name reported above.
-///
-/// # Safety
-/// `s` must be a valid symbolizer pointer; `out_utf8`/`file_out` must be
-/// writable for their capacities (or null); `file_len_out`/`line_out` must be
-/// writable or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_symbolizer_resolve(
-    s: *mut Symbolizer,
-    avma: u64,
-    out_utf8: *mut u8,
-    cap: usize,
-    file_out: *mut u8,
-    file_cap: usize,
-    file_len_out: *mut usize,
-    line_out: *mut u32,
-) -> usize {
-    // Initialize the optional line-info out-params to "unknown" up front, so
-    // every early return (no match, no debug info) leaves them well-defined.
-    if !file_len_out.is_null() {
-        unsafe { *file_len_out = 0 };
-    }
-    if !line_out.is_null() {
-        unsafe { *line_out = 0 };
-    }
-    if s.is_null() || out_utf8.is_null() || cap == 0 {
-        return 0;
-    }
-    let symbolizer = unsafe { &*s };
-    let module = match symbolizer
-        .modules
-        .iter()
-        .find(|m| avma >= m.base_avma && avma < m.end_avma)
-    {
-        Some(m) => m,
-        None => return 0,
-    };
-    let map = match &module.map {
-        Some(m) => m,
-        None => return 0,
-    };
-    // wholesym's `Relative` form on macOS is "offset from __TEXT base"
-    // — exactly `avma - base_avma` for a normally-loaded mach-o image.
-    let rel: u32 = match (avma - module.base_avma).try_into() {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    // Use the async `lookup` (block_on'd through our runtime), not
-    // `lookup_sync`. The sync variant returns the nearest preceding
-    // symbol regardless of whether the address actually falls within
-    // its body — fine when symbol tables are full, but for stripped
-    // dyld_shared_cache members it produces bogus matches like
-    // "vsprintf +41" for an address that's hundreds of bytes past
-    // vsprintf's actual end. The async path validates containment via
-    // debug info / inline records before returning Some.
-    let info = match symbolizer
-        .rt
-        .block_on(map.lookup(LookupAddress::Relative(rel)))
-    {
-        Some(i) => i,
-        None => return 0,
-    };
-    // Source line info lives in `info.frames` (DWARF / inline records), not
-    // in `info.symbol` (which is symbol-table only). The vec runs innermost
-    // inlinee first, so the last entry is the outermost real function — the
-    // one whose name `info.symbol.name` reports. Use its file/line so the
-    // emitted name and source location describe the same frame.
-    if let Some(frame) = info.frames.as_ref().and_then(|f| f.last()) {
-        if let Some(line) = frame.line_number {
-            if !line_out.is_null() {
-                unsafe { *line_out = line };
+    /// Resolve `avma` to `<demangled_name> +<byte_offset>` plus source location,
+    /// or `None` if no registered module contains it (or its map didn't load).
+    pub fn resolve(&self, avma: u64) -> Option<Resolved> {
+        let module = self
+            .modules
+            .iter()
+            .find(|m| avma >= m.base_avma && avma < m.end_avma)?;
+        let map = module.map.as_ref()?;
+        // wholesym's `Relative` form on macOS is "offset from __TEXT base"
+        // — exactly `avma - base_avma` for a normally-loaded mach-o image.
+        let rel: u32 = (avma - module.base_avma).try_into().ok()?;
+        // Use the async `lookup` (block_on'd through our runtime), not
+        // `lookup_sync`. The sync variant returns the nearest preceding symbol
+        // regardless of whether the address falls within its body — fine for
+        // full symbol tables, but for stripped dyld_shared_cache members it
+        // produces bogus matches like "vsprintf +41" hundreds of bytes past
+        // vsprintf's end. The async path validates containment first.
+        let info = self.rt.block_on(map.lookup(LookupAddress::Relative(rel)))?;
+
+        // Source line info lives in `info.frames` (DWARF / inline records), not
+        // `info.symbol`. The vec runs innermost inlinee first, so the last entry
+        // is the outermost real function — the one `info.symbol.name` reports.
+        let (mut file, mut line) = (None, 0u32);
+        if let Some(frame) = info.frames.as_ref().and_then(|f| f.last()) {
+            if let Some(l) = frame.line_number {
+                line = l;
+            }
+            if let Some(path) = frame.file_path.as_ref() {
+                file = Some(String::from_utf8_lossy(path.raw_path().as_bytes()).into_owned());
             }
         }
-        if let Some(path) = frame.file_path.as_ref() {
-            if !file_out.is_null() && file_cap > 0 {
-                let raw = path.raw_path().as_bytes();
-                let fn_ = raw.len().min(file_cap);
-                let dst = unsafe { slice::from_raw_parts_mut(file_out, fn_) };
-                dst.copy_from_slice(&raw[..fn_]);
-                if !file_len_out.is_null() {
-                    unsafe { *file_len_out = fn_ };
-                }
-            }
-        }
-    }
 
-    let offset = rel.saturating_sub(info.symbol.address);
-    let formatted = format!("{} +{}", info.symbol.name, offset);
-    let bytes = formatted.as_bytes();
-    let n = bytes.len().min(cap);
-    let out = unsafe { slice::from_raw_parts_mut(out_utf8, n) };
-    out.copy_from_slice(&bytes[..n]);
-    n
+        let offset = rel.saturating_sub(info.symbol.address);
+        Some(Resolved {
+            name: format!("{} +{}", info.symbol.name, offset),
+            file,
+            line,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn add(s: *mut Symbolizer, path: &str) -> (c_int, u64, String) {
-        let mut count: u64 = 0;
-        let mut err = [0u8; 256];
-        let rc = unsafe {
-            sismo_symbolizer_add_module(
-                s,
-                0,
-                0x300000,
-                path.as_ptr(),
-                path.len(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                &mut count,
-                err.as_mut_ptr(),
-                err.len(),
-            )
-        };
-        let end = err.iter().position(|&b| b == 0).unwrap_or(err.len());
-        (rc, count, String::from_utf8_lossy(&err[..end]).into_owned())
+    fn add(s: &mut Symbolizer, path: &str) -> ModuleLoad {
+        s.add_module(0, 0x300000, Path::new(path), None, None)
     }
 
-    // A missing path must report rc=1 with a non-empty reason; the bridge
-    // used to swallow this, leaving the user with no clue why a module
-    // didn't symbolize.
+    // A missing path must report a non-empty reason with no symbols; the bridge
+    // used to swallow this, leaving the user with no clue why a module didn't
+    // symbolize.
     #[test]
     fn missing_path_yields_reason() {
-        let s = sismo_symbolizer_create();
-        assert!(!s.is_null());
-        let (rc, count, err) = add(s, "/no/such/binary.so");
-        assert_eq!(rc, 1);
-        assert_eq!(count, 0);
-        assert!(!err.is_empty(), "expected a load-failure reason");
-        unsafe { sismo_symbolizer_destroy(s) };
+        let mut s = Symbolizer::new().unwrap();
+        let r = add(&mut s, "/no/such/binary.so");
+        assert_eq!(r.symbol_count, 0);
+        assert!(r.error.is_some(), "expected a load-failure reason");
     }
 
     // The host libc should load with a positive symbol count (skipped if
@@ -371,10 +211,9 @@ mod tests {
         if !std::path::Path::new(path).exists() {
             return;
         }
-        let s = sismo_symbolizer_create();
-        let (rc, count, _) = add(s, path);
-        assert_eq!(rc, 0);
-        assert!(count > 0, "expected a positive symbol count");
-        unsafe { sismo_symbolizer_destroy(s) };
+        let mut s = Symbolizer::new().unwrap();
+        let r = add(&mut s, path);
+        assert!(r.error.is_none());
+        assert!(r.symbol_count > 0, "expected a positive symbol count");
     }
 }

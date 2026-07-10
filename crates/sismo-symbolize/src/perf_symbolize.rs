@@ -19,13 +19,13 @@
 
 use crate::disasm::sismo_disasm_module;
 use sismo_proto::ProtoWriter;
-use crate::symbolizer::{
-    sismo_symbolizer_add_module, sismo_symbolizer_create, sismo_symbolizer_destroy,
-    sismo_symbolizer_resolve, Symbolizer,
-};
+use crate::symbolizer::Symbolizer;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::os::raw::{c_int, c_void};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 // ---- Field tags (protos/perfetto/trace/{trace_packet,profiling/profile_common}) ----
 const TP_FIELD_TRACE_PACKET: u32 = 1;
@@ -147,11 +147,13 @@ pub fn symbolize_trace(trace_path: &str) {
         return; // nothing to symbolize
     }
 
-    let sym = sismo_symbolizer_create();
-    if sym.is_null() {
-        eprintln!("sismo record: symbolization skipped (symbolizer create failed)");
-        return;
-    }
+    let mut sym = match Symbolizer::new() {
+        Some(s) => s,
+        None => {
+            eprintln!("sismo record: symbolization skipped (symbolizer create failed)");
+            return;
+        }
+    };
 
     let mut out = ProtoWriter::new();
     let mut stats: Vec<ModuleStat> = Vec::new();
@@ -172,14 +174,14 @@ pub fn symbolize_trace(trace_path: &str) {
             continue;
         }
         let mut stat = ModuleStat::new(m.name.clone(), m.build_id_hex.clone());
-        let ms = build_module_symbols(sym, m, &mut stat, &mut src_set, &mut src_seen);
+        let ms = build_module_symbols(&mut sym, m, &mut stat, &mut src_set, &mut src_seen);
         n_addrs += stat.n_addrs;
         n_funcs += stat.n_resolved;
         stats.push(stat);
         // Disassemble this module's hot functions while `sym` is scoped exactly
         // as build_module_symbols saw it (line resolution reuses the lookups).
         if let Some(arch) = host_arch {
-            collect_module_disasm(sym, m, arch, &mut asm_records);
+            collect_module_disasm(&sym, m, arch, &mut asm_records);
         }
         if ms.is_empty() {
             continue;
@@ -192,15 +194,12 @@ pub fn symbolize_trace(trace_path: &str) {
     if !out.bytes().is_empty() {
         if let Err(e) = append_bytes(trace_path, out.bytes()) {
             eprintln!("sismo record: symbolization skipped ({e})");
-            unsafe { sismo_symbolizer_destroy(sym) };
             return;
         }
     }
 
     append_source_asm_sidecar(trace_path, &src_set, &asm_records);
     report(&stats, n_addrs, n_funcs);
-
-    unsafe { sismo_symbolizer_destroy(sym) };
 }
 
 /// Append `bytes` at the end of the file at `path`.
@@ -227,27 +226,14 @@ struct Resolved {
     line: u32,
 }
 
-fn resolve(sym: *mut Symbolizer, avma: u64) -> Resolved {
-    let mut name_buf = [0u8; 1024];
-    let mut file_buf = [0u8; 1024];
-    let mut file_len: usize = 0;
-    let mut line: u32 = 0;
-    let n = unsafe {
-        sismo_symbolizer_resolve(
-            sym,
-            avma,
-            name_buf.as_mut_ptr(),
-            name_buf.len(),
-            file_buf.as_mut_ptr(),
-            file_buf.len(),
-            &mut file_len,
-            &mut line,
-        )
-    };
-    Resolved {
-        name: name_buf[..n].to_vec(),
-        file: file_buf[..file_len].to_vec(),
-        line,
+fn resolve(sym: &Symbolizer, avma: u64) -> Resolved {
+    match sym.resolve(avma) {
+        Some(r) => Resolved {
+            name: r.name.into_bytes(),
+            file: r.file.map(String::into_bytes).unwrap_or_default(),
+            line: r.line,
+        },
+        None => Resolved { name: Vec::new(), file: Vec::new(), line: 0 },
     }
 }
 
@@ -256,7 +242,7 @@ fn resolve(sym: *mut Symbolizer, avma: u64) -> Resolved {
 /// Build one ModuleSymbols message for `m`, or return an empty vec if no address
 /// resolved. Field order (path, build_id, then the repeated AddressSymbols).
 fn build_module_symbols(
-    sym: *mut Symbolizer,
+    sym: &mut Symbolizer,
     m: &Module,
     stat: &mut ModuleStat,
     src_set: &mut Vec<Vec<u8>>,
@@ -270,27 +256,16 @@ fn build_module_symbols(
     }
     let end_avma = max_pc + 1;
 
-    let mut symbol_count: u64 = 0;
-    let mut err_buf = [0u8; 256];
-    let rc = unsafe {
-        sismo_symbolizer_add_module(
-            sym,
-            m.load_bias,
-            end_avma,
-            m.name.as_ptr(),
-            m.name.len(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            &mut symbol_count,
-            err_buf.as_mut_ptr(),
-            err_buf.len(),
-        )
-    };
-    stat.symbols_loaded = rc == 0;
-    stat.symbol_count = symbol_count;
-    let err_len = err_buf.iter().position(|&b| b == 0).unwrap_or(err_buf.len());
-    stat.err = err_buf[..err_len].to_vec();
+    let load = sym.add_module(
+        m.load_bias,
+        end_avma,
+        Path::new(OsStr::from_bytes(&m.name)),
+        None,
+        None,
+    );
+    stat.symbols_loaded = load.error.is_none();
+    stat.symbol_count = load.symbol_count;
+    stat.err = load.error.unwrap_or_default().into_bytes();
 
     // Accumulate the repeated AddressSymbols bodies; emit nothing if none match.
     let mut address_symbols: Vec<Vec<u8>> = Vec::new();
@@ -374,7 +349,7 @@ extern "C" fn on_insn(
     }
 }
 
-fn collect_module_disasm(sym: *mut Symbolizer, m: &Module, arch: u32, out: &mut Vec<AsmRecord>) {
+fn collect_module_disasm(sym: &Symbolizer, m: &Module, arch: u32, out: &mut Vec<AsmRecord>) {
     let mut ctx = DisasmCtx { funcs: Vec::new() };
     // rel_pcs are absolute avmas; disasm needs load_bias to reach the link-time
     // addresses. It tags decoded instructions back in avma space, so func_start

@@ -42,7 +42,7 @@ use crate::heap::{
     sismo_heap_build_clock_snapshot_packet, sismo_heap_build_profile_packet, sismo_heap_free,
 };
 use crate::proto::session_config::encode_data_source_descriptor;
-use crate::symbolize::symbolizer::{sismo_symbolizer_create, sismo_symbolizer_destroy, Symbolizer};
+use crate::symbolize::symbolizer::Symbolizer;
 use crate::symbolize::unwinder::{
     sismo_unwinder_create_arm64, sismo_unwinder_destroy, sismo_unwinder_walk_snapshot, Unwinder,
 };
@@ -264,13 +264,15 @@ impl HeapCapture {
             self.park_until_exit();
             return;
         }
-        let symbolizer = sismo_symbolizer_create();
-        if symbolizer.is_null() {
-            eprintln!("heap_capture: symbolizer.create failed");
-            unsafe { sismo_unwinder_destroy(unwinder) };
-            self.park_until_exit();
-            return;
-        }
+        let symbolizer = match Symbolizer::new() {
+            Some(s) => Box::into_raw(Box::new(s)),
+            None => {
+                eprintln!("heap_capture: symbolizer.create failed");
+                unsafe { sismo_unwinder_destroy(unwinder) };
+                self.park_until_exit();
+                return;
+            }
+        };
 
         // Enumerate + register the target's modules into the symbolizer +
         // unwinder (all in Rust). Retries the post-spawn empty-list window,
@@ -291,7 +293,7 @@ impl HeapCapture {
         };
         if image_list.is_null() {
             eprintln!("heap_capture: load_target_modules failed (err={load_err})");
-            unsafe { sismo_symbolizer_destroy(symbolizer) };
+            drop(unsafe { Box::from_raw(symbolizer) });
             unsafe { sismo_unwinder_destroy(unwinder) };
             self.park_until_exit();
             return;
@@ -302,7 +304,7 @@ impl HeapCapture {
             Err(_) => {
                 eprintln!("heap_capture: ring.create failed");
                 unsafe { sismo_dyld_list_free(image_list) };
-                unsafe { sismo_symbolizer_destroy(symbolizer) };
+                drop(unsafe { Box::from_raw(symbolizer) });
                 unsafe { sismo_unwinder_destroy(unwinder) };
                 self.park_until_exit();
                 return;
@@ -322,7 +324,7 @@ impl HeapCapture {
                     eprintln!("heap_capture: connectAndAttach({target_pid}) failed — target's heap_preload may not be loaded yet");
                     drop(ring);
                     unsafe { sismo_dyld_list_free(image_list) };
-                    unsafe { sismo_symbolizer_destroy(symbolizer) };
+                    drop(unsafe { Box::from_raw(symbolizer) });
                     unsafe { sismo_unwinder_destroy(unwinder) };
                     self.park_until_exit();
                     return;
@@ -393,7 +395,7 @@ impl HeapCapture {
         }
         drop(ring);
         unsafe { sismo_dyld_list_free(image_list) };
-        unsafe { sismo_symbolizer_destroy(symbolizer) };
+        drop(unsafe { Box::from_raw(symbolizer) });
         unsafe { sismo_unwinder_destroy(unwinder) };
     }
 

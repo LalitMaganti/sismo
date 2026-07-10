@@ -23,7 +23,7 @@ pub mod heap_ring;
 pub mod macos_heap_capture;
 
 use crate::proto::ProtoWriter;
-use crate::symbolize::symbolizer::{sismo_symbolizer_resolve, Symbolizer};
+use crate::symbolize::symbolizer::Symbolizer;
 use std::collections::HashMap;
 use std::slice;
 
@@ -152,26 +152,12 @@ struct TraceData {
 /// # Safety
 /// `symbolizer` must be a valid `*mut Symbolizer` or null.
 unsafe fn resolve_name(symbolizer: *mut Symbolizer, pc: u64) -> Vec<u8> {
-    let mut name_buf = [0u8; 256];
-    let mut file_buf = [0u8; 1024];
-    let mut file_len: usize = 0;
-    let mut line: u32 = 0;
-    let n = unsafe {
-        sismo_symbolizer_resolve(
-            symbolizer,
-            pc,
-            name_buf.as_mut_ptr(),
-            name_buf.len(),
-            file_buf.as_mut_ptr(),
-            file_buf.len(),
-            &mut file_len,
-            &mut line,
-        )
-    };
-    if n > 0 {
-        name_buf[..n].to_vec()
-    } else {
-        b"?".to_vec()
+    if symbolizer.is_null() {
+        return b"?".to_vec();
+    }
+    match unsafe { &*symbolizer }.resolve(pc) {
+        Some(r) => r.name.into_bytes(),
+        None => b"?".to_vec(),
     }
 }
 

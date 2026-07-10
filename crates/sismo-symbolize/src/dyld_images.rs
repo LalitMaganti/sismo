@@ -14,9 +14,12 @@
 //! macOS-only (Mach APIs); gated in lib.rs. Works on the caller's own task
 //! (`mach_task_self_`) without root — the tests exercise it that way.
 
-use crate::symbolizer::{sismo_symbolizer_add_module, Symbolizer};
+use crate::symbolizer::Symbolizer;
 use crate::unwinder::{sismo_unwinder_add_module, Unwinder};
+use std::ffi::OsStr;
 use std::os::raw::c_void;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::time::Duration;
 
 type MachPort = u32;
@@ -402,26 +405,15 @@ pub unsafe extern "C" fn sismo_load_target_modules(
 
         let end_avma = base.wrapping_add(text_vmsize).min(next_base);
         if !symbolizer.is_null() {
-            let (arch_ptr, arch_len) = match arch_string(cputype, cpusubtype) {
-                Some(a) => (a.as_ptr(), a.len()),
-                None => (std::ptr::null(), 0),
-            };
             let path = &list.images[idx].1;
-            unsafe {
-                sismo_symbolizer_add_module(
-                    symbolizer,
-                    base,
-                    end_avma,
-                    path.as_ptr(),
-                    path.len(),
-                    uuid.as_ptr(),
-                    arch_ptr,
-                    arch_len,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
-                );
-            }
+            let arch = arch_string(cputype, cpusubtype).and_then(|a| std::str::from_utf8(a).ok());
+            unsafe { &mut *symbolizer }.add_module(
+                base,
+                end_avma,
+                Path::new(OsStr::from_bytes(path)),
+                Some(uuid),
+                arch,
+            );
         }
         if !unwinder.is_null() {
             unsafe { sismo_unwinder_add_module(unwinder, base, bytes, bytes_len) };
@@ -482,17 +474,16 @@ mod tests {
         // End-to-end: enumerate own images, read each mach-o, and register into
         // a real symbolizer + unwinder, exercised without root.
         let task = unsafe { mach_task_self_ };
-        let sym = crate::symbolizer::sismo_symbolizer_create();
+        let mut sym = Symbolizer::new().unwrap();
         let unw = crate::unwinder::sismo_unwinder_create_arm64();
         let mut err = ERR_OK;
         let list = unsafe {
-            sismo_load_target_modules(task, sym, unw, 0, 0, std::ptr::null_mut(), None, &mut err)
+            sismo_load_target_modules(task, &mut sym, unw, 0, 0, std::ptr::null_mut(), None, &mut err)
         };
         assert!(!list.is_null(), "load failed, err={err}");
         assert!(unsafe { sismo_dyld_list_count(list) } > 0);
         unsafe {
             sismo_dyld_list_free(list);
-            crate::symbolizer::sismo_symbolizer_destroy(sym);
             crate::unwinder::sismo_unwinder_destroy(unw);
         }
     }
