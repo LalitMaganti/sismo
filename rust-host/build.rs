@@ -29,7 +29,13 @@ fn main() {
     println!("cargo:rerun-if-changed={}", root.join("src").display());
     println!("cargo:rerun-if-changed={}", root.join("build.zig").display());
 
-    // libsismo_zig.a (Zig + C/C++ shims + compiler_rt).
+    // The Perfetto C/C++ glue (producer/consumer/traced shims). Compiled here
+    // with `zig c++` — matching the libc++ Perfetto was built with — rather than
+    // by build.zig, so the C/C++ no longer depends on the Zig build. Runs after
+    // zig_build so Perfetto's generated headers exist.
+    compile_cc_shims(&root, &out);
+
+    // libsismo_zig.a (Zig code + compiler_rt).
     println!("cargo:rustc-link-search=native={}", root.join("zig-out/lib").display());
     println!("cargo:rustc-link-lib=static=sismo_zig");
 
@@ -101,6 +107,82 @@ fn build_heap_preload(root: &PathBuf) {
 
     println!("cargo:rerun-if-changed={}", root.join("heap-preload/src").display());
     println!("cargo:rerun-if-changed={}", root.join("heap-preload/Cargo.toml").display());
+}
+
+/// Compile the Perfetto C/C++ glue shims with `zig c++` and archive them into
+/// libsismo_cc_shims.a. Uses Zig's libc++ (what Perfetto was built with);
+/// compiler_rt refs (__zig_probe_stack, …) resolve against libsismo_zig.a at
+/// the final link. ubsan is off so there's no __ubsan_handle_* runtime dep.
+fn compile_cc_shims(root: &PathBuf, out: &PathBuf) {
+    let target = std::env::var("TARGET").unwrap();
+    let is_macos = target.contains("apple-darwin");
+    let zig_target = rust_to_zig_target(&target);
+
+    let pf = root.join("third_party/src/perfetto");
+    let pf_out = pf.join("out/sismo");
+    let includes = [
+        root.clone(), // repo root, for "src/c/…"-qualified includes
+        pf.join("include"),
+        pf.clone(),
+        pf.join("buildtools/android-unwinding/libunwindstack/include"),
+        pf_out.join("gen"),
+        pf_out.join("gen/build_config"),
+    ];
+
+    let mut files = vec![
+        "sismo_traced.cc",
+        "sismo_consumer.cc",
+        "sismo_trace_query.cc",
+        "perfetto_ds.cc",
+    ];
+    if !is_macos {
+        files.push("sismo_traced_probes.cc"); // Linux traced_probes (ftrace + procfs)
+    }
+
+    let mut objs = Vec::new();
+    for f in &files {
+        let src = root.join("src/c").join(f);
+        let obj = out.join(format!("{f}.o"));
+        let mut cmd = zig_cmd(root, "c++");
+        cmd.args(["-target", &zig_target, "-c"]).arg(&src).arg("-o").arg(&obj);
+        cmd.args(["-std=c++17", "-fno-exceptions", "-fno-rtti", "-DNDEBUG",
+                  "-fno-omit-frame-pointer", "-fno-sanitize=undefined"]);
+        if !is_macos {
+            cmd.arg("-D_GNU_SOURCE");
+        }
+        for inc in &includes {
+            cmd.arg("-I").arg(inc);
+        }
+        assert!(cmd.status().expect("run zig c++").success(), "compile {f} failed");
+        objs.push(obj);
+        println!("cargo:rerun-if-changed={}", src.display());
+    }
+
+    let lib = out.join("libsismo_cc_shims.a");
+    let _ = std::fs::remove_file(&lib);
+    let mut ar = zig_cmd(root, "ar");
+    ar.arg("rcs").arg(&lib).args(&objs);
+    assert!(ar.status().expect("run zig ar").success(), "archive cc shims failed");
+
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=sismo_cc_shims");
+}
+
+/// Map a rustc target triple to the Zig target the pinned toolchain expects.
+fn rust_to_zig_target(target: &str) -> String {
+    let arch = if target.starts_with("aarch64") { "aarch64" } else { "x86_64" };
+    if target.contains("apple-darwin") {
+        format!("{arch}-macos")
+    } else {
+        format!("{arch}-linux-gnu")
+    }
+}
+
+/// A `python3 tools/zig --hermetic <sub>` command (e.g. sub = "c++" or "ar").
+fn zig_cmd(root: &PathBuf, sub: &str) -> Command {
+    let mut cmd = Command::new("python3");
+    cmd.arg(root.join("tools/zig")).arg("--hermetic").arg(sub);
+    cmd
 }
 
 /// Run `zig build <steps>` via the pinned hermetic toolchain.

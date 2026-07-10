@@ -11,8 +11,6 @@ const std = @import("std");
 
 const Component = enum {
     sample_target, // sample-target binary; built on every OS we support
-    sismo_unix, // sismo binary; macOS + Linux
-    sismo_linux, // sismo binary; Linux only
 };
 
 const Language = enum { c, cpp };
@@ -23,13 +21,12 @@ const CSource = struct {
     component: Component,
 };
 
+// The Perfetto C/C++ glue (sismo_traced/consumer/trace_query/perfetto_ds/
+// traced_probes) is compiled by rust-host/build.rs with `zig c++`, not here,
+// so the C/C++ no longer rides the Zig build. Only sample-target's C SDK shim
+// remains (it's part of the Zig sample-target binary).
 const c_sources = [_]CSource{
     .{ .path = "src/c/sample_target_sdk.c", .language = .c, .component = .sample_target },
-    .{ .path = "src/c/sismo_traced.cc", .language = .cpp, .component = .sismo_unix },
-    .{ .path = "src/c/sismo_consumer.cc", .language = .cpp, .component = .sismo_unix },
-    .{ .path = "src/c/sismo_trace_query.cc", .language = .cpp, .component = .sismo_unix },
-    .{ .path = "src/c/perfetto_ds.cc", .language = .cpp, .component = .sismo_unix },
-    .{ .path = "src/c/sismo_traced_probes.cc", .language = .cpp, .component = .sismo_linux },
 };
 
 // Linux gets `-D_GNU_SOURCE` so Perfetto's public headers (which call
@@ -252,9 +249,7 @@ fn addUnixPipeline(
             // link has no such runtime, so keep the archive self-contained.
             .sanitize_c = .trap,
         });
-        addComponentSources(b, mod, .sismo_unix, is_macos);
         if (is_linux) {
-            addComponentSources(b, mod, .sismo_linux, is_macos);
             const bpf_inc = b.fmt("-I{s}", .{b.path("src/c/sismo_bpf").getPath(b)});
             const bpf_compile = b.addSystemCommand(&.{ "clang", "-target", "bpf", "-D__TARGET_ARCH_x86", bpf_inc, "-Wno-missing-declarations", "-O2", "-g", "-c" });
             bpf_compile.addFileArg(b.path("src/c/sismo_bpf/sched.bpf.c"));
@@ -262,8 +257,8 @@ fn addUnixPipeline(
             const bpf_o = bpf_compile.addOutputFileArg("sched.bpf.o");
             mod.addAnonymousImport("sched.bpf.o", .{ .root_source_file = bpf_o });
         }
-        // Include paths to COMPILE the C/C++ shims: repo-root for
-        // "src/c/…"-qualified includes + perfetto's public/gen headers.
+        // Include paths for the Zig cImports (perfetto_shim.h, libbpf.h): repo
+        // root for "src/c/…"-qualified includes + perfetto's public/gen headers.
         mod.addIncludePath(b.path("."));
         mod.addIncludePath(perfetto_root.path(b, "include"));
         if (!is_macos) {
