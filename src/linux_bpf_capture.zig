@@ -1271,3 +1271,44 @@ fn openSampler(cpu: u32, cfg: SamplerCfg, tick_prog: *c.struct_bpf_program) ?Sam
         want -= 1;
     }
 }
+
+// ===== C ABI for the Rust record runner (rust-bridge/src/cmd_record.rs) ======
+// Thin wrapper over Capture, so runRecordLinux can migrate to Rust while the
+// BPF collector itself stays Zig for now. Uses c_allocator (libc is linked).
+
+const StatsC = extern struct {
+    samples: u64,
+    threads: u64,
+    busiest_cycles: u64,
+    data_frames: u64,
+};
+
+/// focus: <0 = survey (none), 0 = cache. Returns an opaque *Capture, or null on
+/// init failure (the caller then records without CPU samples).
+export fn sismo_linux_bpf_capture_init(
+    pid: u32,
+    focus: i32,
+    has_density: bool,
+    density: f64,
+) ?*Capture {
+    const preset: ?focus_presets.FocusPreset = if (focus == 0) .cache else null;
+    return Capture.init(std.heap.c_allocator, pid, preset, if (has_density) density else null) catch null;
+}
+
+/// Join the worker, drain the ring, and report stats.
+export fn sismo_linux_bpf_capture_shutdown(cap: ?*Capture, out: *StatsC) void {
+    const capture = cap orelse return;
+    const s = capture.shutdown();
+    out.* = .{
+        .samples = s.samples,
+        .threads = s.threads,
+        .busiest_cycles = s.busiest_cycles,
+        .data_frames = s.data_frames,
+    };
+}
+
+/// The PEBS skid level the sampler actually opened with (2 = precise).
+export fn sismo_linux_bpf_capture_precise_ip(cap: ?*Capture) u8 {
+    const capture = cap orelse return 0;
+    return capture.sampler_precise_ip;
+}

@@ -22,15 +22,19 @@
 use crate::proto::{ProtoReader, WireValue};
 use crate::record_args::{parse_record_args, RecordArgsC, MODE_EXTERNAL, MODE_IN_PROCESS};
 use crate::session_config::{sismo_encode_trace_config, DataSourceEntryC};
+#[cfg(target_os = "macos")]
 use crate::sismo_config::{sismo_config_cpu_encode, sismo_config_heap_encode, sismo_config_sched_encode};
 use crate::sismo_paths::{sismo_acquire_session_lock, sismo_release_session_lock, CONSUMER_SOCK, PRODUCER_SOCK};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
-// Capture workers (Rust siblings).
+// Capture workers (Rust siblings, macOS in-process sources).
+#[cfg(target_os = "macos")]
 use crate::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
+#[cfg(target_os = "macos")]
 use crate::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
+#[cfg(target_os = "macos")]
 use crate::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
 
 // ---- C++ shim (traced service + consumer session + producer init) ----------
@@ -190,6 +194,7 @@ fn waitpid_exit_watch(pid: c_int, write_fd: c_int) {
 }
 
 /// Attach-mode: kqueue EVFILT_PROC/NOTE_EXIT on a non-child pid, then fire 'X'.
+#[cfg(target_os = "macos")]
 fn kqueue_exit_watch(pid: c_int, write_fd: c_int) {
     let kq = unsafe { kqueue() };
     if kq < 0 {
@@ -329,6 +334,7 @@ fn ds_sismo_vendor(name: &[u8], cfg: &[u8], protovm_kb: u32) -> DataSourceEntryC
 ///
 /// # Safety
 /// `argv` must point to `argc` valid NUL-terminated C strings.
+#[cfg(target_os = "macos")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sismo_run_record_macos(argc: usize, argv: *const *const c_char) -> c_int {
     let all: Vec<&str> = (0..argc)
@@ -343,6 +349,7 @@ pub unsafe extern "C" fn sismo_run_record_macos(argc: usize, argv: *const *const
     run(&all, &rc)
 }
 
+#[cfg(target_os = "macos")]
 fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
     let output_path: &[u8] =
         unsafe { std::slice::from_raw_parts(rc.output_path_ptr, rc.output_path_len) };
@@ -722,6 +729,7 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
 }
 
 /// Shut down whichever captures are non-null, printing per-source stats.
+#[cfg(target_os = "macos")]
 fn shutdown_captures(heap: *mut HeapCapture, cpu: *mut CpuCapture, sched: *mut SchedCapture) {
     if !heap.is_null() {
         let (mut records, mut bytes, mut sites) = (0u64, 0u64, 0u32);
@@ -747,4 +755,359 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
         sismo_traced_destroy(svc);
     }
     sismo_release_session_lock(lock_fd);
+}
+
+// ---- Linux record runner (P5: was runRecordLinux in cmd_record.zig) --------
+
+#[cfg(target_os = "linux")]
+const MODE_OFF: u8 = 2; // --no-<source>
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn sismo_traced_probes_create(producer_socket: *const c_char) -> *mut c_void;
+    fn sismo_traced_probes_stop(svc: *mut c_void);
+    fn sismo_traced_probes_destroy(svc: *mut c_void);
+
+    // rust-bridge calls the Zig BPF collector over this C ABI (src/linux_bpf_capture.zig).
+    fn sismo_linux_bpf_capture_init(pid: u32, focus: i32, has_density: bool, density: f64) -> *mut c_void;
+    fn sismo_linux_bpf_capture_shutdown(cap: *mut c_void, out: *mut LinuxBpfStats);
+    fn sismo_linux_bpf_capture_precise_ip(cap: *mut c_void) -> u8;
+
+    fn sismo_symbolize_trace(path: *const u8, path_len: usize);
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxBpfStats {
+    samples: u64,
+    threads: u64,
+    busiest_cycles: u64,
+    data_frames: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn ds_linux_ftrace() -> DataSourceEntryC {
+    DataSourceEntryC {
+        kind: 2,
+        name: std::ptr::null(),
+        name_len: 0,
+        sismo_config: std::ptr::null(),
+        sismo_config_len: 0,
+        protovm_memory_limit_kb: 0,
+    }
+}
+
+/// `sismo record` on Linux. `argv[0..argc]` are the full process args. Parses
+/// (Rust), then runs the record flow. Returns the process exit code.
+///
+/// # Safety
+/// `argv` must point to `argc` valid NUL-terminated C strings.
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sismo_run_record_linux(argc: usize, argv: *const *const c_char) -> c_int {
+    let all: Vec<&str> = (0..argc)
+        .map(|i| unsafe { CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
+        .collect();
+    let args: &[&str] = if all.len() > 2 { &all[2..] } else { &[] };
+    let mut rc = RecordArgsC::default();
+    if !parse_record_args(args, all.len(), &mut rc) {
+        return 0; // help / error already printed
+    }
+    run_linux(&all, &rc)
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux(all: &[&str], rc: &RecordArgsC) -> c_int {
+    let output_path: &[u8] =
+        unsafe { std::slice::from_raw_parts(rc.output_path_ptr, rc.output_path_len) };
+    let output_path_str = std::str::from_utf8(output_path).unwrap_or("./sismo.pftrace");
+    let duration_secs = if rc.has_duration { Some(rc.duration_secs) } else { None };
+    let flight_recorder = rc.flight_recorder;
+    let buffer_kb = rc.buffer_kb;
+    let no_sched = rc.sched_mode == MODE_OFF;
+    let no_cpu = rc.cpu_mode == MODE_OFF;
+    let no_instrumentation = rc.no_instrumentation;
+    let sample_density = if rc.has_sample_density { Some(rc.sample_density) } else { None };
+
+    // Resolve --focus (only "cache" today); unknown = hard error.
+    let focus_int: i32 = if rc.has_focus {
+        let name = unsafe { std::slice::from_raw_parts(rc.focus_preset_ptr, rc.focus_preset_len) };
+        match name {
+            b"cache" => 0,
+            other => {
+                eprintln!(
+                    "sismo record: unknown focus preset '{}' (supported: cache)",
+                    String::from_utf8_lossy(other)
+                );
+                return 0;
+            }
+        }
+    } else {
+        -1
+    };
+
+    let lock_fd = sismo_acquire_session_lock(unsafe { getpid() });
+    if lock_fd == -2 {
+        eprintln!("sismo record: another sismo session is already running (lock held on /tmp/sismo.lock)");
+        return 0;
+    }
+    if lock_fd < 0 {
+        eprintln!("sismo record: failed to open session lock at /tmp/sismo.lock");
+        return 0;
+    }
+
+    eprintln!(
+        "sismo record: pid={} output={output_path_str}\n  producer sock: {PRODUCER_SOCK}\n  consumer sock: {CONSUMER_SOCK}",
+        unsafe { getpid() }
+    );
+    setenv_str("PERFETTO_PRODUCER_SOCK_NAME", PRODUCER_SOCK);
+    setenv_str("PERFETTO_CONSUMER_SOCK_NAME", CONSUMER_SOCK);
+
+    // Embed traced + init the producer client.
+    let prod_c = CString::new(PRODUCER_SOCK).unwrap();
+    let cons_c = CString::new(CONSUMER_SOCK).unwrap();
+    let svc = unsafe { sismo_traced_create(prod_c.as_ptr(), cons_c.as_ptr()) };
+    if svc.is_null() {
+        eprintln!("sismo record: traced_create failed");
+        sismo_release_session_lock(lock_fd);
+        return 0;
+    }
+    unsafe { sismo_init(prod_c.as_ptr()) };
+
+    // traced_probes (ftrace + procfs) — the sched producer. Skipped by --no-sched.
+    let probes = if no_sched {
+        std::ptr::null_mut()
+    } else {
+        let p = unsafe { sismo_traced_probes_create(prod_c.as_ptr()) };
+        if p.is_null() {
+            eprintln!("sismo record: traced_probes attach failed — sched events disabled");
+        }
+        p
+    };
+    let stop_probes = |probes: *mut c_void| {
+        if !probes.is_null() {
+            unsafe {
+                sismo_traced_probes_stop(probes);
+                sismo_traced_probes_destroy(probes);
+            }
+        }
+    };
+
+    // Spawn the workload (Linux rejects --pid, so a workload is always present).
+    // No DYLD insert — Linux heap preload is a separate pillar.
+    let workload_cmd = all[rc.workload_start];
+    let workload_args: Vec<&str> = all[rc.workload_start + 1..].to_vec();
+    let target_pid = match maybe_spawn(
+        workload_cmd,
+        &workload_args,
+        &[("PERFETTO_PRODUCER_SOCK_NAME", PRODUCER_SOCK)],
+    ) {
+        Some(p) => p,
+        None => {
+            eprintln!("sismo record: failed to spawn '{workload_cmd}' — exiting");
+            stop_probes(probes);
+            teardown_early(svc, lock_fd);
+            return 0;
+        }
+    };
+    eprintln!("sismo record: spawned '{workload_cmd}' pid={target_pid}");
+
+    // BPF CPU collector (per-thread counters + stack sampling), scoped to the
+    // workload. Drains on its own worker thread; shut down on the way out.
+    let bpf = if no_cpu {
+        std::ptr::null_mut()
+    } else {
+        let c = unsafe {
+            sismo_linux_bpf_capture_init(
+                target_pid as u32,
+                focus_int,
+                sample_density.is_some(),
+                sample_density.unwrap_or(0.0),
+            )
+        };
+        if c.is_null() {
+            eprintln!("sismo record: bpf capture init failed — CPU samples disabled");
+        }
+        c
+    };
+    let shutdown_bpf = |bpf: *mut c_void| -> u8 {
+        if bpf.is_null() {
+            return 0;
+        }
+        let mut s = LinuxBpfStats { samples: 0, threads: 0, busiest_cycles: 0, data_frames: 0 };
+        let precise = unsafe { sismo_linux_bpf_capture_precise_ip(bpf) };
+        unsafe { sismo_linux_bpf_capture_shutdown(bpf, &mut s) };
+        eprintln!(
+            "sismo record: bpf — {} samples across {} threads (busiest {} cycles)",
+            s.samples, s.threads, s.busiest_cycles
+        );
+        if s.data_frames > 0 {
+            eprintln!(
+                "sismo record: cache — {} of {} samples carry a data-region frame",
+                s.data_frames, s.samples
+            );
+        }
+        precise
+    };
+
+    // Data source entries.
+    let mut entries: Vec<DataSourceEntryC> = Vec::new();
+    if !no_instrumentation {
+        entries.push(ds_track_event());
+    }
+    if !probes.is_null() {
+        entries.push(ds_linux_ftrace());
+    }
+    if !bpf.is_null() {
+        entries.push(ds_sismo_vendor(b"sismo.linux_cpu_samples", b"", 0));
+    }
+    if entries.is_empty() {
+        eprintln!("sismo record: no data sources enabled — recording would be empty. Drop one of the --no-* flags.");
+        shutdown_bpf(bpf);
+        stop_probes(probes);
+        teardown_early(svc, lock_fd);
+        return 0;
+    }
+
+    if !flight_recorder {
+        unsafe { unlink(rc.output_path_ptr as *const c_char) };
+    }
+    let out_path: &[u8] = if flight_recorder { b"" } else { output_path };
+    let session_name = b"sismo_record";
+    let mut cfg_buf = [0u8; 16384];
+    let cfg_len = unsafe {
+        sismo_encode_trace_config(
+            if flight_recorder { 0 } else { 2 },
+            buffer_kb,
+            0,
+            out_path.as_ptr(),
+            out_path.len(),
+            1024 * 1024 * 1024,
+            session_name.as_ptr(),
+            session_name.len(),
+            entries.as_ptr(),
+            entries.len(),
+            cfg_buf.as_mut_ptr(),
+            cfg_buf.len(),
+        )
+    };
+    if cfg_len == 0 {
+        eprintln!("sismo record: encodeTraceConfig failed (config exceeds buffer)");
+        shutdown_bpf(bpf);
+        stop_probes(probes);
+        teardown_early(svc, lock_fd);
+        return 0;
+    }
+
+    let session = unsafe { sismo_consumer_session_create() };
+    if session.is_null() {
+        eprintln!("sismo record: session_create failed");
+        shutdown_bpf(bpf);
+        stop_probes(probes);
+        teardown_early(svc, lock_fd);
+        return 0;
+    }
+    let setup_rc =
+        unsafe { sismo_consumer_session_setup(session, cfg_buf.as_ptr() as *const c_void, cfg_len) };
+    if setup_rc != 0 {
+        eprintln!("sismo record: session_setup rc={setup_rc} (TraceConfig failed to parse)");
+        unsafe { sismo_consumer_session_destroy(session) };
+        shutdown_bpf(bpf);
+        stop_probes(probes);
+        teardown_early(svc, lock_fd);
+        return 0;
+    }
+
+    unsafe { sismo_consumer_session_start_blocking(session) };
+    if flight_recorder {
+        eprintln!("sismo record: flight-recorder started ({buffer_kb} KB buffer); take snapshots via `sismo snapshot` while running");
+    } else {
+        eprintln!("sismo record: session started, recording until workload exits (or SIGINT)");
+    }
+
+    // Self-pipe + watch threads (Linux is spawn-only — no attach).
+    let mut pipe_fds = [0 as c_int; 2];
+    if unsafe { pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        eprintln!("sismo record: pipe() failed");
+        unsafe { sismo_consumer_session_destroy(session) };
+        shutdown_bpf(bpf);
+        stop_probes(probes);
+        teardown_early(svc, lock_fd);
+        return 0;
+    }
+    let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
+    SIGINT_PIPE_FD.store(wr, Ordering::Release);
+    unsafe { signal(SIGINT, handle_sigint) };
+
+    let watch = std::thread::spawn(move || waitpid_exit_watch(target_pid, wr));
+    if let Some(secs) = duration_secs {
+        std::thread::spawn(move || duration_timer(secs, wr));
+    }
+
+    let mut read_buf = [0u8; 16];
+    let mut workload_done = false;
+    while !workload_done {
+        let n = unsafe { read(rd, read_buf.as_mut_ptr() as *mut c_void, read_buf.len()) };
+        if n <= 0 {
+            continue;
+        }
+        for &b in &read_buf[..n as usize] {
+            match b {
+                b'I' => {
+                    eprintln!("sismo record: SIGINT — sending SIGTERM to workload pid={target_pid}");
+                    unsafe { kill(target_pid, SIGTERM) };
+                }
+                b'T' => {
+                    eprintln!("sismo record: --duration reached — sending SIGTERM to workload pid={target_pid}");
+                    unsafe { kill(target_pid, SIGTERM) };
+                }
+                b'X' => workload_done = true,
+                _ => {}
+            }
+        }
+    }
+
+    unsafe { sismo_consumer_session_stop_blocking(session) };
+    if flight_recorder {
+        eprintln!("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)");
+        shutdown_bpf(bpf);
+    } else {
+        eprintln!("sismo record: trace saved to {output_path_str}");
+        let precise = shutdown_bpf(bpf);
+        let pids = [target_pid];
+        let (fp_ptr, fp_len): (*const u8, usize) = if focus_int == 0 {
+            (b"cache".as_ptr(), 5)
+        } else {
+            (std::ptr::null(), 0)
+        };
+        let ok = unsafe {
+            sismo_append_privileged_marker(
+                rc.output_path_ptr,
+                rc.output_path_len,
+                pids.as_ptr(),
+                pids.len(),
+                fp_ptr,
+                fp_len,
+                precise >= 2,
+            )
+        };
+        if !ok {
+            eprintln!("sismo record: failed to write privileged marker");
+        }
+        // Resolve BPF perf-sample frames to function names (appended offline).
+        if !bpf.is_null() {
+            unsafe { sismo_symbolize_trace(rc.output_path_ptr, rc.output_path_len) };
+        }
+    }
+
+    SIGINT_PIPE_FD.store(-1, Ordering::Release);
+    unsafe { close(rd) };
+    unsafe { close(wr) };
+    let _ = watch.join();
+
+    unsafe { sismo_consumer_session_destroy(session) };
+    stop_probes(probes);
+    unsafe { sismo_traced_stop(svc) };
+    sismo_release_session_lock(lock_fd);
+    0
 }
