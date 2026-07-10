@@ -19,7 +19,7 @@
 //! runtime archives also carry the compiler_rt builtins the shims need, so no
 //! separate Zig staticlib is required.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -124,7 +124,7 @@ fn link_macos() {
 /// libsismo_cc_shims.a. Uses Zig's libc++ (what Perfetto was built with); its
 /// runtime archives (linked via link_cxx_runtime) carry the compiler_rt
 /// builtins. ubsan is off so there's no __ubsan_handle_* runtime dep.
-fn compile_cc_shims(root: &PathBuf, out: &PathBuf) {
+fn compile_cc_shims(root: &Path, out: &Path) {
     let target = std::env::var("TARGET").unwrap();
     let is_macos = target.contains("apple-darwin");
     let zig_target = rust_to_zig_target(&target);
@@ -210,14 +210,14 @@ fn rust_to_zig_target(target: &str) -> String {
 }
 
 /// A `python3 tools/zig --hermetic <sub>` command (e.g. sub = "c++" or "ar").
-fn zig_cmd(root: &PathBuf, sub: &str) -> Command {
+fn zig_cmd(root: &Path, sub: &str) -> Command {
     let mut cmd = Command::new("python3");
     cmd.arg(root.join("tools/zig")).arg("--hermetic").arg(sub);
     cmd
 }
 
 /// Build Perfetto's C++ SDK archive + generated headers via tools/build-perfetto.
-fn build_perfetto(root: &PathBuf) {
+fn build_perfetto(root: &Path) {
     let status = Command::new("python3")
         .arg(root.join("tools/build-perfetto"))
         .current_dir(root)
@@ -231,7 +231,7 @@ fn build_perfetto(root: &PathBuf) {
 /// link libraries. Emitting them as `rustc-link-lib`/`-search` (rather than
 /// `rustc-link-arg`) is what lets these propagate from this dependency's build
 /// script to the final binary's link.
-fn link_cxx_runtime(root: &PathBuf, out: &PathBuf) {
+fn link_cxx_runtime(root: &Path, out: &Path) {
     let probe = out.join("cxx_probe.cpp");
     std::fs::write(
         &probe,
