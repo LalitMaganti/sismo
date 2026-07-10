@@ -16,7 +16,7 @@
 use crate::sched::proc_info::{sismo_proc_parent_pid, sismo_proc_pid_path, sismo_proc_thread_name};
 use crate::proto::{write_kernel_task_state_event, ProtoWriter};
 use crate::proto::sched_protos::{
-    sismo_encode_kernel_process_tree, sismo_macos_sched_vm_program, ProcessC, ThreadC,
+    encode_kernel_process_tree, macos_sched_vm_program, ProcessC, ThreadC,
 };
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::proto::sismo_config::{config_extract, sched_decode};
@@ -51,7 +51,6 @@ const THREAD_MAP_CAPACITY: usize = 16 * 1024;
 // Staging caps per drain.
 const MAX_NEW_THREADS: usize = 256;
 const MAX_NEW_PROCESSES: usize = 128;
-const PROVM_PROGRAM_MAX: usize = 512;
 
 // ---- kdebug ring (crate::sched::kdebug) + timebase -------------------------
 
@@ -405,29 +404,12 @@ impl SchedCapture {
             })
             .collect();
 
-        // Size the tree buffer off the staged payloads.
-        let est: usize = 64
-            + new_threads.iter().map(|(_, _, c)| c.len() + 24).sum::<usize>()
-            + new_processes.iter().map(|(_, _, c)| c.len() + 32).sum::<usize>();
-        let mut tree = vec![0u8; est];
-        let tree_len = unsafe {
-            sismo_encode_kernel_process_tree(
-                procs_c.as_ptr(),
-                procs_c.len(),
-                threads_c.as_ptr(),
-                threads_c.len(),
-                tree.as_mut_ptr(),
-                tree.len(),
-            )
-        };
-        if tree_len == 0 {
-            return;
-        }
+        let tree = encode_kernel_process_tree(&procs_c, &threads_c);
 
         // Wrap in a TracePacket body (no timestamp — tree entries are
         // time-independent metadata) and emit.
         let mut w = ProtoWriter::new();
-        w.write_message(TP_FIELD_GENERIC_KERNEL_PROCESS_TREE, &tree[..tree_len]);
+        w.write_message(TP_FIELD_GENERIC_KERNEL_PROCESS_TREE, &tree);
         unsafe { sismo_ds_emit(slot, w.bytes().as_ptr(), w.bytes().len()) };
     }
 
@@ -566,9 +548,8 @@ pub unsafe extern "C" fn sismo_sched_capture_init() -> *mut SchedCapture {
 
     // Descriptor carries the ProtoVM program (mirrors process-tree packets into
     // traced's DST for ring/flight mode).
-    let mut prog = [0u8; PROVM_PROGRAM_MAX];
-    let prog_len = unsafe { sismo_macos_sched_vm_program(prog.as_mut_ptr(), prog.len()) };
-    let desc = encode_data_source_descriptor(DS_NAME, true, false, &prog[..prog_len]);
+    let prog = macos_sched_vm_program();
+    let desc = encode_data_source_descriptor(DS_NAME, true, false, &prog);
     let slot = unsafe {
         sismo_ds_register(desc.as_ptr(), desc.len(), on_setup, on_start, on_stop, on_flush, cap as *mut c_void)
     };

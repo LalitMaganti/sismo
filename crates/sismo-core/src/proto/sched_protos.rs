@@ -82,33 +82,15 @@ fn encode_thread(t: &ThreadC) -> Vec<u8> {
 /// # Safety
 /// `processes`/`threads` valid for their counts (and each embedded
 /// cmdline/comm pointer valid for its len or null); `out` writable for `cap`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_encode_kernel_process_tree(
-    processes: *const ProcessC,
-    n_processes: usize,
-    threads: *const ThreadC,
-    n_threads: usize,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
-    let procs: &[ProcessC] =
-        if processes.is_null() { &[] } else { unsafe { slice::from_raw_parts(processes, n_processes) } };
-    let thrs: &[ThreadC] =
-        if threads.is_null() { &[] } else { unsafe { slice::from_raw_parts(threads, n_threads) } };
-
+pub fn encode_kernel_process_tree(processes: &[ProcessC], threads: &[ThreadC]) -> Vec<u8> {
     let mut w = ProtoWriter::new();
-    for p in procs {
+    for p in processes {
         w.write_message(1, &encode_process(p));
     }
-    for t in thrs {
+    for t in threads {
         w.write_message(2, &encode_thread(t));
     }
-    let b = w.bytes();
-    if b.len() > cap {
-        return 0;
-    }
-    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len()) };
-    b.len()
+    w.bytes().to_vec()
 }
 
 // ---- ProtoVM VmProgram (fixed macos_sched program) -------------------------
@@ -313,19 +295,9 @@ fn build_macos_sched_vm_program() -> Vec<u8> {
     encode_vm_program(0, &[top])
 }
 
-/// Write the fixed macos_sched ProtoVM program into `out[..cap]`. Returns the
-/// length, or 0 if too small.
-///
-/// # Safety
-/// `out` must be writable for `cap` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_macos_sched_vm_program(out: *mut u8, cap: usize) -> usize {
-    let b = build_macos_sched_vm_program();
-    if b.len() > cap {
-        return 0;
-    }
-    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len()) };
-    b.len()
+/// The fixed macos_sched ProtoVM program bytes.
+pub fn macos_sched_vm_program() -> Vec<u8> {
+    build_macos_sched_vm_program()
 }
 
 #[cfg(test)]
@@ -343,20 +315,10 @@ mod tests {
             is_main_thread: false,
             is_idle: false,
         }];
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_kernel_process_tree(
-                std::ptr::null(),
-                0,
-                threads.as_ptr(),
-                threads.len(),
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
+        let out = encode_kernel_process_tree(&[], &threads);
         // Thread submessage at field 2: outer 12 08, body 08 07 10 03 1a 02 'h' 'i'.
         assert_eq!(
-            &out[..n],
+            &out[..],
             &[0x12, 0x08, 0x08, 0x07, 0x10, 0x03, 0x1a, 0x02, b'h', b'i']
         );
     }
@@ -371,9 +333,8 @@ mod tests {
             "a320a0612040802280130013a0c0a04120208013a04120210003a180a120",
             "8021202087a1202080212041801300018013a021a00",
         );
-        let mut out = [0u8; 4096];
-        let n = unsafe { sismo_macos_sched_vm_program(out.as_mut_ptr(), out.len()) };
-        let got: String = out[..n].iter().map(|b| format!("{b:02x}")).collect();
+        let out = macos_sched_vm_program();
+        let got: String = out.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, expected_hex);
     }
 
