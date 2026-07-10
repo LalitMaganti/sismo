@@ -20,6 +20,8 @@ pub mod cmd_prepare;
 pub mod cmd_snapshot;
 pub mod data_regions;
 pub mod disasm;
+// Perfetto C++ shim FFI (recording control plane: init/traced/consumer).
+pub mod ffi;
 // macOS Mach-based module enumeration + mach-o reading.
 #[cfg(target_os = "macos")]
 pub mod dyld_images;

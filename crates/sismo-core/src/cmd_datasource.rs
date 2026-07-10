@@ -158,13 +158,10 @@ mod macos_run {
     use crate::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
     use crate::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
     use crate::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
+    use crate::ffi::sismo_init;
     use crate::sismo_paths::PRODUCER_SOCK;
     use std::ffi::CString;
-    use std::os::raw::{c_char, c_int};
-
-    extern "C" {
-        fn sismo_init(producer_socket: *const c_char);
-    }
+    use std::os::raw::c_int;
 
     enum Slot {
         Sched(*mut SchedCapture),

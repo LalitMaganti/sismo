@@ -39,32 +39,14 @@ use crate::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_s
 
 // ---- C++ shim (traced service + consumer session + producer init) ----------
 
-#[repr(C)]
-struct TracedSvc {
-    _opaque: [u8; 0],
-}
-#[repr(C)]
-struct ConsumerSession {
-    _opaque: [u8; 0],
-}
+use crate::ffi::{
+    sismo_consumer_query_service_state, sismo_consumer_session_create,
+    sismo_consumer_session_destroy, sismo_consumer_session_setup,
+    sismo_consumer_session_start_blocking, sismo_consumer_session_stop_blocking, sismo_init,
+    sismo_traced_create, sismo_traced_destroy, sismo_traced_stop, ConsumerSession, TracedSvc,
+};
 
 extern "C" {
-    fn sismo_traced_create(producer_socket: *const c_char, consumer_socket: *const c_char) -> *mut TracedSvc;
-    fn sismo_traced_stop(svc: *mut TracedSvc);
-    fn sismo_traced_destroy(svc: *mut TracedSvc);
-    fn sismo_init(producer_socket: *const c_char);
-    fn sismo_consumer_session_create() -> *mut ConsumerSession;
-    fn sismo_consumer_session_setup(session: *mut ConsumerSession, cfg: *const c_void, cfg_len: usize) -> c_int;
-    fn sismo_consumer_session_start_blocking(session: *mut ConsumerSession);
-    fn sismo_consumer_session_stop_blocking(session: *mut ConsumerSession);
-    fn sismo_consumer_session_destroy(session: *mut ConsumerSession);
-    fn sismo_consumer_query_service_state(
-        session: *mut ConsumerSession,
-        out_buf: *mut c_void,
-        out_buf_size: usize,
-        written: *mut usize,
-    ) -> c_int;
-
     // The privileged-pid marker (Rust, but called via its C ABI for uniformity).
     fn sismo_append_privileged_marker(
         path: *const u8,
@@ -761,11 +743,7 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
 // ---- Linux record runner (P5: was runRecordLinux in cmd_record.zig) --------
 
 #[cfg(target_os = "linux")]
-extern "C" {
-    fn sismo_traced_probes_create(producer_socket: *const c_char) -> *mut c_void;
-    fn sismo_traced_probes_stop(svc: *mut c_void);
-    fn sismo_traced_probes_destroy(svc: *mut c_void);
-}
+use crate::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, sismo_traced_probes_stop};
 
 #[cfg(target_os = "linux")]
 use crate::linux_bpf_capture::{self, Capture, FocusPreset};
