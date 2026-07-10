@@ -681,7 +681,7 @@ impl Interner {
 
 use crate::data_regions::DataRegions;
 use crate::proc_maps::ProcMaps;
-use crate::proto::sismo_encode_perf_sample;
+use crate::proto::encode_perf_sample;
 use crate::worker_sdk::sismo_ds_emit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -892,30 +892,16 @@ impl Capture {
             self.data_frames += 1;
         }
 
-        let mut ps_buf = [0u8; 8192];
-        let (ds_ptr, ds_len) = match &data_symbol {
-            Some(s) => (s.as_ptr(), s.len()),
-            None => (std::ptr::null(), 0),
-        };
-        let ps_len = unsafe {
-            sismo_encode_perf_sample(
-                rec.hdr.cpu,
-                rec.hdr.pid,
-                rec.hdr.tid,
-                cs_iid,
-                timebase_count,
-                if nf > 0 { follower_buf.as_ptr() } else { std::ptr::null() },
-                nf,
-                data_address,
-                ds_ptr,
-                ds_len,
-                ps_buf.as_mut_ptr(),
-                ps_buf.len(),
-            )
-        };
-        if ps_len == 0 {
-            return;
-        }
+        let ps = encode_perf_sample(
+            rec.hdr.cpu,
+            rec.hdr.pid,
+            rec.hdr.tid,
+            cs_iid,
+            timebase_count,
+            &follower_buf[..nf],
+            data_address,
+            data_symbol.as_deref(),
+        );
 
         // TracePacket { timestamp, sequence_flags, interned_data?, perf_sample }.
         let mut tp = ProtoWriter::new();
@@ -924,7 +910,7 @@ impl Capture {
         if !idw.bytes().is_empty() {
             tp.write_message(12, idw.bytes());
         }
-        tp.write_message(TP_FIELD_PERF_SAMPLE, &ps_buf[..ps_len]);
+        tp.write_message(TP_FIELD_PERF_SAMPLE, &ps);
         unsafe { sismo_ds_emit(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
     }
 

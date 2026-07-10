@@ -344,7 +344,7 @@ fn encode_clock_snapshot(ts_ns: u64) -> Vec<u8> {
 }
 
 /// Wrap a payload in a TracePacket body (timestamp + optional sequence_flags +
-/// payload-as-field), matching sismo_encode_trace_packet_body.
+/// payload-as-field), matching encode_trace_packet_body.
 fn wrap_trace_packet(
     timestamp_ns: u64,
     sequence_flags: u32,

@@ -15,7 +15,7 @@
 //! macOS only; gated in lib.rs.
 
 use crate::proc_info::{sismo_proc_parent_pid, sismo_proc_pid_path, sismo_proc_thread_name};
-use crate::proto::{sismo_encode_kernel_task_state_event, sismo_encode_trace_packet_body};
+use crate::proto::{encode_kernel_task_state_event, encode_trace_packet_body};
 use crate::sched_protos::{
     sismo_encode_kernel_process_tree, sismo_macos_sched_vm_program, ProcessC, ThreadC,
 };
@@ -433,21 +433,9 @@ impl SchedCapture {
 
         // Wrap in a TracePacket body (no timestamp — tree entries are
         // time-independent metadata) and emit.
-        let mut body = vec![0u8; tree_len + 32];
-        let body_len = unsafe {
-            sismo_encode_trace_packet_body(
-                0,
-                0,
-                TP_FIELD_GENERIC_KERNEL_PROCESS_TREE,
-                tree.as_ptr(),
-                tree_len,
-                body.as_mut_ptr(),
-                body.len(),
-            )
-        };
-        if body_len != 0 {
-            unsafe { sismo_ds_emit(slot, body.as_ptr(), body_len) };
-        }
+        let body =
+            encode_trace_packet_body(0, 0, TP_FIELD_GENERIC_KERNEL_PROCESS_TREE, &tree[..tree_len]);
+        unsafe { sismo_ds_emit(slot, body.as_ptr(), body.len()) };
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -546,37 +534,9 @@ fn lookup_comm<'a>(threads: &'a [KdThreadMap], cache: &'a PtCache, tid: u64) -> 
 }
 
 fn emit_task_state(slot: u32, ts_ns: u64, cpu: i32, comm: &[u8], tid: i64, state: u32, prio: i32) {
-    let mut event = [0u8; 128];
-    let event_len = unsafe {
-        sismo_encode_kernel_task_state_event(
-            cpu,
-            comm.as_ptr(),
-            comm.len(),
-            tid,
-            state,
-            prio,
-            event.as_mut_ptr(),
-            event.len(),
-        )
-    };
-    if event_len == 0 {
-        return;
-    }
-    let mut packet = [0u8; 256];
-    let packet_len = unsafe {
-        sismo_encode_trace_packet_body(
-            ts_ns,
-            0,
-            TP_FIELD_GENERIC_KERNEL_TASK_STATE,
-            event.as_ptr(),
-            event_len,
-            packet.as_mut_ptr(),
-            packet.len(),
-        )
-    };
-    if packet_len != 0 {
-        unsafe { sismo_ds_emit(slot, packet.as_ptr(), packet_len) };
-    }
+    let event = encode_kernel_task_state_event(cpu, comm, tid, state, prio);
+    let packet = encode_trace_packet_body(ts_ns, 0, TP_FIELD_GENERIC_KERNEL_TASK_STATE, &event);
+    unsafe { sismo_ds_emit(slot, packet.as_ptr(), packet.len()) };
 }
 
 /// Create the sched capture: register the data source (with the ProtoVM

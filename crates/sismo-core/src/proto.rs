@@ -7,7 +7,6 @@
 //!
 //! wire types: 0 = VARINT, 2 = LEN (length-delimited).
 
-use std::slice;
 
 /// Length-delimited protobuf encoder over a growable byte buffer. Nested
 /// messages are encoded into their own writer, then `write_message`'d into the
@@ -254,27 +253,17 @@ pub fn encode_perf_defaults_packet(
 /// Encode a PerfSample (TracePacket field 66 body). Fields: cpu=1, pid=2,
 /// tid=3, callstack_iid=4, timebase_count=6, follower_counts=7 (repeated),
 /// data_address=20, data_symbol=21 (the last two are sismo extensions).
-/// Fields are omitted when 0 / absent (null pointer). Writes into out[..cap];
-/// returns bytes written, or 0 if cap is too small.
-///
-/// # Safety
-/// `follower_counts`/`data_symbol` must be valid for their lengths or null;
-/// `out` must be writable for `cap` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_encode_perf_sample(
+/// Fields are omitted when 0 / absent. Returns the encoded PerfSample bytes.
+pub fn encode_perf_sample(
     cpu: u32,
     pid: u32,
     tid: u32,
     callstack_iid: u64,
     timebase_count: u64,
-    follower_counts: *const u64,
-    follower_count: usize,
+    follower_counts: &[u64],
     data_address: u64,
-    data_symbol: *const u8,
-    data_symbol_len: usize,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
+    data_symbol: Option<&[u8]>,
+) -> Vec<u8> {
     let mut w = ProtoWriter::new();
     w.write_uint32(1, cpu);
     w.write_uint32(2, pid);
@@ -285,88 +274,51 @@ pub unsafe extern "C" fn sismo_encode_perf_sample(
     if timebase_count != 0 {
         w.write_uint64(6, timebase_count);
     }
-    if !follower_counts.is_null() {
-        for &fc in unsafe { slice::from_raw_parts(follower_counts, follower_count) } {
-            w.write_uint64(7, fc);
-        }
+    for &fc in follower_counts {
+        w.write_uint64(7, fc);
     }
     if data_address != 0 {
         w.write_uint64(20, data_address);
     }
-    if !data_symbol.is_null() {
-        w.write_string(21, unsafe { slice::from_raw_parts(data_symbol, data_symbol_len) });
+    if let Some(sym) = data_symbol {
+        w.write_string(21, sym);
     }
-
-    let b = w.bytes();
-    if b.len() > cap {
-        return 0;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
-    }
-    b.len()
+    w.bytes().to_vec()
 }
 
 /// Encode a GenericKernelTaskStateEvent (TracePacket field 117 body). Fields:
 /// cpu=1 (int32, always written), comm=2 (string, capped at 64 bytes, omitted
-/// when empty), tid=3 (int64), state=4 (enum/uint32), prio=5 (int32). Writes
-/// into out[..cap]; returns bytes written, or 0 if cap is too small.
-///
-/// # Safety
-/// `comm` must be valid for `comm_len` bytes or null; `out` must be writable
-/// for `cap` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_encode_kernel_task_state_event(
+/// when empty), tid=3 (int64), state=4 (enum/uint32), prio=5 (int32).
+pub fn encode_kernel_task_state_event(
     cpu: i32,
-    comm: *const u8,
-    comm_len: usize,
+    comm: &[u8],
     tid: i64,
     state: u32,
     prio: i32,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
+) -> Vec<u8> {
     let mut w = ProtoWriter::new();
     w.write_int32(1, cpu);
-    if !comm.is_null() && comm_len > 0 {
-        // Cap comm at 64 bytes (Mach thread name max in practice), matching
-        // the prior Zig encoder.
-        let capped = comm_len.min(64);
-        w.write_string(2, unsafe { slice::from_raw_parts(comm, capped) });
+    if !comm.is_empty() {
+        // Cap comm at 64 bytes (Mach thread name max in practice).
+        let capped = comm.len().min(64);
+        w.write_string(2, &comm[..capped]);
     }
     w.write_int64(3, tid);
     w.write_uint32(4, state);
     w.write_int32(5, prio);
-
-    let b = w.bytes();
-    if b.len() > cap {
-        return 0;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
-    }
-    b.len()
+    w.bytes().to_vec()
 }
 
 /// Encode a TracePacket body: optional timestamp (field 8, omitted when 0),
 /// optional sequence_flags (field 13, omitted when 0), then the already-encoded
 /// `payload` wrapped as length-delimited field `payload_field_tag` (e.g. 66 =
-/// perf_sample, 117 = generic_kernel_task_state_event). Writes into out[..cap];
-/// returns bytes written, or 0 if cap is too small.
-///
-/// # Safety
-/// `payload` must be valid for `payload_len` bytes or null; `out` must be
-/// writable for `cap` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_encode_trace_packet_body(
+/// perf_sample, 117 = generic_kernel_task_state_event).
+pub fn encode_trace_packet_body(
     timestamp_ns: u64,
     sequence_flags: u32,
     payload_field_tag: u32,
-    payload: *const u8,
-    payload_len: usize,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
+    payload: &[u8],
+) -> Vec<u8> {
     let mut w = ProtoWriter::new();
     if timestamp_ns != 0 {
         w.write_uint64(8, timestamp_ns);
@@ -374,21 +326,8 @@ pub unsafe extern "C" fn sismo_encode_trace_packet_body(
     if sequence_flags != 0 {
         w.write_uint32(13, sequence_flags);
     }
-    let payload_slice: &[u8] = if payload.is_null() {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(payload, payload_len) }
-    };
-    w.write_message(payload_field_tag, payload_slice);
-
-    let b = w.bytes();
-    if b.len() > cap {
-        return 0;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
-    }
-    b.len()
+    w.write_message(payload_field_tag, payload);
+    w.bytes().to_vec()
 }
 
 #[cfg(test)]
@@ -406,28 +345,14 @@ mod tests {
     #[test]
     fn perf_sample_bytes_are_exact() {
         // cpu=1, pid=2, tid=3, callstack_iid=5; no timebase/followers/data.
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_perf_sample(
-                1, 2, 3, 5, 0, std::ptr::null(), 0, 0, std::ptr::null(), 0,
-                out.as_mut_ptr(), out.len(),
-            )
-        };
+        let got = encode_perf_sample(1, 2, 3, 5, 0, &[], 0, None);
         // cpu(1)=1: 08 01; pid(2)=2: 10 02; tid(3)=3: 18 03; callstack(4)=5: 20 05
-        assert_eq!(&out[..n], &[0x08, 0x01, 0x10, 0x02, 0x18, 0x03, 0x20, 0x05]);
+        assert_eq!(got, [0x08, 0x01, 0x10, 0x02, 0x18, 0x03, 0x20, 0x05]);
     }
 
     #[test]
     fn perf_sample_followers_and_data_symbol() {
-        let followers = [100u64, 200u64];
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_perf_sample(
-                0, 0, 0, 0, 0, followers.as_ptr(), followers.len(), 0xdead,
-                b"[heap]".as_ptr(), 6, out.as_mut_ptr(), out.len(),
-            )
-        };
-        let got = &out[..n];
+        let got = encode_perf_sample(0, 0, 0, 0, 0, &[100, 200], 0xdead, Some(b"[heap]"));
         // follower_counts field 7 (tag 0x38): 38 64 (100), 38 C8 01 (200).
         assert!(got.windows(2).any(|w| w == [0x38, 0x64]));
         assert!(got.windows(3).any(|w| w == [0x38, 0xC8, 0x01]));
@@ -438,48 +363,31 @@ mod tests {
     #[test]
     fn kernel_task_state_event_bytes_are_exact() {
         // cpu=3, comm="foo", tid=42, state=3 (running), prio=31.
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_kernel_task_state_event(
-                3, b"foo".as_ptr(), 3, 42, 3, 31, out.as_mut_ptr(), out.len(),
-            )
-        };
+        let got = encode_kernel_task_state_event(3, b"foo", 42, 3, 31);
         // cpu(1)=3: 08 03; comm(2)="foo": 12 03 66 6F 6F; tid(3)=42: 18 2A;
         // state(4)=3: 20 03; prio(5)=31: 28 1F.
         assert_eq!(
-            &out[..n],
-            &[0x08, 0x03, 0x12, 0x03, 0x66, 0x6F, 0x6F, 0x18, 0x2A, 0x20, 0x03, 0x28, 0x1F],
+            got,
+            [0x08, 0x03, 0x12, 0x03, 0x66, 0x6F, 0x6F, 0x18, 0x2A, 0x20, 0x03, 0x28, 0x1F],
         );
     }
 
     #[test]
     fn kernel_task_state_event_negative_int32_is_bitcast_not_sign_extended() {
         // cpu=-1 must encode as the 5-byte u32 bitcast (FF FF FF FF 0F), not
-        // the 10-byte 64-bit sign-extension — matching proto_writer.zig.
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_kernel_task_state_event(
-                -1, std::ptr::null(), 0, 0, 0, 0, out.as_mut_ptr(), out.len(),
-            )
-        };
-        // cpu(1)=-1: 08 FF FF FF FF 0F; comm omitted (null); tid(3)=0: 18 00;
+        // the 10-byte 64-bit sign-extension.
+        let got = encode_kernel_task_state_event(-1, b"", 0, 0, 0);
+        // cpu(1)=-1: 08 FF FF FF FF 0F; comm omitted; tid(3)=0: 18 00;
         // state(4)=0: 20 00; prio(5)=0: 28 00.
         assert_eq!(
-            &out[..n],
-            &[0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x18, 0x00, 0x20, 0x00, 0x28, 0x00],
+            got,
+            [0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x18, 0x00, 0x20, 0x00, 0x28, 0x00],
         );
     }
 
     #[test]
     fn kernel_task_state_event_comm_capped_at_64() {
-        let comm = [b'a'; 100];
-        let mut out = [0u8; 128];
-        let n = unsafe {
-            sismo_encode_kernel_task_state_event(
-                0, comm.as_ptr(), comm.len(), 0, 0, 0, out.as_mut_ptr(), out.len(),
-            )
-        };
-        let got = &out[..n];
+        let got = encode_kernel_task_state_event(0, &[b'a'; 100], 0, 0, 0);
         // comm field 2 (tag 0x12) with length 64 (0x40).
         assert!(got.windows(2).any(|w| w == [0x12, 0x40]));
     }
@@ -487,39 +395,18 @@ mod tests {
     #[test]
     fn trace_packet_body_wraps_payload_with_timestamp_and_flags() {
         // timestamp=150, sequence_flags=1, payload=[0xAB] under field 66.
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_trace_packet_body(
-                150, 1, 66, [0xABu8].as_ptr(), 1, out.as_mut_ptr(), out.len(),
-            )
-        };
+        let got = encode_trace_packet_body(150, 1, 66, &[0xAB]);
         // timestamp(8)=150: 40 96 01; sequence_flags(13)=1: 68 01;
         // payload(66) len 1: tag=66<<3|2=0x212 -> 92 04, len 01, byte AB.
-        assert_eq!(&out[..n], &[0x40, 0x96, 0x01, 0x68, 0x01, 0x92, 0x04, 0x01, 0xAB]);
+        assert_eq!(got, [0x40, 0x96, 0x01, 0x68, 0x01, 0x92, 0x04, 0x01, 0xAB]);
     }
 
     #[test]
     fn trace_packet_body_omits_zero_timestamp_and_flags() {
-        // timestamp=0 and sequence_flags=0 are both omitted (Into-variant case).
-        let mut out = [0u8; 64];
-        let n = unsafe {
-            sismo_encode_trace_packet_body(
-                0, 0, 117, [0x01u8, 0x02].as_ptr(), 2, out.as_mut_ptr(), out.len(),
-            )
-        };
+        // timestamp=0 and sequence_flags=0 are both omitted.
+        let got = encode_trace_packet_body(0, 0, 117, &[0x01, 0x02]);
         // Only payload(117) len 2: tag=117<<3|2=0x3AA -> AA 07, len 02, 01 02.
-        assert_eq!(&out[..n], &[0xAA, 0x07, 0x02, 0x01, 0x02]);
-    }
-
-    #[test]
-    fn trace_packet_body_returns_zero_when_cap_too_small() {
-        let mut out = [0u8; 4];
-        let n = unsafe {
-            sismo_encode_trace_packet_body(
-                150, 0, 66, [0xAAu8; 8].as_ptr(), 8, out.as_mut_ptr(), out.len(),
-            )
-        };
-        assert_eq!(n, 0);
+        assert_eq!(got, [0xAA, 0x07, 0x02, 0x01, 0x02]);
     }
 
     #[test]

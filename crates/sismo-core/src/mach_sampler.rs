@@ -12,7 +12,7 @@
 //! C++ SDK shim — so rust-bridge keeps no dependency on `sismo_ds_emit` and
 //! `cargo test` still links. macOS/arm64 only; gated in lib.rs.
 
-use crate::proto::{sismo_encode_perf_sample, sismo_encode_trace_packet_body};
+use crate::proto::{encode_perf_sample, encode_trace_packet_body};
 use crate::unwinder::{sismo_unwinder_walk, Unwinder};
 use std::os::raw::{c_int, c_void};
 
@@ -188,37 +188,24 @@ pub unsafe extern "C" fn sismo_cpu_sample_thread(
     unsafe { thread_resume(thread) };
 
     // PerfSample (leaf-only: callstack_iid = 0) → TracePacket body.
-    let mut sample = [0u8; 4096];
-    let sample_len = unsafe {
-        sismo_encode_perf_sample(
-            0, // cpu — core not tracked
-            pid,
-            tid as u32,
-            0, // callstack_iid — interning is a follow-up
-            0, // timebase_count
-            std::ptr::null(),
-            0,
-            0, // data_address
-            std::ptr::null(),
-            0,
-            sample.as_mut_ptr(),
-            sample.len(),
-        )
-    };
-    if sample_len == 0 {
+    let sample = encode_perf_sample(
+        0,        // cpu — core not tracked
+        pid,
+        tid as u32,
+        0,        // callstack_iid — interning is a follow-up
+        0,        // timebase_count
+        &[],      // followers
+        0,        // data_address
+        None,     // data_symbol
+    );
+    let packet = encode_trace_packet_body(now_monotonic_ns(), 0, TP_FIELD_PERF_SAMPLE, &sample);
+    if packet.len() > out_packet_cap {
         return 0;
     }
     unsafe {
-        sismo_encode_trace_packet_body(
-            now_monotonic_ns(),
-            0,
-            TP_FIELD_PERF_SAMPLE,
-            sample.as_ptr(),
-            sample_len,
-            out_packet,
-            out_packet_cap,
-        )
+        std::ptr::copy_nonoverlapping(packet.as_ptr(), out_packet, packet.len());
     }
+    packet.len()
 }
 
 #[cfg(test)]
