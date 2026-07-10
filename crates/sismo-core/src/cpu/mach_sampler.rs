@@ -12,8 +12,7 @@
 //! `cargo test` still links. macOS/arm64 only; gated in lib.rs.
 
 use crate::proto::{write_perf_sample, ProtoWriter};
-use crate::symbolize::unwinder::{sismo_unwinder_walk, Unwinder};
-use std::os::raw::{c_int, c_void};
+use crate::symbolize::unwinder::{StackRegs, Unwinder};
 
 type MachPort = u32;
 const KERN_SUCCESS: i32 = 0;
@@ -96,23 +95,6 @@ unsafe fn thread_cpu_time_us(thread: MachPort) -> Option<u64> {
     Some(us(OFF_USER_SEC, OFF_USER_USEC) + us(OFF_SYS_SEC, OFF_SYS_USEC))
 }
 
-/// Context for the unwinder stack-read callback: the task to read from.
-struct ReadCtx {
-    task: MachPort,
-}
-
-/// Unwinder stack-read callback: read one u64 from the target's stack at `addr`.
-/// Returns 0 on success, 1 on failure.
-unsafe extern "C" fn read_stack_cb(addr: u64, out_value: *mut u64, user_data: *mut c_void) -> c_int {
-    let ctx = unsafe { &*(user_data as *const ReadCtx) };
-    let mut got: u64 = 0;
-    let rc = unsafe { mach_vm_read_overwrite(ctx.task, addr, 8, out_value as u64, &mut got) };
-    if rc != KERN_SUCCESS || got < 8 {
-        return 1;
-    }
-    0
-}
-
 /// Sample one thread. Writes the thread's current CPU-time to `out_new_cpu_us`
 /// (so the caller can track the per-thread delta) and sets `out_active` true
 /// iff the thread ran since `last_cpu_us`. For an active thread, builds a
@@ -168,21 +150,22 @@ pub unsafe extern "C" fn sismo_cpu_sample_thread(
     // Walk the stack (reading target memory via mach_vm_read). The result isn't
     // interned into a callstack yet — leaf-only samples for now — but the walk
     // is kept so the hot path matches production and is ready for interning.
-    let mut ctx = ReadCtx { task };
-    let mut pcs = [0u64; MAX_FRAMES];
-    let _n = unsafe {
-        sismo_unwinder_walk(
-            unwinder,
-            pc,
-            fp,
-            lr,
-            sp,
-            read_stack_cb,
-            &mut ctx as *mut ReadCtx as *mut c_void,
-            pcs.as_mut_ptr(),
-            pcs.len(),
-        )
-    };
+    let _pcs = unsafe { &mut *unwinder }.walk(
+        StackRegs { pc, fp, lr, sp },
+        |addr| {
+            let mut val: u64 = 0;
+            let mut got: u64 = 0;
+            let rc = unsafe {
+                mach_vm_read_overwrite(task, addr, 8, &mut val as *mut u64 as u64, &mut got)
+            };
+            if rc != KERN_SUCCESS || got < 8 {
+                Err(())
+            } else {
+                Ok(val)
+            }
+        },
+        MAX_FRAMES,
+    );
 
     unsafe { thread_resume(thread) };
 

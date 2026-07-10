@@ -1,90 +1,134 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Framehop FFI surface — the Rust unwinder samply uses, exposed over a C ABI.
+//! Framehop-based stack unwinder for arm64 targets (the one samply uses).
 //!
-//! Lifecycle: `sismo_unwinder_create_arm64()` returns an opaque handle;
-//! callers register one or more loaded mach-o images with
-//! `sismo_unwinder_add_module(...)`, then unwind a thread snapshot via
-//! `sismo_unwinder_walk(...)`. `sismo_unwinder_destroy(...)` releases
-//! everything.
+//! [`Unwinder::new_arm64`] creates one; register loaded mach-o images with
+//! [`Unwinder::add_module`], then unwind a live thread via [`Unwinder::walk`]
+//! or a captured stack buffer via [`Unwinder::walk_snapshot`].
 //!
-//! The opaque `*mut Unwinder` is a `Box<Unwinder>::into_raw()` — never
-//! deref'd outside Rust. Callers treat it as opaque.
-//!
-//! Mach-o data passed to `add_module` is expected to be the in-memory
-//! image as seen in the target process — i.e. a contiguous slab read via
-//! `mach_vm_read_overwrite` starting at the LC_SEGMENT_64 __TEXT base
-//! (= `base_avma`). If a section's bytes lie outside the buffer (caller
-//! didn't read enough), that section is silently skipped; framehop
-//! tolerates partial section info as long as `unwind_info` or `eh_frame`
-//! is present.
+//! Mach-o data passed to `add_module` is the in-memory image as seen in the
+//! target process — a contiguous slab read via `mach_vm_read_overwrite` from
+//! the LC_SEGMENT_64 __TEXT base (= `base_avma`). Sections whose bytes lie
+//! outside the slab are silently skipped; framehop tolerates partial section
+//! info as long as `unwind_info` or `eh_frame` is present.
 
 use framehop::aarch64::{CacheAarch64, PtrAuthMask, UnwindRegsAarch64, UnwinderAarch64};
 use framehop::{ExplicitModuleSectionInfo, Module, Unwinder as _};
 use object::endian::{BigEndian, LittleEndian};
 use object::macho::{MachHeader64, Section64, SegmentCommand64, LC_SEGMENT_64, MH_CIGAM_64};
 use object::pod;
-use std::os::raw::{c_int, c_void};
-use std::slice;
 
-/// Opaque handle exposed to C / Zig. Bundles the unwinder state and the
-/// per-thread cache framehop wants `&mut`'d on every `iter_frames` call.
-/// One handle per profiled process is the intended usage.
+/// The framehop unwinder plus the per-thread cache framehop wants `&mut`'d on
+/// every `iter_frames` call. One handle per profiled process is intended.
 pub struct Unwinder {
     inner: UnwinderAarch64<Vec<u8>>,
     cache: CacheAarch64,
 }
 
-/// Callback signature passed to `sismo_unwinder_walk`. Reads 8 bytes from
-/// the target task's address space at `addr`, writes them to `*out_value`.
-/// Returns 0 on success, non-zero on failure (e.g. address unmapped).
-/// `user_data` is the opaque pointer the caller passed alongside the cb.
-pub type ReadStackCb =
-    unsafe extern "C" fn(addr: u64, out_value: *mut u64, user_data: *mut c_void) -> c_int;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn sismo_unwinder_create_arm64() -> *mut Unwinder {
-    let u = Box::new(Unwinder {
-        inner: UnwinderAarch64::new(),
-        cache: CacheAarch64::new(),
-    });
-    Box::into_raw(u)
+/// The arm64 registers a stack walk starts from. `lr`/`pc` are expected to be
+/// PAC-stripped by the caller.
+pub struct StackRegs {
+    pub pc: u64,
+    pub fp: u64,
+    pub lr: u64,
+    pub sp: u64,
 }
 
-/// Free an unwinder from `sismo_unwinder_create_arm64`.
-///
-/// # Safety
-/// `p` must be a pointer returned by `sismo_unwinder_create_arm64` and not yet
-/// destroyed, or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_unwinder_destroy(p: *mut Unwinder) {
-    if p.is_null() {
-        return;
+/// Outcome of [`Unwinder::add_module`].
+pub enum AddModule {
+    /// The image parsed and its unwind sections were registered.
+    Added,
+    /// The bytes didn't parse as a 64-bit mach-o (or had no __TEXT segment).
+    NotMachO,
+    /// The parse succeeded but no usable unwind sections were found.
+    NoUnwindInfo,
+}
+
+impl Unwinder {
+    pub fn new_arm64() -> Unwinder {
+        Unwinder {
+            inner: UnwinderAarch64::new(),
+            cache: CacheAarch64::new(),
+        }
     }
-    drop(unsafe { Box::from_raw(p) });
+
+    /// Register a loaded mach-o image (the in-memory `__TEXT`-based slab read
+    /// from the target at `base_avma`). Sections whose bytes lie outside the
+    /// slab are skipped; framehop tolerates partial info as long as
+    /// `unwind_info` or `eh_frame` is present.
+    pub fn add_module(&mut self, base_avma: u64, mach_o_data: &[u8]) -> AddModule {
+        register_macho(&mut self.inner, base_avma, mach_o_data)
+    }
+
+    /// Walk the stack from a live thread snapshot, reading target memory via
+    /// `read_stack` (8 bytes at a virtual address, `Err` on an unmapped read).
+    /// Returns up to `max_pcs` AVMAs: slot 0 is the snapshot `pc`, the rest are
+    /// framehop-recovered return addresses. Stops on the first iter error.
+    pub fn walk(
+        &mut self,
+        regs: StackRegs,
+        mut read_stack: impl FnMut(u64) -> Result<u64, ()>,
+        max_pcs: usize,
+    ) -> Vec<u64> {
+        // Apply the macOS arm64e 24/40 PAC mask to LRs framehop reads from the
+        // stack. The `lr` passed in is expected to already be stripped; the mask
+        // is idempotent on already-clean pointers.
+        let mut iter = self.inner.iter_frames(
+            regs.pc,
+            UnwindRegsAarch64::new_with_ptr_auth_mask(PtrAuthMask::new_24_40(), regs.lr, regs.sp, regs.fp),
+            &mut self.cache,
+            &mut read_stack,
+        );
+
+        let mut out = Vec::new();
+        while out.len() < max_pcs {
+            match iter.next() {
+                // Push the *lookup* address: IP for slot 0 (the active PC), but
+                // `LR - 1` for return-address slots — LR points just past the
+                // `bl`, so looking up that byte often lands in the wrong basic
+                // block. framehop's `address_for_lookup` applies the -1; samply
+                // records the same adjusted values.
+                Ok(Some(frame)) => out.push(frame.address_for_lookup()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Snapshot-mode walk: unwind from a captured stack-bytes buffer instead of
+    /// live process memory. `snapshot_sp` is the stack pointer at capture time
+    /// and `snapshot_bytes` is `[snapshot_sp .. snapshot_sp+len)`. Reads outside
+    /// the buffer terminate the walk gracefully (samply's DWARF-callstack
+    /// pattern).
+    pub fn walk_snapshot(
+        &mut self,
+        regs: StackRegs,
+        snapshot_bytes: &[u8],
+        snapshot_sp: u64,
+        max_pcs: usize,
+    ) -> Vec<u64> {
+        let read_stack = |addr: u64| -> Result<u64, ()> {
+            let offset = addr.checked_sub(snapshot_sp).ok_or(())?;
+            let idx_end = offset.checked_add(8).ok_or(())? as usize;
+            let bytes = snapshot_bytes.get(offset as usize..idx_end).ok_or(())?;
+            Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+        };
+        self.walk(regs, read_stack, max_pcs)
+    }
 }
 
-/// Register a loaded mach-o image. Returns:
-///   `0` on success,
-///  `-1` if the bytes don't parse as a 64-bit mach-o,
-///  `-2` if the parse succeeded but no usable unwind sections were found.
-///
-/// # Safety
-/// `p` must be a valid unwinder pointer; `mach_o_data` must be valid for
-/// `mach_o_len` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_unwinder_add_module(
-    p: *mut Unwinder,
+/// Parse a mach-o `__TEXT` slab and register its unwind sections into `inner`.
+/// Split out from [`Unwinder::add_module`] to keep the parse at free-function
+/// indentation.
+fn register_macho(
+    inner: &mut UnwinderAarch64<Vec<u8>>,
     base_avma: u64,
-    mach_o_data: *const u8,
-    mach_o_len: usize,
-) -> c_int {
-    if p.is_null() || mach_o_data.is_null() || mach_o_len == 0 {
-        return -1;
+    bytes: &[u8],
+) -> AddModule {
+    if bytes.is_empty() {
+        return AddModule::NotMachO;
     }
-    let unwinder = unsafe { &mut *p };
-    let bytes = unsafe { slice::from_raw_parts(mach_o_data, mach_o_len) };
 
     // Parse manually rather than via `MachOFile64::parse` — that path
     // eagerly validates LC_SYMTAB's offset, which lives in __LINKEDIT
@@ -95,19 +139,19 @@ pub unsafe extern "C" fn sismo_unwinder_add_module(
     let (header, after_header): (&MachHeader64<LittleEndian>, _) =
         match pod::from_bytes(bytes) {
             Ok(x) => x,
-            Err(_) => return -1,
+            Err(_) => return AddModule::NotMachO,
         };
     // object's convention: magic is always read as BigEndian. The result
     // equals MH_CIGAM_64 for a little-endian-encoded mach-o (e.g. arm64
     // macOS). Anything else: not a 64-bit LE mach-o.
     if header.magic.get(BigEndian) != MH_CIGAM_64 {
-        return -1;
+        return AddModule::NotMachO;
     }
     let ncmds = header.ncmds.get(endian) as usize;
     let sizeofcmds = header.sizeofcmds.get(endian) as usize;
     let cmds = match after_header.get(..sizeofcmds) {
         Some(s) => s,
-        None => return -1,
+        None => return AddModule::NotMachO,
     };
 
     let mut info: ExplicitModuleSectionInfo<Vec<u8>> = Default::default();
@@ -218,11 +262,11 @@ pub unsafe extern "C" fn sismo_unwinder_add_module(
     }
 
     if !have_text_segment {
-        return -1;
+        return AddModule::NotMachO;
     }
     info.base_svma = base_svma;
     if info.unwind_info.is_none() && info.eh_frame.is_none() {
-        return -2;
+        return AddModule::NoUnwindInfo;
     }
 
     let span = max_end_svma.saturating_sub(base_svma);
@@ -233,141 +277,7 @@ pub unsafe extern "C" fn sismo_unwinder_add_module(
         base_avma,
         info,
     );
-    unwinder.inner.add_module(module);
-    0
+    inner.add_module(module);
+    AddModule::Added
 }
 
-/// Walk the stack from a thread snapshot. Writes up to `max_pcs` AVMAs
-/// into `out_pcs`. The first slot is always the snapshot `pc`; subsequent
-/// slots are return addresses recovered by framehop. Returns the number
-/// of slots written. Stops on first iter error (best-effort partial walk).
-///
-/// # Safety
-/// `p` must be a valid unwinder pointer; `read_stack_cb` must be safe to call
-/// with `user_data`; `out_pcs` must be writable for `max_pcs` u64s.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_unwinder_walk(
-    p: *mut Unwinder,
-    pc: u64,
-    fp: u64,
-    lr: u64,
-    sp: u64,
-    read_stack_cb: ReadStackCb,
-    user_data: *mut c_void,
-    out_pcs: *mut u64,
-    max_pcs: usize,
-) -> usize {
-    if p.is_null() || out_pcs.is_null() || max_pcs == 0 {
-        return 0;
-    }
-    let unwinder = unsafe { &mut *p };
-    let out = unsafe { slice::from_raw_parts_mut(out_pcs, max_pcs) };
-
-    let mut closure = |addr: u64| -> Result<u64, ()> {
-        let mut v: u64 = 0;
-        let rc = unsafe { read_stack_cb(addr, &mut v, user_data) };
-        if rc == 0 {
-            Ok(v)
-        } else {
-            Err(())
-        }
-    };
-
-    // Apply the macOS arm64e 24/40 PAC mask to LRs framehop reads from
-    // the stack. The `lr` passed in is expected to already be stripped
-    // by the caller; the mask is idempotent on already-clean pointers.
-    let mut iter = unwinder.inner.iter_frames(
-        pc,
-        UnwindRegsAarch64::new_with_ptr_auth_mask(PtrAuthMask::new_24_40(), lr, sp, fp),
-        &mut unwinder.cache,
-        &mut closure,
-    );
-
-    let mut n = 0;
-    while n < max_pcs {
-        match iter.next() {
-            Ok(Some(frame)) => {
-                // Write the *lookup* address: IP for slot 0 (the active
-                // PC), but `LR - 1` for the return-address slots
-                // (subsequent frames). The -1 is the standard adjustment
-                // because LR points to the instruction *after* the bl;
-                // looking up that byte often lands in the wrong basic
-                // block or function. samply records the same adjusted
-                // values in its profile.json.
-                out[n] = frame.address_for_lookup();
-                n += 1;
-            }
-            _ => break,
-        }
-    }
-    n
-}
-
-/// Snapshot-mode walk: unwind from a captured stack-bytes buffer
-/// instead of live process memory. Mirrors samply's
-/// `linux_shared/converter.rs::get_sample_stack` pattern for
-/// perf_event DWARF callstacks.
-///
-/// `snapshot_sp` is the stack-pointer value at capture time;
-/// `snapshot_bytes` is the contents of [snapshot_sp .. snapshot_sp+len)
-/// captured at that moment. Reads outside the buffer return Err to
-/// framehop, which terminates the walk gracefully (samply pattern).
-///
-/// # Safety
-/// `p` must be a valid unwinder pointer; `snapshot_bytes` must be valid for
-/// `snapshot_len` bytes; `out_pcs` must be writable for `max_pcs` u64s.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_unwinder_walk_snapshot(
-    p: *mut Unwinder,
-    pc: u64,
-    fp: u64,
-    lr: u64,
-    sp: u64,
-    snapshot_bytes: *const u8,
-    snapshot_len: usize,
-    snapshot_sp: u64,
-    out_pcs: *mut u64,
-    max_pcs: usize,
-) -> usize {
-    if p.is_null() || out_pcs.is_null() || max_pcs == 0 || snapshot_bytes.is_null() {
-        return 0;
-    }
-    let unwinder = unsafe { &mut *p };
-    let out = unsafe { slice::from_raw_parts_mut(out_pcs, max_pcs) };
-    let snap = unsafe { slice::from_raw_parts(snapshot_bytes, snapshot_len) };
-
-    // Per samply: read 8 bytes at virtual address `addr` by translating
-    // (addr − snapshot_sp) into a buffer offset. Out-of-range reads
-    // return Err — framehop emits a TruncatedStackMarker and the walk
-    // ends cleanly.
-    let mut read_stack = |addr: u64| -> Result<u64, ()> {
-        let offset = addr.checked_sub(snapshot_sp).ok_or(())?;
-        let idx_end = offset.checked_add(8).ok_or(())? as usize;
-        if idx_end > snap.len() {
-            return Err(());
-        }
-        let bytes = &snap[offset as usize..idx_end];
-        let mut a = [0u8; 8];
-        a.copy_from_slice(bytes);
-        Ok(u64::from_le_bytes(a))
-    };
-
-    let mut iter = unwinder.inner.iter_frames(
-        pc,
-        UnwindRegsAarch64::new_with_ptr_auth_mask(PtrAuthMask::new_24_40(), lr, sp, fp),
-        &mut unwinder.cache,
-        &mut read_stack,
-    );
-
-    let mut n = 0;
-    while n < max_pcs {
-        match iter.next() {
-            Ok(Some(frame)) => {
-                out[n] = frame.address_for_lookup();
-                n += 1;
-            }
-            _ => break,
-        }
-    }
-    n
-}

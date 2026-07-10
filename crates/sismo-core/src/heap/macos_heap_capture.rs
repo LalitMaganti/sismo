@@ -43,9 +43,7 @@ use crate::heap::{
 };
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::symbolizer::Symbolizer;
-use crate::symbolize::unwinder::{
-    sismo_unwinder_create_arm64, sismo_unwinder_destroy, sismo_unwinder_walk_snapshot, Unwinder,
-};
+use crate::symbolize::unwinder::{StackRegs, Unwinder};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use crate::worker_sdk::Event;
 
@@ -258,17 +256,12 @@ impl HeapCapture {
         }
 
         // Unwinder + symbolizer must exist before we register modules into them.
-        let unwinder = sismo_unwinder_create_arm64();
-        if unwinder.is_null() {
-            eprintln!("heap_capture: unwinder.create failed");
-            self.park_until_exit();
-            return;
-        }
+        let unwinder = Box::into_raw(Box::new(Unwinder::new_arm64()));
         let symbolizer = match Symbolizer::new() {
             Some(s) => Box::into_raw(Box::new(s)),
             None => {
                 eprintln!("heap_capture: symbolizer.create failed");
-                unsafe { sismo_unwinder_destroy(unwinder) };
+                drop(unsafe { Box::from_raw(unwinder) });
                 self.park_until_exit();
                 return;
             }
@@ -294,7 +287,7 @@ impl HeapCapture {
         if image_list.is_null() {
             eprintln!("heap_capture: load_target_modules failed (err={load_err})");
             drop(unsafe { Box::from_raw(symbolizer) });
-            unsafe { sismo_unwinder_destroy(unwinder) };
+            drop(unsafe { Box::from_raw(unwinder) });
             self.park_until_exit();
             return;
         }
@@ -305,7 +298,7 @@ impl HeapCapture {
                 eprintln!("heap_capture: ring.create failed");
                 unsafe { sismo_dyld_list_free(image_list) };
                 drop(unsafe { Box::from_raw(symbolizer) });
-                unsafe { sismo_unwinder_destroy(unwinder) };
+                drop(unsafe { Box::from_raw(unwinder) });
                 self.park_until_exit();
                 return;
             }
@@ -325,7 +318,7 @@ impl HeapCapture {
                     drop(ring);
                     unsafe { sismo_dyld_list_free(image_list) };
                     drop(unsafe { Box::from_raw(symbolizer) });
-                    unsafe { sismo_unwinder_destroy(unwinder) };
+                    drop(unsafe { Box::from_raw(unwinder) });
                     self.park_until_exit();
                     return;
                 }
@@ -396,7 +389,7 @@ impl HeapCapture {
         drop(ring);
         unsafe { sismo_dyld_list_free(image_list) };
         drop(unsafe { Box::from_raw(symbolizer) });
-        unsafe { sismo_unwinder_destroy(unwinder) };
+        drop(unsafe { Box::from_raw(unwinder) });
     }
 
     /// Drain up to 4096 ring records into the aggregation map.
@@ -435,26 +428,13 @@ impl HeapCapture {
         let fp = read_u64(slice, OFF_REG_FP);
         let stack_bytes = &slice[ALLOC_METADATA_BYTES..];
 
-        let mut pcs = [0u64; MAX_FRAMES];
-        let n = unsafe {
-            sismo_unwinder_walk_snapshot(
-                unwinder,
-                pc,
-                fp,
-                lr,
-                sp,
-                stack_bytes.as_ptr(),
-                stack_bytes.len(),
-                sp,
-                pcs.as_mut_ptr(),
-                MAX_FRAMES,
-            )
-        };
+        let pcs = unsafe { &mut *unwinder }
+            .walk_snapshot(StackRegs { pc, fp, lr, sp }, stack_bytes, sp, MAX_FRAMES);
 
-        let top_pc = if n > 0 { pcs[0] } else { alloc_address };
+        let top_pc = pcs.first().copied().unwrap_or(alloc_address);
         let entry = sizes.entry(top_pc).or_insert_with(|| {
             let mut stat = AllocStats { count: 0, total_size: 0, pcs: [0; MAX_FRAMES], pc_count: 0 };
-            let cap = n.min(MAX_FRAMES);
+            let cap = pcs.len().min(MAX_FRAMES);
             stat.pcs[..cap].copy_from_slice(&pcs[..cap]);
             stat.pc_count = cap;
             stat

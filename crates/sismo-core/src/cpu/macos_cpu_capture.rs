@@ -82,7 +82,7 @@ use crate::worker_sdk::Event;
 use crate::symbolize::dyld_images::{sismo_dyld_list_free, sismo_load_target_modules};
 use crate::cpu::mach_sampler::sismo_cpu_sample_thread;
 use crate::proto::session_config::encode_data_source_descriptor;
-use crate::symbolize::unwinder::{sismo_unwinder_create_arm64, sismo_unwinder_destroy, Unwinder};
+use crate::symbolize::unwinder::Unwinder;
 
 // ---- Worker ----------------------------------------------------------------
 
@@ -213,12 +213,7 @@ impl CpuCapture {
             return;
         }
 
-        let unwinder = sismo_unwinder_create_arm64();
-        if unwinder.is_null() {
-            eprintln!("cpu_sampler: unwinder.create failed");
-            self.park_until_exit();
-            return;
-        }
+        let unwinder = Box::into_raw(Box::new(Unwinder::new_arm64()));
 
         // Register the target's modules into the unwinder (Rust). No symbolizer
         // — cpu samples are symbolized post-record.
@@ -237,7 +232,7 @@ impl CpuCapture {
         };
         if image_list.is_null() {
             eprintln!("cpu_sampler: load_target_modules failed (err={load_err})");
-            unsafe { sismo_unwinder_destroy(unwinder) };
+            drop(unsafe { Box::from_raw(unwinder) });
             self.park_until_exit();
             return;
         }
@@ -305,7 +300,7 @@ impl CpuCapture {
             }
         }
 
-        unsafe { sismo_unwinder_destroy(unwinder) };
+        drop(unsafe { Box::from_raw(unwinder) });
     }
 
     fn sample_one(

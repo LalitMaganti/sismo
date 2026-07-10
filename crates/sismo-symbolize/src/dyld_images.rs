@@ -15,7 +15,7 @@
 //! (`mach_task_self_`) without root — the tests exercise it that way.
 
 use crate::symbolizer::Symbolizer;
-use crate::unwinder::{sismo_unwinder_add_module, Unwinder};
+use crate::unwinder::Unwinder;
 use std::ffi::OsStr;
 use std::os::raw::c_void;
 use std::os::unix::ffi::OsStrExt;
@@ -416,7 +416,8 @@ pub unsafe extern "C" fn sismo_load_target_modules(
             );
         }
         if !unwinder.is_null() {
-            unsafe { sismo_unwinder_add_module(unwinder, base, bytes, bytes_len) };
+            let slab = unsafe { std::slice::from_raw_parts(bytes, bytes_len) };
+            unsafe { &mut *unwinder }.add_module(base, slab);
         }
         unsafe { sismo_dyld_free_bytes(bytes, bytes_len) };
     }
@@ -475,17 +476,14 @@ mod tests {
         // a real symbolizer + unwinder, exercised without root.
         let task = unsafe { mach_task_self_ };
         let mut sym = Symbolizer::new().unwrap();
-        let unw = crate::unwinder::sismo_unwinder_create_arm64();
+        let mut unw = Unwinder::new_arm64();
         let mut err = ERR_OK;
         let list = unsafe {
-            sismo_load_target_modules(task, &mut sym, unw, 0, 0, std::ptr::null_mut(), None, &mut err)
+            sismo_load_target_modules(task, &mut sym, &mut unw, 0, 0, std::ptr::null_mut(), None, &mut err)
         };
         assert!(!list.is_null(), "load failed, err={err}");
         assert!(unsafe { sismo_dyld_list_count(list) } > 0);
-        unsafe {
-            sismo_dyld_list_free(list);
-            crate::unwinder::sismo_unwinder_destroy(unw);
-        }
+        unsafe { sismo_dyld_list_free(list) };
     }
 
     #[test]
