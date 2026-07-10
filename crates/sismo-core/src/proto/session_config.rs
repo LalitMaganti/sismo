@@ -13,7 +13,6 @@
 //! numbers come from the vendored proto schemas.
 
 use crate::proto::ProtoWriter;
-use std::slice;
 
 // ---- DataSourceConfig field numbers ----
 const DSC_NAME: u32 = 1;
@@ -21,30 +20,6 @@ const DSC_TRACK_EVENT_CONFIG: u32 = 113;
 const DSC_FTRACE_CONFIG: u32 = 100;
 const DSC_PROTOVM_CONFIG: u32 = 12;
 const DSC_SISMO_CONFIG: u32 = 2000;
-
-// ---- Helpers ---------------------------------------------------------------
-
-fn ffi_slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
-    if ptr.is_null() {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(ptr, len) }
-    }
-}
-
-/// Copy `bytes` into `out[..cap]`; return the length, or 0 if too small.
-///
-/// # Safety
-/// `out` must be writable for `cap` bytes.
-unsafe fn emit(bytes: &[u8], out: *mut u8, cap: usize) -> usize {
-    if bytes.len() > cap {
-        return 0;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
-    }
-    bytes.len()
-}
 
 // ---- DataSourceDescriptor --------------------------------------------------
 
@@ -82,16 +57,13 @@ const MODE_FILE: u32 = 2;
 const KIND_TRACK_EVENT: u32 = 0;
 const KIND_LINUX_FTRACE: u32 = 2;
 
-/// Flattened `data_sources[*]` entry passed across FFI. `kind` selects which
-/// fields are read: track_event/linux_ftrace need none (their configs are
-/// fixed), sismo_vendor uses name + sismo_config + protovm_memory_limit_kb.
-#[repr(C)]
-pub struct DataSourceEntryC {
+/// A `data_sources[*]` entry. `kind` selects which fields are read:
+/// track_event/linux_ftrace need none (their configs are fixed), sismo_vendor
+/// uses name + sismo_config + protovm_memory_limit_kb.
+pub struct DataSourceEntry<'a> {
     pub kind: u32,
-    pub name: *const u8,
-    pub name_len: usize,
-    pub sismo_config: *const u8,
-    pub sismo_config_len: usize,
+    pub name: &'a [u8],
+    pub sismo_config: &'a [u8],
     pub protovm_memory_limit_kb: u32,
 }
 
@@ -122,7 +94,7 @@ fn encode_ftrace_config() -> Vec<u8> {
     w.bytes().to_vec()
 }
 
-fn encode_data_source_config(entry: &DataSourceEntryC) -> Vec<u8> {
+fn encode_data_source_config(entry: &DataSourceEntry) -> Vec<u8> {
     let mut w = ProtoWriter::new();
     match entry.kind {
         KIND_TRACK_EVENT => {
@@ -135,10 +107,9 @@ fn encode_data_source_config(entry: &DataSourceEntryC) -> Vec<u8> {
         }
         _ => {
             // sismo_vendor (any unrecognized kind is treated as vendor).
-            w.write_string(DSC_NAME, ffi_slice(entry.name, entry.name_len));
-            let cfg = ffi_slice(entry.sismo_config, entry.sismo_config_len);
-            if !cfg.is_empty() {
-                w.write_message(DSC_SISMO_CONFIG, cfg);
+            w.write_string(DSC_NAME, entry.name);
+            if !entry.sismo_config.is_empty() {
+                w.write_message(DSC_SISMO_CONFIG, entry.sismo_config);
             }
             if entry.protovm_memory_limit_kb > 0 {
                 let mut pvc = ProtoWriter::new();
@@ -161,28 +132,16 @@ fn encode_buffer_config(size_kb: u32, fill_policy: u32) -> Vec<u8> {
 }
 
 /// Encode a TraceConfig. `mode` is one of MODE_{RING,CAPPED,FILE}; `entries`
-/// are the flattened data sources. Writes into out[..cap]; returns bytes
-/// written or 0 if too small.
-///
-/// # Safety
-/// `output_path`/`session_name` valid for their lengths or null; `entries`
-/// valid for `entries_len`, as are the pointers inside each entry; `out`
-/// writable for `cap`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_encode_trace_config(
+/// are the data sources.
+pub fn encode_trace_config(
     mode: u32,
     buffer_size_kb: u32,
     duration_ms: u32,
-    output_path: *const u8,
-    output_path_len: usize,
+    output_path: &[u8],
     max_file_size_bytes: u64,
-    session_name: *const u8,
-    session_name_len: usize,
-    entries: *const DataSourceEntryC,
-    entries_len: usize,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
+    session_name: &[u8],
+    entries: &[DataSourceEntry],
+) -> Vec<u8> {
     let mut w = ProtoWriter::new();
 
     // buffers (field 1). Single buffer, always V2 (ProtoVM requires it).
@@ -192,11 +151,6 @@ pub unsafe extern "C" fn sismo_encode_trace_config(
     w.write_message(1, &encode_buffer_config(buffer_size_kb, fill_policy));
 
     // data_sources (field 2); each DataSource.config = field 1.
-    let entries = if entries.is_null() {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(entries, entries_len) }
-    };
     for entry in entries {
         let dsc = encode_data_source_config(entry);
         let mut ds = ProtoWriter::new();
@@ -205,7 +159,7 @@ pub unsafe extern "C" fn sismo_encode_trace_config(
     }
 
     // unique_session_name (field 22).
-    w.write_string(22, ffi_slice(session_name, session_name_len));
+    w.write_string(22, session_name);
 
     match mode {
         MODE_RING => {} // nothing extra
@@ -214,12 +168,12 @@ pub unsafe extern "C" fn sismo_encode_trace_config(
             w.write_uint32(8, 1); // write_into_file
             w.write_uint64(10, max_file_size_bytes);
             w.write_uint32(9, 1000); // file_write_period_ms
-            w.write_string(29, ffi_slice(output_path, output_path_len));
+            w.write_string(29, output_path);
         }
         _ => {}
     }
 
-    unsafe { emit(w.bytes(), out, cap) }
+    w.bytes().to_vec()
 }
 
 #[cfg(test)]
@@ -258,39 +212,17 @@ mod tests {
     #[test]
     fn trace_config_ring_with_track_event() {
         // ring mode, one track_event source, session "s", 8 MB buffer.
-        let entries = [DataSourceEntryC {
+        let entries = [DataSourceEntry {
             kind: KIND_TRACK_EVENT,
-            name: std::ptr::null(),
-            name_len: 0,
-            sismo_config: std::ptr::null(),
-            sismo_config_len: 0,
+            name: b"",
+            sismo_config: b"",
             protovm_memory_limit_kb: 0,
         }];
-        let mut out = [0u8; 256];
-        let n = unsafe {
-            sismo_encode_trace_config(
-                MODE_RING,
-                8192,
-                0,
-                std::ptr::null(),
-                0,
-                0,
-                b"s".as_ptr(),
-                1,
-                entries.as_ptr(),
-                entries.len(),
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
-        let got = &out[..n];
+        let got = encode_trace_config(MODE_RING, 8192, 0, b"", 0, b"s", &entries);
         // Contains a buffer (field 1) with V2 marker (40 01) and the
         // track_event data source name, plus session_name(22) "s" (tag 0xB2 0x01).
         assert!(got.windows(2).any(|w| w == [0x40, 0x01]), "buffer V2 marker");
-        assert!(
-            got.windows(11).any(|w| w == b"track_event"),
-            "track_event source name"
-        );
+        assert!(got.windows(11).any(|w| w == b"track_event"), "track_event source name");
         assert!(
             got.windows(3).any(|w| w == [0xB2, 0x01, 0x01]),
             "session_name field 22, len 1"
@@ -301,32 +233,14 @@ mod tests {
     #[test]
     fn trace_config_file_mode_and_sismo_vendor_with_protovm() {
         let cfg = [0x08u8, 0x2A]; // a stand-in sismo_config payload
-        let entries = [DataSourceEntryC {
-            kind: 1, // KIND_SISMO_VENDOR
-            name: b"sismo.macos_sched".as_ptr(),
-            name_len: b"sismo.macos_sched".len(),
-            sismo_config: cfg.as_ptr(),
-            sismo_config_len: cfg.len(),
+        let entries = [DataSourceEntry {
+            kind: 1, // vendor
+            name: b"sismo.macos_sched",
+            sismo_config: &cfg,
             protovm_memory_limit_kb: 4096,
         }];
-        let mut out = [0u8; 256];
-        let n = unsafe {
-            sismo_encode_trace_config(
-                MODE_FILE,
-                8192,
-                0,
-                b"/tmp/t.pftrace".as_ptr(),
-                b"/tmp/t.pftrace".len(),
-                1024,
-                b"sismo_record".as_ptr(),
-                b"sismo_record".len(),
-                entries.as_ptr(),
-                entries.len(),
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
-        let got = &out[..n];
+        let got =
+            encode_trace_config(MODE_FILE, 8192, 0, b"/tmp/t.pftrace", 1024, b"sismo_record", &entries);
         assert!(got.windows(17).any(|w| w == b"sismo.macos_sched"));
         // sismo_config at field 2000: tag=2000<<3|2=0x3E82 -> 82 7D.
         assert!(got.windows(2).any(|w| w == [0x82, 0x7D]), "sismo_config field 2000");
@@ -334,35 +248,5 @@ mod tests {
         assert!(got.windows(2).any(|w| w == [0x40, 0x01]));
         // output_path(29) "/tmp/t.pftrace": tag=29<<3|2=0xEA 0x01.
         assert!(got.windows(2).any(|w| w == [0xEA, 0x01]));
-    }
-
-    #[test]
-    fn trace_config_returns_zero_when_cap_too_small() {
-        let entries = [DataSourceEntryC {
-            kind: KIND_LINUX_FTRACE,
-            name: std::ptr::null(),
-            name_len: 0,
-            sismo_config: std::ptr::null(),
-            sismo_config_len: 0,
-            protovm_memory_limit_kb: 0,
-        }];
-        let mut out = [0u8; 4];
-        let n = unsafe {
-            sismo_encode_trace_config(
-                MODE_RING,
-                8192,
-                0,
-                std::ptr::null(),
-                0,
-                0,
-                b"s".as_ptr(),
-                1,
-                entries.as_ptr(),
-                entries.len(),
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
-        assert_eq!(n, 0);
     }
 }

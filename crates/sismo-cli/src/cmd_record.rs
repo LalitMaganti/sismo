@@ -20,7 +20,7 @@
 #[cfg(target_os = "macos")]
 use sismo_core::proto::{ProtoReader, WireValue};
 use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
-use sismo_core::proto::session_config::{sismo_encode_trace_config, DataSourceEntryC};
+use sismo_core::proto::session_config::{encode_trace_config, DataSourceEntry};
 #[cfg(target_os = "macos")]
 use sismo_core::proto::sismo_config;
 use sismo_core::sismo_paths::{
@@ -255,26 +255,12 @@ fn wait_for_external_data_sources(session: *mut ConsumerSession, expected: &[&st
 
 // ---- DataSourceEntry builders ----------------------------------------------
 
-fn ds_track_event() -> DataSourceEntryC {
-    DataSourceEntryC {
-        kind: 0,
-        name: std::ptr::null(),
-        name_len: 0,
-        sismo_config: std::ptr::null(),
-        sismo_config_len: 0,
-        protovm_memory_limit_kb: 0,
-    }
+fn ds_track_event() -> DataSourceEntry<'static> {
+    DataSourceEntry { kind: 0, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
 }
 
-fn ds_sismo_vendor(name: &[u8], cfg: &[u8], protovm_kb: u32) -> DataSourceEntryC {
-    DataSourceEntryC {
-        kind: 1,
-        name: name.as_ptr(),
-        name_len: name.len(),
-        sismo_config: cfg.as_ptr(),
-        sismo_config_len: cfg.len(),
-        protovm_memory_limit_kb: protovm_kb,
-    }
+fn ds_sismo_vendor<'a>(name: &'a [u8], cfg: &'a [u8], protovm_kb: u32) -> DataSourceEntry<'a> {
+    DataSourceEntry { kind: 1, name, sismo_config: cfg, protovm_memory_limit_kb: protovm_kb }
 }
 
 // ---- Entry point -----------------------------------------------------------
@@ -472,7 +458,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     let sched_cfg = sismo_config::sched_encode(0);
 
     // Build the entries + external-name list.
-    let mut entries: Vec<DataSourceEntryC> = Vec::new();
+    let mut entries: Vec<DataSourceEntry> = Vec::new();
     let mut external_names: Vec<&str> = Vec::new();
     if !no_instrumentation {
         entries.push(ds_track_event());
@@ -509,30 +495,15 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
     let out_path: &[u8] = if flight_recorder { b"" } else { output_path_str.as_bytes() };
     let session_name = b"sismo_record";
-    let mut cfg_buf = [0u8; 16384];
-    let cfg_len = unsafe {
-        sismo_encode_trace_config(
-            if flight_recorder { 0 } else { 2 }, // ring : file
-            buffer_kb,
-            0,
-            out_path.as_ptr(),
-            out_path.len(),
-            1024 * 1024 * 1024,
-            session_name.as_ptr(),
-            session_name.len(),
-            entries.as_ptr(),
-            entries.len(),
-            cfg_buf.as_mut_ptr(),
-            cfg_buf.len(),
-        )
-    };
-    if cfg_len == 0 {
-        eprintln!("sismo record: encodeTraceConfig failed (config exceeds buffer)");
-        shutdown_captures(heap, cpu, sched);
-        teardown_early(svc, lock_fd);
-        return 0;
-    }
-
+    let cfg = encode_trace_config(
+        if flight_recorder { 0 } else { 2 }, // ring : file
+        buffer_kb,
+        0,
+        out_path,
+        1024 * 1024 * 1024,
+        session_name,
+        &entries,
+    );
     let session = unsafe { sismo_consumer_session_create() };
     if session.is_null() {
         eprintln!("sismo record: session_create failed");
@@ -540,7 +511,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         teardown_early(svc, lock_fd);
         return 0;
     }
-    let setup_rc = unsafe { sismo_consumer_session_setup(session, cfg_buf.as_ptr() as *const c_void, cfg_len) };
+    let setup_rc = unsafe { sismo_consumer_session_setup(session, cfg.as_ptr() as *const c_void, cfg.len()) };
     if setup_rc != 0 {
         eprintln!("sismo record: session_setup rc={setup_rc} (TraceConfig failed to parse)");
         unsafe { sismo_consumer_session_destroy(session) };
@@ -713,15 +684,8 @@ use sismo_core::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, s
 use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
 
 #[cfg(target_os = "linux")]
-fn ds_linux_ftrace() -> DataSourceEntryC {
-    DataSourceEntryC {
-        kind: 2,
-        name: std::ptr::null(),
-        name_len: 0,
-        sismo_config: std::ptr::null(),
-        sismo_config_len: 0,
-        protovm_memory_limit_kb: 0,
-    }
+fn ds_linux_ftrace() -> DataSourceEntry<'static> {
+    DataSourceEntry { kind: 2, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
 }
 
 #[cfg(target_os = "linux")]
@@ -847,7 +811,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     };
 
     // Data source entries.
-    let mut entries: Vec<DataSourceEntryC> = Vec::new();
+    let mut entries: Vec<DataSourceEntry> = Vec::new();
     if !no_instrumentation {
         entries.push(ds_track_event());
     }
@@ -870,31 +834,15 @@ fn run_linux(config: &RecordConfig) -> c_int {
     }
     let out_path: &[u8] = if flight_recorder { b"" } else { output_path_str.as_bytes() };
     let session_name = b"sismo_record";
-    let mut cfg_buf = [0u8; 16384];
-    let cfg_len = unsafe {
-        sismo_encode_trace_config(
-            if flight_recorder { 0 } else { 2 },
-            buffer_kb,
-            0,
-            out_path.as_ptr(),
-            out_path.len(),
-            1024 * 1024 * 1024,
-            session_name.as_ptr(),
-            session_name.len(),
-            entries.as_ptr(),
-            entries.len(),
-            cfg_buf.as_mut_ptr(),
-            cfg_buf.len(),
-        )
-    };
-    if cfg_len == 0 {
-        eprintln!("sismo record: encodeTraceConfig failed (config exceeds buffer)");
-        shutdown_bpf(bpf.take());
-        stop_probes(probes);
-        teardown_early(svc, lock_fd);
-        return 0;
-    }
-
+    let cfg = encode_trace_config(
+        if flight_recorder { 0 } else { 2 },
+        buffer_kb,
+        0,
+        out_path,
+        1024 * 1024 * 1024,
+        session_name,
+        &entries,
+    );
     let session = unsafe { sismo_consumer_session_create() };
     if session.is_null() {
         eprintln!("sismo record: session_create failed");
@@ -904,7 +852,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
         return 0;
     }
     let setup_rc =
-        unsafe { sismo_consumer_session_setup(session, cfg_buf.as_ptr() as *const c_void, cfg_len) };
+        unsafe { sismo_consumer_session_setup(session, cfg.as_ptr() as *const c_void, cfg.len()) };
     if setup_rc != 0 {
         eprintln!("sismo record: session_setup rc={setup_rc} (TraceConfig failed to parse)");
         unsafe { sismo_consumer_session_destroy(session) };
