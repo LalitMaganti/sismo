@@ -121,7 +121,7 @@ extern "C" {
 
 // ---- PMU counter selection (port of the Zig selectCounters + helpers) ------
 
-use crate::pmu_events::{Model, Role, MODELS};
+use crate::cpu::pmu_events::{Model, Role, MODELS};
 
 // perf_event PERF_COUNT_HW_* (config values under PERF_TYPE_HARDWARE).
 const HW_CPU_CYCLES: u32 = 0;
@@ -676,8 +676,8 @@ impl Interner {
 
 // ---- Capture: the collector object (output half) ---------------------------
 
-use crate::data_regions::DataRegions;
-use crate::proc_maps::ProcMaps;
+use crate::symbolize::data_regions::DataRegions;
+use crate::symbolize::proc_maps::ProcMaps;
 use crate::proto::{write_perf_defaults_packet, write_perf_sample};
 use crate::ffi::sismo_ds_emit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1084,7 +1084,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
 
     let mut desc = [0u8; 2048];
     let desc_len = unsafe {
-        crate::session_config::sismo_encode_data_source_descriptor(
+        crate::proto::session_config::sismo_encode_data_source_descriptor(
             DS_NAME.as_ptr(),
             DS_NAME.len(),
             false,

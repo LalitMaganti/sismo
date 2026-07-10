@@ -18,9 +18,9 @@
 //! to the C++ shim; the symbolizer, disassembler, and proto writer are Rust
 //! siblings (direct calls, no FFI round-trip). POSIX-only (file append).
 
-use crate::disasm::sismo_disasm_module;
+use crate::symbolize::disasm::sismo_disasm_module;
 use crate::proto::ProtoWriter;
-use crate::symbolizer::{
+use crate::symbolize::symbolizer::{
     sismo_symbolizer_add_module, sismo_symbolizer_create, sismo_symbolizer_destroy,
     sismo_symbolizer_resolve, Symbolizer,
 };

@@ -14,8 +14,8 @@
 //! macOS-only (Mach APIs); gated in lib.rs. Works on the caller's own task
 //! (`mach_task_self_`) without root — the tests exercise it that way.
 
-use crate::symbolizer::{sismo_symbolizer_add_module, Symbolizer};
-use crate::unwinder::{sismo_unwinder_add_module, Unwinder};
+use crate::symbolize::symbolizer::{sismo_symbolizer_add_module, Symbolizer};
+use crate::symbolize::unwinder::{sismo_unwinder_add_module, Unwinder};
 use std::os::raw::c_void;
 use std::time::Duration;
 
@@ -484,8 +484,8 @@ mod tests {
         // a real symbolizer + unwinder — the whole loop that replaced the Zig
         // setup code, exercised without root.
         let task = unsafe { mach_task_self_ };
-        let sym = crate::symbolizer::sismo_symbolizer_create();
-        let unw = crate::unwinder::sismo_unwinder_create_arm64();
+        let sym = crate::symbolize::symbolizer::sismo_symbolizer_create();
+        let unw = crate::symbolize::unwinder::sismo_unwinder_create_arm64();
         let mut err = ERR_OK;
         let list = unsafe {
             sismo_load_target_modules(task, sym, unw, 0, 0, std::ptr::null_mut(), None, &mut err)
@@ -494,8 +494,8 @@ mod tests {
         assert!(unsafe { sismo_dyld_list_count(list) } > 0);
         unsafe {
             sismo_dyld_list_free(list);
-            crate::symbolizer::sismo_symbolizer_destroy(sym);
-            crate::unwinder::sismo_unwinder_destroy(unw);
+            crate::symbolize::symbolizer::sismo_symbolizer_destroy(sym);
+            crate::symbolize::unwinder::sismo_unwinder_destroy(unw);
         }
     }
 

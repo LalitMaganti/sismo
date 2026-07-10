@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 //! Host entry: Rust owns `main`, routing, and every subcommand. `main` collects
-//! argv and hands it to [`sismo_core::cli::run`], which dispatches to the
+//! argv and hands it to [`sismo_core::command::cli::run`], which dispatches to the
 //! matching Rust command.
 
 // Link sismo-sys for its native side effects: its build script compiles + links
@@ -17,5 +17,5 @@ fn main() {
     let args: Vec<String> = std::env::args_os()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    std::process::exit(sismo_core::cli::run(&args));
+    std::process::exit(sismo_core::command::cli::run(&args));
 }

@@ -16,8 +16,15 @@
 //! Building the bytes here (rather than emitting) keeps rust-bridge free of the
 //! C++ `sismo_ds_emit` symbol, so `cargo test` still links standalone.
 
+#[cfg(target_os = "macos")]
+pub mod heap_protocol;
+#[cfg(target_os = "macos")]
+pub mod heap_ring;
+#[cfg(target_os = "macos")]
+pub mod macos_heap_capture;
+
 use crate::proto::ProtoWriter;
-use crate::symbolizer::{sismo_symbolizer_resolve, Symbolizer};
+use crate::symbolize::symbolizer::{sismo_symbolizer_resolve, Symbolizer};
 use std::collections::HashMap;
 use std::slice;
 

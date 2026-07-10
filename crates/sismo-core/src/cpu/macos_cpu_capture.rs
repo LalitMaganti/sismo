@@ -13,7 +13,7 @@
 //!
 //! macOS/arm64 only; gated in lib.rs.
 
-use crate::sismo_config::{sismo_config_cpu_decode, sismo_config_extract};
+use crate::proto::sismo_config::{sismo_config_cpu_decode, sismo_config_extract};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -80,10 +80,10 @@ use crate::worker_sdk::Event;
 // The rest of the pipeline is already Rust — call the sibling modules directly
 // (no FFI round-trip): descriptor encoding, unwinder lifecycle, module loading,
 // and per-sample capture.
-use crate::dyld_images::{sismo_dyld_list_free, sismo_load_target_modules};
-use crate::mach_sampler::sismo_cpu_sample_thread;
-use crate::session_config::sismo_encode_data_source_descriptor;
-use crate::unwinder::{sismo_unwinder_create_arm64, sismo_unwinder_destroy, Unwinder};
+use crate::symbolize::dyld_images::{sismo_dyld_list_free, sismo_load_target_modules};
+use crate::cpu::mach_sampler::sismo_cpu_sample_thread;
+use crate::proto::session_config::sismo_encode_data_source_descriptor;
+use crate::symbolize::unwinder::{sismo_unwinder_create_arm64, sismo_unwinder_destroy, Unwinder};
 
 // ---- Worker ----------------------------------------------------------------
 

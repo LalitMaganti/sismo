@@ -8,7 +8,7 @@
 //!
 //! The data-plane producer ABI (`sismo_ds_*`, the per-packet emit path) and its
 //! data-source callback types live below; the snapshot clone ABI lives in
-//! [`crate::cmd_snapshot`], which keeps its own `#[cfg(test)]` stub. The
+//! [`crate::command::cmd_snapshot`], which keeps its own `#[cfg(test)]` stub. The
 //! `#[cfg(test)]` stubs here let the standalone test binary link without the
 //! C++ shim. [`crate::worker_sdk`] holds the `Event` primitive the workers pair
 //! with this ABI.

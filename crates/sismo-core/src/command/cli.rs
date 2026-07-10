@@ -22,18 +22,18 @@ enum Commands {
     /// Spawn a command (or attach to --pid) and record sched + CPU samples +
     /// heap into a single Perfetto trace. Stops on SIGINT, target exit, or
     /// --duration. Requires sudo on macOS for kdebug + task_for_pid.
-    Record(crate::record_args::RecordArgs),
+    Record(crate::command::record_args::RecordArgs),
 
     /// Launch a command with sismo's dormant heap client preloaded, so it can
     /// be attached to later via `sismo record --pid <pid>`.
-    Prepare(crate::cmd_prepare::PrepareArgs),
+    Prepare(crate::command::cmd_prepare::PrepareArgs),
 
     /// Snapshot a running flight-recorder session (`sismo record
     /// --flight-recorder`): clone it as a fresh consumer and write the trace.
-    Snapshot(crate::cmd_snapshot::SnapshotArgs),
+    Snapshot(crate::command::cmd_snapshot::SnapshotArgs),
 
     /// Run a daemonized data-source producer for an external `sismo record`.
-    Datasource(crate::cmd_datasource::DatasourceArgs),
+    Datasource(crate::command::cmd_datasource::DatasourceArgs),
 }
 
 /// Parse the process argv (`args[0]` is the exe) and run the chosen subcommand,
@@ -51,9 +51,9 @@ pub fn run(args: &[String]) -> i32 {
             let _ = Cli::command().print_help();
             0
         }
-        Some(Commands::Record(a)) => crate::cmd_record::run(a),
-        Some(Commands::Prepare(a)) => crate::cmd_prepare::run(a),
-        Some(Commands::Snapshot(a)) => crate::cmd_snapshot::run(a),
-        Some(Commands::Datasource(a)) => crate::cmd_datasource::run(a),
+        Some(Commands::Record(a)) => crate::command::cmd_record::run(a),
+        Some(Commands::Prepare(a)) => crate::command::cmd_prepare::run(a),
+        Some(Commands::Snapshot(a)) => crate::command::cmd_snapshot::run(a),
+        Some(Commands::Datasource(a)) => crate::command::cmd_datasource::run(a),
     }
 }

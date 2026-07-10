@@ -14,13 +14,13 @@
 //!
 //! macOS only; gated in lib.rs.
 
-use crate::proc_info::{sismo_proc_parent_pid, sismo_proc_pid_path, sismo_proc_thread_name};
+use crate::sched::proc_info::{sismo_proc_parent_pid, sismo_proc_pid_path, sismo_proc_thread_name};
 use crate::proto::{write_kernel_task_state_event, ProtoWriter};
-use crate::sched_protos::{
+use crate::proto::sched_protos::{
     sismo_encode_kernel_process_tree, sismo_macos_sched_vm_program, ProcessC, ThreadC,
 };
-use crate::session_config::sismo_encode_data_source_descriptor;
-use crate::sismo_config::{sismo_config_extract, sismo_config_sched_decode};
+use crate::proto::session_config::sismo_encode_data_source_descriptor;
+use crate::proto::sismo_config::{sismo_config_extract, sismo_config_sched_decode};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use crate::worker_sdk::Event;
 use std::collections::HashMap;

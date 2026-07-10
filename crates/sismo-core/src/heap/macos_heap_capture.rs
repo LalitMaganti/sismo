@@ -24,9 +24,9 @@
 //! macOS/arm64 only; gated in lib.rs.
 
 use crate::heap::{HeapImage, HeapSite};
-use crate::heap_protocol::{connect_and_attach, AttachConfig};
-use crate::heap_ring::RingBuffer;
-use crate::sismo_config::{sismo_config_extract, sismo_config_heap_decode};
+use crate::heap::heap_protocol::{connect_and_attach, AttachConfig};
+use crate::heap::heap_ring::RingBuffer;
+use crate::proto::sismo_config::{sismo_config_extract, sismo_config_heap_decode};
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -34,16 +34,16 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 // Sibling Rust modules (direct calls, no FFI round-trip).
-use crate::dyld_images::{
+use crate::symbolize::dyld_images::{
     sismo_dyld_list_count, sismo_dyld_list_free, sismo_dyld_list_get, sismo_load_target_modules,
     ImageList,
 };
 use crate::heap::{
     sismo_heap_build_clock_snapshot_packet, sismo_heap_build_profile_packet, sismo_heap_free,
 };
-use crate::session_config::sismo_encode_data_source_descriptor;
-use crate::symbolizer::{sismo_symbolizer_create, sismo_symbolizer_destroy, Symbolizer};
-use crate::unwinder::{
+use crate::proto::session_config::sismo_encode_data_source_descriptor;
+use crate::symbolize::symbolizer::{sismo_symbolizer_create, sismo_symbolizer_destroy, Symbolizer};
+use crate::symbolize::unwinder::{
     sismo_unwinder_create_arm64, sismo_unwinder_destroy, sismo_unwinder_walk_snapshot, Unwinder,
 };
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};

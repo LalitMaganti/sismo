@@ -13,7 +13,7 @@
 //! `cargo test` still links. macOS/arm64 only; gated in lib.rs.
 
 use crate::proto::{write_perf_sample, ProtoWriter};
-use crate::unwinder::{sismo_unwinder_walk, Unwinder};
+use crate::symbolize::unwinder::{sismo_unwinder_walk, Unwinder};
 use std::os::raw::{c_int, c_void};
 
 type MachPort = u32;

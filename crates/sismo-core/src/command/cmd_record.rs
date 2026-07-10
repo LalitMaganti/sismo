@@ -20,10 +20,10 @@
 //! macOS-only; gated in lib.rs. Validated by `sudo tools/e2e-all-sources`.
 
 use crate::proto::{ProtoReader, WireValue};
-use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
-use crate::session_config::{sismo_encode_trace_config, DataSourceEntryC};
+use crate::command::record_args::{RecordArgs, RecordConfig, SourceMode};
+use crate::proto::session_config::{sismo_encode_trace_config, DataSourceEntryC};
 #[cfg(target_os = "macos")]
-use crate::sismo_config::{sismo_config_cpu_encode, sismo_config_heap_encode, sismo_config_sched_encode};
+use crate::proto::sismo_config::{sismo_config_cpu_encode, sismo_config_heap_encode, sismo_config_sched_encode};
 use crate::sismo_paths::{sismo_acquire_session_lock, sismo_release_session_lock, CONSUMER_SOCK, PRODUCER_SOCK};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
@@ -31,11 +31,11 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 // Capture workers (Rust siblings, macOS in-process sources).
 #[cfg(target_os = "macos")]
-use crate::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
+use crate::cpu::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
 #[cfg(target_os = "macos")]
-use crate::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
+use crate::heap::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
 #[cfg(target_os = "macos")]
-use crate::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
+use crate::sched::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
 
 // ---- C++ shim (traced service + consumer session + producer init) ----------
 
@@ -432,7 +432,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         let ok = match attach_pid {
             Some(pid) => {
                 let mut sock_buf = [0u8; 128];
-                let has_socket = match crate::heap_protocol::socket_path(pid, &mut sock_buf) {
+                let has_socket = match crate::heap::heap_protocol::socket_path(pid, &mut sock_buf) {
                     Some(len) => {
                         sock_buf[len] = 0;
                         unsafe { libc::access(sock_buf.as_ptr() as *const c_char, 0) == 0 } // F_OK
@@ -709,7 +709,7 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
 use crate::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, sismo_traced_probes_stop};
 
 #[cfg(target_os = "linux")]
-use crate::linux_bpf_capture::{self, Capture, FocusPreset};
+use crate::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
 
 #[cfg(target_os = "linux")]
 fn ds_linux_ftrace() -> DataSourceEntryC {
@@ -989,7 +989,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
         }
         // Resolve BPF perf-sample frames to function names (appended offline).
         if had_bpf {
-            crate::perf_symbolize::symbolize_trace(output_path_str);
+            crate::symbolize::perf_symbolize::symbolize_trace(output_path_str);
         }
     }
 

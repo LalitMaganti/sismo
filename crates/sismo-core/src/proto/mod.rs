@@ -7,6 +7,9 @@
 //!
 //! wire types: 0 = VARINT, 2 = LEN (length-delimited).
 
+pub mod sched_protos;
+pub mod session_config;
+pub mod sismo_config;
 
 /// Length-delimited protobuf encoder over a growable byte buffer. Nested
 /// messages are encoded into their own writer, then `write_message`'d into the
