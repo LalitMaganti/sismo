@@ -986,3 +986,372 @@ impl Capture {
         self.ksym_names.insert(rec.id, name.to_vec());
     }
 }
+
+// ---- init / worker / DS lifecycle / C ABI ----------------------------------
+
+use crate::worker_sdk::{sismo_ds_register, sismo_flush_done, sismo_stop_done};
+use std::ptr;
+use std::time::Duration;
+
+/// Kernel-side BPF object, compiled by build.rs (Linux only).
+const BPF_OBJ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sched.bpf.o"));
+const DS_NAME: &[u8] = b"sismo.linux_cpu_samples";
+
+/// Recording stats handed back to the record runner (matches cmd_record).
+#[repr(C)]
+pub struct LinuxBpfStats {
+    pub samples: u64,
+    pub threads: u64,
+    pub busiest_cycles: u64,
+    pub data_frames: u64,
+}
+
+fn preset_name(p: FocusPreset) -> &'static str {
+    match p {
+        FocusPreset::Cache => "cache",
+    }
+}
+
+// A raw Capture pointer smuggled into the worker thread. The Capture is heap-
+// stable for the collector's lifetime and the worker is the sole owner of its
+// non-atomic fields between ring_buffer callbacks, so the crossing is sound.
+struct SendPtr(*mut Capture);
+unsafe impl Send for SendPtr {}
+
+extern "C" fn on_setup(_user: *mut c_void, _cfg: *const c_void, _cfg_len: usize) {}
+
+extern "C" fn on_start(user: *mut c_void) {
+    let c = unsafe { &*(user as *mut Capture) };
+    c.need_defaults.store(true, Ordering::Release);
+    c.active.store(true, Ordering::Release);
+}
+
+extern "C" fn on_stop(user: *mut c_void, stopper: *mut c_void) {
+    let c = unsafe { &*(user as *mut Capture) };
+    if stopper.is_null() {
+        c.active.store(false, Ordering::Release);
+    } else {
+        c.stop_req.store(stopper as usize, Ordering::Release);
+    }
+}
+
+extern "C" fn on_flush(user: *mut c_void, flusher: *mut c_void) {
+    let c = unsafe { &*(user as *mut Capture) };
+    if !flusher.is_null() {
+        c.flush_req.store(flusher as usize, Ordering::Release);
+    }
+}
+
+unsafe extern "C" fn on_event(ctx: *mut c_void, data: *mut c_void, _size: usize) -> c_int {
+    let c = &mut *(ctx as *mut Capture);
+    let hdr = &*(data as *const SismoHdr);
+    c.handle(hdr);
+    0
+}
+
+/// Drain a pending flush/stop ack requested by the tracing thread. Runs on the
+/// worker so the final ring-buffer records are emitted before we ack.
+fn service_acks(cap: *mut Capture) {
+    let c = unsafe { &*cap };
+    let fh = c.flush_req.swap(0, Ordering::AcqRel);
+    if fh != 0 {
+        unsafe { ring_buffer__consume(c.rb) };
+        unsafe { sismo_flush_done(fh as *mut c_void) };
+    }
+    let sh = c.stop_req.swap(0, Ordering::AcqRel);
+    if sh != 0 {
+        unsafe { ring_buffer__consume(c.rb) };
+        c.active.store(false, Ordering::Release);
+        unsafe { sismo_stop_done(sh as *mut c_void) };
+    }
+}
+
+fn worker_entry(cap: *mut Capture) {
+    let exit = unsafe { &(*cap).exit_requested };
+    let rb = unsafe { (*cap).rb };
+    while !exit.load(Ordering::Acquire) {
+        unsafe { ring_buffer__consume(rb) };
+        service_acks(cap);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { ring_buffer__consume(rb) };
+    service_acks(cap);
+}
+
+fn map_fd(obj: *mut BpfObject, name: &std::ffi::CStr) -> Option<c_int> {
+    let m = unsafe { bpf_object__find_map_by_name(obj, name.as_ptr()) };
+    if m.is_null() {
+        return None;
+    }
+    Some(unsafe { bpf_map__fd(m) })
+}
+
+fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *mut Capture {
+    let cap = Box::into_raw(Box::new(Capture {
+        obj: ptr::null_mut(),
+        rb: ptr::null_mut(),
+        links: Vec::new(),
+        perf_fds: Vec::new(),
+        worker: None,
+        exit_requested: AtomicBool::new(false),
+        acc: HashMap::new(),
+        samples: 0,
+        target_pid: pid,
+        maps: ptr::null_mut(),
+        maps_tried: false,
+        last_maps_ns: 0,
+        interner: Interner::new(),
+        ksym_names: HashMap::new(),
+        counters: Vec::new(),
+        active_slots: Vec::new(),
+        focus,
+        data_regions: ptr::null_mut(),
+        last_data_parse_ns: 0,
+        data_frames: 0,
+        sampler_precise_ip: 0,
+        ds_slot: u32::MAX,
+        active: AtomicBool::new(false),
+        need_defaults: AtomicBool::new(false),
+        flush_req: AtomicUsize::new(0),
+        stop_req: AtomicUsize::new(0),
+    }));
+    let c = unsafe { &mut *cap };
+    c.counters = select_counters();
+
+    let mut desc = [0u8; 2048];
+    let desc_len = unsafe {
+        crate::session_config::sismo_encode_data_source_descriptor(
+            DS_NAME.as_ptr(),
+            DS_NAME.len(),
+            false,
+            false,
+            ptr::null(),
+            0,
+            desc.as_mut_ptr(),
+            desc.len(),
+        )
+    };
+    if desc_len == 0 {
+        drop(unsafe { Box::from_raw(cap) });
+        return ptr::null_mut();
+    }
+    let slot = unsafe {
+        sismo_ds_register(
+            desc.as_ptr(),
+            desc_len,
+            on_setup,
+            on_start,
+            on_stop,
+            on_flush,
+            cap as *mut c_void,
+        )
+    };
+    if slot == u32::MAX {
+        drop(unsafe { Box::from_raw(cap) });
+        return ptr::null_mut();
+    }
+    c.ds_slot = slot;
+
+    let obj = unsafe { bpf_object__open_mem(BPF_OBJ.as_ptr() as *const c_void, BPF_OBJ.len(), ptr::null()) };
+    if obj.is_null() {
+        drop(unsafe { Box::from_raw(cap) });
+        return ptr::null_mut();
+    }
+    if unsafe { bpf_object__load(obj) } != 0 {
+        unsafe { bpf_object__close(obj) };
+        drop(unsafe { Box::from_raw(cap) });
+        return ptr::null_mut();
+    }
+    c.obj = obj;
+
+    let (counters_fd, cfg_fd, events_fd) = match (
+        map_fd(obj, c"counters_pe"),
+        map_fd(obj, c"cfg"),
+        map_fd(obj, c"events"),
+    ) {
+        (Some(a), Some(b), Some(d)) => (a, b, d),
+        _ => {
+            unsafe { bpf_object__close(obj) };
+            drop(unsafe { Box::from_raw(cap) });
+            return ptr::null_mut();
+        }
+    };
+
+    let max_cpus = SISMO_MAX_CPUS as u32;
+    let ncpu = (unsafe { libbpf_num_possible_cpus() } as u32).min(max_cpus);
+    let counters = c.counters.clone();
+    let mut opened = [false; SISMO_MAX_COUNTERS];
+    if !counters.is_empty() {
+        for cpu in 0..ncpu {
+            let mut group_leader: i32 = -1;
+            let mut cur_group = counters[0].group;
+            for (cslot, ctr) in counters.iter().enumerate() {
+                if ctr.group != cur_group {
+                    cur_group = ctr.group;
+                    group_leader = -1;
+                }
+                let fd = match open_counter(cpu, ctr.src, group_leader) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                if group_leader == -1 {
+                    group_leader = fd;
+                }
+                c.perf_fds.push(fd);
+                let idx: u32 = (cslot as u32) * max_cpus + cpu;
+                let fd_u = fd as u32;
+                unsafe {
+                    bpf_map_update_elem(
+                        counters_fd,
+                        &idx as *const u32 as *const c_void,
+                        &fd_u as *const u32 as *const c_void,
+                        0,
+                    )
+                };
+                if cpu == 0 {
+                    opened[cslot] = true;
+                }
+            }
+        }
+    }
+    for (cslot, &on) in opened.iter().enumerate() {
+        if on {
+            c.active_slots.push(cslot as u8);
+        }
+    }
+
+    let zero: u32 = 0;
+    unsafe {
+        bpf_map_update_elem(
+            cfg_fd,
+            &zero as *const u32 as *const c_void,
+            &pid as *const u32 as *const c_void,
+            0,
+        )
+    };
+
+    let ss = unsafe { bpf_object__find_program_by_name(obj, c"on_sched_switch".as_ptr()) };
+    if !ss.is_null() {
+        let link = unsafe { bpf_program__attach(ss) };
+        if !link.is_null() {
+            c.links.push(link);
+        }
+    }
+
+    let sampler_cfg = resolve_sampler(focus, density);
+    if sampler_cfg.is_none() {
+        if let Some(p) = focus {
+            eprintln!(
+                "sismo record: --focus {}: leader event unavailable on this CPU (model not in the PMU table); no CPU samples recorded",
+                preset_name(p)
+            );
+        }
+    }
+    let tick_prog = unsafe { bpf_object__find_program_by_name(obj, c"on_tick".as_ptr()) };
+    if let Some(scfg) = &sampler_cfg {
+        if !tick_prog.is_null() {
+            let mut any = false;
+            for cpu in 0..ncpu {
+                if let Some(h) = open_sampler(cpu, scfg, tick_prog) {
+                    c.links.push(h.link);
+                    c.perf_fds.push(h.fd);
+                    if !any || h.precise_ip < c.sampler_precise_ip {
+                        c.sampler_precise_ip = h.precise_ip;
+                    }
+                    any = true;
+                }
+            }
+            if focus.is_some() && any && c.sampler_precise_ip < scfg.precise_ip {
+                eprintln!(
+                    "sismo record: focus sampler could not get PEBS (precise_ip {} < {}); samples will skid",
+                    c.sampler_precise_ip, scfg.precise_ip
+                );
+            }
+        }
+    }
+
+    c.rb = unsafe { ring_buffer__new(events_fd, on_event, cap as *mut c_void, ptr::null()) };
+    if c.rb.is_null() {
+        // Undo attaches + fds, then free. Worker never started.
+        for &l in &c.links {
+            unsafe { bpf_link__destroy(l) };
+        }
+        for &fd in &c.perf_fds {
+            unsafe { close(fd) };
+        }
+        unsafe { bpf_object__close(obj) };
+        drop(unsafe { Box::from_raw(cap) });
+        return ptr::null_mut();
+    }
+
+    let send = SendPtr(cap);
+    c.worker = Some(std::thread::spawn(move || {
+        let send = send;
+        worker_entry(send.0)
+    }));
+    cap
+}
+
+/// Start the Linux CPU collector for `pid`. `focus` selects a preset (0 =
+/// cache) or -1 for the survey sampler. Returns an opaque handle, or null.
+#[no_mangle]
+pub unsafe extern "C" fn sismo_linux_bpf_capture_init(
+    pid: u32,
+    focus: i32,
+    has_density: bool,
+    density: f64,
+) -> *mut c_void {
+    let f = match focus {
+        0 => Some(FocusPreset::Cache),
+        _ => None,
+    };
+    let d = if has_density { Some(density) } else { None };
+    capture_init(pid, f, d) as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sismo_linux_bpf_capture_shutdown(cap: *mut c_void, out: *mut LinuxBpfStats) {
+    if cap.is_null() {
+        return;
+    }
+    let mut boxed = Box::from_raw(cap as *mut Capture);
+    boxed.exit_requested.store(true, Ordering::Release);
+    if let Some(w) = boxed.worker.take() {
+        let _ = w.join();
+    }
+    let busiest = boxed.acc.values().copied().max().unwrap_or(0);
+    if !out.is_null() {
+        *out = LinuxBpfStats {
+            samples: boxed.samples,
+            threads: boxed.acc.len() as u64,
+            busiest_cycles: busiest,
+            data_frames: boxed.data_frames,
+        };
+    }
+    if !boxed.rb.is_null() {
+        ring_buffer__free(boxed.rb);
+    }
+    for &l in &boxed.links {
+        bpf_link__destroy(l);
+    }
+    for &fd in &boxed.perf_fds {
+        close(fd);
+    }
+    if !boxed.obj.is_null() {
+        bpf_object__close(boxed.obj);
+    }
+    if !boxed.maps.is_null() {
+        sismo_proc_maps_destroy(boxed.maps);
+    }
+    if !boxed.data_regions.is_null() {
+        sismo_data_regions_destroy(boxed.data_regions);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sismo_linux_bpf_capture_precise_ip(cap: *mut c_void) -> u8 {
+    if cap.is_null() {
+        return 0;
+    }
+    (*(cap as *mut Capture)).sampler_precise_ip
+}
