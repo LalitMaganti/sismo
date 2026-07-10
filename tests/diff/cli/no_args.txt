@@ -1,35 +1,18 @@
 $ sismo 
 exit: 0
 --- stdout ---
+cross-platform desktop tracing/profiling tool
+
+Usage: sismo [COMMAND]
+
+Commands:
+  record      Spawn a command (or attach to --pid) and record sched + CPU samples + heap into a single Perfetto trace. Stops on SIGINT, target exit, or --duration. Requires sudo on macOS for kdebug + task_for_pid
+  prepare     Launch a command with sismo's dormant heap client preloaded, so it can be attached to later via `sismo record --pid <pid>`
+  snapshot    Snapshot a running flight-recorder session (`sismo record --flight-recorder`): clone it as a fresh consumer and write the trace
+  datasource  Run a daemonized data-source producer for an external `sismo record`
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
 
 --- stderr ---
-sismo - cross-platform desktop tracing/profiling tool
-
-Usage:
-  sismo record [--output <path>] [--duration <dur>] <command> [args...]
-  sismo record [--output <path>] [--duration <dur>] --pid <pid>
-      Spawn <command> (or attach to --pid) and record sched +
-      CPU samples + heap into a single Perfetto trace. Stops on
-      SIGINT, target exit, or --duration. Default --output:
-      ./sismo.pftrace. Requires sudo on macOS for kdebug +
-      task_for_pid.
-
-  sismo prepare <command> [args...]
-      Launch <command> with sismo's dormant heap client preloaded
-      and PERFETTO_PRODUCER_SOCK_NAME set to the well-known path.
-      The launched process can be attached to later via
-      `sismo record --pid <pid>`.
-
-  sismo snapshot [--output <path>]
-      Capture a snapshot of a running flight-recorder session
-      (`sismo record --flight-recorder`). Connects to the in-
-      process service as a fresh consumer, clones the session,
-      writes the trace, exits — the recorder is uninvolved.
-
-  sismo datasource <name>
-      Daemonized producer. <name> in {macos_sched, macos_cpu_samples,
-      heap}. Connects to PERFETTO_PRODUCER_SOCK_NAME, registers
-      sismo.<name>, blocks until killed.
-
-  sismo --help
-      Show this help.

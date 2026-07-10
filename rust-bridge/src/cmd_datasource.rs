@@ -122,22 +122,18 @@ fn block_until_stopped() {
 
 // ---- Entry point -----------------------------------------------------------
 
-/// `sismo datasource` subcommand. `argv[0..argc]` are the full process args.
-///
-/// # Safety
-/// `argv` must point to `argc` valid NUL-terminated C strings.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_cmd_datasource(
-    argc: usize,
-    argv: *const *const std::os::raw::c_char,
-) -> std::os::raw::c_int {
-    let args: Vec<&str> = (0..argc)
-        .map(|i| unsafe { std::ffi::CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
-        .collect();
-    // Skip argv[0] (exe) + argv[1] ("datasource").
-    let rest: &[&str] = if args.len() > 2 { &args[2..] } else { &[] };
+#[derive(clap::Args)]
+pub struct DatasourceArgs {
+    /// One or more of: macos_sched, macos_cpu_samples, heap, all-privileged.
+    #[arg(required = true)]
+    names: Vec<String>,
+}
 
-    let kinds = match collect_kinds(rest) {
+/// `sismo datasource` subcommand.
+pub fn run(args: DatasourceArgs) -> i32 {
+    let rest: Vec<&str> = args.names.iter().map(String::as_str).collect();
+
+    let kinds = match collect_kinds(&rest) {
         Ok(k) => k,
         Err(()) => return 0, // usage already printed
     };

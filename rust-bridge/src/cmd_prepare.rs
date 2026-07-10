@@ -24,63 +24,25 @@
 //! POSIX (execvp); cfg-gated off Windows like the rest of the CLI cluster.
 
 use crate::sismo_paths::{resolve_heap_dylib_path, PRODUCER_SOCK};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 
 extern "C" {
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
 }
 
-/// What the args say to do.
-enum Action<'a> {
-    Help,
-    NoCommand,
-    Run(Vec<&'a str>),
+#[derive(clap::Args)]
+pub struct PrepareArgs {
+    /// The workload command and its arguments. A `--flag` after the command is
+    /// passed to the workload, not parsed by sismo.
+    #[arg(required = true, trailing_var_arg = true)]
+    command: Vec<String>,
 }
 
-/// Parse `sismo prepare`'s args (everything after "prepare"). The first
-/// positional is the workload argv[0]; `--help` is only honored as the first
-/// token (afterwards it's a workload arg, matching the Zig behavior).
-fn parse_prepare<'a>(rest: &[&'a str]) -> Action<'a> {
-    if rest.first() == Some(&"--help") {
-        return Action::Help;
-    }
-    if rest.is_empty() {
-        return Action::NoCommand;
-    }
-    Action::Run(rest.to_vec())
-}
-
-/// `sismo prepare` subcommand. `argv[0..argc]` are the full process args (exe,
-/// "prepare", then the workload command). On success this process is replaced by
-/// the workload (execvp) and never returns; returns non-zero only on error.
-///
-/// # Safety
-/// `argv` must point to `argc` valid NUL-terminated C strings.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_cmd_prepare(argc: usize, argv: *const *const c_char) -> c_int {
-    let args: Vec<&str> = (0..argc)
-        .map(|i| unsafe { CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
-        .collect();
-    // Skip argv[0] (exe) + argv[1] ("prepare").
-    let rest: &[&str] = if args.len() > 2 { &args[2..] } else { &[] };
-
-    let workload = match parse_prepare(rest) {
-        Action::Help => {
-            println!(
-                "usage: sismo prepare <command> [args...]\n\n  \
-                 Launch <command> with sismo's heap-profiler dormant client\n  \
-                 preloaded. The launched process can later be recorded via\n  \
-                 `sismo record --pid <pid>`."
-            );
-            return 0;
-        }
-        Action::NoCommand => {
-            eprintln!("sismo prepare: no command specified\nusage: sismo prepare <command> [args...]");
-            return 0;
-        }
-        Action::Run(w) => w,
-    };
+/// On success this process is replaced by the workload (execvp) and never
+/// returns; returns non-zero only on error.
+pub fn run(args: PrepareArgs) -> i32 {
+    let workload = args.command;
 
     let heap_dylib = match resolve_heap_dylib_path() {
         Some(p) => p,
@@ -97,7 +59,7 @@ pub unsafe extern "C" fn sismo_cmd_prepare(argc: usize, argv: *const *const c_ch
     // Build NUL-terminated argv for execvp.
     let cstrs: Vec<CString> = workload
         .iter()
-        .map(|a| CString::new(*a).unwrap_or_default())
+        .map(|a| CString::new(a.as_str()).unwrap_or_default())
         .collect();
     let mut ptrs: Vec<*const c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
@@ -106,29 +68,4 @@ pub unsafe extern "C" fn sismo_cmd_prepare(argc: usize, argv: *const *const c_ch
     let rc = unsafe { execvp(cstrs[0].as_ptr(), ptrs.as_ptr()) };
     eprintln!("sismo prepare: execvp({}) failed rc={rc}", workload[0]);
     1
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn help_as_first_token() {
-        assert!(matches!(parse_prepare(&["--help"]), Action::Help));
-        assert!(matches!(parse_prepare(&["--help", "extra"]), Action::Help));
-    }
-
-    #[test]
-    fn empty_is_no_command() {
-        assert!(matches!(parse_prepare(&[]), Action::NoCommand));
-    }
-
-    #[test]
-    fn workload_captured_verbatim() {
-        match parse_prepare(&["./app", "-x", "--help"]) {
-            // --help after the command is a workload arg, not our flag.
-            Action::Run(w) => assert_eq!(w, vec!["./app", "-x", "--help"]),
-            _ => panic!("expected Run"),
-        }
-    }
 }

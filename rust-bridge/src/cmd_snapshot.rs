@@ -26,7 +26,6 @@
 //! so the pure helpers (arg parse, default-path formatting) test standalone.
 
 use crate::sismo_paths::{CONSUMER_SOCK, PRODUCER_SOCK};
-use std::ffi::CStr;
 use std::io::Write;
 use std::os::raw::{c_char, c_int, c_void};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,49 +77,18 @@ extern "C" fn snapshot_chunk_cb(data: *const c_void, size: usize, _has_more: boo
 
 // ---- Entry point -----------------------------------------------------------
 
-/// `sismo snapshot` subcommand. `argv[0..argc]` are the full process args
-/// (exe, "snapshot", then flags), matching the Zig call site. Returns the
-/// process exit code (0 ok, non-zero on error — matching runSnapshot which
-/// returned void but printed + bailed; here 0 always unless a real failure).
-///
-/// # Safety
-/// `argv` must point to `argc` valid NUL-terminated C strings.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_cmd_snapshot(argc: usize, argv: *const *const c_char) -> c_int {
-    let args: Vec<&str> = (0..argc)
-        .map(|i| unsafe { CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
-        .collect();
+#[derive(clap::Args)]
+pub struct SnapshotArgs {
+    /// Output trace path (default: ./sismo-<UTC>.pftrace).
+    #[arg(long)]
+    output: Option<String>,
+}
 
-    // Skip argv[0] (exe) + argv[1] ("snapshot").
-    let mut output_arg: Option<&str> = None;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i] {
-            "--output" => {
-                if i + 1 >= args.len() {
-                    eprintln!("sismo snapshot: --output needs a value");
-                    return 0;
-                }
-                output_arg = Some(args[i + 1]);
-                i += 2;
-            }
-            "--help" => {
-                println!(
-                    "usage: sismo snapshot [--output <path>]\n\n  \
-                     Capture a snapshot of the currently-running flight-recorder\n  \
-                     session. Default output: ./sismo-<UTC>.pftrace."
-                );
-                return 0;
-            }
-            other => {
-                eprintln!("sismo snapshot: unknown arg '{other}'");
-                return 0;
-            }
-        }
-    }
-
+/// `sismo snapshot` subcommand. Returns the process exit code (0 ok, non-zero
+/// on error).
+pub fn run(args: SnapshotArgs) -> i32 {
     let default_path;
-    let output_path: &str = match output_arg {
+    let output_path: &str = match &args.output {
         Some(p) => p,
         None => {
             default_path = default_output_path();

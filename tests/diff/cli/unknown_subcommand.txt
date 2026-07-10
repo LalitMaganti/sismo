@@ -3,35 +3,8 @@ exit: 2
 --- stdout ---
 
 --- stderr ---
-sismo: unknown subcommand 'boguscmd'
+error: unrecognized subcommand 'boguscmd'
 
-sismo - cross-platform desktop tracing/profiling tool
+Usage: sismo [COMMAND]
 
-Usage:
-  sismo record [--output <path>] [--duration <dur>] <command> [args...]
-  sismo record [--output <path>] [--duration <dur>] --pid <pid>
-      Spawn <command> (or attach to --pid) and record sched +
-      CPU samples + heap into a single Perfetto trace. Stops on
-      SIGINT, target exit, or --duration. Default --output:
-      ./sismo.pftrace. Requires sudo on macOS for kdebug +
-      task_for_pid.
-
-  sismo prepare <command> [args...]
-      Launch <command> with sismo's dormant heap client preloaded
-      and PERFETTO_PRODUCER_SOCK_NAME set to the well-known path.
-      The launched process can be attached to later via
-      `sismo record --pid <pid>`.
-
-  sismo snapshot [--output <path>]
-      Capture a snapshot of a running flight-recorder session
-      (`sismo record --flight-recorder`). Connects to the in-
-      process service as a fresh consumer, clones the session,
-      writes the trace, exits — the recorder is uninvolved.
-
-  sismo datasource <name>
-      Daemonized producer. <name> in {macos_sched, macos_cpu_samples,
-      heap}. Connects to PERFETTO_PRODUCER_SOCK_NAME, registers
-      sismo.<name>, blocks until killed.
-
-  sismo --help
-      Show this help.
+For more information, try '--help'.

@@ -1,23 +1,17 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! The single `sismo record` argument parser (all platforms), built on clap.
+//! `sismo record` argument parsing (all platforms), on clap derive.
 //!
-//! One parser, one flag set everywhere — platform differences are a small
-//! post-parse capability check (`--pid` is macOS-only, `--focus` /
-//! `--sample-density` are Linux-only), NOT a separate per-OS parser. It produces
-//! a C-ABI `RecordArgsC` consumed by both the Rust macOS runner
-//! (rust-bridge/src/cmd_record.rs) and the Zig Linux runner (cmd_record.zig).
-//!
-//! The workload command is the trailing argv tail (`workload_start` is its
-//! absolute argv index); `--output` / `--focus` values are leaked as
-//! NUL-terminated C strings (the record process is one-shot, so the bounded
-//! leak of the final args is fine). Focus is passed as its preset *name* — the
-//! Linux runner resolves it via focus_presets, keeping this parser decoupled.
+//! One flag set everywhere — platform differences are a small post-parse
+//! capability check (`--pid` is macOS-only, `--focus` / `--sample-density` are
+//! Linux-only), NOT a separate per-OS parser. [`RecordArgs`] is the raw clap
+//! struct (a subcommand payload); [`RecordArgs::resolve`] validates it and
+//! produces the native [`RecordConfig`] both runners consume.
 
-use clap::{Arg, ArgAction, Command};
+use clap::Args;
 
-// ---- Scalar value parsers (also clap value_parsers) ------------------------
+// ---- Scalar value parsers --------------------------------------------------
 
 /// Parse `s` as a base-10 integer, scale by `multiplier`, fit into u64. None on
 /// non-numeric input, overflow, a zero result, or exceeding `max`.
@@ -78,324 +72,203 @@ fn clap_density(s: &str) -> Result<f64, String> {
     }
 }
 
-// ---- Value parsers still exposed to the Zig build --------------------------
-// (Kept for any transitional Zig caller; the Rust parser uses the fns above.)
-
-/// # Safety
-/// `s` valid for `s_len`; `out` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_parse_buffer_kb(s: *const u8, s_len: usize, out: *mut u32) -> bool {
-    match parse_buffer_kb(unsafe { std::slice::from_raw_parts(s, s_len) }) {
-        Some(v) => {
-            unsafe { *out = v };
-            true
-        }
-        None => false,
-    }
-}
-
-/// # Safety
-/// `s` valid for `s_len`; `out` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_parse_duration_seconds(s: *const u8, s_len: usize, out: *mut u32) -> bool {
-    match parse_duration_seconds(unsafe { std::slice::from_raw_parts(s, s_len) }) {
-        Some(v) => {
-            unsafe { *out = v };
-            true
-        }
-        None => false,
-    }
-}
-
-// ---- RecordArgsC + defaults ------------------------------------------------
-
-// SourceMode wire values (match cmd_record.zig SourceMode ordering).
-pub(crate) const MODE_IN_PROCESS: u8 = 0;
-pub(crate) const MODE_EXTERNAL: u8 = 1;
-const MODE_OFF: u8 = 2;
-
-// NUL-terminated default so `output_path_ptr` works as a C string (unlink);
-// `output_path_len` excludes the NUL. argv-derived / leaked values are too.
-const DEFAULT_OUTPUT: &[u8] = b"./sismo.pftrace\0";
-const DEFAULT_OUTPUT_LEN: usize = DEFAULT_OUTPUT.len() - 1;
 const DEFAULT_BUFFER_KB: u32 = 128 * 1024;
+const DEFAULT_OUTPUT: &str = "./sismo.pftrace";
 
-/// Fully-parsed `sismo record` arguments, C-ABI for both runners. Layout: 8-byte
-/// fields first, then 4-byte, then 1-byte — identical to the Zig `extern struct
-/// RecordArgsC` (size-guarded on both sides).
-#[repr(C)]
-pub struct RecordArgsC {
-    pub output_path_ptr: *const u8, // NUL-terminated at [output_path_len]
-    pub output_path_len: usize,
-    pub workload_start: usize, // absolute argv index of the workload cmd; == argc if none
-    pub focus_preset_ptr: *const u8, // preset name (Linux); null if none
-    pub focus_preset_len: usize,
-    pub sample_density: f64,
-    pub attach_pid: i32,
-    pub duration_secs: u32,
-    pub buffer_kb: u32,
-    pub sched_mode: u8,
-    pub cpu_mode: u8,
-    pub heap_mode: u8,
-    pub has_attach_pid: bool,
-    pub has_duration: bool,
+// ---- Parsed + resolved args ------------------------------------------------
+
+/// How a data source is captured: in this process, in an external `sismo
+/// datasource` producer, or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    InProcess,
+    External,
+    Off,
+}
+
+/// Raw `sismo record` flags as clap parses them. Resolve into a [`RecordConfig`]
+/// before use — that folds the `--no-*`/`--external-*`/`--all-external` flags
+/// into per-source modes and enforces the cross-flag rules.
+#[derive(Args, Debug)]
+#[command(override_usage = "\
+sismo record [--output <path>] [--duration <dur>] [--flight-recorder [--buffer <size>]]\n         \
+[--no-instrumentation] [--no-sched|--external-sched] [--no-cpu|--external-cpu]\n         \
+[--no-heap|--external-heap] [--all-external] [--focus <preset>] [--sample-density <x>]\n         \
+(--pid <pid> | <command> [args...])")]
+pub struct RecordArgs {
+    #[arg(long)]
+    output: Option<String>,
+    #[arg(long, value_parser = clap_duration)]
+    duration: Option<u32>,
+    #[arg(long)]
+    flight_recorder: bool,
+    #[arg(long, value_parser = clap_buffer)]
+    buffer: Option<u32>,
+    #[arg(long)]
+    no_instrumentation: bool,
+    #[arg(long, conflicts_with = "command")]
+    pid: Option<i32>,
+    #[arg(long, conflicts_with = "external_sched")]
+    no_sched: bool,
+    #[arg(long)]
+    external_sched: bool,
+    #[arg(long, conflicts_with = "external_cpu")]
+    no_cpu: bool,
+    #[arg(long)]
+    external_cpu: bool,
+    #[arg(long, conflicts_with = "external_heap")]
+    no_heap: bool,
+    #[arg(long)]
+    external_heap: bool,
+    #[arg(long)]
+    all_external: bool,
+    #[arg(long)]
+    focus: Option<String>,
+    #[arg(long, value_parser = clap_density)]
+    sample_density: Option<f64>,
+    // The workload + its own flags: everything after the first positional token.
+    // Not allow_hyphen_values, so a *leading* unknown `--flag` still errors.
+    #[arg(trailing_var_arg = true)]
+    command: Vec<String>,
+}
+
+/// Fully-resolved `sismo record` config, consumed by both runners.
+pub struct RecordConfig {
+    pub output: String,
+    /// The workload command + args; empty when attaching via `--pid`.
+    pub workload: Vec<String>,
+    pub attach_pid: Option<i32>,
+    pub duration_secs: Option<u32>,
     pub flight_recorder: bool,
-    pub buffer_set: bool,
+    pub buffer_kb: u32,
+    pub sched_mode: SourceMode,
+    pub cpu_mode: SourceMode,
+    pub heap_mode: SourceMode,
     pub no_instrumentation: bool,
-    pub has_focus: bool,
-    pub has_sample_density: bool,
+    pub focus: Option<String>,
+    pub sample_density: Option<f64>,
 }
 
-impl Default for RecordArgsC {
-    fn default() -> Self {
-        RecordArgsC {
-            output_path_ptr: DEFAULT_OUTPUT.as_ptr(),
-            output_path_len: DEFAULT_OUTPUT_LEN,
-            workload_start: 0,
-            focus_preset_ptr: std::ptr::null(),
-            focus_preset_len: 0,
-            sample_density: 0.0,
-            attach_pid: 0,
-            duration_secs: 0,
-            buffer_kb: DEFAULT_BUFFER_KB,
-            sched_mode: MODE_IN_PROCESS,
-            cpu_mode: MODE_IN_PROCESS,
-            heap_mode: MODE_IN_PROCESS,
-            has_attach_pid: false,
-            has_duration: false,
-            flight_recorder: false,
-            buffer_set: false,
-            no_instrumentation: false,
-            has_focus: false,
-            has_sample_density: false,
-        }
-    }
-}
-
-/// Leak a NUL-terminated copy of `s`, returning (ptr, len-excluding-NUL). The
-/// record process is one-shot, so leaking the final args is bounded + fine.
-fn leak_cstr(s: &str) -> (*const u8, usize) {
-    let mut v = s.as_bytes().to_vec();
-    let len = v.len();
-    v.push(0);
-    let boxed = v.into_boxed_slice();
-    let ptr = boxed.as_ptr();
-    std::mem::forget(boxed);
-    (ptr, len)
-}
-
-// ---- The parser ------------------------------------------------------------
-
-fn command() -> Command {
-    Command::new("sismo record")
-        .no_binary_name(true)
-        .override_usage(
-            "sismo record [--output <path>] [--duration <dur>] [--flight-recorder [--buffer <size>]]\n         \
-             [--no-instrumentation] [--no-sched|--external-sched] [--no-cpu|--external-cpu]\n         \
-             [--no-heap|--external-heap] [--all-external] [--focus <preset>] [--sample-density <x>]\n         \
-             (--pid <pid> | <command> [args...])",
-        )
-        .arg(Arg::new("output").long("output").num_args(1))
-        .arg(Arg::new("duration").long("duration").num_args(1).value_parser(clap_duration))
-        .arg(Arg::new("flight-recorder").long("flight-recorder").action(ArgAction::SetTrue))
-        .arg(Arg::new("buffer").long("buffer").num_args(1).value_parser(clap_buffer))
-        .arg(Arg::new("no-instrumentation").long("no-instrumentation").action(ArgAction::SetTrue))
-        .arg(
-            Arg::new("pid")
-                .long("pid")
-                .num_args(1)
-                .value_parser(clap::value_parser!(i32))
-                .conflicts_with("command"),
-        )
-        .arg(Arg::new("no-sched").long("no-sched").action(ArgAction::SetTrue).conflicts_with("external-sched"))
-        .arg(Arg::new("external-sched").long("external-sched").action(ArgAction::SetTrue))
-        .arg(Arg::new("no-cpu").long("no-cpu").action(ArgAction::SetTrue).conflicts_with("external-cpu"))
-        .arg(Arg::new("external-cpu").long("external-cpu").action(ArgAction::SetTrue))
-        .arg(Arg::new("no-heap").long("no-heap").action(ArgAction::SetTrue).conflicts_with("external-heap"))
-        .arg(Arg::new("external-heap").long("external-heap").action(ArgAction::SetTrue))
-        .arg(Arg::new("all-external").long("all-external").action(ArgAction::SetTrue))
-        .arg(Arg::new("focus").long("focus").num_args(1))
-        .arg(Arg::new("sample-density").long("sample-density").num_args(1).value_parser(clap_density))
-        // trailing_var_arg captures the workload + its own flags once the
-        // command token is seen; a leading unknown `--flag` still errors (it's
-        // not allow_hyphen_values, so it isn't silently taken as the command).
-        .arg(Arg::new("command").num_args(0..).trailing_var_arg(true))
-}
-
-/// Parse `sismo record` args. `record_args` is argv[2..] (after exe + "record");
-/// `all_argc` is the full argv length (so `workload_start` is absolute). Fills
-/// `out`, returns true to proceed or false if help / an error was printed.
-pub(crate) fn parse_record_args(record_args: &[&str], all_argc: usize, out: &mut RecordArgsC) -> bool {
-    *out = RecordArgsC::default();
-    out.workload_start = all_argc; // none unless a workload is found
-
-    let m = match command().try_get_matches_from(record_args) {
-        Ok(m) => m,
-        Err(e) => {
-            // --help prints to stdout (success kind); errors to stderr. Either
-            // way this parse is done and the caller stops.
-            let _ = e.print();
-            return false;
-        }
-    };
-
-    // Source-mode resolution. --no-X/--external-X conflicts are enforced by
-    // clap; --all-external only promotes the still-in_process ones.
-    let resolve = |no: &str, ext: &str| -> u8 {
-        if m.get_flag(no) {
-            MODE_OFF
-        } else if m.get_flag(ext) {
-            MODE_EXTERNAL
-        } else {
-            MODE_IN_PROCESS
-        }
-    };
-    out.sched_mode = resolve("no-sched", "external-sched");
-    out.cpu_mode = resolve("no-cpu", "external-cpu");
-    out.heap_mode = resolve("no-heap", "external-heap");
-    if m.get_flag("all-external") {
-        for md in [&mut out.sched_mode, &mut out.cpu_mode, &mut out.heap_mode] {
-            if *md == MODE_IN_PROCESS {
-                *md = MODE_EXTERNAL;
+impl RecordArgs {
+    /// Validate + fold into a [`RecordConfig`]. On a violated rule it prints the
+    /// message and returns `Err(exit_code)` (the caller returns it).
+    pub fn resolve(self) -> Result<RecordConfig, i32> {
+        let mode = |off: bool, ext: bool| {
+            if off {
+                SourceMode::Off
+            } else if ext {
+                SourceMode::External
+            } else {
+                SourceMode::InProcess
+            }
+        };
+        let mut sched = mode(self.no_sched, self.external_sched);
+        let mut cpu = mode(self.no_cpu, self.external_cpu);
+        let mut heap = mode(self.no_heap, self.external_heap);
+        if self.all_external {
+            for m in [&mut sched, &mut cpu, &mut heap] {
+                if *m == SourceMode::InProcess {
+                    *m = SourceMode::External;
+                }
             }
         }
-    }
 
-    out.flight_recorder = m.get_flag("flight-recorder");
-    out.no_instrumentation = m.get_flag("no-instrumentation");
-    if let Some(&kb) = m.get_one::<u32>("buffer") {
-        out.buffer_kb = kb;
-        out.buffer_set = true;
-    }
-    if let Some(&secs) = m.get_one::<u32>("duration") {
-        out.duration_secs = secs;
-        out.has_duration = true;
-    }
-    if let Some(p) = m.get_one::<String>("output") {
-        let (ptr, len) = leak_cstr(p);
-        out.output_path_ptr = ptr;
-        out.output_path_len = len;
-    }
-
-    // --pid is a macOS-only capability (Linux would need a pidfd exit watcher).
-    if let Some(&pid) = m.get_one::<i32>("pid") {
-        if !cfg!(target_os = "macos") {
+        // --pid is a macOS-only capability (Linux would need a pidfd exit watcher).
+        if self.pid.is_some() && !cfg!(target_os = "macos") {
             eprintln!("sismo record: --pid attach is not supported on this platform");
-            return false;
+            return Err(0);
         }
-        out.attach_pid = pid;
-        out.has_attach_pid = true;
-    }
-    // --focus / --sample-density are Linux-only (BPF/PEBS path).
-    if let Some(f) = m.get_one::<String>("focus") {
-        if !cfg!(target_os = "linux") {
+        // --focus / --sample-density are Linux-only (BPF/PEBS path).
+        if self.focus.is_some() && !cfg!(target_os = "linux") {
             eprintln!("sismo record: --focus needs the Linux BPF/PEBS path (not supported on this platform)");
-            return false;
+            return Err(0);
         }
-        let (ptr, len) = leak_cstr(f);
-        out.focus_preset_ptr = ptr;
-        out.focus_preset_len = len;
-        out.has_focus = true;
-    }
-    if let Some(&sd) = m.get_one::<f64>("sample-density") {
-        out.sample_density = sd;
-        out.has_sample_density = true;
-    }
 
-    // Workload = the trailing "command" values, which are the argv tail.
-    let workload_len = m.get_many::<String>("command").map(|v| v.len()).unwrap_or(0);
-    let have_cmd = workload_len > 0;
-    if have_cmd {
-        out.workload_start = all_argc - workload_len;
-    }
+        let have_cmd = !self.command.is_empty();
+        if self.pid.is_none() && !have_cmd {
+            eprintln!("sismo record: need either --pid <pid> or a workload <command>");
+            return Err(0);
+        }
+        if self.sample_density.is_some() && self.focus.is_none() {
+            eprintln!("sismo record: --sample-density only applies with --focus");
+            return Err(0);
+        }
 
-    // Validation. (--pid vs command is enforced by clap conflicts_with.)
-    if !out.has_attach_pid && !have_cmd {
-        eprintln!("sismo record: need either --pid <pid> or a workload <command>");
-        return false;
-    }
-    if out.has_sample_density && !out.has_focus {
-        eprintln!("sismo record: --sample-density only applies with --focus");
-        return false;
-    }
-    if out.flight_recorder && !out.buffer_set {
-        out.buffer_kb = 256 * 1024;
-    }
-    true
-}
+        let buffer_kb = match self.buffer {
+            Some(kb) => kb,
+            None if self.flight_recorder => 256 * 1024,
+            None => DEFAULT_BUFFER_KB,
+        };
 
-/// C ABI: parse `argv[0..argc]` into `*out`. Used by the Zig Linux runner; the
-/// Rust macOS runner calls `parse_record_args` directly.
-///
-/// # Safety
-/// `argv` must point to `argc` valid NUL-terminated C strings; `out` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_parse_record_args(
-    argc: usize,
-    argv: *const *const std::os::raw::c_char,
-    out: *mut RecordArgsC,
-) -> bool {
-    let all: Vec<&str> = (0..argc)
-        .map(|i| unsafe { std::ffi::CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
-        .collect();
-    let args: &[&str] = if all.len() > 2 { &all[2..] } else { &[] };
-    parse_record_args(args, all.len(), unsafe { &mut *out })
+        Ok(RecordConfig {
+            output: self.output.unwrap_or_else(|| DEFAULT_OUTPUT.to_string()),
+            workload: self.command,
+            attach_pid: self.pid,
+            duration_secs: self.duration,
+            flight_recorder: self.flight_recorder,
+            buffer_kb,
+            sched_mode: sched,
+            cpu_mode: cpu,
+            heap_mode: heap,
+            no_instrumentation: self.no_instrumentation,
+            focus: self.focus,
+            sample_density: self.sample_density,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
-    // Parse argv[2..] with a total argc of `2 + args.len()` (no real exe/subcmd
-    // tokens needed — clap has no_binary_name).
-    fn parse(args: &[&str]) -> Option<RecordArgsC> {
-        let mut out = RecordArgsC::default();
-        if parse_record_args(args, 2 + args.len(), &mut out) {
-            Some(out)
-        } else {
-            None
-        }
+    // A tiny Parser wrapper so tests can parse a bare RecordArgs flag list.
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        r: RecordArgs,
+    }
+
+    fn parse(args: &[&str]) -> Option<RecordConfig> {
+        let argv = std::iter::once("record").chain(args.iter().copied());
+        let cli = TestCli::try_parse_from(argv).ok()?;
+        cli.r.resolve().ok()
     }
 
     #[test]
     fn defaults_with_just_a_command() {
         let a = parse(&["./app"]).unwrap();
-        assert_eq!(a.workload_start, 2); // command is the last (only) arg → abs idx 2
-        assert!(!a.has_attach_pid);
+        assert_eq!(a.workload, vec!["./app"]);
+        assert!(a.attach_pid.is_none());
         assert_eq!(a.buffer_kb, DEFAULT_BUFFER_KB);
-        assert_eq!(a.sched_mode, MODE_IN_PROCESS);
-        assert_eq!(a.output_path_len, DEFAULT_OUTPUT_LEN);
-        let s = unsafe { std::slice::from_raw_parts(a.output_path_ptr, a.output_path_len + 1) };
-        assert_eq!(s, b"./sismo.pftrace\0"); // NUL-terminated for C use
+        assert_eq!(a.sched_mode, SourceMode::InProcess);
+        assert_eq!(a.output, DEFAULT_OUTPUT);
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn pid_attach_and_modes() {
         let a = parse(&["--pid", "4242", "--no-heap", "--external-cpu"]).unwrap();
-        assert!(a.has_attach_pid);
-        assert_eq!(a.attach_pid, 4242);
-        assert_eq!(a.heap_mode, MODE_OFF);
-        assert_eq!(a.cpu_mode, MODE_EXTERNAL);
-        assert_eq!(a.workload_start, 2 + 4); // no workload → all_argc
+        assert_eq!(a.attach_pid, Some(4242));
+        assert_eq!(a.heap_mode, SourceMode::Off);
+        assert_eq!(a.cpu_mode, SourceMode::External);
+        assert!(a.workload.is_empty());
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn all_external_only_promotes_in_process() {
         let a = parse(&["--no-sched", "--all-external", "--pid", "1"]).unwrap();
-        assert_eq!(a.sched_mode, MODE_OFF);
-        assert_eq!(a.cpu_mode, MODE_EXTERNAL);
-        assert_eq!(a.heap_mode, MODE_EXTERNAL);
+        assert_eq!(a.sched_mode, SourceMode::Off);
+        assert_eq!(a.cpu_mode, SourceMode::External);
+        assert_eq!(a.heap_mode, SourceMode::External);
     }
 
     #[test]
     fn double_dash_workload_is_the_argv_tail() {
-        // `-- ./app --weird`: 3 tokens; workload = ["./app","--weird"] (the `--`
-        // is consumed). all_argc = 2+3 = 5; workload_start = 5 - 2 = 3.
         let a = parse(&["--", "./app", "--weird"]).unwrap();
-        assert_eq!(a.workload_start, 3);
-        assert!(!a.has_attach_pid);
+        assert_eq!(a.workload, vec!["./app", "--weird"]);
+        assert!(a.attach_pid.is_none());
     }
 
     #[test]
@@ -423,12 +296,9 @@ mod tests {
     }
 
     #[test]
-    fn output_override_leaks_a_cstring() {
+    fn output_override() {
         let a = parse(&["--output", "/tmp/x.pftrace", "sleep"]).unwrap();
-        let s = unsafe { std::slice::from_raw_parts(a.output_path_ptr, a.output_path_len) };
-        assert_eq!(s, b"/tmp/x.pftrace");
-        // NUL terminator present for C use.
-        assert_eq!(unsafe { *a.output_path_ptr.add(a.output_path_len) }, 0);
+        assert_eq!(a.output, "/tmp/x.pftrace");
     }
 
     #[test]

@@ -20,12 +20,12 @@
 //! macOS-only; gated in lib.rs. Validated by `sudo tools/e2e-all-sources`.
 
 use crate::proto::{ProtoReader, WireValue};
-use crate::record_args::{parse_record_args, RecordArgsC, MODE_EXTERNAL, MODE_IN_PROCESS};
+use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
 use crate::session_config::{sismo_encode_trace_config, DataSourceEntryC};
 #[cfg(target_os = "macos")]
 use crate::sismo_config::{sismo_config_cpu_encode, sismo_config_heap_encode, sismo_config_sched_encode};
 use crate::sismo_paths::{sismo_acquire_session_lock, sismo_release_session_lock, CONSUMER_SOCK, PRODUCER_SOCK};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -330,36 +330,38 @@ fn ds_sismo_vendor(name: &[u8], cfg: &[u8], protovm_kb: u32) -> DataSourceEntryC
 // ---- Entry point -----------------------------------------------------------
 
 /// `sismo record` on macOS. `argv[0..argc]` are the full process args. Parses
-/// (Rust) then runs the whole record flow. Returns the process exit code.
-///
-/// # Safety
-/// `argv` must point to `argc` valid NUL-terminated C strings.
-#[cfg(target_os = "macos")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_run_record_macos(argc: usize, argv: *const *const c_char) -> c_int {
-    let all: Vec<&str> = (0..argc)
-        .map(|i| unsafe { CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
-        .collect();
-    let args: &[&str] = if all.len() > 2 { &all[2..] } else { &[] };
-
-    let mut rc = RecordArgsC::default();
-    if !parse_record_args(args, all.len(), &mut rc) {
-        return 0; // help / error already printed
+/// `sismo record` entry. Resolves the args, then runs the platform flow.
+pub fn run(args: RecordArgs) -> i32 {
+    let config = match args.resolve() {
+        Ok(c) => c,
+        Err(code) => return code, // message already printed
+    };
+    #[cfg(target_os = "macos")]
+    {
+        run_macos_flow(&config)
     }
-    run(&all, &rc)
+    #[cfg(target_os = "linux")]
+    {
+        run_linux(&config)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = config;
+        eprintln!("sismo record: not supported on this platform");
+        1
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
-    let output_path: &[u8] =
-        unsafe { std::slice::from_raw_parts(rc.output_path_ptr, rc.output_path_len) };
-    let output_path_str = std::str::from_utf8(output_path).unwrap_or("./sismo.pftrace");
-    let attach_pid: Option<i32> = if rc.has_attach_pid { Some(rc.attach_pid) } else { None };
-    let duration_secs: Option<c_uint> = if rc.has_duration { Some(rc.duration_secs) } else { None };
-    let flight_recorder = rc.flight_recorder;
-    let buffer_kb = rc.buffer_kb;
-    let (sched_mode, cpu_mode, heap_mode) = (rc.sched_mode, rc.cpu_mode, rc.heap_mode);
-    let no_instrumentation = rc.no_instrumentation;
+fn run_macos_flow(config: &RecordConfig) -> c_int {
+    let output_path_str: &str = &config.output;
+    let output_c = CString::new(config.output.as_str()).unwrap_or_default();
+    let attach_pid: Option<i32> = config.attach_pid;
+    let duration_secs: Option<c_uint> = config.duration_secs;
+    let flight_recorder = config.flight_recorder;
+    let buffer_kb = config.buffer_kb;
+    let (sched_mode, cpu_mode, heap_mode) = (config.sched_mode, config.cpu_mode, config.heap_mode);
+    let no_instrumentation = config.no_instrumentation;
 
     // Attach sanity check.
     if let Some(pid) = attach_pid {
@@ -372,13 +374,13 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
     // Privilege warning for in-process privileged sources.
     if unsafe { geteuid() } != 0 {
         let mut unmet: Vec<&str> = Vec::new();
-        if sched_mode == MODE_IN_PROCESS {
+        if sched_mode == SourceMode::InProcess {
             unmet.push("sched");
         }
-        if cpu_mode == MODE_IN_PROCESS {
+        if cpu_mode == SourceMode::InProcess {
             unmet.push("cpu");
         }
-        if heap_mode == MODE_IN_PROCESS {
+        if heap_mode == SourceMode::InProcess {
             unmet.push("heap");
         }
         if !unmet.is_empty() {
@@ -436,8 +438,8 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
                     return 0;
                 }
             };
-            let workload_cmd = all[rc.workload_start];
-            let workload_args: Vec<&str> = all[rc.workload_start + 1..].to_vec();
+            let workload_cmd = config.workload[0].as_str();
+            let workload_args: Vec<&str> = config.workload[1..].iter().map(String::as_str).collect();
             let pid = match maybe_spawn(
                 workload_cmd,
                 &workload_args,
@@ -462,7 +464,7 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
     };
 
     // Capture workers (in-process only).
-    let sched: *mut SchedCapture = if sched_mode == MODE_IN_PROCESS {
+    let sched: *mut SchedCapture = if sched_mode == SourceMode::InProcess {
         let c = unsafe { sismo_sched_capture_init() };
         if c.is_null() {
             eprintln!("sismo record: sched capture init failed");
@@ -471,7 +473,7 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
     } else {
         std::ptr::null_mut()
     };
-    let cpu: *mut CpuCapture = if cpu_mode == MODE_IN_PROCESS {
+    let cpu: *mut CpuCapture = if cpu_mode == SourceMode::InProcess {
         let c = unsafe { sismo_cpu_capture_init(0) };
         if c.is_null() {
             eprintln!("sismo record: cpu capture init failed");
@@ -480,7 +482,7 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
     } else {
         std::ptr::null_mut()
     };
-    let heap: *mut HeapCapture = if heap_mode == MODE_IN_PROCESS {
+    let heap: *mut HeapCapture = if heap_mode == SourceMode::InProcess {
         // In attach mode, heap needs the target prepared (its socket exists).
         let ok = match attach_pid {
             Some(pid) => {
@@ -529,22 +531,22 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
     if !no_instrumentation {
         entries.push(ds_track_event());
     }
-    if !heap.is_null() || heap_mode == MODE_EXTERNAL {
+    if !heap.is_null() || heap_mode == SourceMode::External {
         entries.push(ds_sismo_vendor(b"sismo.heap", heap_cfg, 0));
-        if heap_mode == MODE_EXTERNAL {
+        if heap_mode == SourceMode::External {
             external_names.push("sismo.heap");
         }
     }
-    if !cpu.is_null() || cpu_mode == MODE_EXTERNAL {
+    if !cpu.is_null() || cpu_mode == SourceMode::External {
         entries.push(ds_sismo_vendor(b"sismo.macos_cpu_samples", cpu_cfg, 0));
-        if cpu_mode == MODE_EXTERNAL {
+        if cpu_mode == SourceMode::External {
             external_names.push("sismo.macos_cpu_samples");
         }
     }
-    if !sched.is_null() || sched_mode == MODE_EXTERNAL {
+    if !sched.is_null() || sched_mode == SourceMode::External {
         // ProtoVM DST for GenericKernelProcessTree (see the Zig comment).
         entries.push(ds_sismo_vendor(b"sismo.macos_sched", sched_cfg, 4 * 1024));
-        if sched_mode == MODE_EXTERNAL {
+        if sched_mode == SourceMode::External {
             external_names.push("sismo.macos_sched");
         }
     }
@@ -557,10 +559,9 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
 
     // FILE mode pre-clears the output; flight mode writes nothing.
     if !flight_recorder {
-        // output_path is NUL-terminated at [len] (default or argv).
-        unsafe { unlink(rc.output_path_ptr as *const c_char) };
+        unsafe { unlink(output_c.as_ptr()) };
     }
-    let out_path: &[u8] = if flight_recorder { b"" } else { output_path };
+    let out_path: &[u8] = if flight_recorder { b"" } else { output_path_str.as_bytes() };
     let session_name = b"sismo_record";
     let mut cfg_buf = [0u8; 16384];
     let cfg_len = unsafe {
@@ -697,8 +698,8 @@ fn run(all: &[&str], rc: &RecordArgsC) -> c_int {
         let pids = [target_pid];
         let ok = unsafe {
             sismo_append_privileged_marker(
-                rc.output_path_ptr,
-                rc.output_path_len,
+                output_path_str.as_ptr(),
+                output_path_str.len(),
                 pids.as_ptr(),
                 pids.len(),
                 std::ptr::null(),
@@ -760,9 +761,6 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
 // ---- Linux record runner (P5: was runRecordLinux in cmd_record.zig) --------
 
 #[cfg(target_os = "linux")]
-const MODE_OFF: u8 = 2; // --no-<source>
-
-#[cfg(target_os = "linux")]
 extern "C" {
     fn sismo_traced_probes_create(producer_socket: *const c_char) -> *mut c_void;
     fn sismo_traced_probes_stop(svc: *mut c_void);
@@ -797,53 +795,26 @@ fn ds_linux_ftrace() -> DataSourceEntryC {
     }
 }
 
-/// `sismo record` on Linux. `argv[0..argc]` are the full process args. Parses
-/// (Rust), then runs the record flow. Returns the process exit code.
-///
-/// # Safety
-/// `argv` must point to `argc` valid NUL-terminated C strings.
 #[cfg(target_os = "linux")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_run_record_linux(argc: usize, argv: *const *const c_char) -> c_int {
-    let all: Vec<&str> = (0..argc)
-        .map(|i| unsafe { CStr::from_ptr(*argv.add(i)) }.to_str().unwrap_or(""))
-        .collect();
-    let args: &[&str] = if all.len() > 2 { &all[2..] } else { &[] };
-    let mut rc = RecordArgsC::default();
-    if !parse_record_args(args, all.len(), &mut rc) {
-        return 0; // help / error already printed
-    }
-    run_linux(&all, &rc)
-}
-
-#[cfg(target_os = "linux")]
-fn run_linux(all: &[&str], rc: &RecordArgsC) -> c_int {
-    let output_path: &[u8] =
-        unsafe { std::slice::from_raw_parts(rc.output_path_ptr, rc.output_path_len) };
-    let output_path_str = std::str::from_utf8(output_path).unwrap_or("./sismo.pftrace");
-    let duration_secs = if rc.has_duration { Some(rc.duration_secs) } else { None };
-    let flight_recorder = rc.flight_recorder;
-    let buffer_kb = rc.buffer_kb;
-    let no_sched = rc.sched_mode == MODE_OFF;
-    let no_cpu = rc.cpu_mode == MODE_OFF;
-    let no_instrumentation = rc.no_instrumentation;
-    let sample_density = if rc.has_sample_density { Some(rc.sample_density) } else { None };
+fn run_linux(config: &RecordConfig) -> c_int {
+    let output_path_str: &str = &config.output;
+    let output_c = CString::new(config.output.as_str()).unwrap_or_default();
+    let duration_secs = config.duration_secs;
+    let flight_recorder = config.flight_recorder;
+    let buffer_kb = config.buffer_kb;
+    let no_sched = config.sched_mode == SourceMode::Off;
+    let no_cpu = config.cpu_mode == SourceMode::Off;
+    let no_instrumentation = config.no_instrumentation;
+    let sample_density = config.sample_density;
 
     // Resolve --focus (only "cache" today); unknown = hard error.
-    let focus_int: i32 = if rc.has_focus {
-        let name = unsafe { std::slice::from_raw_parts(rc.focus_preset_ptr, rc.focus_preset_len) };
-        match name {
-            b"cache" => 0,
-            other => {
-                eprintln!(
-                    "sismo record: unknown focus preset '{}' (supported: cache)",
-                    String::from_utf8_lossy(other)
-                );
-                return 0;
-            }
+    let focus_int: i32 = match config.focus.as_deref() {
+        None => -1,
+        Some("cache") => 0,
+        Some(other) => {
+            eprintln!("sismo record: unknown focus preset '{other}' (supported: cache)");
+            return 0;
         }
-    } else {
-        -1
     };
 
     let lock_fd = sismo_acquire_session_lock(unsafe { getpid() });
@@ -895,8 +866,8 @@ fn run_linux(all: &[&str], rc: &RecordArgsC) -> c_int {
 
     // Spawn the workload (Linux rejects --pid, so a workload is always present).
     // No DYLD insert — Linux heap preload is a separate pillar.
-    let workload_cmd = all[rc.workload_start];
-    let workload_args: Vec<&str> = all[rc.workload_start + 1..].to_vec();
+    let workload_cmd = config.workload[0].as_str();
+    let workload_args: Vec<&str> = config.workload[1..].iter().map(String::as_str).collect();
     let target_pid = match maybe_spawn(
         workload_cmd,
         &workload_args,
@@ -970,9 +941,9 @@ fn run_linux(all: &[&str], rc: &RecordArgsC) -> c_int {
     }
 
     if !flight_recorder {
-        unsafe { unlink(rc.output_path_ptr as *const c_char) };
+        unsafe { unlink(output_c.as_ptr()) };
     }
-    let out_path: &[u8] = if flight_recorder { b"" } else { output_path };
+    let out_path: &[u8] = if flight_recorder { b"" } else { output_path_str.as_bytes() };
     let session_name = b"sismo_record";
     let mut cfg_buf = [0u8; 16384];
     let cfg_len = unsafe {
@@ -1082,8 +1053,8 @@ fn run_linux(all: &[&str], rc: &RecordArgsC) -> c_int {
         };
         let ok = unsafe {
             sismo_append_privileged_marker(
-                rc.output_path_ptr,
-                rc.output_path_len,
+                output_path_str.as_ptr(),
+                output_path_str.len(),
                 pids.as_ptr(),
                 pids.len(),
                 fp_ptr,
@@ -1096,7 +1067,7 @@ fn run_linux(all: &[&str], rc: &RecordArgsC) -> c_int {
         }
         // Resolve BPF perf-sample frames to function names (appended offline).
         if !bpf.is_null() {
-            unsafe { sismo_symbolize_trace(rc.output_path_ptr, rc.output_path_len) };
+            unsafe { sismo_symbolize_trace(output_path_str.as_ptr(), output_path_str.len()) };
         }
     }
 
