@@ -766,22 +766,11 @@ extern "C" {
     fn sismo_traced_probes_stop(svc: *mut c_void);
     fn sismo_traced_probes_destroy(svc: *mut c_void);
 
-    // rust-bridge calls the Zig BPF collector over this C ABI (src/linux_bpf_capture.zig).
-    fn sismo_linux_bpf_capture_init(pid: u32, focus: i32, has_density: bool, density: f64) -> *mut c_void;
-    fn sismo_linux_bpf_capture_shutdown(cap: *mut c_void, out: *mut LinuxBpfStats);
-    fn sismo_linux_bpf_capture_precise_ip(cap: *mut c_void) -> u8;
-
     fn sismo_symbolize_trace(path: *const u8, path_len: usize);
 }
 
 #[cfg(target_os = "linux")]
-#[repr(C)]
-struct LinuxBpfStats {
-    samples: u64,
-    threads: u64,
-    busiest_cycles: u64,
-    data_frames: u64,
-}
+use crate::linux_bpf_capture::{self, Capture, FocusPreset};
 
 #[cfg(target_os = "linux")]
 fn ds_linux_ftrace() -> DataSourceEntryC {
@@ -885,29 +874,23 @@ fn run_linux(config: &RecordConfig) -> c_int {
 
     // BPF CPU collector (per-thread counters + stack sampling), scoped to the
     // workload. Drains on its own worker thread; shut down on the way out.
-    let bpf = if no_cpu {
-        std::ptr::null_mut()
+    let mut bpf: Option<Box<Capture>> = if no_cpu {
+        None
     } else {
-        let c = unsafe {
-            sismo_linux_bpf_capture_init(
-                target_pid as u32,
-                focus_int,
-                sample_density.is_some(),
-                sample_density.unwrap_or(0.0),
-            )
-        };
-        if c.is_null() {
+        let focus = if focus_int == 0 { Some(FocusPreset::Cache) } else { None };
+        let c = linux_bpf_capture::init(target_pid as u32, focus, sample_density);
+        if c.is_none() {
             eprintln!("sismo record: bpf capture init failed — CPU samples disabled");
         }
         c
     };
-    let shutdown_bpf = |bpf: *mut c_void| -> u8 {
-        if bpf.is_null() {
+    let had_bpf = bpf.is_some();
+    let shutdown_bpf = |bpf: Option<Box<Capture>>| -> u8 {
+        let Some(c) = bpf else {
             return 0;
-        }
-        let mut s = LinuxBpfStats { samples: 0, threads: 0, busiest_cycles: 0, data_frames: 0 };
-        let precise = unsafe { sismo_linux_bpf_capture_precise_ip(bpf) };
-        unsafe { sismo_linux_bpf_capture_shutdown(bpf, &mut s) };
+        };
+        let precise = c.precise_ip();
+        let s = c.shutdown();
         eprintln!(
             "sismo record: bpf — {} samples across {} threads (busiest {} cycles)",
             s.samples, s.threads, s.busiest_cycles
@@ -929,12 +912,12 @@ fn run_linux(config: &RecordConfig) -> c_int {
     if !probes.is_null() {
         entries.push(ds_linux_ftrace());
     }
-    if !bpf.is_null() {
+    if had_bpf {
         entries.push(ds_sismo_vendor(b"sismo.linux_cpu_samples", b"", 0));
     }
     if entries.is_empty() {
         eprintln!("sismo record: no data sources enabled — recording would be empty. Drop one of the --no-* flags.");
-        shutdown_bpf(bpf);
+        shutdown_bpf(bpf.take());
         stop_probes(probes);
         teardown_early(svc, lock_fd);
         return 0;
@@ -964,7 +947,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     };
     if cfg_len == 0 {
         eprintln!("sismo record: encodeTraceConfig failed (config exceeds buffer)");
-        shutdown_bpf(bpf);
+        shutdown_bpf(bpf.take());
         stop_probes(probes);
         teardown_early(svc, lock_fd);
         return 0;
@@ -973,7 +956,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     let session = unsafe { sismo_consumer_session_create() };
     if session.is_null() {
         eprintln!("sismo record: session_create failed");
-        shutdown_bpf(bpf);
+        shutdown_bpf(bpf.take());
         stop_probes(probes);
         teardown_early(svc, lock_fd);
         return 0;
@@ -983,7 +966,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     if setup_rc != 0 {
         eprintln!("sismo record: session_setup rc={setup_rc} (TraceConfig failed to parse)");
         unsafe { sismo_consumer_session_destroy(session) };
-        shutdown_bpf(bpf);
+        shutdown_bpf(bpf.take());
         stop_probes(probes);
         teardown_early(svc, lock_fd);
         return 0;
@@ -1001,7 +984,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     if unsafe { pipe(pipe_fds.as_mut_ptr()) } != 0 {
         eprintln!("sismo record: pipe() failed");
         unsafe { sismo_consumer_session_destroy(session) };
-        shutdown_bpf(bpf);
+        shutdown_bpf(bpf.take());
         stop_probes(probes);
         teardown_early(svc, lock_fd);
         return 0;
@@ -1041,10 +1024,10 @@ fn run_linux(config: &RecordConfig) -> c_int {
     unsafe { sismo_consumer_session_stop_blocking(session) };
     if flight_recorder {
         eprintln!("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)");
-        shutdown_bpf(bpf);
+        shutdown_bpf(bpf.take());
     } else {
         eprintln!("sismo record: trace saved to {output_path_str}");
-        let precise = shutdown_bpf(bpf);
+        let precise = shutdown_bpf(bpf.take());
         let pids = [target_pid];
         let (fp_ptr, fp_len): (*const u8, usize) = if focus_int == 0 {
             (b"cache".as_ptr(), 5)
@@ -1066,7 +1049,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
             eprintln!("sismo record: failed to write privileged marker");
         }
         // Resolve BPF perf-sample frames to function names (appended offline).
-        if !bpf.is_null() {
+        if had_bpf {
             unsafe { sismo_symbolize_trace(output_path_str.as_ptr(), output_path_str.len()) };
         }
     }

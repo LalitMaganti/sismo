@@ -1282,61 +1282,53 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
     cap
 }
 
-/// Start the Linux CPU collector for `pid`. `focus` selects a preset (0 =
-/// cache) or -1 for the survey sampler. Returns an opaque handle, or null.
-#[no_mangle]
-pub unsafe extern "C" fn sismo_linux_bpf_capture_init(
-    pid: u32,
-    focus: i32,
-    has_density: bool,
-    density: f64,
-) -> *mut c_void {
-    let f = match focus {
-        0 => Some(FocusPreset::Cache),
-        _ => None,
-    };
-    let d = if has_density { Some(density) } else { None };
-    capture_init(pid, f, d) as *mut c_void
+/// Start the Linux CPU collector for `pid`, or None if init failed. The worker
+/// thread keeps a raw pointer into the returned box for its lifetime, so the box
+/// must live until [`Capture::shutdown`] (which joins the worker first).
+pub fn init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> Option<Box<Capture>> {
+    let p = capture_init(pid, focus, density);
+    if p.is_null() {
+        None
+    } else {
+        // capture_init handed off ownership via Box::into_raw; reclaim it.
+        Some(unsafe { Box::from_raw(p) })
+    }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn sismo_linux_bpf_capture_shutdown(cap: *mut c_void, out: *mut LinuxBpfStats) {
-    if cap.is_null() {
-        return;
+impl Capture {
+    /// The lowest precise_ip the samplers actually got (2 = full PEBS).
+    pub fn precise_ip(&self) -> u8 {
+        self.sampler_precise_ip
     }
-    let mut boxed = Box::from_raw(cap as *mut Capture);
-    boxed.exit_requested.store(true, Ordering::Release);
-    if let Some(w) = boxed.worker.take() {
-        let _ = w.join();
-    }
-    let busiest = boxed.acc.values().copied().max().unwrap_or(0);
-    if !out.is_null() {
-        *out = LinuxBpfStats {
-            samples: boxed.samples,
-            threads: boxed.acc.len() as u64,
-            busiest_cycles: busiest,
-            data_frames: boxed.data_frames,
+
+    /// Stop the worker, tear down BPF, and return the run stats. Consumes self.
+    pub fn shutdown(mut self: Box<Self>) -> LinuxBpfStats {
+        self.exit_requested.store(true, Ordering::Release);
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+        let stats = LinuxBpfStats {
+            samples: self.samples,
+            threads: self.acc.len() as u64,
+            busiest_cycles: self.acc.values().copied().max().unwrap_or(0),
+            data_frames: self.data_frames,
         };
+        // The worker has joined, so the raw-pointer aliasing is over.
+        unsafe {
+            if !self.rb.is_null() {
+                ring_buffer__free(self.rb);
+            }
+            for &l in &self.links {
+                bpf_link__destroy(l);
+            }
+            for &fd in &self.perf_fds {
+                close(fd);
+            }
+            if !self.obj.is_null() {
+                bpf_object__close(self.obj);
+            }
+        }
+        stats
+        // maps / data_regions dropped with self.
     }
-    if !boxed.rb.is_null() {
-        ring_buffer__free(boxed.rb);
-    }
-    for &l in &boxed.links {
-        bpf_link__destroy(l);
-    }
-    for &fd in &boxed.perf_fds {
-        close(fd);
-    }
-    if !boxed.obj.is_null() {
-        bpf_object__close(boxed.obj);
-    }
-    // maps / data_regions are owned Options — dropped with `boxed`.
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn sismo_linux_bpf_capture_precise_ip(cap: *mut c_void) -> u8 {
-    if cap.is_null() {
-        return 0;
-    }
-    (*(cap as *mut Capture)).sampler_precise_ip
 }
