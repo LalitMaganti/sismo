@@ -39,6 +39,11 @@ jobs:
       - name: Install BPF build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev clang
 
+      # sismo-proto is the dependency-free wire-encoding crate; its encoder
+      # round-trip tests run standalone.
+      - name: Unit tests (sismo-proto)
+        run: python3 tools/cargo --hermetic test --manifest-path crates/sismo-proto/Cargo.toml
+
       - name: Unit tests (sismo-core)
         run: python3 tools/cargo --hermetic test --manifest-path crates/sismo-core/Cargo.toml
 

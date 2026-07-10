@@ -12,7 +12,7 @@
 //! tree is built per-drain from flattened FFI arrays. Both are covered by
 //! byte-exact tests.
 
-use crate::proto::ProtoWriter;
+use crate::ProtoWriter;
 use std::slice;
 
 // ---- GenericKernelProcessTree (field 122 body) -----------------------------

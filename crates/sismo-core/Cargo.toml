@@ -18,6 +18,7 @@ lto = "thin"
 codegen-units = 1
 
 [dependencies]
+sismo-proto = { path = "../sismo-proto" }
 framehop = { version = "0.16.0", default-features = false, features = ["macho"] }
 object = { version = "0.39.1", default-features = false, features = ["std", "read", "macho", "elf"] }
 tokio = { version = "1.52.1", features = ["rt"] }

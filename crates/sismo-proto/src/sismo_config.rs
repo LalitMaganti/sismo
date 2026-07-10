@@ -8,7 +8,7 @@
 //! All configs ride at vendor-extension field 2000 of `DataSourceConfig`.
 //! See protos/sismo_config.proto.
 
-use crate::proto::ProtoWriter;
+use crate::ProtoWriter;
 
 /// Field on Perfetto's `DataSourceConfig` carrying sismo's config bytes.
 const DSC_SISMO_CONFIG_FIELD: u64 = 2000;

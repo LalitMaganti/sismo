@@ -11,9 +11,12 @@
 
 pub mod cpu;
 pub mod heap;
-pub mod proto;
 pub mod sched;
 pub mod symbolize;
+
+// Wire encoding + session/config protos live in their own dependency-free
+// crate; re-exported here so the capture modules keep a single `proto` path.
+pub use sismo_proto as proto;
 
 // Perfetto C++ shim FFI (recording control plane + producer data-plane ABI).
 pub mod ffi;

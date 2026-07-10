@@ -12,7 +12,7 @@
 //! The C++ side only parses these; every byte on the wire is built here. Field
 //! numbers come from the vendored proto schemas.
 
-use crate::proto::ProtoWriter;
+use crate::ProtoWriter;
 
 // ---- DataSourceConfig field numbers ----
 const DSC_NAME: u32 = 1;
