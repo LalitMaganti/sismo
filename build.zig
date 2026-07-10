@@ -227,27 +227,10 @@ fn addUnixPipeline(
         target_step.dependOn(&b.addInstallArtifact(target_exe, .{}).step);
     }
 
-    // Heap preload dylib — macOS only. DYLD_INSERT_LIBRARIES + the
-    // `__DATA,__interpose` mechanism are macOS-specific. The Linux
-    // analog (LD_PRELOAD + GLIBC malloc hooks) lives in a sibling
-    // `heap_preload_linux.zig` once we get there.
-    if (is_macos) {
-        const heap_mod = b.createModule(.{
-            .root_source_file = b.path("src/heap_preload_macos.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        const heap_lib = b.addLibrary(.{
-            .name = "sismo_heap",
-            .root_module = heap_mod,
-            .linkage = .dynamic,
-        });
-        b.installArtifact(heap_lib);
-
-        const heap_step = b.step("heap-preload", "Build the macOS heap preload dylib (Q2-macOS)");
-        heap_step.dependOn(&b.addInstallArtifact(heap_lib, .{}).step);
-    }
+    // Heap preload dylib — macOS only. Now built from the Rust cdylib
+    // (heap-preload/) and installed to zig-out/lib/libsismo_heap.dylib by
+    // rust-host/build.rs; see src/heap_preload_macos.zig (retired). The Linux
+    // analog (LD_PRELOAD + GLIBC malloc hooks) is P5.
 
     // -------------------------------------------------------------------------
     // libsismo_zig.a — the Zig + C/C++ half of sismo as a static archive. The
