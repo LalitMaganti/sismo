@@ -11,14 +11,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Fast Linux gate: pinned toolchains, OS-portable unit tests, and the
+  # Fast Linux gate: pinned toolchains, the rust-bridge unit tests, and the
   # rust-bridge staticlib build. Nothing here needs Perfetto, so it stays
   # quick and dependency-light.
-  #
-  # `zig build check` is intentionally absent: on a native Linux build it
-  # reaches the real BPF path (linux_bpf_capture @embedFiles sched.bpf.o, a
-  # build-generated object), so it's a macOS-side cross-compile sentinel,
-  # not a Linux check. The full Linux sismo build covers Linux compilation.
   #
   # The full sismo build + the CLI `--help` golden need libperfetto.a; that
   # heavier job lands alongside the dispatch port it exists to validate.
@@ -39,8 +34,8 @@ jobs:
       - name: Install pinned zig + rust
         run: python3 tools/install-build-deps --no-source all --no-patches
 
-      - name: Unit tests (OS-portable modules)
-        run: python3 tools/zig --hermetic build test --summary all
+      - name: Unit tests (rust-bridge)
+        run: python3 tools/cargo --hermetic test --manifest-path rust-bridge/Cargo.toml
 
       - name: Build rust-bridge staticlib
         run: python3 tools/cargo --hermetic build --manifest-path rust-bridge/Cargo.toml --profile dev

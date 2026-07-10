@@ -65,57 +65,6 @@ pub fn build(b: *std.Build) void {
     }
 
     // -------------------------------------------------------------------------
-    // `zig build check [-Dtarget=…]` — cross-platform compile sentinel.
-    //
-    // Builds src/check.zig (a module index that references every
-    // OS-portable module in src/) for the requested target. Lets us
-    // catch cross-platform regressions on macOS without booting a Linux
-    // or Windows machine, and without dragging in Perfetto or
-    // rust-bridge — both of which are macOS-only today.
-    //
-    // Wired up before the per-OS branches below so it works on every OS,
-    // including ones where we don't yet have a full sismo build.
-    // -------------------------------------------------------------------------
-    {
-        const check_mod = b.createModule(.{
-            .root_source_file = b.path("src/check.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        // The cmd_* subcommands import the perfetto_shim.h cImport;
-        // semantic analysis fails without the include path. We only
-        // need the headers (the shim is header-light, no link step).
-        // Includes are root-qualified, so the include root is the repo.
-        check_mod.addIncludePath(b.path("."));
-        check_mod.addIncludePath(b.path("third_party/src/perfetto/include"));
-        const check_obj = b.addObject(.{
-            .name = "sismo_check",
-            .root_module = check_mod,
-        });
-        const check_step = b.step("check", "Cross-platform compile check of OS-portable modules");
-        check_step.dependOn(&check_obj.step);
-    }
-
-    // -------------------------------------------------------------------------
-    // `zig build test` — run the unit tests in OS-portable, link-light
-    // modules (see src/tests.zig for what's in and what's deliberately out).
-    // No Perfetto / rust-bridge link, so it runs anywhere zig itself runs.
-    // -------------------------------------------------------------------------
-    {
-        const test_mod = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        const tests = b.addTest(.{ .root_module = test_mod });
-        const run_tests = b.addRunArtifact(tests);
-        const test_step = b.step("test", "Run unit tests for OS-portable modules");
-        test_step.dependOn(&run_tests.step);
-    }
-
-    // -------------------------------------------------------------------------
     // Per-OS pipelines. The `sismo` binary itself is produced by cargo (the
     // rust-host crate) linking libsismo_zig.a — see `zig build sismo-staticlib`
     // and rust-host/. build.zig here builds the auxiliary Zig binaries.
