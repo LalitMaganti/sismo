@@ -35,7 +35,7 @@ jobs:
         run: python3 tools/install-build-deps --no-source all --no-patches
 
       - name: Unit tests (rust-bridge)
-        run: python3 tools/cargo --hermetic test --manifest-path rust-bridge/Cargo.toml
+        run: python3 tools/cargo --hermetic test --manifest-path crates/rust-bridge/Cargo.toml
 
       - name: Build rust-bridge staticlib
-        run: python3 tools/cargo --hermetic build --manifest-path rust-bridge/Cargo.toml --profile dev
+        run: python3 tools/cargo --hermetic build --manifest-path crates/rust-bridge/Cargo.toml --profile dev

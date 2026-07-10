@@ -15,7 +15,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // crates/rust-host -> repo root is two levels up.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
         .parent()
         .unwrap()
         .to_path_buf();
@@ -82,7 +85,7 @@ fn link_macos() {
 /// cargo is isolated: it uses the crate's own `heap-preload/target`, and we drop
 /// the outer build's CARGO env so it doesn't inherit our manifest/target.
 fn build_heap_preload(root: &PathBuf) {
-    let manifest = root.join("heap-preload/Cargo.toml");
+    let manifest = root.join("crates/heap-preload/Cargo.toml");
     let status = Command::new("python3")
         .arg(root.join("tools/cargo"))
         .args(["--hermetic", "build", "--release", "--manifest-path"])
@@ -94,13 +97,13 @@ fn build_heap_preload(root: &PathBuf) {
         .expect("run cargo build for heap-preload");
     assert!(status.success(), "heap-preload cdylib build failed");
 
-    let src = root.join("heap-preload/target/release/libsismo_heap_preload.dylib");
+    let src = root.join("crates/heap-preload/target/release/libsismo_heap_preload.dylib");
     let dst_dir = root.join("zig-out/lib");
     std::fs::create_dir_all(&dst_dir).expect("mkdir zig-out/lib");
     std::fs::copy(&src, dst_dir.join("libsismo_heap.dylib")).expect("install libsismo_heap.dylib");
 
-    println!("cargo:rerun-if-changed={}", root.join("heap-preload/src").display());
-    println!("cargo:rerun-if-changed={}", root.join("heap-preload/Cargo.toml").display());
+    println!("cargo:rerun-if-changed={}", root.join("crates/heap-preload/src").display());
+    println!("cargo:rerun-if-changed={}", root.join("crates/heap-preload/Cargo.toml").display());
 }
 
 /// Compile the Perfetto C/C++ glue shims with `zig c++` and archive them into

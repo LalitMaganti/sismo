@@ -13,7 +13,10 @@ fn main() {
     if target_os != "linux" {
         return;
     }
+    // crates/rust-bridge -> repo root is two levels up.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
         .parent()
         .unwrap()
         .to_path_buf();
