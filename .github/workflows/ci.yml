@@ -34,6 +34,11 @@ jobs:
       - name: Install pinned zig + rust
         run: python3 tools/install-build-deps --no-source all --no-patches
 
+      # Building rust-bridge compiles the kernel BPF object (sismo-sys), which
+      # #include's <bpf/bpf_helpers.h> and needs clang with the bpf target.
+      - name: Install BPF build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev clang
+
       - name: Unit tests (rust-bridge)
         run: python3 tools/cargo --hermetic test --manifest-path crates/rust-bridge/Cargo.toml
 
