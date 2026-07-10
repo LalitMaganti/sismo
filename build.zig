@@ -81,12 +81,8 @@ fn addUnixPipeline(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) void {
-    const os_tag = target.result.os.tag;
-    const is_linux = os_tag == .linux;
-
-    // Perfetto's C++ SDK and the sample-target workload are built by cargo
-    // (rust-host/build.rs). This Zig build now only produces the compiler_rt
-    // shim archive and the sismo-run cap launcher.
+    // The `sismo` binary, sample-target, and sismo-run are all built by cargo.
+    // This Zig build now produces only the compiler_rt shim archive.
 
     // -------------------------------------------------------------------------
     // libsismo_zig.a — compiler_rt for the cargo-linked binary. The `sismo`
@@ -113,23 +109,6 @@ fn addUnixPipeline(
         lib.bundle_compiler_rt = true;
         const step = b.step("sismo-staticlib", "Build libsismo_zig.a (compiler_rt for the cargo binary)");
         step.dependOn(&b.addInstallArtifact(lib, .{}).step);
-    }
-
-    // sismo-run: capability-stable launcher (Linux only). File caps live on
-    // this tiny binary (it rebuilds only when its own source changes), so
-    // `sismo` never needs re-setcap after a build — the launcher raises the
-    // BPF caps to ambient and exec's the sibling `sismo`. See src/sismo_run.zig.
-    if (is_linux) {
-        const run_mod = b.createModule(.{
-            .root_source_file = b.path("src/sismo_run.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        const run_exe = b.addExecutable(.{ .name = "sismo-run", .root_module = run_mod });
-        b.installArtifact(run_exe);
-        const run_step = b.step("sismo-run", "Build the capability-stable BPF launcher");
-        run_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     }
 }
 

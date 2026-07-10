@@ -1,0 +1,19 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
+# Its own crate, deliberately dependency-free: file caps attach to the built
+# inode, so this binary must rebuild as rarely as possible. No deps means a
+# `cargo build` only relinks it when its own source changes, keeping the caps
+# a one-time `setcap` grants.
+[package]
+name = "sismo-run"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sismo-run"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

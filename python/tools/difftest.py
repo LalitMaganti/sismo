@@ -32,9 +32,9 @@ import tempfile
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN: str = os.path.join(ROOT_DIR, "zig-out", "bin")
 # `sismo` and `sample-target` are cargo-built (rust-host/); sismo-run is the
-# Zig-built cap launcher in zig-out/bin.
+# cargo-built cap launcher (its own crate, so its file caps survive rebuilds).
 SISMO: str = os.path.join(ROOT_DIR, "rust-host", "target", "debug", "sismo")
-SISMO_RUN: str = os.path.join(BIN, "sismo-run")
+SISMO_RUN: str = os.path.join(ROOT_DIR, "sismo-run", "target", "debug", "sismo-run")
 SAMPLE_TARGET: str = os.path.join(ROOT_DIR, "rust-host", "target", "debug", "sample-target")
 TP_SHELL: str = os.path.join(
     ROOT_DIR, "third_party", "src", "perfetto", "out", "sismo", "trace_processor_shell"
@@ -89,6 +89,8 @@ def cpu_symbolize_actual() -> str:
         )
         if rec.returncode != 0 or not os.path.getsize(trace):
             raise Skip("recording produced no trace (BPF caps on sismo-run?)")
+        if tp_scalar(trace, "SELECT count(*) FROM perf_sample;") == 0:
+            raise Skip("recording captured no CPU samples (setcap sismo-run?)")
         mapping = tp_scalar(
             trace,
             "SELECT count(*) FROM stack_profile_mapping "
