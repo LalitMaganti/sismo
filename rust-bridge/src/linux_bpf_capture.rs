@@ -501,3 +501,178 @@ fn open_sampler(cpu: u32, cfg: &SamplerCfg, tick_prog: *mut BpfProgram) -> Optio
         want -= 1;
     }
 }
+
+// ---- InternedData interner (port of the Zig Interner + intern* methods) -----
+
+use crate::proto::ProtoWriter;
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FrameKey {
+    mapping_iid: u64,
+    rel_pc: u64,
+    name_iid: u64,
+}
+
+/// Per-sequence callstack interning state. Mirrors the iids written into the
+/// trace's InternedData tables so each entry is emitted once; reset whenever a
+/// fresh incremental-state-cleared sequence begins. Worker-thread only.
+#[derive(Default)]
+struct Interner {
+    paths: HashMap<Vec<u8>, u64>,
+    build_ids: HashMap<Vec<u8>, u64>,
+    func_names: HashMap<Vec<u8>, u64>,
+    mappings: HashMap<u64, u64>, // map.start -> iid
+    frames: HashMap<FrameKey, u64>,
+    callstacks: HashMap<Vec<u8>, u64>, // frame-id bytes -> iid
+    next_path: u64,
+    next_build_id: u64,
+    next_func_name: u64,
+    next_mapping: u64,
+    next_frame: u64,
+    next_callstack: u64,
+}
+
+impl Interner {
+    fn new() -> Self {
+        Interner {
+            next_path: 1,
+            next_build_id: 1,
+            next_func_name: 1,
+            next_mapping: 1,
+            next_frame: 1,
+            next_callstack: 1,
+            ..Default::default()
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Interner::new();
+    }
+
+    /// Intern `bytes` into `map`, emitting InternedString{iid=1,str=2} under
+    /// `field` (17 = mapping_paths, 16 = build_ids, 5 = function_names).
+    fn intern_string(
+        map: &mut HashMap<Vec<u8>, u64>,
+        next: &mut u64,
+        field: u32,
+        bytes: &[u8],
+        idw: &mut ProtoWriter,
+    ) -> u64 {
+        if let Some(&iid) = map.get(bytes) {
+            return iid;
+        }
+        let iid = *next;
+        *next += 1;
+        map.insert(bytes.to_vec(), iid);
+        let mut s = ProtoWriter::new();
+        s.write_uint64(1, iid);
+        s.write_string(2, bytes);
+        idw.write_message(field, s.bytes());
+        iid
+    }
+
+    fn intern_path(&mut self, path: &[u8], idw: &mut ProtoWriter) -> u64 {
+        Self::intern_string(&mut self.paths, &mut self.next_path, 17, path, idw)
+    }
+    fn intern_build_id(&mut self, raw: &[u8], idw: &mut ProtoWriter) -> u64 {
+        Self::intern_string(&mut self.build_ids, &mut self.next_build_id, 16, raw, idw)
+    }
+    fn intern_func_name(&mut self, name: &[u8], idw: &mut ProtoWriter) -> u64 {
+        Self::intern_string(&mut self.func_names, &mut self.next_func_name, 5, name, idw)
+    }
+
+    /// InternedData.mappings (19): Mapping{iid=1, build_id=2, start=4, end=5,
+    /// load_bias=6, exact_offset=8, path_string_ids=7}. load_bias = base avma.
+    fn intern_mapping(
+        &mut self,
+        start: u64,
+        end: u64,
+        offset: u64,
+        base_avma: u64,
+        path: &[u8],
+        build_id: &[u8],
+        idw: &mut ProtoWriter,
+    ) -> u64 {
+        if let Some(&iid) = self.mappings.get(&start) {
+            return iid;
+        }
+        let iid = self.next_mapping;
+        self.next_mapping += 1;
+        self.mappings.insert(start, iid);
+        let path_iid = self.intern_path(path, idw);
+        let build_id_iid = if !build_id.is_empty() {
+            self.intern_build_id(build_id, idw)
+        } else {
+            0
+        };
+        let mut mp = ProtoWriter::new();
+        mp.write_uint64(1, iid);
+        if build_id_iid != 0 {
+            mp.write_uint64(2, build_id_iid);
+        }
+        mp.write_uint64(4, start);
+        mp.write_uint64(5, end);
+        mp.write_uint64(6, base_avma);
+        mp.write_uint64(8, offset);
+        mp.write_uint64(7, path_iid);
+        idw.write_message(19, mp.bytes());
+        iid
+    }
+
+    /// The synthetic "[kernel.kallsyms]" mapping every kernel frame shares
+    /// (keyed by sentinel start 0 — real mappings never start at 0).
+    fn intern_kernel_mapping(&mut self, idw: &mut ProtoWriter) -> u64 {
+        if let Some(&iid) = self.mappings.get(&0) {
+            return iid;
+        }
+        let iid = self.next_mapping;
+        self.next_mapping += 1;
+        self.mappings.insert(0, iid);
+        let path_iid = self.intern_path(b"[kernel.kallsyms]", idw);
+        let mut mp = ProtoWriter::new();
+        mp.write_uint64(1, iid);
+        mp.write_uint64(7, path_iid);
+        idw.write_message(19, mp.bytes());
+        iid
+    }
+
+    /// InternedData.frames (6): Frame{iid=1, function_name_id=2, mapping_id=3,
+    /// rel_pc=4}. function_name_id set only for inline-named (kernel) frames.
+    fn intern_frame(&mut self, key: FrameKey, idw: &mut ProtoWriter) -> u64 {
+        if let Some(&iid) = self.frames.get(&key) {
+            return iid;
+        }
+        let iid = self.next_frame;
+        self.next_frame += 1;
+        self.frames.insert(key, iid);
+        let mut f = ProtoWriter::new();
+        f.write_uint64(1, iid);
+        if key.name_iid != 0 {
+            f.write_uint64(2, key.name_iid);
+        }
+        f.write_uint64(3, key.mapping_iid);
+        f.write_uint64(4, key.rel_pc);
+        idw.write_message(6, f.bytes());
+        iid
+    }
+
+    /// InternedData.callstacks (7): Callstack{iid=1, frame_ids=2}. `fids` is
+    /// bottom-frame-first (the caller reverses the leaf-first BPF stack).
+    fn intern_callstack_ids(&mut self, fids: &[u64], idw: &mut ProtoWriter) -> u64 {
+        let key: Vec<u8> = fids.iter().flat_map(|f| f.to_ne_bytes()).collect();
+        if let Some(&iid) = self.callstacks.get(&key) {
+            return iid;
+        }
+        let iid = self.next_callstack;
+        self.next_callstack += 1;
+        self.callstacks.insert(key, iid);
+        let mut cs = ProtoWriter::new();
+        cs.write_uint64(1, iid);
+        for &fid in fids {
+            cs.write_uint64(2, fid);
+        }
+        idw.write_message(7, cs.bytes());
+        iid
+    }
+}
