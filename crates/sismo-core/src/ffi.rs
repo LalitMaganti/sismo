@@ -60,6 +60,30 @@ extern "C" {
     ) -> c_int;
 }
 
+// ---- Snapshot clone (flight-recorder consumer stream) ----------------------
+
+/// Chunk callback the clone stream invokes with each slice of trace bytes.
+pub type ChunkCb =
+    extern "C" fn(data: *const c_void, size: usize, has_more: bool, user_arg: *mut c_void);
+
+#[cfg(not(test))]
+extern "C" {
+    pub fn sismo_consumer_clone_and_stream(
+        name: *const c_char,
+        cb: ChunkCb,
+        user_arg: *mut c_void,
+    ) -> c_int;
+}
+
+#[cfg(test)]
+pub unsafe extern "C" fn sismo_consumer_clone_and_stream(
+    _name: *const c_char,
+    _cb: ChunkCb,
+    _user_arg: *mut c_void,
+) -> c_int {
+    0
+}
+
 // ---- Data-plane producer ABI (per data-source emit path) -------------------
 
 /// Data-source lifecycle callbacks (invoked by the SDK on its IO thread).

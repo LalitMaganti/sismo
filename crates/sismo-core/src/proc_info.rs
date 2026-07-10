@@ -25,10 +25,7 @@ const PBI_PPID_OFFSET: usize = 16; // proc_bsdinfo.pbi_ppid (u32)
 const PTH_NAME_OFFSET: usize = 48; // proc_threadinfo.pth_name
 const PTH_NAME_LEN: usize = 64; // MAXTHREADNAMESIZE
 
-extern "C" {
-    fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut c_void, buffersize: i32) -> i32;
-    fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
-}
+use libc::{proc_pidinfo, proc_pidpath};
 
 /// Parent pid of `pid` via PROC_PIDTBSDINFO. Writes `*out_ppid` and returns
 /// true on success; false on any proc_pidinfo failure (pid gone, etc.).

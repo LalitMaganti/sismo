@@ -27,26 +27,10 @@
 
 use crate::sismo_paths::{CONSUMER_SOCK, PRODUCER_SOCK};
 use std::io::Write;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_void};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// ---- C++ clone shim --------------------------------------------------------
-
-type ChunkCb = extern "C" fn(data: *const c_void, size: usize, has_more: bool, user_arg: *mut c_void);
-
-#[cfg(not(test))]
-extern "C" {
-    fn sismo_consumer_clone_and_stream(name: *const c_char, cb: ChunkCb, user_arg: *mut c_void) -> c_int;
-}
-
-#[cfg(test)]
-unsafe extern "C" fn sismo_consumer_clone_and_stream(
-    _name: *const c_char,
-    _cb: ChunkCb,
-    _user_arg: *mut c_void,
-) -> c_int {
-    0
-}
+use crate::ffi::sismo_consumer_clone_and_stream;
 
 // ---- Snapshot streaming ----------------------------------------------------
 
