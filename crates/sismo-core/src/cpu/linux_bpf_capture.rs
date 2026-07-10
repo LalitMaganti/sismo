@@ -4,7 +4,6 @@
 //! Linux BPF CPU collector. Per-thread PMU counters + timer-tick stack sampling,
 //! scoped to the workload, emitted as thread-scoped Perfetto PerfSamples.
 
-#![allow(dead_code)]
 
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -332,6 +331,10 @@ pub enum FocusPreset {
 }
 
 enum Leader {
+    // Cycles-leader sampler path: `open_focus_sampler` handles it, but no
+    // `FocusPreset` constructs it yet (the planned stalls preset would). Kept as
+    // the wired integration point, not deleted — see sismo_focus_mode.
+    #[allow(dead_code)]
     Cycles,
     Role(Role),
 }
