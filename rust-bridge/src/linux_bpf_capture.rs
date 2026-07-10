@@ -327,3 +327,177 @@ fn select_counters() -> Vec<Counter> {
     }
     COUNTERS_FALLBACK.to_vec()
 }
+
+// ---- focus presets (port of src/focus_presets.zig) -------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum FocusPreset {
+    Cache,
+}
+
+enum Leader {
+    Cycles,
+    Role(Role),
+}
+
+struct FocusSpec {
+    leader: Leader,
+    precise_ip: u8, // u2
+    period: u64,
+    sample_data_addr: bool,
+}
+
+pub fn focus_from_name(name: &[u8]) -> Option<FocusPreset> {
+    match name {
+        b"cache" => Some(FocusPreset::Cache),
+        _ => None,
+    }
+}
+
+fn focus_spec(p: FocusPreset) -> FocusSpec {
+    match p {
+        // Sample on retired loads that missed L3 (precise, carries Data_LA).
+        FocusPreset::Cache => FocusSpec {
+            leader: Leader::Role(Role::l3_miss_load),
+            precise_ip: 2,
+            period: 2003,
+            sample_data_addr: true,
+        },
+    }
+}
+
+// ---- perf_event_open (port of openCounter / resolveSampler / openSampler) ---
+
+use perf_event_open_sys as sys;
+
+extern "C" {
+    fn close(fd: c_int) -> c_int;
+}
+
+/// Open a counting perf event as part of `group_fd`'s group (-1 = new leader),
+/// per-CPU. Returns the fd, or None if the PMU can't schedule it.
+fn open_counter(cpu: u32, src: Src, group_fd: i32) -> Option<i32> {
+    let mut attr: sys::bindings::perf_event_attr = unsafe { std::mem::zeroed() };
+    attr.size = std::mem::size_of::<sys::bindings::perf_event_attr>() as u32;
+    match src {
+        Src::Hw(h) => {
+            attr.type_ = sys::bindings::PERF_TYPE_HARDWARE;
+            attr.config = h as u64;
+        }
+        Src::Raw(r) => {
+            attr.type_ = sys::bindings::PERF_TYPE_RAW;
+            attr.config = r as u64;
+        }
+    }
+    let rc = unsafe { sys::perf_event_open(&mut attr, -1, cpu as i32, group_fd, 0) };
+    if rc < 0 {
+        None
+    } else {
+        Some(rc as i32)
+    }
+}
+
+/// The resolved sampler leader: what to overflow on, period, PEBS precision.
+struct SamplerCfg {
+    typ: u32,
+    config: u64,
+    period: u64,
+    precise_ip: u8,
+    sample_data_addr: bool,
+}
+
+fn scale_period(default_period: u64, density: Option<f64>) -> u64 {
+    match density {
+        None => default_period,
+        Some(d) => {
+            let scaled = default_period as f64 / d;
+            if scaled < 1.0 {
+                1
+            } else {
+                scaled as u64
+            }
+        }
+    }
+}
+
+/// Resolve the sampler from the optional focus preset. Survey = cycles/~1M/no
+/// PEBS. A focus preset supplies the event/period/precision; None if an event
+/// leader can't be resolved on this CPU (never silently falls back to cycles).
+fn resolve_sampler(focus: Option<FocusPreset>, density: Option<f64>) -> Option<SamplerCfg> {
+    let cycles_config = HW_CPU_CYCLES as u64;
+    let p = match focus {
+        None => {
+            return Some(SamplerCfg {
+                typ: sys::bindings::PERF_TYPE_HARDWARE,
+                config: cycles_config,
+                period: 1_000_003,
+                precise_ip: 0,
+                sample_data_addr: false,
+            })
+        }
+        Some(p) => p,
+    };
+    let s = focus_spec(p);
+    let period = scale_period(s.period, density);
+    match s.leader {
+        Leader::Cycles => Some(SamplerCfg {
+            typ: sys::bindings::PERF_TYPE_HARDWARE,
+            config: cycles_config,
+            period,
+            precise_ip: s.precise_ip,
+            sample_data_addr: false,
+        }),
+        Leader::Role(role) => {
+            let cfg = config_for_role(role)?;
+            Some(SamplerCfg {
+                typ: sys::bindings::PERF_TYPE_RAW,
+                config: cfg,
+                period,
+                precise_ip: s.precise_ip,
+                sample_data_addr: s.sample_data_addr,
+            })
+        }
+    }
+}
+
+struct SamplerHandle {
+    fd: i32,
+    link: *mut BpfLink,
+    precise_ip: u8,
+}
+
+/// Open the per-CPU sampler perf event AND attach on_tick to it, trying the
+/// requested precise_ip and falling back through lower levels as one unit
+/// (both the open and the BPF attach can reject a precise event).
+fn open_sampler(cpu: u32, cfg: &SamplerCfg, tick_prog: *mut BpfProgram) -> Option<SamplerHandle> {
+    let mut want = cfg.precise_ip;
+    loop {
+        let mut attr: sys::bindings::perf_event_attr = unsafe { std::mem::zeroed() };
+        attr.type_ = cfg.typ;
+        attr.size = std::mem::size_of::<sys::bindings::perf_event_attr>() as u32;
+        attr.config = cfg.config;
+        attr.__bindgen_anon_1.sample_period = cfg.period;
+        attr.set_precise_ip(want as u64);
+        // bpf_get_stack on a PEBS event needs the callchain sample (else -EPROTO).
+        if want > 0 {
+            attr.sample_type |= sys::bindings::PERF_SAMPLE_CALLCHAIN as u64;
+        }
+        // Data_LA only resolves on a precise event.
+        if cfg.sample_data_addr && want > 0 {
+            attr.sample_type |= sys::bindings::PERF_SAMPLE_ADDR as u64;
+        }
+        let rc = unsafe { sys::perf_event_open(&mut attr, -1, cpu as i32, -1, 0) };
+        if rc >= 0 {
+            let fd = rc as i32;
+            let link = unsafe { bpf_program__attach_perf_event(tick_prog, fd) };
+            if !link.is_null() {
+                return Some(SamplerHandle { fd, link, precise_ip: want });
+            }
+            unsafe { close(fd) }; // attach refused this event; retry lower
+        }
+        if want == 0 {
+            return None;
+        }
+        want -= 1;
+    }
+}

@@ -32,3 +32,7 @@ wholesym = "0.8.1"
 yaxpeax-arch = "0.3"
 yaxpeax-x86 = "2"
 yaxpeax-arm = "0.3"
+
+# perf_event_open ABI (structs + syscall) for the Linux BPF CPU collector.
+[target.'cfg(target_os = "linux")'.dependencies]
+perf-event-open-sys = "4"
