@@ -278,7 +278,10 @@ def install_rust(dep: BinaryDep, target_dir: str) -> bool:
     rust_dir = os.path.join(target_dir, "rust")
     stamp_path = os.path.join(target_dir, ".rust.stamp")
 
-    if os.path.exists(stamp_path) and os.path.isdir(rust_dir):
+    # clippy-driver must be present too, else an older install (rustc+cargo only)
+    # would be treated as up to date and `cargo clippy` would keep failing.
+    clippy_driver = os.path.join(rust_dir, "rustc", "bin", "clippy-driver")
+    if os.path.exists(stamp_path) and os.path.isdir(rust_dir) and os.path.exists(clippy_driver):
         with open(stamp_path) as f:
             if f.read().strip() == dep.version:
                 return True
@@ -313,6 +316,18 @@ def install_rust(dep: BinaryDep, target_dir: str) -> bool:
                 comp_dir = os.path.join(src_dir, component)
                 if os.path.exists(comp_dir):
                     shutil.copytree(comp_dir, os.path.join(rust_dir, component))
+
+            # clippy-driver + cargo-clippy land next to rustc (so clippy-driver
+            # finds librustc_driver via ../lib). From the same tarball as rustc,
+            # so their metadata SVHs match — a `cargo clippy` from a mismatched
+            # build rejects the freshly-compiled deps with E0514.
+            clippy_bin = os.path.join(src_dir, "clippy-preview", "bin")
+            if os.path.isdir(clippy_bin):
+                for exe in os.listdir(clippy_bin):
+                    shutil.copy2(
+                        os.path.join(clippy_bin, exe),
+                        os.path.join(rust_dir, "rustc", "bin", exe),
+                    )
 
             std_dirs = [d for d in os.listdir(src_dir) if d.startswith("rust-std-")]
             if not std_dirs:

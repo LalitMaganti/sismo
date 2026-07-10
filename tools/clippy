@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
+"""Run `cargo clippy -D warnings` across the workspace crates with the hermetic
+Rust toolchain (rustc + clippy-driver from third_party/bin) on PATH.
+
+Unlike `tools/cargo`, this does NOT force RUSTC / RUSTFLAGS=--sysroot: clippy-
+driver detects its own sysroot from its location and rejects an externally
+forced one (prelude errors), and forcing RUSTC makes it disagree with the rustc
+that compiled the deps (E0514). Putting the whole toolchain on PATH keeps it
+self-consistent.
+
+Usage: tools/clippy [extra cargo-clippy args]   (e.g. --fix)
+`-D warnings` is always appended, so any warning — including dead_code — fails.
+"""
+
+import os
+import subprocess
+import sys
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT_DIR)
+
+from python.tools.run_rust_binary import get_platform_dir
+
+# Crates that build (and thus clippy) on the Linux host. heap-preload is a
+# macOS cdylib but its lib still compiles for the host, so it lints too.
+CRATES = ["sismo-core", "sismo-cli", "sismo-sys", "sismo-run", "sismo-heap-preload"]
+
+
+def main() -> int:
+    os_dir, _ = get_platform_dir()
+    if os_dir is None:
+        print(f"OS not supported: {sys.platform}", file=sys.stderr)
+        return 1
+
+    rust_root = os.path.join(ROOT_DIR, "third_party", "bin", os_dir, "rust")
+    clippy_driver = os.path.join(rust_root, "rustc", "bin", "clippy-driver")
+    if not os.path.exists(clippy_driver):
+        print("clippy-driver not found — run tools/install-build-deps", file=sys.stderr)
+        return 1
+
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join(
+        [
+            os.path.join(rust_root, "rustc", "bin"),
+            os.path.join(rust_root, "cargo", "bin"),
+            env.get("PATH", ""),
+        ]
+    )
+    # Drop any forcing inherited from tools/cargo — it breaks clippy-driver.
+    env.pop("RUSTC", None)
+    env.pop("RUSTFLAGS", None)
+
+    extra = sys.argv[1:]
+    rc = 0
+    for crate in CRATES:
+        manifest = os.path.join(ROOT_DIR, "crates", crate, "Cargo.toml")
+        cmd = ["cargo", "clippy", "--manifest-path", manifest] + extra + ["--", "-D", "warnings"]
+        print("==>", " ".join(cmd), flush=True)
+        rc |= subprocess.call(cmd, env=env)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

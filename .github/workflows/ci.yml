@@ -52,3 +52,9 @@ jobs:
 
       - name: Build sismo-cli
         run: python3 tools/cargo --hermetic build --manifest-path crates/sismo-cli/Cargo.toml --profile dev
+
+      # Lint every non-Perfetto crate with `-D warnings`, so dead code and other
+      # clippy findings fail the build. Uses the hermetic clippy-driver via
+      # tools/clippy (not tools/cargo, whose forced sysroot breaks clippy).
+      - name: Clippy (-D warnings)
+        run: python3 tools/clippy
