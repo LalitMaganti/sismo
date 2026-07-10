@@ -16,8 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-// Perfetto C TrackEvent shim (src/c/sample_target_sdk.c), linked via the
-// rust-host build. All emit calls are no-ops until te_init connects.
+// Link sismo-sys for its native side effects only: its build script compiles
+// and links libsismo_cc_shims.a (which carries this bin's TrackEvent shim) plus
+// the Perfetto archive. Without this the rlib — and its native libs — get pruned.
+use sismo_sys as _;
+
+// Perfetto C TrackEvent shim (csrc/sample_target_sdk.c, compiled into
+// libsismo_cc_shims.a by sismo-sys). All emit calls are no-ops until te_init
+// connects.
 extern "C" {
     fn sismo_target_te_init();
     fn sismo_target_slice_begin(name: *const c_char);

@@ -9,6 +9,17 @@ name = "sismo-sys"
 version = "0.0.0"
 edition = "2021"
 publish = false
+# Declares that this crate's build script owns native linkage (the BPF object
+# and, under `perfetto-shim`, the Perfetto archive + C/C++ shims). Required for
+# the build script's `rustc-link-lib` directives to propagate to the binaries
+# that depend on this crate.
+links = "sismo_sys"
 
 [lib]
 doctest = false
+
+[features]
+# Compile + link the Perfetto C++ SDK and the C/C++ shims (csrc/*.cc). Enabled
+# by the `sismo` binary crate; off for plain sismo-core builds so `cargo test`
+# skips the expensive Perfetto compile.
+perfetto-shim = []
