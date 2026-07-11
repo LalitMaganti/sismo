@@ -95,31 +95,50 @@ fn encode_ftrace_config() -> Vec<u8> {
     w.bytes().to_vec()
 }
 
-fn encode_data_source_config(entry: &DataSourceEntry) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    match entry.kind {
-        KIND_TRACK_EVENT => {
-            w.write_string(DSC_NAME, b"track_event");
-            w.write_message(DSC_TRACK_EVENT_CONFIG, &encode_track_event_config());
-        }
-        KIND_LINUX_FTRACE => {
-            w.write_string(DSC_NAME, b"linux.ftrace");
-            w.write_message(DSC_FTRACE_CONFIG, &encode_ftrace_config());
-        }
-        _ => {
-            // sismo_vendor (any unrecognized kind is treated as vendor).
-            w.write_string(DSC_NAME, entry.name);
-            if !entry.sismo_config.is_empty() {
-                w.write_message(DSC_SISMO_CONFIG, entry.sismo_config);
-            }
-            if entry.protovm_memory_limit_kb > 0 {
-                let mut pvc = ProtoWriter::new();
-                pvc.write_uint32(1, entry.protovm_memory_limit_kb); // memory_limit_kb
-                w.write_message(DSC_PROTOVM_CONFIG, pvc.bytes());
-            }
-        }
+impl<'a> DataSourceEntry<'a> {
+    /// The perfetto built-in `track_event` data source (fixed config).
+    pub fn track_event() -> DataSourceEntry<'static> {
+        DataSourceEntry { kind: KIND_TRACK_EVENT, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
     }
-    w.bytes().to_vec()
+
+    /// The perfetto built-in `linux.ftrace` data source (fixed config).
+    pub fn linux_ftrace() -> DataSourceEntry<'static> {
+        DataSourceEntry { kind: KIND_LINUX_FTRACE, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
+    }
+
+    /// A sismo vendor data source named `name`, carrying `sismo_config` (field
+    /// 2000) and an optional ProtoVM `memory_limit_kb`.
+    pub fn sismo_vendor(name: &'a [u8], sismo_config: &'a [u8], protovm_memory_limit_kb: u32) -> DataSourceEntry<'a> {
+        DataSourceEntry { kind: KIND_SISMO_VENDOR, name, sismo_config, protovm_memory_limit_kb }
+    }
+
+    /// Encode this entry as a DataSourceConfig.
+    fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        match self.kind {
+            KIND_TRACK_EVENT => {
+                w.write_string(DSC_NAME, b"track_event");
+                w.write_message(DSC_TRACK_EVENT_CONFIG, &encode_track_event_config());
+            }
+            KIND_LINUX_FTRACE => {
+                w.write_string(DSC_NAME, b"linux.ftrace");
+                w.write_message(DSC_FTRACE_CONFIG, &encode_ftrace_config());
+            }
+            _ => {
+                // sismo_vendor (any unrecognized kind is treated as vendor).
+                w.write_string(DSC_NAME, self.name);
+                if !self.sismo_config.is_empty() {
+                    w.write_message(DSC_SISMO_CONFIG, self.sismo_config);
+                }
+                if self.protovm_memory_limit_kb > 0 {
+                    let mut pvc = ProtoWriter::new();
+                    pvc.write_uint32(1, self.protovm_memory_limit_kb); // memory_limit_kb
+                    w.write_message(DSC_PROTOVM_CONFIG, pvc.bytes());
+                }
+            }
+        }
+        w.bytes().to_vec()
+    }
 }
 
 fn encode_buffer_config(size_kb: u32, fill_policy: u32) -> Vec<u8> {
@@ -153,7 +172,7 @@ pub fn encode_trace_config(
 
     // data_sources (field 2); each DataSource.config = field 1.
     for entry in entries {
-        let dsc = encode_data_source_config(entry);
+        let dsc = entry.encode();
         let mut ds = ProtoWriter::new();
         ds.write_message(1, &dsc);
         w.write_message(2, ds.bytes());

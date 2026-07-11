@@ -20,11 +20,7 @@
 #[cfg(target_os = "macos")]
 use sismo_core::proto::{ProtoReader, WireValue};
 use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
-use sismo_core::proto::session_config::{
-    encode_trace_config, DataSourceEntry, KIND_SISMO_VENDOR, KIND_TRACK_EVENT, MODE_FILE, MODE_RING,
-};
-#[cfg(target_os = "linux")]
-use sismo_core::proto::session_config::KIND_LINUX_FTRACE;
+use sismo_core::proto::session_config::{encode_trace_config, DataSourceEntry, MODE_FILE, MODE_RING};
 #[cfg(target_os = "macos")]
 use sismo_core::proto::sismo_config;
 use sismo_core::sismo_paths::{
@@ -274,16 +270,6 @@ fn wait_for_external_data_sources(session: *mut ConsumerSession, expected: &[&st
     }
 }
 
-// ---- DataSourceEntry builders ----------------------------------------------
-
-fn ds_track_event() -> DataSourceEntry<'static> {
-    DataSourceEntry { kind: KIND_TRACK_EVENT, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
-}
-
-fn ds_sismo_vendor<'a>(name: &'a [u8], cfg: &'a [u8], protovm_kb: u32) -> DataSourceEntry<'a> {
-    DataSourceEntry { kind: KIND_SISMO_VENDOR, name, sismo_config: cfg, protovm_memory_limit_kb: protovm_kb }
-}
-
 // ---- Entry point -----------------------------------------------------------
 
 /// `sismo record` on macOS. `argv[0..argc]` are the full process args. Parses
@@ -482,23 +468,23 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     let mut entries: Vec<DataSourceEntry> = Vec::new();
     let mut external_names: Vec<&str> = Vec::new();
     if !no_instrumentation {
-        entries.push(ds_track_event());
+        entries.push(DataSourceEntry::track_event());
     }
     if heap.is_some() || heap_mode == SourceMode::External {
-        entries.push(ds_sismo_vendor(b"sismo.heap", &heap_cfg, 0));
+        entries.push(DataSourceEntry::sismo_vendor(b"sismo.heap", &heap_cfg, 0));
         if heap_mode == SourceMode::External {
             external_names.push("sismo.heap");
         }
     }
     if cpu.is_some() || cpu_mode == SourceMode::External {
-        entries.push(ds_sismo_vendor(b"sismo.macos_cpu_samples", &cpu_cfg, 0));
+        entries.push(DataSourceEntry::sismo_vendor(b"sismo.macos_cpu_samples", &cpu_cfg, 0));
         if cpu_mode == SourceMode::External {
             external_names.push("sismo.macos_cpu_samples");
         }
     }
     if sched.is_some() || sched_mode == SourceMode::External {
         // ProtoVM DST for GenericKernelProcessTree.
-        entries.push(ds_sismo_vendor(b"sismo.macos_sched", &sched_cfg, 4 * 1024));
+        entries.push(DataSourceEntry::sismo_vendor(b"sismo.macos_sched", &sched_cfg, 4 * 1024));
         if sched_mode == SourceMode::External {
             external_names.push("sismo.macos_sched");
         }
@@ -663,10 +649,6 @@ use sismo_core::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, s
 #[cfg(target_os = "linux")]
 use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
 
-#[cfg(target_os = "linux")]
-fn ds_linux_ftrace() -> DataSourceEntry<'static> {
-    DataSourceEntry { kind: KIND_LINUX_FTRACE, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
-}
 
 #[cfg(target_os = "linux")]
 fn run_linux(config: &RecordConfig) -> c_int {
@@ -793,13 +775,13 @@ fn run_linux(config: &RecordConfig) -> c_int {
     // Data source entries.
     let mut entries: Vec<DataSourceEntry> = Vec::new();
     if !no_instrumentation {
-        entries.push(ds_track_event());
+        entries.push(DataSourceEntry::track_event());
     }
     if !probes.is_null() {
-        entries.push(ds_linux_ftrace());
+        entries.push(DataSourceEntry::linux_ftrace());
     }
     if had_bpf {
-        entries.push(ds_sismo_vendor(b"sismo.linux_cpu_samples", b"", 0));
+        entries.push(DataSourceEntry::sismo_vendor(b"sismo.linux_cpu_samples", b"", 0));
     }
     if entries.is_empty() {
         eprintln!("sismo record: no data sources enabled — recording would be empty. Drop one of the --no-* flags.");
