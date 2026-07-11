@@ -56,9 +56,10 @@ const MAX_NEW_PROCESSES: usize = 128;
 
 use crate::sched::kdebug::{kdebug_drain, kdebug_read_thread_map, kdebug_start, kdebug_teardown};
 
+// libc's mach_timebase_info struct is deprecated (points at the mach2 crate),
+// so keep this one hand-rolled; clock_gettime comes from libc.
 extern "C" {
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
-    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
 }
 
 #[repr(C)]
@@ -66,16 +67,10 @@ struct MachTimebaseInfo {
     numer: u32,
     denom: u32,
 }
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-const CLOCK_MONOTONIC: i32 = 6;
 
 fn now_ns() -> u64 {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
