@@ -11,7 +11,7 @@
 //! C++ SDK shim — so this module keeps no dependency on `sismo_ds_emit` and
 //! `cargo test` still links. macOS/arm64 only; gated in lib.rs.
 
-use crate::proto::{write_perf_sample, ProtoWriter};
+use crate::proto::ProtoWriter;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
 
 type MachPort = u32;
@@ -173,8 +173,7 @@ pub fn sample_thread(
     // TracePacket body: timestamp + PerfSample (leaf-only: callstack_iid = 0).
     let mut w = ProtoWriter::new();
     w.write_uint64(8, now_monotonic_ns());
-    write_perf_sample(
-        &mut w,
+    w.write_perf_sample(
         TP_FIELD_PERF_SAMPLE,
         0,        // cpu — core not tracked
         pid,

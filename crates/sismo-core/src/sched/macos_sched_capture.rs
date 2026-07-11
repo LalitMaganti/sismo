@@ -14,7 +14,7 @@
 //! macOS only; gated in lib.rs.
 
 use crate::sched::proc_info::{parent_pid, pid_path, thread_name};
-use crate::proto::{write_kernel_task_state_event, ProtoWriter};
+use crate::proto::ProtoWriter;
 use crate::proto::sched_protos::{
     encode_kernel_process_tree, macos_sched_vm_program, ProcessC, ThreadC,
 };
@@ -499,8 +499,7 @@ fn emit_task_state(slot: u32, ts_ns: u64, cpu: i32, comm: &[u8], tid: i64, state
     if ts_ns != 0 {
         w.write_uint64(8, ts_ns);
     }
-    write_kernel_task_state_event(
-        &mut w,
+    w.write_kernel_task_state_event(
         TP_FIELD_GENERIC_KERNEL_TASK_STATE,
         cpu,
         comm,

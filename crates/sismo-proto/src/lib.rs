@@ -231,118 +231,120 @@ mod reader_tests {
 }
 
 
-/// Write a TracePacket carrying PerfSampleDefaults into `w`, ready to hand to
-/// sismo_ds_emit. Replaces the encodePerfSampleDefaults + encodeTracePacket
-/// Defaults + encodeTracePacketBody chain in linux_bpf_capture's emitDefaults.
-///
-/// Layout:
-///   TracePacket {
-///     sequence_flags = 13 (omitted if 0),
-///     trace_packet_defaults = 59 : TracePacketDefaults {
-///       timestamp_clock_id = 58 (omitted if 0),
-///       perf_sample_defaults = 12 : PerfSampleDefaults {
-///         timebase = 1 : Timebase { frequency = 2 (omitted if 0), name = 10 },
-///         followers = 4 (repeated) : FollowerEvent { name = 4 },
-///         sample_scope = 5 (omitted if 0),
-///       },
-///     },
-///   }
-pub fn write_perf_defaults_packet(
-    w: &mut ProtoWriter,
-    timebase_name: &[u8],
-    timebase_freq: u64,
-    followers: &[&[u8]],
-    sample_scope: u32,
-    timestamp_clock_id: u32,
-    sequence_flags: u32,
-) {
-    if sequence_flags != 0 {
-        w.write_uint32(13, sequence_flags);
-    }
-    w.message(59, |tpd| {
-        if timestamp_clock_id != 0 {
-            tpd.write_uint32(58, timestamp_clock_id);
+impl ProtoWriter {
+    /// Write a TracePacket carrying PerfSampleDefaults, ready to hand to
+    /// sismo_ds_emit.
+    ///
+    /// Layout:
+    ///   TracePacket {
+    ///     sequence_flags = 13 (omitted if 0),
+    ///     trace_packet_defaults = 59 : TracePacketDefaults {
+    ///       timestamp_clock_id = 58 (omitted if 0),
+    ///       perf_sample_defaults = 12 : PerfSampleDefaults {
+    ///         timebase = 1 : Timebase { frequency = 2 (omitted if 0), name = 10 },
+    ///         followers = 4 (repeated) : FollowerEvent { name = 4 },
+    ///         sample_scope = 5 (omitted if 0),
+    ///       },
+    ///     },
+    ///   }
+    pub fn write_perf_defaults_packet(
+        &mut self,
+        timebase_name: &[u8],
+        timebase_freq: u64,
+        followers: &[&[u8]],
+        sample_scope: u32,
+        timestamp_clock_id: u32,
+        sequence_flags: u32,
+    ) {
+        if sequence_flags != 0 {
+            self.write_uint32(13, sequence_flags);
         }
-        tpd.message(12, |psd| {
-            psd.message(1, |tb| {
-                if timebase_freq != 0 {
-                    tb.write_uint64(2, timebase_freq);
-                }
-                tb.write_string(10, timebase_name);
-            });
-            for f in followers {
-                psd.message(4, |fe| fe.write_string(4, f));
+        self.message(59, |tpd| {
+            if timestamp_clock_id != 0 {
+                tpd.write_uint32(58, timestamp_clock_id);
             }
-            if sample_scope != 0 {
-                psd.write_uint32(5, sample_scope);
+            tpd.message(12, |psd| {
+                psd.message(1, |tb| {
+                    if timebase_freq != 0 {
+                        tb.write_uint64(2, timebase_freq);
+                    }
+                    tb.write_string(10, timebase_name);
+                });
+                for f in followers {
+                    psd.message(4, |fe| fe.write_string(4, f));
+                }
+                if sample_scope != 0 {
+                    psd.write_uint32(5, sample_scope);
+                }
+            });
+        });
+    }
+
+    /// Write a PerfSample as length-delimited field `field` of the current
+    /// message. PerfSample fields: cpu=1, pid=2, tid=3, callstack_iid=4,
+    /// timebase_count=6, follower_counts=7 (repeated), data_address=20,
+    /// data_symbol=21 (the last two are sismo extensions). Fields are omitted
+    /// when 0 / absent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_perf_sample(
+        &mut self,
+        field: u32,
+        cpu: u32,
+        pid: u32,
+        tid: u32,
+        callstack_iid: u64,
+        timebase_count: u64,
+        follower_counts: &[u64],
+        data_address: u64,
+        data_symbol: Option<&[u8]>,
+    ) {
+        self.message(field, |m| {
+            m.write_uint32(1, cpu);
+            m.write_uint32(2, pid);
+            m.write_uint32(3, tid);
+            if callstack_iid != 0 {
+                m.write_uint64(4, callstack_iid);
+            }
+            if timebase_count != 0 {
+                m.write_uint64(6, timebase_count);
+            }
+            for &fc in follower_counts {
+                m.write_uint64(7, fc);
+            }
+            if data_address != 0 {
+                m.write_uint64(20, data_address);
+            }
+            if let Some(sym) = data_symbol {
+                m.write_string(21, sym);
             }
         });
-    });
-}
+    }
 
-/// Write a PerfSample as length-delimited field `field` of the current message.
-/// PerfSample fields: cpu=1, pid=2, tid=3, callstack_iid=4, timebase_count=6,
-/// follower_counts=7 (repeated), data_address=20, data_symbol=21 (the last two
-/// are sismo extensions). Fields are omitted when 0 / absent.
-#[allow(clippy::too_many_arguments)]
-pub fn write_perf_sample(
-    w: &mut ProtoWriter,
-    field: u32,
-    cpu: u32,
-    pid: u32,
-    tid: u32,
-    callstack_iid: u64,
-    timebase_count: u64,
-    follower_counts: &[u64],
-    data_address: u64,
-    data_symbol: Option<&[u8]>,
-) {
-    w.message(field, |m| {
-        m.write_uint32(1, cpu);
-        m.write_uint32(2, pid);
-        m.write_uint32(3, tid);
-        if callstack_iid != 0 {
-            m.write_uint64(4, callstack_iid);
-        }
-        if timebase_count != 0 {
-            m.write_uint64(6, timebase_count);
-        }
-        for &fc in follower_counts {
-            m.write_uint64(7, fc);
-        }
-        if data_address != 0 {
-            m.write_uint64(20, data_address);
-        }
-        if let Some(sym) = data_symbol {
-            m.write_string(21, sym);
-        }
-    });
-}
-
-/// Write a GenericKernelTaskStateEvent as length-delimited field `field` of the
-/// current message. Event fields: cpu=1 (int32, always written), comm=2 (string,
-/// capped at 64 bytes, omitted when empty), tid=3 (int64), state=4 (enum/uint32),
-/// prio=5 (int32).
-pub fn write_kernel_task_state_event(
-    w: &mut ProtoWriter,
-    field: u32,
-    cpu: i32,
-    comm: &[u8],
-    tid: i64,
-    state: u32,
-    prio: i32,
-) {
-    w.message(field, |m| {
-        m.write_int32(1, cpu);
-        if !comm.is_empty() {
-            // Cap comm at 64 bytes (Mach thread name max in practice).
-            let capped = comm.len().min(64);
-            m.write_string(2, &comm[..capped]);
-        }
-        m.write_int64(3, tid);
-        m.write_uint32(4, state);
-        m.write_int32(5, prio);
-    });
+    /// Write a GenericKernelTaskStateEvent as length-delimited field `field` of
+    /// the current message. Event fields: cpu=1 (int32, always written), comm=2
+    /// (string, capped at 64 bytes, omitted when empty), tid=3 (int64),
+    /// state=4 (enum/uint32), prio=5 (int32).
+    pub fn write_kernel_task_state_event(
+        &mut self,
+        field: u32,
+        cpu: i32,
+        comm: &[u8],
+        tid: i64,
+        state: u32,
+        prio: i32,
+    ) {
+        self.message(field, |m| {
+            m.write_int32(1, cpu);
+            if !comm.is_empty() {
+                // Cap comm at 64 bytes (Mach thread name max in practice).
+                let capped = comm.len().min(64);
+                m.write_string(2, &comm[..capped]);
+            }
+            m.write_int64(3, tid);
+            m.write_uint32(4, state);
+            m.write_int32(5, prio);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -390,7 +392,7 @@ mod tests {
     fn perf_sample_fields_round_trip() {
         // cpu=1, pid=2, tid=3, callstack_iid=5; no timebase/followers/data.
         let mut w = ProtoWriter::new();
-        write_perf_sample(&mut w, 66, 1, 2, 3, 5, 0, &[], 0, None);
+        w.write_perf_sample(66, 1, 2, 3, 5, 0, &[], 0, None);
         let ps = sub(w.bytes(), 66);
         assert_eq!(varint(ps, 1), 1);
         assert_eq!(varint(ps, 2), 2);
@@ -403,7 +405,7 @@ mod tests {
     #[test]
     fn perf_sample_followers_and_data_symbol() {
         let mut w = ProtoWriter::new();
-        write_perf_sample(&mut w, 66, 0, 0, 0, 0, 0, &[100, 200], 0xdead, Some(b"[heap]"));
+        w.write_perf_sample(66, 0, 0, 0, 0, 0, &[100, 200], 0xdead, Some(b"[heap]"));
         let ps = sub(w.bytes(), 66);
         let follower_counts: Vec<u64> = ProtoReader::new(ps)
             .filter_map(|(f, v)| match (f, v) {
@@ -420,7 +422,7 @@ mod tests {
     fn kernel_task_state_event_fields_round_trip() {
         // cpu=3, comm="foo", tid=42, state=3 (running), prio=31.
         let mut w = ProtoWriter::new();
-        write_kernel_task_state_event(&mut w, 117, 3, b"foo", 42, 3, 31);
+        w.write_kernel_task_state_event(117, 3, b"foo", 42, 3, 31);
         let ev = sub(w.bytes(), 117);
         assert_eq!(varint(ev, 1), 3);
         assert_eq!(sub(ev, 2), b"foo");
@@ -434,7 +436,7 @@ mod tests {
         // cpu=-1 must encode as the 5-byte u32 bitcast (FF FF FF FF 0F), not
         // the 10-byte 64-bit sign-extension. comm empty -> field 2 omitted.
         let mut w = ProtoWriter::new();
-        write_kernel_task_state_event(&mut w, 117, -1, b"", 0, 0, 0);
+        w.write_kernel_task_state_event(117, -1, b"", 0, 0, 0);
         let ev = sub(w.bytes(), 117);
         // cpu(1)=-1: 08 FF FF FF FF 0F (5-byte varint), then tid/state/prio=0.
         assert_eq!(&ev[..6], [0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
@@ -445,7 +447,7 @@ mod tests {
     #[test]
     fn kernel_task_state_event_comm_capped_at_64() {
         let mut w = ProtoWriter::new();
-        write_kernel_task_state_event(&mut w, 117, 0, &[b'a'; 100], 0, 0, 0);
+        w.write_kernel_task_state_event(117, 0, &[b'a'; 100], 0, 0, 0);
         assert_eq!(sub(sub(w.bytes(), 117), 2).len(), 64);
     }
 
@@ -454,7 +456,7 @@ mod tests {
         // timebase name "x", no freq, no followers, scope=thread(2),
         // clock=MONOTONIC(3), seq=INCREMENTAL_STATE_CLEARED(1).
         let mut w = ProtoWriter::new();
-        write_perf_defaults_packet(&mut w, b"x", 0, &[], 2, 3, 1);
+        w.write_perf_defaults_packet(b"x", 0, &[], 2, 3, 1);
         assert_eq!(varint(w.bytes(), 13), 1); // sequence_flags
         let tpd = sub(w.bytes(), 59);
         assert_eq!(varint(tpd, 58), 3); // timestamp_clock_id
@@ -470,7 +472,7 @@ mod tests {
     fn perf_defaults_packet_with_followers() {
         let followers: [&[u8]; 2] = [b"a", b"bb"];
         let mut w = ProtoWriter::new();
-        write_perf_defaults_packet(&mut w, b"tb", 0, &followers, 2, 3, 1);
+        w.write_perf_defaults_packet(b"tb", 0, &followers, 2, 3, 1);
         let psd = sub(sub(w.bytes(), 59), 12);
         let names: Vec<Vec<u8>> = ProtoReader::new(psd)
             .filter_map(|(f, v)| match (f, v) {

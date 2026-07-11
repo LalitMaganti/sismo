@@ -678,7 +678,6 @@ impl Interner {
 
 use crate::symbolize::data_regions::DataRegions;
 use crate::symbolize::proc_maps::ProcMaps;
-use crate::proto::{write_perf_defaults_packet, write_perf_sample};
 use crate::ffi::sismo_ds_emit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -854,8 +853,7 @@ impl Capture {
             }
         }
         let mut w = ProtoWriter::new();
-        write_perf_defaults_packet(
-            &mut w,
+        w.write_perf_defaults_packet(
             timebase_name,
             0,
             &followers,
@@ -898,8 +896,7 @@ impl Capture {
         if !idw.bytes().is_empty() {
             tp.write_message(12, idw.bytes());
         }
-        write_perf_sample(
-            &mut tp,
+        tp.write_perf_sample(
             TP_FIELD_PERF_SAMPLE,
             rec.hdr.cpu,
             rec.hdr.pid,
