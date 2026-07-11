@@ -18,7 +18,7 @@ type MachPort = u32;
 const KERN_SUCCESS: i32 = 0;
 
 // Mach flavors / counts.
-const THREAD_BASIC_INFO: i32 = 3;
+const THREAD_BASIC_INFO: u32 = 3;
 const THREAD_BASIC_INFO_COUNT: u32 = 10; // sizeof(thread_basic_info_data_t)/4 = 40/4
 const ARM_THREAD_STATE64: i32 = 6;
 const ARM_THREAD_STATE64_COUNT: u32 = 68; // sizeof(arm_thread_state64_t)/4 = 272/4
@@ -37,18 +37,12 @@ const OFF_USER_USEC: usize = 4;
 const OFF_SYS_SEC: usize = 8;
 const OFF_SYS_USEC: usize = 12;
 
-const CLOCK_MONOTONIC: i32 = 6; // <time.h> on Darwin
 const TP_FIELD_PERF_SAMPLE: u32 = 66;
 const MAX_FRAMES: usize = 32;
 
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
+// libc lacks thread_suspend/resume/get_state + mach_vm_read_overwrite; keep
+// those hand-rolled. thread_info + clock_gettime come from libc.
 extern "C" {
-    fn thread_info(target: MachPort, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
     fn thread_suspend(target: MachPort) -> i32;
     fn thread_resume(target: MachPort) -> i32;
     fn thread_get_state(target: MachPort, flavor: i32, state: *mut i32, count: *mut u32) -> i32;
@@ -59,7 +53,6 @@ extern "C" {
         data: u64,
         out_size: *mut u64,
     ) -> i32;
-    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
 }
 
 fn read_u64(b: &[u8], off: usize) -> u64 {
@@ -76,8 +69,8 @@ fn strip_pac(v: u64) -> u64 {
 }
 
 fn now_monotonic_ns() -> u64 {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -85,7 +78,7 @@ fn now_monotonic_ns() -> u64 {
 unsafe fn thread_cpu_time_us(thread: MachPort) -> Option<u64> {
     let mut buf = [0u8; 40];
     let mut count = THREAD_BASIC_INFO_COUNT;
-    let rc = unsafe { thread_info(thread, THREAD_BASIC_INFO, buf.as_mut_ptr() as *mut i32, &mut count) };
+    let rc = unsafe { libc::thread_info(thread, THREAD_BASIC_INFO, buf.as_mut_ptr() as *mut i32, &mut count) };
     if rc != KERN_SUCCESS {
         return None;
     }
