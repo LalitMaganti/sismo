@@ -165,6 +165,38 @@ fn kqueue_exit_watch(pid: c_int, write_fd: c_int) {
     unsafe { close(kq) };
 }
 
+/// Block on the self-pipe `rd` until the workload exits ('X') or a stop signal
+/// arrives ('I' SIGINT / 'T' --duration). For a spawned workload a stop signal
+/// SIGTERMs it and the loop keeps waiting for its 'X'; for an attached pid it
+/// just ends recording, leaving the target running.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_workload_exit(rd: c_int, target_pid: c_int, is_attach: bool) {
+    let mut read_buf = [0u8; 16];
+    let mut workload_done = false;
+    while !workload_done {
+        let n = unsafe { read(rd, read_buf.as_mut_ptr() as *mut c_void, read_buf.len()) };
+        if n <= 0 {
+            continue;
+        }
+        for &b in &read_buf[..n as usize] {
+            match b {
+                b'I' | b'T' => {
+                    let reason = if b == b'I' { "SIGINT" } else { "--duration reached" };
+                    if is_attach {
+                        eprintln!("sismo record: {reason} — stopping recording (attached pid={target_pid} keeps running)");
+                        workload_done = true;
+                    } else {
+                        eprintln!("sismo record: {reason} — sending SIGTERM to workload pid={target_pid}");
+                        unsafe { kill(target_pid, SIGTERM) };
+                    }
+                }
+                b'X' => workload_done = true,
+                _ => {}
+            }
+        }
+    }
+}
+
 /// --duration timer: sleep `seconds` (looping over EINTR) then fire 'T'.
 fn duration_timer(seconds: c_uint, write_fd: c_int) {
     let mut remaining = Timespec { tv_sec: seconds as i64, tv_nsec: 0 };
@@ -561,39 +593,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         std::thread::spawn(move || duration_timer(secs, wr));
     }
 
-    // Main wait loop.
-    let mut read_buf = [0u8; 16];
-    let mut workload_done = false;
-    while !workload_done {
-        let n = unsafe { read(rd, read_buf.as_mut_ptr() as *mut c_void, read_buf.len()) };
-        if n <= 0 {
-            continue;
-        }
-        for &b in &read_buf[..n as usize] {
-            match b {
-                b'I' => {
-                    if !is_attach {
-                        eprintln!("sismo record: SIGINT — sending SIGTERM to workload pid={target_pid}");
-                        unsafe { kill(target_pid, SIGTERM) };
-                    } else {
-                        eprintln!("sismo record: SIGINT — stopping recording (attached pid={target_pid} keeps running)");
-                        workload_done = true;
-                    }
-                }
-                b'T' => {
-                    if !is_attach {
-                        eprintln!("sismo record: --duration reached — sending SIGTERM to workload pid={target_pid}");
-                        unsafe { kill(target_pid, SIGTERM) };
-                    } else {
-                        eprintln!("sismo record: --duration reached — stopping recording (attached pid={target_pid} keeps running)");
-                        workload_done = true;
-                    }
-                }
-                b'X' => workload_done = true,
-                _ => {}
-            }
-        }
-    }
+    wait_for_workload_exit(rd, target_pid, is_attach);
 
     // Stop the session.
     unsafe { sismo_consumer_session_stop_blocking(session) };
@@ -868,28 +868,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
         std::thread::spawn(move || duration_timer(secs, wr));
     }
 
-    let mut read_buf = [0u8; 16];
-    let mut workload_done = false;
-    while !workload_done {
-        let n = unsafe { read(rd, read_buf.as_mut_ptr() as *mut c_void, read_buf.len()) };
-        if n <= 0 {
-            continue;
-        }
-        for &b in &read_buf[..n as usize] {
-            match b {
-                b'I' => {
-                    eprintln!("sismo record: SIGINT — sending SIGTERM to workload pid={target_pid}");
-                    unsafe { kill(target_pid, SIGTERM) };
-                }
-                b'T' => {
-                    eprintln!("sismo record: --duration reached — sending SIGTERM to workload pid={target_pid}");
-                    unsafe { kill(target_pid, SIGTERM) };
-                }
-                b'X' => workload_done = true,
-                _ => {}
-            }
-        }
-    }
+    wait_for_workload_exit(rd, target_pid, false);
 
     unsafe { sismo_consumer_session_stop_blocking(session) };
     if flight_recorder {
