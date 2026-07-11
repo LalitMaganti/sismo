@@ -36,7 +36,7 @@ import {findNode, type SismoNav, subpageToNav} from './nav_state';
 import {renderFocusPage} from './focus/focus_page';
 import {loadingBody} from './page_common';
 import {CpuTabsView} from './cpu/cpu_tabs';
-import {LatencyView} from './views/latency_view';
+import {LatencyTabsView} from './latency/latency_tabs';
 import {renderMemoryView} from './views/memory_view';
 
 interface SismoPageAttrs {
@@ -139,7 +139,9 @@ export class SismoPage implements m.ClassComponent<SismoPageAttrs> {
         // under the header divider; the tabs pad their own content.
         return m(CpuTabsView, {trace, priv: privileged});
       case 'latency':
-        return m('.pf-sismo-page__body', m(LatencyView, {trace, privileged}));
+        // Full-width like CPU: the tab bar sits flush under the header divider
+        // and the tabs pad their own content.
+        return m(LatencyTabsView, {trace, priv: privileged});
       case 'memory':
         return m('.pf-sismo-page__body', renderMemoryView());
     }
