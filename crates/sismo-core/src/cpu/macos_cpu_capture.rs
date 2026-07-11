@@ -80,7 +80,7 @@ use crate::worker_sdk::Event;
 // (no FFI round-trip): descriptor encoding, unwinder lifecycle, module loading,
 // and per-sample capture.
 use crate::symbolize::dyld_images::load_target_modules;
-use crate::cpu::mach_sampler::sismo_cpu_sample_thread;
+use crate::cpu::mach_sampler::sample_thread;
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::unwinder::Unwinder;
 
@@ -295,7 +295,7 @@ impl CpuCapture {
         &self,
         task: MachPort,
         thread: MachPort,
-        unwinder: *mut Unwinder,
+        unwinder: &mut Unwinder,
         pid: u32,
         slot: u32,
         states: &mut std::collections::HashMap<MachPort, (u64, u64)>,
@@ -308,29 +308,13 @@ impl CpuCapture {
         });
         let (tid, last_cpu_us) = *entry;
 
-        let mut new_cpu_us = last_cpu_us;
-        let mut active = false;
-        let mut packet = [0u8; 4160];
-        let packet_len = unsafe {
-            sismo_cpu_sample_thread(
-                task,
-                thread,
-                unwinder,
-                pid,
-                tid,
-                last_cpu_us,
-                &mut new_cpu_us,
-                &mut active,
-                packet.as_mut_ptr(),
-                packet.len(),
-            )
-        };
-        entry.1 = new_cpu_us;
-        if active {
+        let sample = sample_thread(task, thread, unwinder, pid, tid, last_cpu_us);
+        entry.1 = sample.new_cpu_us;
+        if sample.active {
             self.active_samples.fetch_add(1, Ordering::Relaxed);
         }
-        if packet_len != 0 {
-            unsafe { sismo_ds_emit(slot, packet.as_ptr(), packet_len) };
+        if let Some(packet) = sample.packet {
+            unsafe { sismo_ds_emit(slot, packet.as_ptr(), packet.len()) };
         }
     }
 }

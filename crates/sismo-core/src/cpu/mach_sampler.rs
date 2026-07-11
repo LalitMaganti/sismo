@@ -95,41 +95,42 @@ unsafe fn thread_cpu_time_us(thread: MachPort) -> Option<u64> {
     Some(us(OFF_USER_SEC, OFF_USER_USEC) + us(OFF_SYS_SEC, OFF_SYS_USEC))
 }
 
-/// Sample one thread. Writes the thread's current CPU-time to `out_new_cpu_us`
-/// (so the caller can track the per-thread delta) and sets `out_active` true
-/// iff the thread ran since `last_cpu_us`. For an active thread, builds a
-/// PerfSample TracePacket body into `out_packet[..cap]` and returns its length;
-/// returns 0 (no packet) for an idle thread or any Mach failure.
-///
-/// # Safety
-/// `unwinder` valid; `out_*` writable; `out_packet` writable for `cap`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_cpu_sample_thread(
+/// The outcome of sampling one thread.
+pub struct ThreadSample {
+    /// The thread's current CPU-time (µs); the caller tracks the per-thread
+    /// delta from it. Falls back to `last_cpu_us` when the read fails.
+    pub new_cpu_us: u64,
+    /// True iff the thread ran since `last_cpu_us`.
+    pub active: bool,
+    /// The PerfSample TracePacket body, present only for an active thread that
+    /// suspended and unwound cleanly.
+    pub packet: Option<Vec<u8>>,
+}
+
+/// Sample one thread: read its CPU-time, and for a thread that ran since
+/// `last_cpu_us`, suspend it, unwind its stack, and build a PerfSample
+/// TracePacket body.
+pub fn sample_thread(
     task: MachPort,
     thread: MachPort,
-    unwinder: *mut Unwinder,
+    unwinder: &mut Unwinder,
     pid: u32,
     tid: u64,
     last_cpu_us: u64,
-    out_new_cpu_us: *mut u64,
-    out_active: *mut bool,
-    out_packet: *mut u8,
-    out_packet_cap: usize,
-) -> usize {
-    unsafe { *out_active = false };
-
+) -> ThreadSample {
     let cpu_now = match unsafe { thread_cpu_time_us(thread) } {
         Some(c) => c,
-        None => return 0,
+        None => return ThreadSample { new_cpu_us: last_cpu_us, active: false, packet: None },
     };
-    unsafe { *out_new_cpu_us = cpu_now };
     if cpu_now == last_cpu_us {
-        return 0; // idle — no point unwinding the same stack
+        // idle — no point unwinding the same stack
+        return ThreadSample { new_cpu_us: cpu_now, active: false, packet: None };
     }
-    unsafe { *out_active = true };
+
+    let active = |packet| ThreadSample { new_cpu_us: cpu_now, active: true, packet };
 
     if unsafe { thread_suspend(thread) } != KERN_SUCCESS {
-        return 0;
+        return active(None);
     }
 
     let mut state = [0u8; ARM_THREAD_STATE64_SIZE];
@@ -139,7 +140,7 @@ pub unsafe extern "C" fn sismo_cpu_sample_thread(
     };
     if rc != KERN_SUCCESS {
         unsafe { thread_resume(thread) };
-        return 0;
+        return active(None);
     }
 
     let pc = strip_pac(read_u64(&state, OFF_PC));
@@ -150,7 +151,7 @@ pub unsafe extern "C" fn sismo_cpu_sample_thread(
     // Walk the stack (reading target memory via mach_vm_read). The result isn't
     // interned into a callstack yet — leaf-only samples for now — but the walk
     // is kept so the hot path matches production and is ready for interning.
-    let _pcs = unsafe { &mut *unwinder }.walk(
+    let _pcs = unwinder.walk(
         StackRegs { pc, fp, lr, sp },
         |addr| {
             let mut val: u64 = 0;
@@ -184,14 +185,7 @@ pub unsafe extern "C" fn sismo_cpu_sample_thread(
         0,        // data_address
         None,     // data_symbol
     );
-    let packet = w.bytes();
-    if packet.len() > out_packet_cap {
-        return 0;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(packet.as_ptr(), out_packet, packet.len());
-    }
-    packet.len()
+    active(Some(w.bytes().to_vec()))
 }
 
 #[cfg(test)]
