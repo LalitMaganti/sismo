@@ -72,8 +72,11 @@ fn clap_density(s: &str) -> Result<f64, String> {
     }
 }
 
-const DEFAULT_BUFFER_KB: u32 = 128 * 1024;
-const DEFAULT_OUTPUT: &str = "./sismo.pftrace";
+/// Default rolling ring buffer for the dump-on-exit mode (the default).
+const RING_BUFFER_KB: u32 = 256 * 1024;
+/// In-flight buffer for `--long-trace` streaming to disk (flushed continuously,
+/// so it need not hold the whole trace).
+const STREAM_BUFFER_KB: u32 = 128 * 1024;
 
 // ---- Parsed + resolved args ------------------------------------------------
 
@@ -91,7 +94,7 @@ pub enum SourceMode {
 /// into per-source modes and enforces the cross-flag rules.
 #[derive(Args, Debug)]
 #[command(override_usage = "\
-sismo record [--output <path>] [--duration <dur>] [--flight-recorder [--buffer <size>]]\n         \
+sismo record [--output <path>] [--duration <dur>] [--long-trace] [--buffer <size>]\n         \
 [--no-instrumentation] [--no-sched|--external-sched] [--no-cpu|--external-cpu]\n         \
 [--no-heap|--external-heap] [--all-external] [--focus <preset>] [--sample-density <x>]\n         \
 (--pid <pid> | <command> [args...])")]
@@ -101,7 +104,7 @@ pub struct RecordArgs {
     #[arg(long, value_parser = clap_duration)]
     duration: Option<u32>,
     #[arg(long)]
-    flight_recorder: bool,
+    long_trace: bool,
     #[arg(long, value_parser = clap_buffer)]
     buffer: Option<u32>,
     #[arg(long)]
@@ -134,12 +137,15 @@ pub struct RecordArgs {
 
 /// Fully-resolved `sismo record` config, consumed by both runners.
 pub struct RecordConfig {
-    pub output: String,
+    /// Explicit `--output`, or None to default to a timestamped path at record time.
+    pub output: Option<String>,
     /// The workload command + args; empty when attaching via `--pid`.
     pub workload: Vec<String>,
     pub attach_pid: Option<i32>,
     pub duration_secs: Option<u32>,
-    pub flight_recorder: bool,
+    /// Stream continuously to disk (unbounded) instead of the default rolling
+    /// ring buffer dumped on exit.
+    pub long_trace: bool,
     pub buffer_kb: u32,
     pub sched_mode: SourceMode,
     pub cpu_mode: SourceMode,
@@ -196,16 +202,16 @@ impl RecordArgs {
 
         let buffer_kb = match self.buffer {
             Some(kb) => kb,
-            None if self.flight_recorder => 256 * 1024,
-            None => DEFAULT_BUFFER_KB,
+            None if self.long_trace => STREAM_BUFFER_KB,
+            None => RING_BUFFER_KB,
         };
 
         Ok(RecordConfig {
-            output: self.output.unwrap_or_else(|| DEFAULT_OUTPUT.to_string()),
+            output: self.output,
             workload: self.command,
             attach_pid: self.pid,
             duration_secs: self.duration,
-            flight_recorder: self.flight_recorder,
+            long_trace: self.long_trace,
             buffer_kb,
             sched_mode: sched,
             cpu_mode: cpu,
@@ -240,9 +246,10 @@ mod tests {
         let a = parse(&["./app"]).unwrap();
         assert_eq!(a.workload, vec!["./app"]);
         assert!(a.attach_pid.is_none());
-        assert_eq!(a.buffer_kb, DEFAULT_BUFFER_KB);
+        assert_eq!(a.buffer_kb, RING_BUFFER_KB);
         assert_eq!(a.sched_mode, SourceMode::InProcess);
-        assert_eq!(a.output, DEFAULT_OUTPUT);
+        assert_eq!(a.output, None);
+        assert!(!a.long_trace);
     }
 
     #[test]
@@ -272,11 +279,17 @@ mod tests {
     }
 
     #[test]
-    fn flight_recorder_bumps_buffer() {
-        let a = parse(&["--flight-recorder", "sleep", "1"]).unwrap();
-        assert_eq!(a.buffer_kb, 256 * 1024);
-        let b = parse(&["--flight-recorder", "--buffer", "512MB", "sleep", "1"]).unwrap();
-        assert_eq!(b.buffer_kb, 512 * 1024);
+    fn long_trace_uses_stream_buffer_default_uses_ring() {
+        let a = parse(&["--long-trace", "sleep", "1"]).unwrap();
+        assert_eq!(a.buffer_kb, STREAM_BUFFER_KB);
+        assert!(a.long_trace);
+        // Default (no --long-trace) uses the larger rolling ring buffer.
+        let b = parse(&["sleep", "1"]).unwrap();
+        assert_eq!(b.buffer_kb, RING_BUFFER_KB);
+        assert!(!b.long_trace);
+        // --buffer overrides either mode.
+        let c = parse(&["--long-trace", "--buffer", "512MB", "sleep", "1"]).unwrap();
+        assert_eq!(c.buffer_kb, 512 * 1024);
     }
 
     #[test]
@@ -298,7 +311,7 @@ mod tests {
     #[test]
     fn output_override() {
         let a = parse(&["--output", "/tmp/x.pftrace", "sleep"]).unwrap();
-        assert_eq!(a.output, "/tmp/x.pftrace");
+        assert_eq!(a.output.as_deref(), Some("/tmp/x.pftrace"));
     }
 
     #[test]

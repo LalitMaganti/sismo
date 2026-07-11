@@ -193,6 +193,26 @@ fn wait_for_workload_exit(rd: c_int, target_pid: c_int, is_attach: bool) {
     }
 }
 
+/// Print the "recording started" banner, spelling out how the trace is captured
+/// and how to stop, for the default rolling-buffer mode vs. `--long-trace`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn print_start_banner(long_trace: bool, buffer_kb: u32, output_path: &str) {
+    if long_trace {
+        eprintln!(
+            "sismo record: recording — long-trace: streaming continuously to {output_path}\n  \
+             stop & finalize:   Ctrl-C (or workload exit)"
+        );
+    } else {
+        let buffer_mb = buffer_kb / 1024;
+        eprintln!(
+            "sismo record: recording — rolling {buffer_mb} MB buffer; trace written to {output_path} on stop\n  \
+             snapshot anytime:  sismo snapshot\n  \
+             stop & save:       Ctrl-C (or workload exit)\n  \
+             long full runs:    re-run with --long-trace to stream continuously to disk"
+        );
+    }
+}
+
 /// --duration timer: sleep `seconds` (looping over EINTR) then fire 'T'.
 fn duration_timer(seconds: c_uint, write_fd: c_int) {
     let mut remaining = Timespec { tv_sec: seconds as i64, tv_nsec: 0 };
@@ -297,11 +317,12 @@ pub fn run(args: RecordArgs) -> i32 {
 
 #[cfg(target_os = "macos")]
 fn run_macos_flow(config: &RecordConfig) -> c_int {
-    let output_path_str: &str = &config.output;
-    let output_c = CString::new(config.output.as_str()).unwrap_or_default();
+    let output: String = config.output.clone().unwrap_or_else(crate::trace_sink::timestamped_output_path);
+    let output_path_str: &str = &output;
+    let output_c = CString::new(output.as_str()).unwrap_or_default();
     let attach_pid: Option<i32> = config.attach_pid;
     let duration_secs: Option<c_uint> = config.duration_secs;
-    let flight_recorder = config.flight_recorder;
+    let long_trace = config.long_trace;
     let buffer_kb = config.buffer_kb;
     let (sched_mode, cpu_mode, heap_mode) = (config.sched_mode, config.cpu_mode, config.heap_mode);
     let no_instrumentation = config.no_instrumentation;
@@ -496,14 +517,15 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         return 0;
     }
 
-    // FILE mode pre-clears the output; flight mode writes nothing.
-    if !flight_recorder {
+    // --long-trace streams straight to the file, so pre-clear it. The default
+    // ring mode writes the file only on exit (a clone, which truncates).
+    if long_trace {
         unsafe { unlink(output_c.as_ptr()) };
     }
-    let out_path: &[u8] = if flight_recorder { b"" } else { output_path_str.as_bytes() };
+    let out_path: &[u8] = if long_trace { output_path_str.as_bytes() } else { b"" };
     let session_name = b"sismo_record";
     let cfg = encode_trace_config(
-        if flight_recorder { MODE_RING } else { MODE_FILE }, // ring : file
+        if long_trace { MODE_FILE } else { MODE_RING }, // stream-to-file : rolling ring
         buffer_kb,
         0,
         out_path,
@@ -547,11 +569,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
 
     unsafe { sismo_consumer_session_start_blocking(session) };
-    if flight_recorder {
-        eprintln!("sismo record: flight-recorder started ({buffer_kb} KB buffer); take snapshots via `sismo snapshot` while running");
-    } else {
-        eprintln!("sismo record: session started, recording until workload exits (or SIGINT)");
-    }
+    print_start_banner(long_trace, buffer_kb, output_path_str);
 
     // Self-pipe + watch threads.
     let mut pipe_fds = [0 as c_int; 2];
@@ -581,15 +599,27 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
 
     wait_for_workload_exit(rd, target_pid, is_attach);
 
-    // Stop the session.
-    unsafe { sismo_consumer_session_stop_blocking(session) };
-    if flight_recorder {
-        eprintln!("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)");
-    } else {
-        eprintln!("sismo record: trace saved to {output_path_str}");
+    if long_trace {
+        // Streaming mode: traced already wrote the file; stop finalizes it.
+        unsafe { sismo_consumer_session_stop_blocking(session) };
+        eprintln!("sismo record: saved {output_path_str}");
         if !append_privileged_marker(output_path_str, &[target_pid], None, false) {
             eprintln!("sismo record: failed to write privileged marker");
         }
+    } else {
+        // Rolling-buffer mode: clone the live session to the file (the clone
+        // flushes the capture workers, exactly like `sismo snapshot`), then stop.
+        eprintln!("sismo record: stopping — writing trace to {output_path_str}");
+        match crate::trace_sink::clone_session_to_file("sismo_record", output_path_str) {
+            Ok(bytes) => {
+                eprintln!("sismo record: saved {output_path_str} ({bytes} bytes)");
+                if !append_privileged_marker(output_path_str, &[target_pid], None, false) {
+                    eprintln!("sismo record: failed to write privileged marker");
+                }
+            }
+            Err(e) => eprintln!("sismo record: failed to write trace: {e}"),
+        }
+        unsafe { sismo_consumer_session_stop_blocking(session) };
     }
 
     // Capture shutdowns (with stats).
@@ -652,10 +682,11 @@ use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
 
 #[cfg(target_os = "linux")]
 fn run_linux(config: &RecordConfig) -> c_int {
-    let output_path_str: &str = &config.output;
-    let output_c = CString::new(config.output.as_str()).unwrap_or_default();
+    let output: String = config.output.clone().unwrap_or_else(crate::trace_sink::timestamped_output_path);
+    let output_path_str: &str = &output;
+    let output_c = CString::new(output.as_str()).unwrap_or_default();
     let duration_secs = config.duration_secs;
-    let flight_recorder = config.flight_recorder;
+    let long_trace = config.long_trace;
     let buffer_kb = config.buffer_kb;
     let no_sched = config.sched_mode == SourceMode::Off;
     let no_cpu = config.cpu_mode == SourceMode::Off;
@@ -791,13 +822,15 @@ fn run_linux(config: &RecordConfig) -> c_int {
         return 0;
     }
 
-    if !flight_recorder {
+    // --long-trace streams straight to the file, so pre-clear it. The default
+    // ring mode writes the file only on exit (a clone, which truncates).
+    if long_trace {
         unsafe { unlink(output_c.as_ptr()) };
     }
-    let out_path: &[u8] = if flight_recorder { b"" } else { output_path_str.as_bytes() };
+    let out_path: &[u8] = if long_trace { output_path_str.as_bytes() } else { b"" };
     let session_name = b"sismo_record";
     let cfg = encode_trace_config(
-        if flight_recorder { MODE_RING } else { MODE_FILE },
+        if long_trace { MODE_FILE } else { MODE_RING },
         buffer_kb,
         0,
         out_path,
@@ -825,11 +858,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     }
 
     unsafe { sismo_consumer_session_start_blocking(session) };
-    if flight_recorder {
-        eprintln!("sismo record: flight-recorder started ({buffer_kb} KB buffer); take snapshots via `sismo snapshot` while running");
-    } else {
-        eprintln!("sismo record: session started, recording until workload exits (or SIGINT)");
-    }
+    print_start_banner(long_trace, buffer_kb, output_path_str);
 
     // Self-pipe + watch threads (Linux is spawn-only — no attach).
     let mut pipe_fds = [0 as c_int; 2];
@@ -852,21 +881,37 @@ fn run_linux(config: &RecordConfig) -> c_int {
 
     wait_for_workload_exit(rd, target_pid, false);
 
-    unsafe { sismo_consumer_session_stop_blocking(session) };
-    if flight_recorder {
-        eprintln!("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)");
-        shutdown_bpf(bpf.take());
-    } else {
-        eprintln!("sismo record: trace saved to {output_path_str}");
+    let focus_preset: Option<&[u8]> = if focus_int == 0 { Some(b"cache".as_slice()) } else { None };
+    if long_trace {
+        // Streaming mode: traced already wrote the file; stop finalizes it.
+        unsafe { sismo_consumer_session_stop_blocking(session) };
         let precise = shutdown_bpf(bpf.take());
-        let focus_preset: Option<&[u8]> = if focus_int == 0 { Some(b"cache".as_slice()) } else { None };
+        eprintln!("sismo record: saved {output_path_str}");
         if !append_privileged_marker(output_path_str, &[target_pid], focus_preset, precise >= 2) {
             eprintln!("sismo record: failed to write privileged marker");
         }
-        // Resolve BPF perf-sample frames to function names (appended offline).
         if had_bpf {
             sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str);
         }
+    } else {
+        // Rolling-buffer mode: drain the BPF worker into the still-active session
+        // (it self-drains on shutdown, so this must precede the clone), clone the
+        // session to the file, then stop.
+        let precise = shutdown_bpf(bpf.take());
+        eprintln!("sismo record: stopping — writing trace to {output_path_str}");
+        match crate::trace_sink::clone_session_to_file("sismo_record", output_path_str) {
+            Ok(bytes) => {
+                eprintln!("sismo record: saved {output_path_str} ({bytes} bytes)");
+                if !append_privileged_marker(output_path_str, &[target_pid], focus_preset, precise >= 2) {
+                    eprintln!("sismo record: failed to write privileged marker");
+                }
+                if had_bpf {
+                    sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str);
+                }
+            }
+            Err(e) => eprintln!("sismo record: failed to write trace: {e}"),
+        }
+        unsafe { sismo_consumer_session_stop_blocking(session) };
     }
 
     SIGINT_PIPE_FD.store(-1, Ordering::Release);

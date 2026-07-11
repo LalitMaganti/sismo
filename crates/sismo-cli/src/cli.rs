@@ -28,8 +28,8 @@ enum Commands {
     /// be attached to later via `sismo record --pid <pid>`.
     Prepare(crate::cmd_prepare::PrepareArgs),
 
-    /// Snapshot a running flight-recorder session (`sismo record
-    /// --flight-recorder`): clone it as a fresh consumer and write the trace.
+    /// Snapshot a running `sismo record`: clone its rolling buffer as a fresh
+    /// consumer and write the trace, while recording continues.
     Snapshot(crate::cmd_snapshot::SnapshotArgs),
 
     /// Run a daemonized data-source producer for an external `sismo record`.
