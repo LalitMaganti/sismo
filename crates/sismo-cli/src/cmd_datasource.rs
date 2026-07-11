@@ -155,66 +155,63 @@ pub fn run(args: DatasourceArgs) -> i32 {
 #[cfg(target_os = "macos")]
 mod macos_run {
     use super::{block_until_stopped, install_stop_handlers, Kind};
-    use sismo_core::cpu::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
-    use sismo_core::heap::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
-    use sismo_core::sched::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
+    use sismo_core::cpu::macos_cpu_capture::CpuCapture;
+    use sismo_core::heap::macos_heap_capture::HeapCapture;
+    use sismo_core::sched::macos_sched_capture::SchedCapture;
     use sismo_core::ffi::sismo_init;
     use sismo_core::sismo_paths::PRODUCER_SOCK;
     use std::ffi::CString;
     use std::os::raw::c_int;
 
     enum Slot {
-        Sched(*mut SchedCapture),
-        Cpu(*mut CpuCapture),
-        Heap(*mut HeapCapture),
+        Sched(Box<SchedCapture>),
+        Cpu(Box<CpuCapture>),
+        Heap(Box<HeapCapture>),
     }
 
-    /// Register one kind's capture worker. Null on registration failure.
+    /// Register one kind's capture worker. `None` on registration failure.
     fn register(kind: Kind) -> Option<Slot> {
         match kind {
             Kind::Sched => {
-                let c = unsafe { sismo_sched_capture_init() };
-                if c.is_null() {
-                    return None;
-                }
+                let c = SchedCapture::start()?;
                 eprintln!("sismo datasource: sismo.macos_sched registered");
                 Some(Slot::Sched(c))
             }
             Kind::Cpu => {
-                let c = unsafe { sismo_cpu_capture_init(0) };
-                if c.is_null() {
-                    return None;
-                }
+                let c = CpuCapture::start(0)?;
                 eprintln!("sismo datasource: sismo.macos_cpu_samples registered");
                 Some(Slot::Cpu(c))
             }
             Kind::Heap => {
-                let c = unsafe { sismo_heap_capture_init() };
-                if c.is_null() {
-                    return None;
-                }
+                let c = HeapCapture::start()?;
                 eprintln!("sismo datasource: sismo.heap registered");
                 Some(Slot::Heap(c))
             }
         }
     }
 
-    fn shutdown(slot: &Slot) {
-        match *slot {
+    fn shutdown(slot: Slot) {
+        match slot {
             Slot::Sched(c) => {
-                let (mut events, mut drains) = (0u64, 0u64);
-                unsafe { sismo_sched_capture_shutdown(c, &mut events, &mut drains) };
-                eprintln!("sismo datasource: sismo.macos_sched stopped — {events} events / {drains} drains");
+                let s = c.shutdown();
+                eprintln!(
+                    "sismo datasource: sismo.macos_sched stopped — {} events / {} drains",
+                    s.events_emitted, s.drain_calls
+                );
             }
             Slot::Cpu(c) => {
-                let (mut samples, mut active) = (0u64, 0u64);
-                unsafe { sismo_cpu_capture_shutdown(c, &mut samples, &mut active) };
-                eprintln!("sismo datasource: sismo.macos_cpu_samples stopped — {samples} samples ({active} active)");
+                let s = c.shutdown();
+                eprintln!(
+                    "sismo datasource: sismo.macos_cpu_samples stopped — {} samples ({} active)",
+                    s.samples, s.active_samples
+                );
             }
             Slot::Heap(c) => {
-                let (mut records, mut bytes, mut sites) = (0u64, 0u64, 0u32);
-                unsafe { sismo_heap_capture_shutdown(c, &mut records, &mut bytes, &mut sites) };
-                eprintln!("sismo datasource: sismo.heap stopped — {records} records / ~{bytes} bytes / {sites} sites");
+                let s = c.shutdown();
+                eprintln!(
+                    "sismo datasource: sismo.heap stopped — {} records / ~{} bytes / {} sites",
+                    s.records, s.bytes_alloc, s.sites
+                );
             }
         }
     }
@@ -235,7 +232,7 @@ mod macos_run {
                 Some(s) => slots.push(s),
                 None => {
                     eprintln!("sismo datasource: capture init failed — tearing down");
-                    for s in slots.iter().rev() {
+                    for s in slots.into_iter().rev() {
                         shutdown(s);
                     }
                     return 1;
@@ -250,7 +247,7 @@ mod macos_run {
         block_until_stopped();
 
         // Reverse registration order so each worker tears down before the next.
-        for s in slots.iter().rev() {
+        for s in slots.into_iter().rev() {
             shutdown(s);
         }
         0

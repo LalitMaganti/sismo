@@ -32,11 +32,11 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 // Capture workers (Rust siblings, macOS in-process sources).
 #[cfg(target_os = "macos")]
-use sismo_core::cpu::macos_cpu_capture::{sismo_cpu_capture_init, sismo_cpu_capture_shutdown, CpuCapture};
+use sismo_core::cpu::macos_cpu_capture::CpuCapture;
 #[cfg(target_os = "macos")]
-use sismo_core::heap::macos_heap_capture::{sismo_heap_capture_init, sismo_heap_capture_shutdown, HeapCapture};
+use sismo_core::heap::macos_heap_capture::HeapCapture;
 #[cfg(target_os = "macos")]
-use sismo_core::sched::macos_sched_capture::{sismo_sched_capture_init, sismo_sched_capture_shutdown, SchedCapture};
+use sismo_core::sched::macos_sched_capture::SchedCapture;
 
 // ---- C++ shim (traced service + consumer session + producer init) ----------
 
@@ -402,25 +402,25 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     };
 
     // Capture workers (in-process only).
-    let sched: *mut SchedCapture = if sched_mode == SourceMode::InProcess {
-        let c = unsafe { sismo_sched_capture_init() };
-        if c.is_null() {
+    let mut sched: Option<Box<SchedCapture>> = if sched_mode == SourceMode::InProcess {
+        let c = SchedCapture::start();
+        if c.is_none() {
             eprintln!("sismo record: sched capture init failed");
         }
         c
     } else {
-        std::ptr::null_mut()
+        None
     };
-    let cpu: *mut CpuCapture = if cpu_mode == SourceMode::InProcess {
-        let c = unsafe { sismo_cpu_capture_init(0) };
-        if c.is_null() {
+    let mut cpu: Option<Box<CpuCapture>> = if cpu_mode == SourceMode::InProcess {
+        let c = CpuCapture::start(0);
+        if c.is_none() {
             eprintln!("sismo record: cpu capture init failed");
         }
         c
     } else {
-        std::ptr::null_mut()
+        None
     };
-    let heap: *mut HeapCapture = if heap_mode == SourceMode::InProcess {
+    let mut heap: Option<Box<HeapCapture>> = if heap_mode == SourceMode::InProcess {
         // In attach mode, heap needs the target prepared (its socket exists).
         let ok = match attach_pid {
             Some(pid) => {
@@ -440,16 +440,16 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
             None => true,
         };
         if ok {
-            let c = unsafe { sismo_heap_capture_init() };
-            if c.is_null() {
+            let c = HeapCapture::start();
+            if c.is_none() {
                 eprintln!("sismo record: heap capture init failed");
             }
             c
         } else {
-            std::ptr::null_mut()
+            None
         }
     } else {
-        std::ptr::null_mut()
+        None
     };
 
     // Per-DS sismo configs (field 2000 of each DataSourceConfig).
@@ -463,19 +463,19 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     if !no_instrumentation {
         entries.push(ds_track_event());
     }
-    if !heap.is_null() || heap_mode == SourceMode::External {
+    if heap.is_some() || heap_mode == SourceMode::External {
         entries.push(ds_sismo_vendor(b"sismo.heap", &heap_cfg, 0));
         if heap_mode == SourceMode::External {
             external_names.push("sismo.heap");
         }
     }
-    if !cpu.is_null() || cpu_mode == SourceMode::External {
+    if cpu.is_some() || cpu_mode == SourceMode::External {
         entries.push(ds_sismo_vendor(b"sismo.macos_cpu_samples", &cpu_cfg, 0));
         if cpu_mode == SourceMode::External {
             external_names.push("sismo.macos_cpu_samples");
         }
     }
-    if !sched.is_null() || sched_mode == SourceMode::External {
+    if sched.is_some() || sched_mode == SourceMode::External {
         // ProtoVM DST for GenericKernelProcessTree.
         entries.push(ds_sismo_vendor(b"sismo.macos_sched", &sched_cfg, 4 * 1024));
         if sched_mode == SourceMode::External {
@@ -484,7 +484,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
     if entries.is_empty() {
         eprintln!("sismo record: no data sources enabled — recording would be empty. Drop one of the --no-* flags.");
-        shutdown_captures(heap, cpu, sched);
+        shutdown_captures(&mut heap, &mut cpu, &mut sched);
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -507,7 +507,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     let session = unsafe { sismo_consumer_session_create() };
     if session.is_null() {
         eprintln!("sismo record: session_create failed");
-        shutdown_captures(heap, cpu, sched);
+        shutdown_captures(&mut heap, &mut cpu, &mut sched);
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -515,7 +515,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     if setup_rc != 0 {
         eprintln!("sismo record: session_setup rc={setup_rc} (TraceConfig failed to parse)");
         unsafe { sismo_consumer_session_destroy(session) };
-        shutdown_captures(heap, cpu, sched);
+        shutdown_captures(&mut heap, &mut cpu, &mut sched);
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -533,7 +533,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
             }
             eprintln!("  start a sidecar with `sudo sismo datasource <name>` (or `all-privileged`) and re-run.");
             unsafe { sismo_consumer_session_destroy(session) };
-            shutdown_captures(heap, cpu, sched);
+            shutdown_captures(&mut heap, &mut cpu, &mut sched);
             teardown_early(svc, lock_fd);
             return 0;
         }
@@ -551,7 +551,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     if unsafe { pipe(pipe_fds.as_mut_ptr()) } != 0 {
         eprintln!("sismo record: pipe() failed");
         unsafe { sismo_consumer_session_destroy(session) };
-        shutdown_captures(heap, cpu, sched);
+        shutdown_captures(&mut heap, &mut cpu, &mut sched);
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -630,7 +630,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
 
     // Capture shutdowns (with stats).
-    shutdown_captures(heap, cpu, sched);
+    shutdown_captures(&mut heap, &mut cpu, &mut sched);
 
     // Join the exit watcher (it has fired 'X' or is about to), then tear down.
     let _ = watch.join();
@@ -646,23 +646,26 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     0
 }
 
-/// Shut down whichever captures are non-null, printing per-source stats.
+/// Shut down whichever captures are present, printing per-source stats. Takes
+/// each handle out with `Option::take`, so calling it again is a no-op — the
+/// error paths and the final teardown can all call it.
 #[cfg(target_os = "macos")]
-fn shutdown_captures(heap: *mut HeapCapture, cpu: *mut CpuCapture, sched: *mut SchedCapture) {
-    if !heap.is_null() {
-        let (mut records, mut bytes, mut sites) = (0u64, 0u64, 0u32);
-        unsafe { sismo_heap_capture_shutdown(heap, &mut records, &mut bytes, &mut sites) };
-        eprintln!("sismo record: heap — {records} records, ~{bytes} bytes, {sites} sites");
+fn shutdown_captures(
+    heap: &mut Option<Box<HeapCapture>>,
+    cpu: &mut Option<Box<CpuCapture>>,
+    sched: &mut Option<Box<SchedCapture>>,
+) {
+    if let Some(c) = heap.take() {
+        let s = c.shutdown();
+        eprintln!("sismo record: heap — {} records, ~{} bytes, {} sites", s.records, s.bytes_alloc, s.sites);
     }
-    if !cpu.is_null() {
-        let (mut samples, mut active) = (0u64, 0u64);
-        unsafe { sismo_cpu_capture_shutdown(cpu, &mut samples, &mut active) };
-        eprintln!("sismo record: cpu — {samples} samples ({active} active)");
+    if let Some(c) = cpu.take() {
+        let s = c.shutdown();
+        eprintln!("sismo record: cpu — {} samples ({} active)", s.samples, s.active_samples);
     }
-    if !sched.is_null() {
-        let (mut events, mut drains) = (0u64, 0u64);
-        unsafe { sismo_sched_capture_shutdown(sched, &mut events, &mut drains) };
-        eprintln!("sismo record: sched — {events} events emitted across {drains} drains");
+    if let Some(c) = sched.take() {
+        let s = c.shutdown();
+        eprintln!("sismo record: sched — {} events emitted across {} drains", s.events_emitted, s.drain_calls);
     }
 }
 

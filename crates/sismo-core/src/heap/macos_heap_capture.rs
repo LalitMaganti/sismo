@@ -15,8 +15,8 @@
 //!
 //! The ring read side, control protocol, unwinder, symbolizer, module loading,
 //! config decode, and heap-profile assembly are all already-Rust siblings —
-//! called directly, no FFI round-trip. cmd_record/cmd_datasource (Zig) drive
-//! this via `sismo_heap_capture_init` / `sismo_heap_capture_shutdown`.
+//! called directly, no FFI round-trip. cmd_record/cmd_datasource drive this via
+//! `HeapCapture::start` / `HeapCapture::shutdown`.
 //!
 //! The producer C ABI (`sismo_ds_*`) is provided by the C++ shim in the final
 //! binary; `#[cfg(test)]` stubs (in worker_sdk) stand in so `cargo test` links.
@@ -469,79 +469,70 @@ impl HeapCapture {
     }
 }
 
-/// Create the heap capture: register the data source and spawn the worker
-/// thread. Returns an opaque handle, or null on registration failure.
-///
-/// # Safety
-/// The returned pointer must be passed to `sismo_heap_capture_shutdown` once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_heap_capture_init() -> *mut HeapCapture {
-    let cap = Box::into_raw(Box::new(HeapCapture {
-        ds_slot: AtomicU32::new(U32_MAX),
-        wakeup: Event::new(),
-        running: AtomicBool::new(false),
-        exit_requested: AtomicBool::new(false),
-        pending_stopper: AtomicUsize::new(0),
-        pending_flusher: AtomicUsize::new(0),
-        setup_received: AtomicBool::new(false),
-        setup_target_pid: AtomicU32::new(0),
-        setup_ring_size: AtomicU64::new(0),
-        setup_sample_interval: AtomicU64::new(0),
-        target_pid: AtomicU32::new(0),
-        sample_interval: AtomicU64::new(DEFAULT_SAMPLE_INTERVAL_BYTES),
-        records: AtomicU64::new(0),
-        bytes_alloc: AtomicU64::new(0),
-        sites_observed: AtomicU32::new(0),
-        thread: Mutex::new(None),
-    }));
+impl HeapCapture {
+    /// Create the heap capture: register the data source and spawn the worker
+    /// thread. `None` on registration failure.
+    pub fn start() -> Option<Box<HeapCapture>> {
+        let cap = Box::new(HeapCapture {
+            ds_slot: AtomicU32::new(U32_MAX),
+            wakeup: Event::new(),
+            running: AtomicBool::new(false),
+            exit_requested: AtomicBool::new(false),
+            pending_stopper: AtomicUsize::new(0),
+            pending_flusher: AtomicUsize::new(0),
+            setup_received: AtomicBool::new(false),
+            setup_target_pid: AtomicU32::new(0),
+            setup_ring_size: AtomicU64::new(0),
+            setup_sample_interval: AtomicU64::new(0),
+            target_pid: AtomicU32::new(0),
+            sample_interval: AtomicU64::new(DEFAULT_SAMPLE_INTERVAL_BYTES),
+            records: AtomicU64::new(0),
+            bytes_alloc: AtomicU64::new(0),
+            sites_observed: AtomicU32::new(0),
+            thread: Mutex::new(None),
+        });
 
-    // Register the data source (descriptor built via the Rust encoder).
-    let desc = encode_data_source_descriptor(DS_NAME, true, false, &[]);
-    let slot = unsafe {
-        sismo_ds_register(desc.as_ptr(), desc.len(), on_setup, on_start, on_stop, on_flush, cap as *mut c_void)
-    };
-    if slot == U32_MAX {
-        drop(unsafe { Box::from_raw(cap) });
-        return std::ptr::null_mut();
+        // The worker shares `&HeapCapture` via the box's (stable) heap address,
+        // which outlives the thread: shutdown joins it before the box drops.
+        let cap_addr = &*cap as *const HeapCapture as usize;
+
+        // Register the data source (descriptor built via the Rust encoder).
+        let desc = encode_data_source_descriptor(DS_NAME, true, false, &[]);
+        let slot = unsafe {
+            sismo_ds_register(desc.as_ptr(), desc.len(), on_setup, on_start, on_stop, on_flush, cap_addr as *mut c_void)
+        };
+        if slot == U32_MAX {
+            return None;
+        }
+        cap.ds_slot.store(slot, Ordering::Release);
+
+        let handle = std::thread::spawn(move || {
+            let self_ = unsafe { &*(cap_addr as *const HeapCapture) };
+            self_.run();
+        });
+        *cap.thread.lock().unwrap() = Some(handle);
+        Some(cap)
     }
-    unsafe { (*cap).ds_slot.store(slot, Ordering::Release) };
 
-    // Spawn the worker. It shares `&HeapCapture` via the raw pointer, valid
-    // until shutdown joins the thread and frees the box.
-    let cap_addr = cap as usize;
-    let handle = std::thread::spawn(move || {
-        let self_ = unsafe { &*(cap_addr as *const HeapCapture) };
-        self_.run();
-    });
-    *unsafe { &*cap }.thread.lock().unwrap() = Some(handle);
-    cap
+    /// Signal exit, join the worker, and return the accumulated stats.
+    pub fn shutdown(self: Box<Self>) -> HeapStats {
+        self.exit_requested.store(true, Ordering::Release);
+        self.wakeup.set();
+        let handle = self.thread.lock().unwrap().take();
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+        HeapStats {
+            records: self.records.load(Ordering::Relaxed),
+            bytes_alloc: self.bytes_alloc.load(Ordering::Relaxed),
+            sites: self.sites_observed.load(Ordering::Relaxed),
+        }
+    }
 }
 
-/// Signal exit, join the worker, write stats, and free the capture.
-///
-/// # Safety
-/// `cap` must be a pointer from `sismo_heap_capture_init`, passed once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_heap_capture_shutdown(
-    cap: *mut HeapCapture,
-    out_records: *mut u64,
-    out_bytes_alloc: *mut u64,
-    out_sites: *mut u32,
-) {
-    if cap.is_null() {
-        return;
-    }
-    let self_ = unsafe { &*cap };
-    self_.exit_requested.store(true, Ordering::Release);
-    self_.wakeup.set();
-    let handle = self_.thread.lock().unwrap().take();
-    if let Some(h) = handle {
-        let _ = h.join();
-    }
-    unsafe {
-        *out_records = self_.records.load(Ordering::Relaxed);
-        *out_bytes_alloc = self_.bytes_alloc.load(Ordering::Relaxed);
-        *out_sites = self_.sites_observed.load(Ordering::Relaxed);
-    }
-    drop(unsafe { Box::from_raw(cap) });
+/// Heap stats reported by [`HeapCapture::shutdown`].
+pub struct HeapStats {
+    pub records: u64,
+    pub bytes_alloc: u64,
+    pub sites: u32,
 }

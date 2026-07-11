@@ -525,76 +525,69 @@ fn emit_task_state(slot: u32, ts_ns: u64, cpu: i32, comm: &[u8], tid: i64, state
     unsafe { sismo_ds_emit(slot, w.bytes().as_ptr(), w.bytes().len()) };
 }
 
-/// Create the sched capture: register the data source (with the ProtoVM
-/// program) and spawn the worker thread. Returns null on registration failure.
-///
-/// # Safety
-/// The returned pointer must be passed to `sismo_sched_capture_shutdown` once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_sched_capture_init() -> *mut SchedCapture {
-    let cap = Box::into_raw(Box::new(SchedCapture {
-        ds_slot: AtomicU32::new(u32::MAX),
-        config_kernel_buffer_events: DEFAULT_KERNEL_BUFFER_EVENTS,
-        wakeup: Event::new(),
-        running: AtomicBool::new(false),
-        exit_requested: AtomicBool::new(false),
-        pending_stopper: AtomicUsize::new(0),
-        setup_received: AtomicBool::new(false),
-        setup_kernel_buffer_events: AtomicI32::new(0),
-        events_emitted: AtomicU64::new(0),
-        drain_calls: AtomicU64::new(0),
-        thread: Mutex::new(None),
-    }));
+impl SchedCapture {
+    /// Create the sched capture: register the data source (with the ProtoVM
+    /// program) and spawn the worker thread. `None` on registration failure.
+    pub fn start() -> Option<Box<SchedCapture>> {
+        let cap = Box::new(SchedCapture {
+            ds_slot: AtomicU32::new(u32::MAX),
+            config_kernel_buffer_events: DEFAULT_KERNEL_BUFFER_EVENTS,
+            wakeup: Event::new(),
+            running: AtomicBool::new(false),
+            exit_requested: AtomicBool::new(false),
+            pending_stopper: AtomicUsize::new(0),
+            setup_received: AtomicBool::new(false),
+            setup_kernel_buffer_events: AtomicI32::new(0),
+            events_emitted: AtomicU64::new(0),
+            drain_calls: AtomicU64::new(0),
+            thread: Mutex::new(None),
+        });
 
-    // Descriptor carries the ProtoVM program (mirrors process-tree packets into
-    // traced's DST for ring/flight mode).
-    let prog = macos_sched_vm_program();
-    let desc = encode_data_source_descriptor(DS_NAME, true, false, &prog);
-    let slot = unsafe {
-        sismo_ds_register(desc.as_ptr(), desc.len(), on_setup, on_start, on_stop, on_flush, cap as *mut c_void)
-    };
-    if slot == u32::MAX {
-        drop(unsafe { Box::from_raw(cap) });
-        return std::ptr::null_mut();
+        // The worker shares `&SchedCapture` via the box's (stable) heap address,
+        // which outlives the thread: shutdown joins it before the box drops.
+        let cap_addr = &*cap as *const SchedCapture as usize;
+
+        // Descriptor carries the ProtoVM program (mirrors process-tree packets
+        // into traced's DST for ring/flight mode).
+        let prog = macos_sched_vm_program();
+        let desc = encode_data_source_descriptor(DS_NAME, true, false, &prog);
+        let slot = unsafe {
+            sismo_ds_register(desc.as_ptr(), desc.len(), on_setup, on_start, on_stop, on_flush, cap_addr as *mut c_void)
+        };
+        if slot == u32::MAX {
+            return None;
+        }
+        cap.ds_slot.store(slot, Ordering::Release);
+
+        let handle = std::thread::spawn(move || {
+            let self_ = unsafe { &*(cap_addr as *const SchedCapture) };
+            self_.run();
+        });
+        *cap.thread.lock().unwrap() = Some(handle);
+        Some(cap)
     }
-    unsafe { (*cap).ds_slot.store(slot, Ordering::Release) };
 
-    let cap_addr = cap as usize;
-    let handle = std::thread::spawn(move || {
-        let self_ = unsafe { &*(cap_addr as *const SchedCapture) };
-        self_.run();
-    });
-    *unsafe { &*cap }.thread.lock().unwrap() = Some(handle);
-    cap
+    /// Signal exit, join the worker, tear down the kdebug session, and return
+    /// the accumulated stats.
+    pub fn shutdown(self: Box<Self>) -> SchedStats {
+        self.exit_requested.store(true, Ordering::Release);
+        self.wakeup.set();
+        let handle = self.thread.lock().unwrap().take();
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+        unsafe { sismo_kdebug_teardown() };
+        SchedStats {
+            events_emitted: self.events_emitted.load(Ordering::Relaxed),
+            drain_calls: self.drain_calls.load(Ordering::Relaxed),
+        }
+    }
 }
 
-/// Signal exit, join the worker, tear down the kdebug session, write stats, and
-/// free the capture.
-///
-/// # Safety
-/// `cap` must be a pointer from `sismo_sched_capture_init`, passed once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_sched_capture_shutdown(
-    cap: *mut SchedCapture,
-    out_events_emitted: *mut u64,
-    out_drain_calls: *mut u64,
-) {
-    if cap.is_null() {
-        return;
-    }
-    let self_ = unsafe { &*cap };
-    self_.exit_requested.store(true, Ordering::Release);
-    self_.wakeup.set();
-    let handle = self_.thread.lock().unwrap().take();
-    if let Some(h) = handle {
-        let _ = h.join();
-    }
-    unsafe { sismo_kdebug_teardown() };
-    unsafe {
-        *out_events_emitted = self_.events_emitted.load(Ordering::Relaxed);
-        *out_drain_calls = self_.drain_calls.load(Ordering::Relaxed);
-    }
-    drop(unsafe { Box::from_raw(cap) });
+/// Sched stats reported by [`SchedCapture::shutdown`].
+pub struct SchedStats {
+    pub events_emitted: u64,
+    pub drain_calls: u64,
 }
 
 #[cfg(test)]
