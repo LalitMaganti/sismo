@@ -79,7 +79,7 @@ use crate::worker_sdk::Event;
 // The rest of the pipeline is already Rust — call the sibling modules directly
 // (no FFI round-trip): descriptor encoding, unwinder lifecycle, module loading,
 // and per-sample capture.
-use crate::symbolize::dyld_images::{sismo_dyld_list_free, sismo_load_target_modules};
+use crate::symbolize::dyld_images::load_target_modules;
 use crate::cpu::mach_sampler::sismo_cpu_sample_thread;
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::unwinder::Unwinder;
@@ -150,9 +150,6 @@ extern "C" fn on_flush(_user_arg: *mut c_void, flusher: *mut c_void) {
     }
 }
 
-extern "C" fn abort_cb(ctx: *mut c_void) -> bool {
-    as_ref(ctx).exit_requested.load(Ordering::Acquire)
-}
 
 impl CpuCapture {
     fn park_until_exit(&self) {
@@ -213,30 +210,23 @@ impl CpuCapture {
             return;
         }
 
-        let unwinder = Box::into_raw(Box::new(Unwinder::new_arm64()));
+        let mut unwinder = Unwinder::new_arm64();
 
         // Register the target's modules into the unwinder (Rust). No symbolizer
-        // — cpu samples are symbolized post-record.
-        let mut load_err = 0u32;
-        let image_list = unsafe {
-            sismo_load_target_modules(
-                task,
-                std::ptr::null_mut(),
-                unwinder,
-                50 * 1_000_000,
-                5 * 1_000_000_000,
-                self as *const CpuCapture as *mut c_void,
-                Some(abort_cb),
-                &mut load_err,
-            )
-        };
-        if image_list.is_null() {
+        // — cpu samples are symbolized post-record. The returned image list is
+        // unused here (cpu doesn't emit mappings), so it drops immediately.
+        if let Err(load_err) = load_target_modules(
+            task,
+            None,
+            Some(&mut unwinder),
+            50 * 1_000_000,
+            5 * 1_000_000_000,
+            || self.exit_requested.load(Ordering::Acquire),
+        ) {
             eprintln!("cpu_sampler: load_target_modules failed (err={load_err})");
-            drop(unsafe { Box::from_raw(unwinder) });
             self.park_until_exit();
             return;
         }
-        unsafe { sismo_dyld_list_free(image_list) };
 
         // thread port -> (tid, last_cpu_us)
         let mut thread_states: std::collections::HashMap<MachPort, (u64, u64)> =
@@ -267,7 +257,7 @@ impl CpuCapture {
                     }
                     let threads = unsafe { std::slice::from_raw_parts(list, count as usize) };
                     for &t in threads {
-                        self.sample_one(task, t, unwinder, pid, slot, &mut thread_states);
+                        self.sample_one(task, t, &mut unwinder, pid, slot, &mut thread_states);
                     }
                     // Free the Mach-allocated thread-port array.
                     for &t in threads {
@@ -299,8 +289,6 @@ impl CpuCapture {
                 self.wakeup.wait();
             }
         }
-
-        drop(unsafe { Box::from_raw(unwinder) });
     }
 
     fn sample_one(

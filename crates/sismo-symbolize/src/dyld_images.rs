@@ -17,7 +17,6 @@
 use crate::symbolizer::Symbolizer;
 use crate::unwinder::Unwinder;
 use std::ffi::OsStr;
-use std::os::raw::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
@@ -34,7 +33,6 @@ const LC_UUID: u32 = 0x1b;
 const IMAGE_INFO_SIZE: usize = 24;
 
 // Enumerate error codes; only EMPTY drives the retry loop.
-const ERR_OK: u32 = 0;
 const ERR_TASK_INFO: u32 = 1;
 const ERR_EMPTY: u32 = 2;
 const ERR_VM_READ: u32 = 3;
@@ -102,135 +100,94 @@ unsafe fn read_cstring(task: MachPort, addr: u64) -> Vec<u8> {
     }
 }
 
-/// Owned image list, accessed by index.
+/// Owned list of loaded mach-o images: `(base_avma, path)` per image.
 pub struct ImageList {
-    images: Vec<(u64, Vec<u8>)>, // (base_avma, path)
+    images: Vec<(u64, Vec<u8>)>,
 }
 
-/// Enumerate all loaded mach-o images in `task`. On success returns a heap
-/// `ImageList` (free with `sismo_dyld_list_free`) and writes ERR_OK; on failure
-/// returns null and writes an ERR_* code (the facade retries on ERR_EMPTY).
-///
-/// # Safety
-/// `out_err` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_dyld_enumerate(task: MachPort, out_err: *mut u32) -> *mut ImageList {
-    let set_err = |e: u32| unsafe { *out_err = e };
-
-    let mut info = TaskDyldInfo::default();
-    let mut count = (std::mem::size_of::<TaskDyldInfo>() / 4) as u32;
-    let rc = unsafe {
-        task_info(task, TASK_DYLD_INFO, &mut info as *mut TaskDyldInfo as *mut i32, &mut count)
-    };
-    if rc != KERN_SUCCESS {
-        set_err(ERR_TASK_INFO);
-        return std::ptr::null_mut();
-    }
-    if info.all_image_info_addr == 0 {
-        set_err(ERR_EMPTY);
-        return std::ptr::null_mut();
-    }
-
-    // dyld_all_image_infos head: version(u32), infoArrayCount(u32), infoArray(u64).
-    let mut head = [0u8; 16];
-    match unsafe { vm_read(task, info.all_image_info_addr, &mut head) } {
-        Some(n) if n >= 16 => {}
-        _ => {
-            set_err(ERR_VM_READ);
-            return std::ptr::null_mut();
+impl ImageList {
+    /// Enumerate all loaded mach-o images in `task`. `Err(ERR_*)` on failure
+    /// (the caller retries on `ERR_EMPTY`).
+    pub fn enumerate(task: MachPort) -> Result<ImageList, u32> {
+        let mut info = TaskDyldInfo::default();
+        let mut count = (std::mem::size_of::<TaskDyldInfo>() / 4) as u32;
+        let rc = unsafe {
+            task_info(task, TASK_DYLD_INFO, &mut info as *mut TaskDyldInfo as *mut i32, &mut count)
+        };
+        if rc != KERN_SUCCESS {
+            return Err(ERR_TASK_INFO);
         }
-    }
-    let info_array_count = read_u32(&head, 4);
-    let info_array = read_u64(&head, 8);
-    if info_array == 0 || info_array_count == 0 {
-        set_err(ERR_EMPTY);
-        return std::ptr::null_mut();
-    }
-
-    let mut entries = vec![0u8; info_array_count as usize * IMAGE_INFO_SIZE];
-    let got = match unsafe { vm_read(task, info_array, &mut entries) } {
-        Some(g) => g,
-        None => {
-            set_err(ERR_VM_READ);
-            return std::ptr::null_mut();
+        if info.all_image_info_addr == 0 {
+            return Err(ERR_EMPTY);
         }
-    };
-    let usable = got / IMAGE_INFO_SIZE;
 
-    let mut images = Vec::with_capacity(usable);
-    for i in 0..usable {
-        let e = &entries[i * IMAGE_INFO_SIZE..];
-        let load_address = read_u64(e, 0);
-        let file_path = read_u64(e, 8);
-        let path = unsafe { read_cstring(task, file_path) };
-        images.push((load_address, path));
+        // dyld_all_image_infos head: version(u32), infoArrayCount(u32), infoArray(u64).
+        let mut head = [0u8; 16];
+        match unsafe { vm_read(task, info.all_image_info_addr, &mut head) } {
+            Some(n) if n >= 16 => {}
+            _ => return Err(ERR_VM_READ),
+        }
+        let info_array_count = read_u32(&head, 4);
+        let info_array = read_u64(&head, 8);
+        if info_array == 0 || info_array_count == 0 {
+            return Err(ERR_EMPTY);
+        }
+
+        let mut entries = vec![0u8; info_array_count as usize * IMAGE_INFO_SIZE];
+        let got = match unsafe { vm_read(task, info_array, &mut entries) } {
+            Some(g) => g,
+            None => return Err(ERR_VM_READ),
+        };
+        let usable = got / IMAGE_INFO_SIZE;
+
+        let mut images = Vec::with_capacity(usable);
+        for i in 0..usable {
+            let e = &entries[i * IMAGE_INFO_SIZE..];
+            let load_address = read_u64(e, 0);
+            let file_path = read_u64(e, 8);
+            let path = unsafe { read_cstring(task, file_path) };
+            images.push((load_address, path));
+        }
+        Ok(ImageList { images })
     }
-    set_err(ERR_OK);
-    Box::into_raw(Box::new(ImageList { images }))
+
+    pub fn len(&self) -> usize {
+        self.images.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty()
+    }
+
+    /// `(base_avma, path)` for each image (sorted by base after `load_target_modules`).
+    pub fn images(&self) -> &[(u64, Vec<u8>)] {
+        &self.images
+    }
 }
 
-/// # Safety
-/// `list` must be a valid pointer from `sismo_dyld_enumerate`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_dyld_list_count(list: *const ImageList) -> usize {
-    unsafe { &*list }.images.len()
-}
-
-/// Write the base address + borrowed path pointer for image `idx`. The path
-/// pointer is valid until `sismo_dyld_list_free`.
-///
-/// # Safety
-/// `list` valid; `idx < count`; out-params writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_dyld_list_get(
-    list: *const ImageList,
-    idx: usize,
-    out_base: *mut u64,
-    out_path: *mut *const u8,
-    out_path_len: *mut usize,
-) {
-    let (base, path) = &unsafe { &*list }.images[idx];
-    unsafe {
-        *out_base = *base;
-        *out_path = path.as_ptr();
-        *out_path_len = path.len();
-    }
-}
-
-/// # Safety
-/// `list` must be a valid pointer from `sismo_dyld_enumerate`, freed once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_dyld_list_free(list: *mut ImageList) {
-    if !list.is_null() {
-        drop(unsafe { Box::from_raw(list) });
-    }
+/// An in-memory mach-o image read from a target task.
+pub struct MachoImage {
+    /// The `__TEXT` slab; may be a short read near a mapping edge — framehop's
+    /// parser tolerates partial section data.
+    pub text: Vec<u8>,
+    pub text_vmsize: u64,
+    pub cputype: u32,
+    pub cpusubtype: u32,
+    pub uuid: [u8; 16],
 }
 
 /// Read the in-memory mach-o image at `base_avma`: enough of `__TEXT` for
-/// framehop, plus metadata. Returns the `__TEXT` slab (free with
-/// `sismo_dyld_free_bytes`) and writes metadata to the out-params; null on any
-/// failure (not a 64-bit mach-o, no `__TEXT`, or a failed read).
-///
-/// # Safety
-/// out-params writable; `out_uuid` writable for 16 bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_dyld_read_macho(
-    task: MachPort,
-    base_avma: u64,
-    out_text_vmsize: *mut u64,
-    out_cputype: *mut u32,
-    out_cpusubtype: *mut u32,
-    out_uuid: *mut u8,
-    out_bytes_len: *mut usize,
-) -> *mut u8 {
+/// framehop, plus metadata. `None` on any failure (not a 64-bit mach-o, no
+/// `__TEXT`, or a failed read).
+pub fn read_macho(task: MachPort, base_avma: u64) -> Option<MachoImage> {
     // Header (mach_header_64, 32 bytes).
     let mut hdr = [0u8; 32];
     match unsafe { vm_read(task, base_avma, &mut hdr) } {
         Some(n) if n >= 32 => {}
-        _ => return std::ptr::null_mut(),
+        _ => return None,
     }
     if read_u32(&hdr, 0) != MH_MAGIC_64 {
-        return std::ptr::null_mut();
+        return None;
     }
     let cputype = read_u32(&hdr, 4);
     let cpusubtype = read_u32(&hdr, 8);
@@ -241,7 +198,7 @@ pub unsafe extern "C" fn sismo_dyld_read_macho(
     let mut cmds = vec![0u8; sizeofcmds];
     match unsafe { vm_read(task, base_avma + 32, &mut cmds) } {
         Some(n) if n >= sizeofcmds => {}
-        _ => return std::ptr::null_mut(),
+        _ => return None,
     }
 
     // Walk for __TEXT.vmsize (the executable footprint) + LC_UUID.
@@ -270,40 +227,18 @@ pub unsafe extern "C" fn sismo_dyld_read_macho(
         off += cmdsize;
     }
     if text_vmsize == 0 {
-        return std::ptr::null_mut();
+        return None;
     }
 
-    // Read the full __TEXT segment (short reads near a mapping edge are fine —
-    // framehop's parser tolerates partial section data).
+    // Read the full __TEXT segment (short reads near a mapping edge are fine).
     let mut buf = vec![0u8; text_vmsize as usize];
     let got = match unsafe { vm_read(task, base_avma, &mut buf) } {
         Some(g) => g,
-        None => return std::ptr::null_mut(),
+        None => return None,
     };
     buf.truncate(got);
 
-    unsafe {
-        *out_text_vmsize = text_vmsize;
-        *out_cputype = cputype;
-        *out_cpusubtype = cpusubtype;
-        std::ptr::copy_nonoverlapping(uuid.as_ptr(), out_uuid, 16);
-        *out_bytes_len = buf.len();
-    }
-    let boxed = buf.into_boxed_slice();
-    Box::into_raw(boxed) as *mut u8
-}
-
-/// Free a buffer returned by `sismo_dyld_read_macho`.
-///
-/// # Safety
-/// `ptr`/`len` must be exactly what `sismo_dyld_read_macho` returned, freed once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_dyld_free_bytes(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-    drop(unsafe { Box::from_raw(slice as *mut [u8]) });
+    Some(MachoImage { text: buf, text_vmsize, cputype, cpusubtype, uuid })
 }
 
 /// Map (cputype, cpusubtype) to wholesym's arch string, or None for unknown.
@@ -326,59 +261,42 @@ fn arch_string(cputype: u32, cpusubtype: u32) -> Option<&'static [u8]> {
     }
 }
 
-/// Abort callback (polled between enumerate retries): return true to bail.
-type AbortCb = extern "C" fn(*mut c_void) -> bool;
-
 /// Enumerate the target's modules (retrying the post-spawn empty-list window,
-/// polling `abort_cb` between tries), sort by load address, and register each
-/// into the symbolizer (if non-null) + unwinder (if non-null) — reading each
-/// image's `__TEXT` slab and computing its end address from `__TEXT` vmsize
-/// clamped to the next image's base. Returns the sorted `ImageList` (free with
-/// `sismo_dyld_list_free`) for the caller to reuse (e.g. heap mappings); writes
-/// an ERR_* code to `out_err` and returns null on enumerate failure.
+/// polling `abort` between tries), sort by load address, and register each into
+/// `symbolizer` and/or `unwinder` when present — reading each image's `__TEXT`
+/// slab and computing its end address from `__TEXT` vmsize clamped to the next
+/// image's base. Returns the sorted `ImageList` for the caller to reuse (e.g.
+/// heap mappings); `Err(ERR_*)` on enumerate failure.
 ///
 /// This folds what was a Zig setup loop into one Rust call: the dyld read, the
-/// mach-o parse, and the symbolizer/unwinder registration are all Rust-side, so
-/// the `__TEXT` bytes never cross FFI.
-///
-/// # Safety
-/// `symbolizer`/`unwinder` valid-or-null; `abort_cb`/`abort_ctx` valid together
-/// or the callback absent; `out_err` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_load_target_modules(
+/// mach-o parse, and the symbolizer/unwinder registration are all Rust-side.
+pub fn load_target_modules(
     task: MachPort,
-    symbolizer: *mut Symbolizer,
-    unwinder: *mut Unwinder,
+    mut symbolizer: Option<&mut Symbolizer>,
+    mut unwinder: Option<&mut Unwinder>,
     poll_interval_ns: u64,
     max_total_ns: u64,
-    abort_ctx: *mut c_void,
-    abort_cb: Option<AbortCb>,
-    out_err: *mut u32,
-) -> *mut ImageList {
+    abort: impl Fn() -> bool,
+) -> Result<ImageList, u32> {
     // Enumerate with retry on the empty-list window.
     let max_attempts = if poll_interval_ns == 0 { 1 } else { max_total_ns / poll_interval_ns };
     let mut attempt: u64 = 0;
-    let list_ptr = loop {
-        let mut err = ERR_OK;
-        let p = unsafe { sismo_dyld_enumerate(task, &mut err) };
-        if !p.is_null() {
-            break p;
-        }
-        if err != ERR_EMPTY || attempt + 1 >= max_attempts {
-            unsafe { *out_err = err };
-            return std::ptr::null_mut();
-        }
-        if let Some(cb) = abort_cb {
-            if cb(abort_ctx) {
-                unsafe { *out_err = ERR_EMPTY };
-                return std::ptr::null_mut();
+    let mut list = loop {
+        match ImageList::enumerate(task) {
+            Ok(l) => break l,
+            Err(err) => {
+                if err != ERR_EMPTY || attempt + 1 >= max_attempts {
+                    return Err(err);
+                }
+                if abort() {
+                    return Err(ERR_EMPTY);
+                }
+                std::thread::sleep(Duration::from_nanos(poll_interval_ns));
+                attempt += 1;
             }
         }
-        std::thread::sleep(Duration::from_nanos(poll_interval_ns));
-        attempt += 1;
     };
 
-    let list = unsafe { &mut *list_ptr };
     list.images.sort_by_key(|(base, _)| *base);
 
     let n = list.images.len();
@@ -386,44 +304,23 @@ pub unsafe extern "C" fn sismo_load_target_modules(
         let base = list.images[idx].0;
         let next_base = if idx + 1 < n { list.images[idx + 1].0 } else { u64::MAX };
 
-        let (mut text_vmsize, mut cputype, mut cpusubtype, mut bytes_len) = (0u64, 0u32, 0u32, 0usize);
-        let mut uuid = [0u8; 16];
-        let bytes = unsafe {
-            sismo_dyld_read_macho(
-                task,
-                base,
-                &mut text_vmsize,
-                &mut cputype,
-                &mut cpusubtype,
-                uuid.as_mut_ptr(),
-                &mut bytes_len,
-            )
+        let macho = match read_macho(task, base) {
+            Some(m) => m,
+            None => continue,
         };
-        if bytes.is_null() {
-            continue;
-        }
 
-        let end_avma = base.wrapping_add(text_vmsize).min(next_base);
-        if !symbolizer.is_null() {
+        let end_avma = base.wrapping_add(macho.text_vmsize).min(next_base);
+        if let Some(sym) = symbolizer.as_deref_mut() {
             let path = &list.images[idx].1;
-            let arch = arch_string(cputype, cpusubtype).and_then(|a| std::str::from_utf8(a).ok());
-            unsafe { &mut *symbolizer }.add_module(
-                base,
-                end_avma,
-                Path::new(OsStr::from_bytes(path)),
-                Some(uuid),
-                arch,
-            );
+            let arch = arch_string(macho.cputype, macho.cpusubtype).and_then(|a| std::str::from_utf8(a).ok());
+            sym.add_module(base, end_avma, Path::new(OsStr::from_bytes(path)), Some(macho.uuid), arch);
         }
-        if !unwinder.is_null() {
-            let slab = unsafe { std::slice::from_raw_parts(bytes, bytes_len) };
-            unsafe { &mut *unwinder }.add_module(base, slab);
+        if let Some(unw) = unwinder.as_deref_mut() {
+            unw.add_module(base, &macho.text);
         }
-        unsafe { sismo_dyld_free_bytes(bytes, bytes_len) };
     }
 
-    unsafe { *out_err = ERR_OK };
-    list_ptr
+    Ok(list)
 }
 
 #[cfg(test)]
@@ -434,40 +331,23 @@ mod tests {
     fn enumerate_and_read_own_images() {
         // Read our OWN task — no root needed (reading self, not task_for_pid).
         let task = unsafe { mach_task_self_ };
-        let mut err = ERR_OK;
-        let list = unsafe { sismo_dyld_enumerate(task, &mut err) };
-        assert!(!list.is_null(), "enumerate failed, err={err}");
-        let n = unsafe { sismo_dyld_list_count(list) };
-        assert!(n > 0, "expected at least the main executable + dylibs");
-
-        // First image: base + path present.
-        let (mut base, mut path_ptr, mut path_len) = (0u64, std::ptr::null::<u8>(), 0usize);
-        unsafe { sismo_dyld_list_get(list, 0, &mut base, &mut path_ptr, &mut path_len) };
-        assert_ne!(base, 0);
+        let list = ImageList::enumerate(task).expect("enumerate failed");
+        assert!(!list.is_empty(), "expected at least the main executable + dylibs");
+        assert_ne!(list.images()[0].0, 0);
 
         // Find an image that reads as a 64-bit mach-o with a __TEXT segment
         // (the main executable always does).
         let mut found_macho = false;
-        for i in 0..n {
-            let (mut b, mut p, mut pl) = (0u64, std::ptr::null::<u8>(), 0usize);
-            unsafe { sismo_dyld_list_get(list, i, &mut b, &mut p, &mut pl) };
-            let (mut tvs, mut ct, mut cst, mut blen) = (0u64, 0u32, 0u32, 0usize);
-            let mut uuid = [0u8; 16];
-            let bytes = unsafe {
-                sismo_dyld_read_macho(task, b, &mut tvs, &mut ct, &mut cst, uuid.as_mut_ptr(), &mut blen)
-            };
-            if !bytes.is_null() {
-                assert!(tvs > 0 && blen > 0);
+        for (base, _) in list.images() {
+            if let Some(m) = read_macho(task, *base) {
+                assert!(m.text_vmsize > 0 && !m.text.is_empty());
                 // Slab starts with the mach-o magic.
-                let slab = unsafe { std::slice::from_raw_parts(bytes, blen) };
-                assert_eq!(read_u32(slab, 0), MH_MAGIC_64);
-                unsafe { sismo_dyld_free_bytes(bytes, blen) };
+                assert_eq!(read_u32(&m.text, 0), MH_MAGIC_64);
                 found_macho = true;
                 break;
             }
         }
         assert!(found_macho, "no readable 64-bit mach-o among own images");
-        unsafe { sismo_dyld_list_free(list) };
     }
 
     #[test]
@@ -477,23 +357,15 @@ mod tests {
         let task = unsafe { mach_task_self_ };
         let mut sym = Symbolizer::new().unwrap();
         let mut unw = Unwinder::new_arm64();
-        let mut err = ERR_OK;
-        let list = unsafe {
-            sismo_load_target_modules(task, &mut sym, &mut unw, 0, 0, std::ptr::null_mut(), None, &mut err)
-        };
-        assert!(!list.is_null(), "load failed, err={err}");
-        assert!(unsafe { sismo_dyld_list_count(list) } > 0);
-        unsafe { sismo_dyld_list_free(list) };
+        let list = load_target_modules(task, Some(&mut sym), Some(&mut unw), 0, 0, || false)
+            .expect("load failed");
+        assert!(!list.is_empty());
     }
 
     #[test]
     fn read_macho_rejects_non_macho_address() {
         let task = unsafe { mach_task_self_ };
-        // Address 0 is unmapped → vm_read fails → null.
-        let (mut tvs, mut ct, mut cst, mut blen) = (0u64, 0u32, 0u32, 0usize);
-        let mut uuid = [0u8; 16];
-        let bytes =
-            unsafe { sismo_dyld_read_macho(task, 0, &mut tvs, &mut ct, &mut cst, uuid.as_mut_ptr(), &mut blen) };
-        assert!(bytes.is_null());
+        // Address 0 is unmapped → vm_read fails → None.
+        assert!(read_macho(task, 0).is_none());
     }
 }

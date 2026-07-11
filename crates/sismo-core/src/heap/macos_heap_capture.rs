@@ -34,10 +34,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 // Sibling Rust modules (direct calls, no FFI round-trip).
-use crate::symbolize::dyld_images::{
-    sismo_dyld_list_count, sismo_dyld_list_free, sismo_dyld_list_get, sismo_load_target_modules,
-    ImageList,
-};
+use crate::symbolize::dyld_images::{load_target_modules, ImageList};
 use crate::heap::{
     sismo_heap_build_clock_snapshot_packet, sismo_heap_build_profile_packet, sismo_heap_free,
 };
@@ -183,9 +180,6 @@ extern "C" fn on_flush(user_arg: *mut c_void, flusher: *mut c_void) {
     self_.wakeup.set();
 }
 
-extern "C" fn abort_cb(ctx: *mut c_void) -> bool {
-    as_ref(ctx).exit_requested.load(Ordering::Acquire)
-}
 
 impl HeapCapture {
     /// Setup-failure path: park honoring stop, flush, and exit so the
@@ -256,12 +250,11 @@ impl HeapCapture {
         }
 
         // Unwinder + symbolizer must exist before we register modules into them.
-        let unwinder = Box::into_raw(Box::new(Unwinder::new_arm64()));
-        let symbolizer = match Symbolizer::new() {
-            Some(s) => Box::into_raw(Box::new(s)),
+        let mut unwinder = Unwinder::new_arm64();
+        let mut symbolizer = match Symbolizer::new() {
+            Some(s) => s,
             None => {
                 eprintln!("heap_capture: symbolizer.create failed");
-                drop(unsafe { Box::from_raw(unwinder) });
                 self.park_until_exit();
                 return;
             }
@@ -269,36 +262,28 @@ impl HeapCapture {
 
         // Enumerate + register the target's modules into the symbolizer +
         // unwinder (all in Rust). Retries the post-spawn empty-list window,
-        // polling abort_cb so shutdown interrupts the wait. The returned list
-        // (sorted by base) is kept for the profile's mappings.
-        let mut load_err = 0u32;
-        let image_list = unsafe {
-            sismo_load_target_modules(
-                task,
-                symbolizer,
-                unwinder,
-                50 * 1_000_000,
-                5 * 1_000_000_000,
-                self as *const HeapCapture as *mut c_void,
-                Some(abort_cb),
-                &mut load_err,
-            )
+        // polling the abort closure so shutdown interrupts the wait. The returned
+        // list (sorted by base) is kept for the profile's mappings.
+        let image_list = match load_target_modules(
+            task,
+            Some(&mut symbolizer),
+            Some(&mut unwinder),
+            50 * 1_000_000,
+            5 * 1_000_000_000,
+            || self.exit_requested.load(Ordering::Acquire),
+        ) {
+            Ok(l) => l,
+            Err(load_err) => {
+                eprintln!("heap_capture: load_target_modules failed (err={load_err})");
+                self.park_until_exit();
+                return;
+            }
         };
-        if image_list.is_null() {
-            eprintln!("heap_capture: load_target_modules failed (err={load_err})");
-            drop(unsafe { Box::from_raw(symbolizer) });
-            drop(unsafe { Box::from_raw(unwinder) });
-            self.park_until_exit();
-            return;
-        }
 
         let ring = match RingBuffer::create(ring_size_bytes) {
             Ok(r) => r,
             Err(_) => {
                 eprintln!("heap_capture: ring.create failed");
-                unsafe { sismo_dyld_list_free(image_list) };
-                drop(unsafe { Box::from_raw(symbolizer) });
-                drop(unsafe { Box::from_raw(unwinder) });
                 self.park_until_exit();
                 return;
             }
@@ -316,9 +301,6 @@ impl HeapCapture {
                 Err(_) => {
                     eprintln!("heap_capture: connectAndAttach({target_pid}) failed — target's heap_preload may not be loaded yet");
                     drop(ring);
-                    unsafe { sismo_dyld_list_free(image_list) };
-                    drop(unsafe { Box::from_raw(symbolizer) });
-                    drop(unsafe { Box::from_raw(unwinder) });
                     self.park_until_exit();
                     return;
                 }
@@ -336,7 +318,7 @@ impl HeapCapture {
             }
 
             if self.running.load(Ordering::Acquire) {
-                self.drain_into(&ring, unwinder, &mut sizes_by_top_pc);
+                self.drain_into(&ring, &mut unwinder, &mut sizes_by_top_pc);
             }
 
             // Flush: catch up on the ring, stamp the snapshot moment HERE (not
@@ -344,10 +326,10 @@ impl HeapCapture {
             // the emit duration), then emit the ProfilePacket.
             let flusher = self.pending_flusher.swap(0, Ordering::AcqRel);
             if flusher != 0 {
-                self.drain_into(&ring, unwinder, &mut sizes_by_top_pc);
+                self.drain_into(&ring, &mut unwinder, &mut sizes_by_top_pc);
                 let snapshot_ts = now_ns();
                 self.sites_observed.store(sizes_by_top_pc.len() as u32, Ordering::Release);
-                self.emit_profile(&sizes_by_top_pc, image_list, symbolizer, snapshot_ts);
+                self.emit_profile(&sizes_by_top_pc, &image_list, &mut symbolizer, snapshot_ts);
                 unsafe { sismo_flush_done(flusher as *mut c_void) };
             }
 
@@ -364,10 +346,10 @@ impl HeapCapture {
                     ctrl_fd_open = false;
                     self.wakeup.wait_timeout(Duration::from_nanos(DETACH_SETTLE_NS));
                 }
-                self.drain_into(&ring, unwinder, &mut sizes_by_top_pc);
+                self.drain_into(&ring, &mut unwinder, &mut sizes_by_top_pc);
                 let snapshot_ts = now_ns();
                 self.sites_observed.store(sizes_by_top_pc.len() as u32, Ordering::Release);
-                self.emit_profile(&sizes_by_top_pc, image_list, symbolizer, snapshot_ts);
+                self.emit_profile(&sizes_by_top_pc, &image_list, &mut symbolizer, snapshot_ts);
                 unsafe { sismo_stop_done(stopper as *mut c_void) };
                 self.running.store(false, Ordering::Release);
             }
@@ -386,17 +368,14 @@ impl HeapCapture {
         if ctrl_fd_open {
             unsafe { close(ctrl_fd) };
         }
-        drop(ring);
-        unsafe { sismo_dyld_list_free(image_list) };
-        drop(unsafe { Box::from_raw(symbolizer) });
-        drop(unsafe { Box::from_raw(unwinder) });
+        // ring, image_list, symbolizer, and unwinder drop here.
     }
 
     /// Drain up to 4096 ring records into the aggregation map.
     fn drain_into(
         &self,
         ring: &RingBuffer,
-        unwinder: *mut Unwinder,
+        unwinder: &mut Unwinder,
         sizes: &mut HashMap<u64, AllocStats>,
     ) {
         let mut batch = 0u64;
@@ -414,7 +393,7 @@ impl HeapCapture {
     fn process_record(
         &self,
         slice: &[u8],
-        unwinder: *mut Unwinder,
+        unwinder: &mut Unwinder,
         sizes: &mut HashMap<u64, AllocStats>,
     ) {
         if slice.len() < ALLOC_METADATA_BYTES + STACK_SNAPSHOT_BYTES {
@@ -428,8 +407,8 @@ impl HeapCapture {
         let fp = read_u64(slice, OFF_REG_FP);
         let stack_bytes = &slice[ALLOC_METADATA_BYTES..];
 
-        let pcs = unsafe { &mut *unwinder }
-            .walk_snapshot(StackRegs { pc, fp, lr, sp }, stack_bytes, sp, MAX_FRAMES);
+        let pcs =
+            unwinder.walk_snapshot(StackRegs { pc, fp, lr, sp }, stack_bytes, sp, MAX_FRAMES);
 
         let top_pc = pcs.first().copied().unwrap_or(alloc_address);
         let entry = sizes.entry(top_pc).or_insert_with(|| {
@@ -453,8 +432,8 @@ impl HeapCapture {
     fn emit_profile(
         &self,
         sizes: &HashMap<u64, AllocStats>,
-        image_list: *mut ImageList,
-        symbolizer: *mut Symbolizer,
+        image_list: &ImageList,
+        symbolizer: &mut Symbolizer,
         snapshot_ts_ns: u64,
     ) {
         let slot = self.ds_slot.load(Ordering::Acquire);
@@ -464,15 +443,15 @@ impl HeapCapture {
         // HeapImage array from the Rust image list (sorted by base in
         // load_target_modules; iid = index + 1, so order matters). Paths point
         // into the list, which outlives this call.
-        let image_count = unsafe { sismo_dyld_list_count(image_list) };
-        let mut images: Vec<HeapImage> = Vec::with_capacity(image_count);
-        for i in 0..image_count {
-            let mut base: u64 = 0;
-            let mut path_ptr: *const u8 = std::ptr::null();
-            let mut path_len: usize = 0;
-            unsafe { sismo_dyld_list_get(image_list, i, &mut base, &mut path_ptr, &mut path_len) };
-            images.push(HeapImage { base_avma: base, path_ptr, path_len });
-        }
+        let images: Vec<HeapImage> = image_list
+            .images()
+            .iter()
+            .map(|(base, path)| HeapImage {
+                base_avma: *base,
+                path_ptr: path.as_ptr(),
+                path_len: path.len(),
+            })
+            .collect();
 
         let mut sites: Vec<HeapSite> = Vec::with_capacity(sizes.len());
         for s in sizes.values() {
