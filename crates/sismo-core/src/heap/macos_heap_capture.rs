@@ -71,27 +71,17 @@ const OFF_REG_PC: usize = 48;
 const OFF_REG_LR: usize = 56;
 const OFF_REG_FP: usize = 64;
 
-// CLOCK_MONOTONIC (Darwin value 6).
-const CLOCK_MONOTONIC: i32 = 6;
 type MachPort = u32;
 const KERN_SUCCESS: i32 = 0;
 
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
+// libc's mach_task_self_ is deprecated (mach2 crate); keep it hand-rolled.
 extern "C" {
     static mach_task_self_: MachPort;
-    fn task_for_pid(target_tport: MachPort, pid: i32, t: *mut MachPort) -> i32;
-    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
-    fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 
 fn now_ns() -> u64 {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -241,7 +231,7 @@ impl HeapCapture {
 
         // ---- Heavy setup phase -----------------------------------------
         let mut task: MachPort = 0;
-        if unsafe { task_for_pid(mach_task_self_, target_pid as i32, &mut task) } != KERN_SUCCESS {
+        if unsafe { libc::task_for_pid(mach_task_self_, target_pid as i32, &mut task) } != KERN_SUCCESS {
             eprintln!("heap_capture: task_for_pid({target_pid}) failed — need sudo or the debugger entitlement.");
             self.park_until_exit();
             return;
@@ -340,7 +330,7 @@ impl HeapCapture {
             let stopper = self.pending_stopper.swap(0, Ordering::AcqRel);
             if stopper != 0 {
                 if ctrl_fd_open {
-                    unsafe { close(ctrl_fd) };
+                    unsafe { libc::close(ctrl_fd) };
                     ctrl_fd_open = false;
                     self.wakeup.wait_timeout(Duration::from_nanos(DETACH_SETTLE_NS));
                 }
@@ -364,7 +354,7 @@ impl HeapCapture {
         }
 
         if ctrl_fd_open {
-            unsafe { close(ctrl_fd) };
+            unsafe { libc::close(ctrl_fd) };
         }
         // ring, image_list, symbolizer, and unwinder drop here.
     }
