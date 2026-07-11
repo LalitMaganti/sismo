@@ -13,7 +13,7 @@
 //!
 //! macOS only; gated in lib.rs.
 
-use crate::sched::proc_info::{sismo_proc_parent_pid, sismo_proc_pid_path, sismo_proc_thread_name};
+use crate::sched::proc_info::{parent_pid, pid_path, thread_name};
 use crate::proto::{write_kernel_task_state_event, ProtoWriter};
 use crate::proto::sched_protos::{
     encode_kernel_process_tree, macos_sched_vm_program, ProcessC, ThreadC,
@@ -52,14 +52,11 @@ const THREAD_MAP_CAPACITY: usize = 16 * 1024;
 const MAX_NEW_THREADS: usize = 256;
 const MAX_NEW_PROCESSES: usize = 128;
 
-// ---- kdebug ring (crate::sched::kdebug) + timebase -------------------------
+// ---- kdebug ring + timebase ------------------------------------------------
+
+use crate::sched::kdebug::{kdebug_drain, kdebug_read_thread_map, kdebug_start, kdebug_teardown};
 
 extern "C" {
-    fn sismo_kdebug_start(buffer_events: i32) -> i32;
-    fn sismo_kdebug_drain(out: *mut u8, cap_events: usize, out_count: *mut usize) -> bool;
-    fn sismo_kdebug_read_thread_map(out: *mut u8, cap_bytes: usize, out_entries: *mut usize) -> bool;
-    fn sismo_kdebug_teardown();
-
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
     fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
 }
@@ -228,7 +225,7 @@ impl SchedCapture {
         let (tb_n, tb_d) = (tb.numer as u64, tb.denom as u64);
 
         let mut setup_failed = false;
-        if unsafe { sismo_kdebug_start(kernel_buffer_events) } != 0 {
+        if kdebug_start(kernel_buffer_events).is_err() {
             eprintln!("macos_sched_capture: kdebug.start failed");
             setup_failed = true;
         }
@@ -295,17 +292,20 @@ impl SchedCapture {
         cache: &mut PtCache,
     ) {
         let t0 = now_ns();
-        let mut n_evt = 0usize;
-        unsafe {
-            sismo_kdebug_drain(event_buf.as_mut_ptr() as *mut u8, event_buf.len(), &mut n_evt)
+        // KdBuf / KdThreadMap are repr(C) POD; kdebug reads raw bytes into them.
+        let evt_bytes = unsafe {
+            std::slice::from_raw_parts_mut(event_buf.as_mut_ptr() as *mut u8, std::mem::size_of_val(event_buf))
         };
+        let n_evt = kdebug_drain(evt_bytes).unwrap_or(0);
         let t_drain = now_ns();
 
-        let mut n_thr = 0usize;
-        let cap_bytes = std::mem::size_of_val(thread_map_buf);
-        unsafe {
-            sismo_kdebug_read_thread_map(thread_map_buf.as_mut_ptr() as *mut u8, cap_bytes, &mut n_thr)
+        let thr_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                thread_map_buf.as_mut_ptr() as *mut u8,
+                std::mem::size_of_val(thread_map_buf),
+            )
         };
+        let n_thr = kdebug_read_thread_map(thr_bytes).unwrap_or(0);
         let thread_map = &thread_map_buf[..n_thr.min(thread_map_buf.len())];
 
         self.refresh_and_emit_tree(slot, thread_map, cache);
@@ -348,32 +348,18 @@ impl SchedCapture {
             let known = cache.threads.get(&tid).map(|(p, _)| *p == pid).unwrap_or(false);
             if !known {
                 // Resolve pth_name; fall back to the threadmap comm.
-                let mut name_buf = [0u8; 64];
-                let n = unsafe { sismo_proc_thread_name(pid, tid, name_buf.as_mut_ptr(), name_buf.len()) };
-                let name: Vec<u8> = if n > 0 {
-                    name_buf[..n].to_vec()
-                } else {
-                    threadmap_command(t).to_vec()
-                };
+                let name = thread_name(pid, tid).unwrap_or_else(|| threadmap_command(t).to_vec());
                 cache.threads.insert(tid, (pid, name.clone()));
                 if new_threads.len() < MAX_NEW_THREADS {
                     new_threads.push((tid, pid, name));
                 }
 
                 if !cache.processes.contains_key(&pid) {
-                    let mut ppid = 0u32;
-                    if unsafe { sismo_proc_parent_pid(pid, &mut ppid) } {}
-                    let mut path_buf = [0u8; 1024];
-                    let plen = unsafe { sismo_proc_pid_path(pid, path_buf.as_mut_ptr(), path_buf.len()) };
-                    // proc_pidpath's length trails a NUL — trim trailing NULs.
-                    let trimmed = {
-                        let s = &path_buf[..plen];
-                        let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-                        s[..end].to_vec()
-                    };
-                    cache.processes.insert(pid, (ppid as i32, trimmed.clone()));
+                    let ppid = parent_pid(pid).unwrap_or(0) as i32;
+                    let path = pid_path(pid).unwrap_or_default();
+                    cache.processes.insert(pid, (ppid, path.clone()));
                     if new_processes.len() < MAX_NEW_PROCESSES {
-                        new_processes.push((pid, ppid as i32, trimmed));
+                        new_processes.push((pid, ppid, path));
                     }
                 }
             }
@@ -576,7 +562,7 @@ impl SchedCapture {
         if let Some(h) = handle {
             let _ = h.join();
         }
-        unsafe { sismo_kdebug_teardown() };
+        kdebug_teardown();
         SchedStats {
             events_emitted: self.events_emitted.load(Ordering::Relaxed),
             drain_calls: self.drain_calls.load(Ordering::Relaxed),

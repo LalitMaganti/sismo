@@ -30,14 +30,17 @@ const DBG_MACH: u32 = 1;
 const DBG_MACH_SCHED: u32 = 0x40;
 const KDBG_SUBCLSTYPE: u32 = 0x0002_0000;
 
-const KD_BUF_SIZE: usize = 64; // sizeof(kd_buf) on arm64
 const KD_THREADMAP_ENTRY_SIZE: usize = 32; // sizeof(kd_threadmap): u64 + i32 + [20]u8, 8-aligned
 
-// sismo_kdebug_start return codes.
-const START_OK: i32 = 0;
-const START_SETUP_FAILED: i32 = 1;
-const START_SETREG_FAILED: i32 = 2;
-const START_ENABLE_FAILED: i32 = 3;
+/// Why [`kdebug_start`] failed.
+pub enum StartError {
+    /// KDSETBUF or KDSETUP failed.
+    Setup,
+    /// KDSETREG (the DBG_MACH_SCHED filter) failed.
+    SetReg,
+    /// KDENABLE failed.
+    Enable,
+}
 
 extern "C" {
     fn sysctl(
@@ -74,19 +77,16 @@ unsafe fn sysctl_set_int(cmd: i32, value: i32) -> i32 {
 }
 
 /// Tear down any prior session, size the buffer, install the DBG_MACH_SCHED
-/// filter, and enable capture. Returns START_OK or a START_* failure code.
-///
-/// # Safety
-/// Calls the KERN_KDEBUG sysctls (needs root); no invalid memory access.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_kdebug_start(buffer_events: i32) -> i32 {
+/// filter, and enable capture. Calls the KERN_KDEBUG sysctls, which need root
+/// (they return EPERM otherwise).
+pub fn kdebug_start(buffer_events: i32) -> Result<(), StartError> {
     unsafe {
         let _ = sysctl_void(KERN_KDREMOVE); // idempotent teardown
         if sysctl_set_int(KERN_KDSETBUF, buffer_events) < 0 {
-            return START_SETUP_FAILED;
+            return Err(StartError::Setup);
         }
         if sysctl_void(KERN_KDSETUP) < 0 {
-            return START_SETUP_FAILED;
+            return Err(StartError::Setup);
         }
         let mut reg = KdRegType {
             reg_type: KDBG_SUBCLSTYPE,
@@ -107,67 +107,47 @@ pub unsafe extern "C" fn sismo_kdebug_start(buffer_events: i32) -> i32 {
         ) < 0
         {
             let _ = sysctl_void(KERN_KDREMOVE);
-            return START_SETREG_FAILED;
+            return Err(StartError::SetReg);
         }
         if sysctl_set_int(KERN_KDENABLE, 1) < 0 {
             let _ = sysctl_void(KERN_KDREMOVE);
-            return START_ENABLE_FAILED;
+            return Err(StartError::Enable);
         }
-        START_OK
+        Ok(())
     }
 }
 
-/// Drain the kernel ring into `out` (space for `cap_events` × 64-byte kd_bufs)
-/// WITHOUT stopping capture. Writes the event count to `*out_count`. Returns
-/// false on sysctl failure.
-///
-/// # Safety
-/// `out` must be writable for `cap_events * 64` bytes; `out_count` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_kdebug_drain(out: *mut u8, cap_events: usize, out_count: *mut usize) -> bool {
+/// Drain the kernel ring into `out` (a buffer of 64-byte kd_bufs) WITHOUT
+/// stopping capture. Returns the event count, or `None` on sysctl failure.
+pub fn kdebug_drain(out: &mut [u8]) -> Option<usize> {
     let mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADTR];
-    let mut len = cap_events * KD_BUF_SIZE;
+    let mut len = out.len();
     let rc = unsafe {
-        sysctl(mib.as_ptr(), mib.len() as u32, out as *mut c_void, &mut len, std::ptr::null(), 0)
+        sysctl(mib.as_ptr(), mib.len() as u32, out.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null(), 0)
     };
     if rc < 0 {
-        return false;
+        return None;
     }
     // KDREADTR overwrites len with the event *count*, not the byte count.
-    unsafe { *out_count = len };
-    true
+    Some(len)
 }
 
-/// Read the current thread map (KERN_KDREADCURTHRMAP) into `out`. `cap_bytes`
-/// is the buffer capacity; writes the entry count to `*out_entries`. Returns
-/// false on sysctl failure.
-///
-/// # Safety
-/// `out` writable for `cap_bytes`; `out_entries` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_kdebug_read_thread_map(
-    out: *mut u8,
-    cap_bytes: usize,
-    out_entries: *mut usize,
-) -> bool {
+/// Read the current thread map (KERN_KDREADCURTHRMAP) into `out`. Returns the
+/// entry count, or `None` on sysctl failure.
+pub fn kdebug_read_thread_map(out: &mut [u8]) -> Option<usize> {
     let mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADCURTHRMAP];
-    let mut len = cap_bytes;
+    let mut len = out.len();
     let rc = unsafe {
-        sysctl(mib.as_ptr(), mib.len() as u32, out as *mut c_void, &mut len, std::ptr::null(), 0)
+        sysctl(mib.as_ptr(), mib.len() as u32, out.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null(), 0)
     };
     if rc < 0 {
-        return false;
+        return None;
     }
-    unsafe { *out_entries = len / KD_THREADMAP_ENTRY_SIZE };
-    true
+    Some(len / KD_THREADMAP_ENTRY_SIZE)
 }
 
 /// Tear down the kdebug session (frees the kernel buffers).
-///
-/// # Safety
-/// Calls a KERN_KDEBUG sysctl; no memory access.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_kdebug_teardown() {
+pub fn kdebug_teardown() {
     unsafe {
         let _ = sysctl_void(KERN_KDREMOVE);
     }
@@ -181,18 +161,15 @@ mod tests {
     fn start_without_root_fails_cleanly() {
         // cargo test runs unprivileged, so the KERN_KDEBUG sysctls return EPERM.
         // We just need the call path to not crash and to report failure.
-        let rc = unsafe { sismo_kdebug_start(1000) };
-        assert_ne!(rc, START_OK, "kdebug start should fail without root");
-        unsafe { sismo_kdebug_teardown() }; // must be a harmless no-op
+        assert!(kdebug_start(1000).is_err(), "kdebug start should fail without root");
+        kdebug_teardown(); // must be a harmless no-op
     }
 
     #[test]
     fn drain_without_session_reports_cleanly() {
-        let mut buf = [0u8; KD_BUF_SIZE * 4];
-        let mut count = 12345usize;
-        // No active session (and unprivileged) → sysctl fails → false, and we
-        // must not touch out_count on failure / must not crash.
-        let ok = unsafe { sismo_kdebug_drain(buf.as_mut_ptr(), 4, &mut count) };
-        assert!(!ok || count <= 4);
+        let mut buf = [0u8; 4 * 64]; // room for 4 kd_bufs
+        // No active session (and unprivileged) → sysctl fails → None; must not crash.
+        let n = kdebug_drain(&mut buf);
+        assert!(n.is_none() || n.unwrap() <= 4);
     }
 }
