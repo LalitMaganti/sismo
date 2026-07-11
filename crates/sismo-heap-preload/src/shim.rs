@@ -27,43 +27,25 @@ use crate::ring::RingBuffer;
 use crate::sampler::Sampler;
 use crate::wire::{AllocMetadata, RegBlockArm64, MAX_REGISTER_DATA_BYTES, STACK_SNAPSHOT_BYTES};
 use std::cell::{Cell, RefCell};
-use std::os::raw::{c_int, c_void};
+use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 // ---- libc ------------------------------------------------------------------
 
-#[repr(C)]
-#[derive(Default)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-const CLOCK_MONOTONIC: c_int = 6;
-
+// malloc stays hand-declared (not via the libc crate): the __interpose tuple
+// below stores this symbol as the original function. Everything else is libc.
 extern "C" {
     fn malloc(size: usize) -> *mut c_void;
-    fn clock_gettime(clk: c_int, tp: *mut Timespec) -> c_int;
-    fn pthread_create(
-        thread: *mut usize,
-        attr: *const c_void,
-        start: extern "C" fn(*mut c_void) -> *mut c_void,
-        arg: *mut c_void,
-    ) -> c_int;
-    fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
-    fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
-    fn close(fd: c_int) -> c_int;
-    fn nanosleep(req: *const Timespec, rem: *mut c_void) -> c_int;
-    fn getpid() -> c_int;
 }
 
 fn now_ns() -> u64 {
-    let mut ts = Timespec::default();
-    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 fn log(s: &[u8]) {
-    unsafe { write(2, s.as_ptr() as *const c_void, s.len()) };
+    unsafe { libc::write(2, s.as_ptr() as *const c_void, s.len()) };
 }
 
 // ---- Global state ----------------------------------------------------------
@@ -99,8 +81,8 @@ fn sample_size_for(size: u64) -> u64 {
     T_SAMPLER.with(|cell| {
         let mut opt = cell.borrow_mut();
         if opt.is_none() || T_SAMPLER_GEN.with(|g| g.get()) != gen {
-            let mut ts = Timespec::default();
-            unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
             let seed = ts.tv_nsec as u64 ^ (cell as *const _ as u64);
             *opt = Some(Sampler::new(G_SAMPLING_INTERVAL.load(Ordering::Relaxed), seed));
             T_SAMPLER_GEN.with(|g| g.set(gen));
@@ -113,7 +95,7 @@ fn sample_size_for(size: u64) -> u64 {
 
 extern "C" fn listener_thread(_: *mut c_void) -> *mut c_void {
     set_in_capture(true); // never re-enter the shim from this thread
-    let pid = unsafe { getpid() };
+    let pid = unsafe { libc::getpid() };
     let listener = match protocol::listen_for_attach(pid) {
         Ok(l) => l,
         Err(_) => {
@@ -154,7 +136,7 @@ extern "C" fn listener_thread(_: *mut c_void) -> *mut c_void {
 
         // Block on the control connection until EOF (a liveness signal only).
         let mut b = [0u8; 1];
-        unsafe { read(attach.conn_fd, b.as_mut_ptr() as *mut c_void, 1) };
+        unsafe { libc::read(attach.conn_fd, b.as_mut_ptr() as *mut c_void, 1) };
 
         // Detach: disable, tear down the ring (Drop munmaps + closes shm_fd).
         G_ENABLED.store(false, Ordering::Release);
@@ -163,13 +145,13 @@ extern "C" fn listener_thread(_: *mut c_void) -> *mut c_void {
         if !old.is_null() {
             drop(unsafe { Box::from_raw(old) });
         }
-        unsafe { close(attach.conn_fd) };
+        unsafe { libc::close(attach.conn_fd) };
     }
 }
 
 fn sleep_us(us: u64) {
-    let ts = Timespec { tv_sec: (us / 1_000_000) as i64, tv_nsec: ((us % 1_000_000) * 1000) as i64 };
-    unsafe { nanosleep(&ts, std::ptr::null_mut()) };
+    let ts = libc::timespec { tv_sec: (us / 1_000_000) as i64, tv_nsec: ((us % 1_000_000) * 1000) as i64 };
+    unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
 }
 
 // ---- Module init (dyld load) -----------------------------------------------
@@ -179,8 +161,8 @@ extern "C" fn module_init() {
         return;
     }
     set_in_capture(true);
-    let mut tid: usize = 0;
-    unsafe { pthread_create(&mut tid, std::ptr::null(), listener_thread, std::ptr::null_mut()) };
+    let mut tid: libc::pthread_t = 0;
+    unsafe { libc::pthread_create(&mut tid, std::ptr::null(), listener_thread, std::ptr::null_mut()) };
     set_in_capture(false);
     log(b"sismo-heap: preload loaded, listener thread spawned\n");
 }

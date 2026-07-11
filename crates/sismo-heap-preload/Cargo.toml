@@ -3,10 +3,10 @@
 
 # The macOS heap preload: a DYLD_INSERT_LIBRARIES dylib that interposes malloc
 # and streams sampled allocations to the recorder over a shm ring. It is
-# injected into arbitrary target processes, so it links NOTHING heavy (no
+# injected into arbitrary target processes, so it depends on nothing heavy (no
 # sismo-core) and carries its own tiny copies of the wire layout + ring
-# (attach/write side) + control protocol (listen/accept side). Migrated from
-# src/heap_preload_macos.zig (P6).
+# (attach/write side) + control protocol (listen/accept side). libc is fine —
+# it's compile-time bindings to the same libSystem the dylib already links.
 
 [package]
 name = "sismo-heap-preload"
@@ -20,6 +20,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+libc = "0.2"
 
 [profile.release]
 panic = "abort"    # never unwind into the injected target
