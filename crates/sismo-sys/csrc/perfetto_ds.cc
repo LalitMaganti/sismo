@@ -264,6 +264,16 @@ extern "C" void sismo_ds_emit_offcpu(uint32_t slot,
 #undef EMIT_AUX_SLOT
 }
 
+// Flush the slot's off-CPU trace writer so its buffered packets reach the
+// service. The SDK flushes the primary sequence as part of the flush protocol,
+// but the off-CPU writer is ours, so the worker flushes it explicitly (on the
+// emitting thread) before acking a flush/stop, or its tail would be dropped.
+extern "C" void sismo_ds_flush_offcpu(uint32_t slot) {
+  if (slot < kMaxSlots && g_aux_writer[slot]) {
+    g_aux_writer[slot]->Flush();
+  }
+}
+
 extern "C" void sismo_stop_done(void* handle) {
     if (!handle) return;
     auto* fn = static_cast<std::function<void()>*>(handle);

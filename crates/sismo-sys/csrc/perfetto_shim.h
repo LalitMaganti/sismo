@@ -130,6 +130,8 @@ uint32_t sismo_ds_register(const uint8_t* desc_bytes, size_t desc_len,
 void sismo_ds_emit_offcpu(uint32_t slot,
                           const uint8_t* packet_bytes,
                           size_t packet_len);
+// Flush the off-CPU writer (call before acking a flush/stop) so its tail lands.
+void sismo_ds_flush_offcpu(uint32_t slot);
 
 void sismo_ds_emit(uint32_t slot,
                    const uint8_t* packet_bytes,

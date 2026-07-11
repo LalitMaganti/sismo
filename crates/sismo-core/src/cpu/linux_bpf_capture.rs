@@ -1025,7 +1025,7 @@ impl Capture {
 
 // ---- init / worker / DS lifecycle / C ABI ----------------------------------
 
-use crate::ffi::{sismo_ds_register, sismo_flush_done, sismo_stop_done};
+use crate::ffi::{sismo_ds_flush_offcpu, sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use std::ptr;
 use std::time::Duration;
 
@@ -1089,11 +1089,15 @@ fn service_acks(cap: *mut Capture) {
     let fh = c.flush_req.swap(0, Ordering::AcqRel);
     if fh != 0 {
         unsafe { ring_buffer__consume(c.rb) };
+        // Commit the off-CPU writer's tail before acking — the SDK flushes the
+        // primary sequence for us, but the off-CPU writer is ours.
+        unsafe { sismo_ds_flush_offcpu(c.ds_slot) };
         unsafe { sismo_flush_done(fh as *mut c_void) };
     }
     let sh = c.stop_req.swap(0, Ordering::AcqRel);
     if sh != 0 {
         unsafe { ring_buffer__consume(c.rb) };
+        unsafe { sismo_ds_flush_offcpu(c.ds_slot) };
         c.active.store(false, Ordering::Release);
         unsafe { sismo_stop_done(sh as *mut c_void) };
     }
