@@ -21,7 +21,6 @@ use std::time::Duration;
 
 const DS_NAME: &[u8] = b"sismo.macos_cpu_samples";
 const DEFAULT_INTERVAL_NS: u64 = 1_000_000; // 1 kHz
-const U32_MAX: u32 = u32::MAX;
 
 // ---- Mach thread enumeration (task_for_pid + task_threads + thread_info) ----
 
@@ -282,7 +281,7 @@ impl CpuCapture {
         let interval =
             if default_interval_ns != 0 { default_interval_ns } else { DEFAULT_INTERVAL_NS };
         let cap = Box::new(CpuCapture {
-            ds_slot: AtomicU32::new(U32_MAX),
+            ds_slot: AtomicU32::new(u32::MAX),
             config_interval_ns: interval,
             wakeup: Event::new(),
             running: AtomicBool::new(false),
@@ -315,7 +314,7 @@ impl CpuCapture {
                 cap_addr as *mut c_void,
             )
         };
-        if slot == U32_MAX {
+        if slot == u32::MAX {
             return None;
         }
         cap.ds_slot.store(slot, Ordering::Release);

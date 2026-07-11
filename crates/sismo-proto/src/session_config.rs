@@ -49,13 +49,14 @@ pub fn encode_data_source_descriptor(
 // ---- TraceConfig -----------------------------------------------------------
 
 /// TraceConfig mode. Maps to fill_policy + write_into_file / duration_ms.
-const MODE_RING: u32 = 0;
-const MODE_CAPPED: u32 = 1;
-const MODE_FILE: u32 = 2;
+pub const MODE_RING: u32 = 0;
+pub const MODE_CAPPED: u32 = 1;
+pub const MODE_FILE: u32 = 2;
 
-/// DataSourceEntry kind tags. Vendor (1) is the `_` fallback in `add_entry`.
-const KIND_TRACK_EVENT: u32 = 0;
-const KIND_LINUX_FTRACE: u32 = 2;
+/// DataSourceEntry kind tags. `KIND_SISMO_VENDOR` is the `_` fallback in `add_entry`.
+pub const KIND_TRACK_EVENT: u32 = 0;
+pub const KIND_SISMO_VENDOR: u32 = 1;
+pub const KIND_LINUX_FTRACE: u32 = 2;
 
 /// A `data_sources[*]` entry. `kind` selects which fields are read:
 /// track_event/linux_ftrace need none (their configs are fixed), sismo_vendor

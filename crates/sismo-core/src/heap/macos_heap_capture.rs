@@ -43,7 +43,6 @@ use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_
 use crate::worker_sdk::{now_ns, read_u64, wait_for_setup, Event};
 
 const DS_NAME: &[u8] = b"sismo.heap";
-const U32_MAX: u32 = u32::MAX;
 
 // Producer-side defaults; on_setup may override target_pid / ring_size /
 // sample_interval via SismoHeapConfig.
@@ -436,7 +435,7 @@ impl HeapCapture {
     /// thread. `None` on registration failure.
     pub fn start() -> Option<Box<HeapCapture>> {
         let cap = Box::new(HeapCapture {
-            ds_slot: AtomicU32::new(U32_MAX),
+            ds_slot: AtomicU32::new(u32::MAX),
             wakeup: Event::new(),
             running: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
@@ -463,7 +462,7 @@ impl HeapCapture {
         let slot = unsafe {
             sismo_ds_register(desc.as_ptr(), desc.len(), on_setup, on_start, on_stop, on_flush, cap_addr as *mut c_void)
         };
-        if slot == U32_MAX {
+        if slot == u32::MAX {
             return None;
         }
         cap.ds_slot.store(slot, Ordering::Release);

@@ -20,7 +20,11 @@
 #[cfg(target_os = "macos")]
 use sismo_core::proto::{ProtoReader, WireValue};
 use crate::record_args::{RecordArgs, RecordConfig, SourceMode};
-use sismo_core::proto::session_config::{encode_trace_config, DataSourceEntry};
+use sismo_core::proto::session_config::{
+    encode_trace_config, DataSourceEntry, KIND_SISMO_VENDOR, KIND_TRACK_EVENT, MODE_FILE, MODE_RING,
+};
+#[cfg(target_os = "linux")]
+use sismo_core::proto::session_config::KIND_LINUX_FTRACE;
 #[cfg(target_os = "macos")]
 use sismo_core::proto::sismo_config;
 use sismo_core::sismo_paths::{
@@ -77,17 +81,13 @@ extern "C" fn handle_sigint(_sig: c_int) {
     }
 }
 
-fn setenv_str(k: &str, v: &str) {
-    std::env::set_var(k, v);
-}
-
 // ---- Workload spawn --------------------------------------------------------
 
 /// posix_spawnp `path` with `args` (its argv[1..]) after applying `env`
 /// overrides. Returns the child pid, or None on failure.
 fn maybe_spawn(path: &str, args: &[&str], env: &[(&str, &str)]) -> Option<i32> {
     for (k, v) in env {
-        setenv_str(k, v);
+        std::env::set_var(k, v);
     }
     let path_c = CString::new(path).ok()?;
     let mut argv_c: Vec<CString> = Vec::with_capacity(args.len() + 1);
@@ -245,11 +245,11 @@ fn wait_for_external_data_sources(session: *mut ConsumerSession, expected: &[&st
 // ---- DataSourceEntry builders ----------------------------------------------
 
 fn ds_track_event() -> DataSourceEntry<'static> {
-    DataSourceEntry { kind: 0, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
+    DataSourceEntry { kind: KIND_TRACK_EVENT, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
 }
 
 fn ds_sismo_vendor<'a>(name: &'a [u8], cfg: &'a [u8], protovm_kb: u32) -> DataSourceEntry<'a> {
-    DataSourceEntry { kind: 1, name, sismo_config: cfg, protovm_memory_limit_kb: protovm_kb }
+    DataSourceEntry { kind: KIND_SISMO_VENDOR, name, sismo_config: cfg, protovm_memory_limit_kb: protovm_kb }
 }
 
 // ---- Entry point -----------------------------------------------------------
@@ -336,8 +336,8 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     eprintln!(
         "sismo record: pid={my_pid} output={output_path_str}\n  producer sock: {PRODUCER_SOCK}\n  consumer sock: {CONSUMER_SOCK}"
     );
-    setenv_str("PERFETTO_PRODUCER_SOCK_NAME", PRODUCER_SOCK);
-    setenv_str("PERFETTO_CONSUMER_SOCK_NAME", CONSUMER_SOCK);
+    std::env::set_var("PERFETTO_PRODUCER_SOCK_NAME", PRODUCER_SOCK);
+    std::env::set_var("PERFETTO_CONSUMER_SOCK_NAME", CONSUMER_SOCK);
 
     // Embed traced + init the producer client.
     let prod_c = CString::new(PRODUCER_SOCK).unwrap();
@@ -485,7 +485,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     let out_path: &[u8] = if flight_recorder { b"" } else { output_path_str.as_bytes() };
     let session_name = b"sismo_record";
     let cfg = encode_trace_config(
-        if flight_recorder { 0 } else { 2 }, // ring : file
+        if flight_recorder { MODE_RING } else { MODE_FILE }, // ring : file
         buffer_kb,
         0,
         out_path,
@@ -665,7 +665,7 @@ use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
 
 #[cfg(target_os = "linux")]
 fn ds_linux_ftrace() -> DataSourceEntry<'static> {
-    DataSourceEntry { kind: 2, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
+    DataSourceEntry { kind: KIND_LINUX_FTRACE, name: b"", sismo_config: b"", protovm_memory_limit_kb: 0 }
 }
 
 #[cfg(target_os = "linux")]
@@ -706,8 +706,8 @@ fn run_linux(config: &RecordConfig) -> c_int {
         "sismo record: pid={} output={output_path_str}\n  producer sock: {PRODUCER_SOCK}\n  consumer sock: {CONSUMER_SOCK}",
         unsafe { getpid() }
     );
-    setenv_str("PERFETTO_PRODUCER_SOCK_NAME", PRODUCER_SOCK);
-    setenv_str("PERFETTO_CONSUMER_SOCK_NAME", CONSUMER_SOCK);
+    std::env::set_var("PERFETTO_PRODUCER_SOCK_NAME", PRODUCER_SOCK);
+    std::env::set_var("PERFETTO_CONSUMER_SOCK_NAME", CONSUMER_SOCK);
 
     // Embed traced + init the producer client.
     let prod_c = CString::new(PRODUCER_SOCK).unwrap();
@@ -815,7 +815,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     let out_path: &[u8] = if flight_recorder { b"" } else { output_path_str.as_bytes() };
     let session_name = b"sismo_record";
     let cfg = encode_trace_config(
-        if flight_recorder { 0 } else { 2 },
+        if flight_recorder { MODE_RING } else { MODE_FILE },
         buffer_kb,
         0,
         out_path,
