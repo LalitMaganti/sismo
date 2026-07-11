@@ -345,22 +345,30 @@ struct FocusSpec {
     sample_data_addr: bool,
 }
 
-pub fn focus_from_name(name: &[u8]) -> Option<FocusPreset> {
-    match name {
-        b"cache" => Some(FocusPreset::Cache),
-        _ => None,
+impl FocusPreset {
+    pub fn from_name(name: &[u8]) -> Option<FocusPreset> {
+        match name {
+            b"cache" => Some(FocusPreset::Cache),
+            _ => None,
+        }
     }
-}
 
-fn focus_spec(p: FocusPreset) -> FocusSpec {
-    match p {
-        // Sample on retired loads that missed L3 (precise, carries Data_LA).
-        FocusPreset::Cache => FocusSpec {
-            leader: Leader::Role(Role::l3_miss_load),
-            precise_ip: 2,
-            period: 2003,
-            sample_data_addr: true,
-        },
+    fn name(self) -> &'static str {
+        match self {
+            FocusPreset::Cache => "cache",
+        }
+    }
+
+    fn spec(self) -> FocusSpec {
+        match self {
+            // Sample on retired loads that missed L3 (precise, carries Data_LA).
+            FocusPreset::Cache => FocusSpec {
+                leader: Leader::Role(Role::l3_miss_load),
+                precise_ip: 2,
+                period: 2003,
+                sample_data_addr: true,
+            },
+        }
     }
 }
 
@@ -432,7 +440,7 @@ fn resolve_sampler(focus: Option<FocusPreset>, density: Option<f64>) -> Option<S
         }
         Some(p) => p,
     };
-    let s = focus_spec(p);
+    let s = p.spec();
     let period = scale_period(s.period, density);
     match s.leader {
         Leader::Cycles => Some(SamplerCfg {
@@ -966,12 +974,6 @@ pub struct LinuxBpfStats {
     pub data_frames: u64,
 }
 
-fn preset_name(p: FocusPreset) -> &'static str {
-    match p {
-        FocusPreset::Cache => "cache",
-    }
-}
-
 // A raw Capture pointer smuggled into the worker thread. The Capture is heap-
 // stable for the collector's lifetime and the worker is the sole owner of its
 // non-atomic fields between ring_buffer callbacks, so the crossing is sound.
@@ -1187,7 +1189,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         if let Some(p) = focus {
             eprintln!(
                 "sismo record: --focus {}: leader event unavailable on this CPU (model not in the PMU table); no CPU samples recorded",
-                preset_name(p)
+                p.name()
             );
         }
     }
