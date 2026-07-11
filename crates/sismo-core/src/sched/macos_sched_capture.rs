@@ -153,7 +153,7 @@ extern "C" fn on_setup(user_arg: *mut c_void, dsc_bytes: *const c_void, dsc_size
     let self_ = as_ref(user_arg);
     if !dsc_bytes.is_null() {
         let dsc = unsafe { std::slice::from_raw_parts(dsc_bytes as *const u8, dsc_size) };
-        if let Some(kbe) = config_extract(dsc).and_then(sched_decode) {
+        if let Some(kbe) = config_extract(dsc).map(sched_decode) {
             self_.setup_kernel_buffer_events.store(kbe, Ordering::Release);
         }
     }

@@ -91,7 +91,7 @@ extern "C" fn on_setup(user_arg: *mut c_void, dsc_bytes: *const c_void, dsc_size
     // Extract sismo_config (field 2000) then decode target_pid + interval_us.
     if !dsc_bytes.is_null() {
         let dsc = unsafe { std::slice::from_raw_parts(dsc_bytes as *const u8, dsc_size) };
-        if let Some((pid, interval_us)) = config_extract(dsc).and_then(cpu_decode) {
+        if let Some((pid, interval_us)) = config_extract(dsc).map(cpu_decode) {
             self_.setup_target_pid.store(pid, Ordering::Release);
             self_.setup_interval_us.store(interval_us, Ordering::Release);
         }
