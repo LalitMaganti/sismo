@@ -25,29 +25,11 @@ const U32_MAX: u32 = u32::MAX;
 
 // ---- Mach thread enumeration (task_for_pid + task_threads + thread_info) ----
 
-const THREAD_BASIC_INFO: u32 = 3;
-const THREAD_BASIC_INFO_COUNT: u32 = 10;
 const THREAD_IDENTIFIER_INFO: u32 = 4;
 const THREAD_IDENTIFIER_INFO_COUNT: u32 = 6;
 
-fn read_i32(b: &[u8], off: usize) -> i32 {
-    i32::from_le_bytes(b[off..off + 4].try_into().unwrap())
-}
 fn read_u64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-}
-
-unsafe fn thread_cpu_time_us(thread: MachPort) -> Option<u64> {
-    let mut buf = [0u8; 40];
-    let mut count = THREAD_BASIC_INFO_COUNT;
-    if unsafe { libc::thread_info(thread, THREAD_BASIC_INFO, buf.as_mut_ptr() as *mut i32, &mut count) }
-        != KERN_SUCCESS
-    {
-        return None;
-    }
-    // user_time (@0) + system_time (@8), each { i32 sec; i32 usec }.
-    let us = |so: usize, uo: usize| read_i32(&buf, so) as u64 * 1_000_000 + read_i32(&buf, uo) as u64;
-    Some(us(0, 4) + us(8, 12))
 }
 
 unsafe fn thread_kernel_tid(thread: MachPort) -> u64 {
@@ -70,7 +52,7 @@ use crate::worker_sdk::Event;
 // (no FFI round-trip): descriptor encoding, unwinder lifecycle, module loading,
 // and per-sample capture.
 use crate::symbolize::dyld_images::load_target_modules;
-use crate::cpu::mach_sampler::sample_thread;
+use crate::cpu::mach_sampler::{sample_thread, thread_cpu_time_us};
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::unwinder::Unwinder;
 
@@ -388,10 +370,7 @@ mod tests {
 
     #[test]
     fn own_thread_cpu_time_and_tid_readable() {
-        extern "C" {
-            fn mach_thread_self() -> MachPort;
-        }
-        let t = unsafe { mach_thread_self() };
+        let t = unsafe { crate::mach::mach_thread_self() };
         assert!(unsafe { thread_cpu_time_us(t) }.is_some());
         // tid may be 0 in odd sandboxes, but the call must not crash.
         let _ = unsafe { thread_kernel_tid(t) };

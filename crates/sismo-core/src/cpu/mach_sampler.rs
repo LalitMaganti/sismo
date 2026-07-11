@@ -60,7 +60,10 @@ fn now_monotonic_ns() -> u64 {
 }
 
 /// Total user+system CPU time for `thread`, in microseconds, or None on failure.
-unsafe fn thread_cpu_time_us(thread: MachPort) -> Option<u64> {
+///
+/// # Safety
+/// `thread` must be a live mach thread port.
+pub unsafe fn thread_cpu_time_us(thread: MachPort) -> Option<u64> {
     let mut buf = [0u8; 40];
     let mut count = THREAD_BASIC_INFO_COUNT;
     let rc = unsafe { libc::thread_info(thread, THREAD_BASIC_INFO, buf.as_mut_ptr() as *mut i32, &mut count) };
