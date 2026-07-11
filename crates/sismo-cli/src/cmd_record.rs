@@ -49,18 +49,7 @@ use sismo_core::ffi::{
 #[cfg(target_os = "macos")]
 use sismo_core::ffi::{sismo_consumer_query_service_state, ConsumerSession};
 
-extern "C" {
-    // The privileged-pid marker (Rust, but called via its C ABI for uniformity).
-    fn sismo_append_privileged_marker(
-        path: *const u8,
-        path_len: usize,
-        pids: *const i32,
-        pids_len: usize,
-        focus: *const u8,
-        focus_len: usize,
-        is_focus: bool,
-    ) -> bool;
-}
+use crate::privileged_marker::append_privileged_marker;
 
 // ---- libc ------------------------------------------------------------------
 
@@ -612,19 +601,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         eprintln!("sismo record: flight-recorder stopped (buffer discarded; use `sismo snapshot` before stopping to capture)");
     } else {
         eprintln!("sismo record: trace saved to {output_path_str}");
-        let pids = [target_pid];
-        let ok = unsafe {
-            sismo_append_privileged_marker(
-                output_path_str.as_ptr(),
-                output_path_str.len(),
-                pids.as_ptr(),
-                pids.len(),
-                std::ptr::null(),
-                0,
-                false,
-            )
-        };
-        if !ok {
+        if !append_privileged_marker(output_path_str, &[target_pid], None, false) {
             eprintln!("sismo record: failed to write privileged marker");
         }
     }
@@ -921,24 +898,8 @@ fn run_linux(config: &RecordConfig) -> c_int {
     } else {
         eprintln!("sismo record: trace saved to {output_path_str}");
         let precise = shutdown_bpf(bpf.take());
-        let pids = [target_pid];
-        let (fp_ptr, fp_len): (*const u8, usize) = if focus_int == 0 {
-            (b"cache".as_ptr(), 5)
-        } else {
-            (std::ptr::null(), 0)
-        };
-        let ok = unsafe {
-            sismo_append_privileged_marker(
-                output_path_str.as_ptr(),
-                output_path_str.len(),
-                pids.as_ptr(),
-                pids.len(),
-                fp_ptr,
-                fp_len,
-                precise >= 2,
-            )
-        };
-        if !ok {
+        let focus_preset: Option<&[u8]> = if focus_int == 0 { Some(b"cache".as_slice()) } else { None };
+        if !append_privileged_marker(output_path_str, &[target_pid], focus_preset, precise >= 2) {
             eprintln!("sismo record: failed to write privileged marker");
         }
         // Resolve BPF perf-sample frames to function names (appended offline).

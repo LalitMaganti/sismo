@@ -11,7 +11,6 @@
 
 use sismo_core::proto::ProtoWriter;
 use std::io::Write;
-use std::slice;
 
 // TracePacket / TrackEvent / TrackDescriptor / DebugAnnotation field tags.
 const TP_FIELD_TRACE_PACKET: u32 = 1;
@@ -102,42 +101,23 @@ fn build_marker(pids: &[i32], focus_preset: Option<&[u8]>, focus_precise: bool, 
     out.bytes().to_vec()
 }
 
-/// Append the privileged-pid marker to the trace file at `path`. No-op if
-/// `n_pids == 0`. Returns true on success, false on any I/O failure.
-///
-/// # Safety
-/// `path`/`pids`/`focus_preset` must be valid for their lengths (focus_preset
-/// null = absent).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_append_privileged_marker(
-    path: *const u8,
-    path_len: usize,
-    pids: *const i32,
-    n_pids: usize,
-    focus_preset: *const u8,
-    focus_preset_len: usize,
+/// Append the privileged-pid marker to the trace file at `path`. No-op (success)
+/// if `pids` is empty. `focus_preset` is `None` when absent. Returns true on
+/// success, false on any I/O failure.
+pub fn append_privileged_marker(
+    path: &str,
+    pids: &[i32],
+    focus_preset: Option<&[u8]>,
     focus_precise: bool,
 ) -> bool {
-    if n_pids == 0 {
+    if pids.is_empty() {
         return true; // nothing to mark — success
     }
-    let pids = unsafe { slice::from_raw_parts(pids, n_pids) };
-    let focus = if focus_preset.is_null() || focus_preset_len == 0 {
-        None
-    } else {
-        Some(unsafe { slice::from_raw_parts(focus_preset, focus_preset_len) })
-    };
-    let path_bytes = unsafe { slice::from_raw_parts(path, path_len) };
-    let path_str = match std::str::from_utf8(path_bytes) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    let bytes = build_marker(pids, focus, focus_precise, now_monotonic_ns());
+    let bytes = build_marker(pids, focus_preset, focus_precise, now_monotonic_ns());
 
     // Append to the existing trace file (perfetto streams are just concatenated
     // length-delimited TracePackets).
-    match std::fs::OpenOptions::new().append(true).open(path_str) {
+    match std::fs::OpenOptions::new().append(true).open(path) {
         Ok(mut f) => f.write_all(&bytes).is_ok(),
         Err(_) => false,
     }
