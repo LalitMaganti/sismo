@@ -12,7 +12,7 @@
 //! Constants are taken from the macOS SDK headers (sys/sysctl.h, sys/kdebug.h)
 //! — stable kernel ABI. macOS-only; gated in lib.rs.
 
-use std::os::raw::c_void;
+use libc::c_void;
 
 // sys/sysctl.h
 const CTL_KERN: i32 = 1;
@@ -42,17 +42,6 @@ pub enum StartError {
     Enable,
 }
 
-extern "C" {
-    fn sysctl(
-        name: *const i32,
-        namelen: u32,
-        oldp: *mut c_void,
-        oldlenp: *mut usize,
-        newp: *const c_void,
-        newlen: usize,
-    ) -> i32;
-}
-
 #[repr(C)]
 struct KdRegType {
     reg_type: u32,
@@ -63,16 +52,16 @@ struct KdRegType {
 }
 
 unsafe fn sysctl_void(cmd: i32) -> i32 {
-    let mib = [CTL_KERN, KERN_KDEBUG, cmd];
+    let mut mib = [CTL_KERN, KERN_KDEBUG, cmd];
     unsafe {
-        sysctl(mib.as_ptr(), mib.len() as u32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), 0)
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0)
     }
 }
 
 unsafe fn sysctl_set_int(cmd: i32, value: i32) -> i32 {
-    let mib = [CTL_KERN, KERN_KDEBUG, cmd, value];
+    let mut mib = [CTL_KERN, KERN_KDEBUG, cmd, value];
     unsafe {
-        sysctl(mib.as_ptr(), mib.len() as u32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), 0)
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0)
     }
 }
 
@@ -95,14 +84,14 @@ pub fn kdebug_start(buffer_events: i32) -> Result<(), StartError> {
             value3: 0,
             value4: 0,
         };
-        let mib = [CTL_KERN, KERN_KDEBUG, KERN_KDSETREG];
+        let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDSETREG];
         let mut len = std::mem::size_of::<KdRegType>();
-        if sysctl(
-            mib.as_ptr(),
+        if libc::sysctl(
+            mib.as_mut_ptr(),
             mib.len() as u32,
             &mut reg as *mut KdRegType as *mut c_void,
             &mut len,
-            std::ptr::null(),
+            std::ptr::null_mut(),
             0,
         ) < 0
         {
@@ -120,10 +109,10 @@ pub fn kdebug_start(buffer_events: i32) -> Result<(), StartError> {
 /// Drain the kernel ring into `out` (a buffer of 64-byte kd_bufs) WITHOUT
 /// stopping capture. Returns the event count, or `None` on sysctl failure.
 pub fn kdebug_drain(out: &mut [u8]) -> Option<usize> {
-    let mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADTR];
+    let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADTR];
     let mut len = out.len();
     let rc = unsafe {
-        sysctl(mib.as_ptr(), mib.len() as u32, out.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null(), 0)
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, out.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0)
     };
     if rc < 0 {
         return None;
@@ -135,10 +124,10 @@ pub fn kdebug_drain(out: &mut [u8]) -> Option<usize> {
 /// Read the current thread map (KERN_KDREADCURTHRMAP) into `out`. Returns the
 /// entry count, or `None` on sysctl failure.
 pub fn kdebug_read_thread_map(out: &mut [u8]) -> Option<usize> {
-    let mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADCURTHRMAP];
+    let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADCURTHRMAP];
     let mut len = out.len();
     let rc = unsafe {
-        sysctl(mib.as_ptr(), mib.len() as u32, out.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null(), 0)
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, out.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0)
     };
     if rc < 0 {
         return None;
