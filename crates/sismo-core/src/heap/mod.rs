@@ -8,9 +8,9 @@
 //! ProfilePacket — interning function names (symbolized via the Rust wholesym
 //! symbolizer) and mapping paths into one string pool, deduping frames by PC,
 //! and emitting one HeapSample per site — plus the ClockSnapshot the heap
-//! parser needs. Each is returned already wrapped in a TracePacket body
-//! (timestamp + optional sequence_flags + payload field), as a heap buffer the
-//! caller emits via the C++ SDK shim and then frees with `sismo_heap_free`.
+//! parser needs. Each is returned as a `Vec<u8>` already wrapped in a
+//! TracePacket body (timestamp + optional sequence_flags + payload field) that
+//! the caller emits via the C++ SDK shim.
 //!
 //! Building the bytes here (rather than emitting) keeps this module free of the
 //! C++ `sismo_ds_emit` symbol, so `cargo test` still links standalone.
@@ -25,7 +25,6 @@ pub mod macos_heap_capture;
 use crate::proto::ProtoWriter;
 use crate::symbolize::symbolizer::Symbolizer;
 use std::collections::HashMap;
-use std::slice;
 
 // ---- Field number constants (from the vendored protos) --------------------
 
@@ -86,23 +85,19 @@ const HS_ALLOC_COUNT: u32 = 5;
 
 const HEAP_NAME: &[u8] = b"libc.malloc";
 
-// ---- FFI input types -------------------------------------------------------
+// ---- Input types -----------------------------------------------------------
 
-/// A loaded mach-o image: its load address and (borrowed) path bytes. Passed
-/// sorted ascending by `base_avma`, matching heap_capture's ordering.
-#[repr(C)]
-pub struct HeapImage {
+/// A loaded mach-o image: its load address and path bytes. Passed sorted
+/// ascending by `base_avma`, matching heap_capture's ordering.
+pub struct HeapImage<'a> {
     pub base_avma: u64,
-    pub path_ptr: *const u8,
-    pub path_len: usize,
+    pub path: &'a [u8],
 }
 
 /// An aggregated allocation site: a callstack (leaf-first PCs) with its total
 /// sampled bytes and allocation count.
-#[repr(C)]
-pub struct HeapSite {
-    pub pcs: *const u64,
-    pub pc_count: usize,
+pub struct HeapSite<'a> {
+    pub pcs: &'a [u64],
     pub count: u64,
     pub total_size: u64,
 }
@@ -148,14 +143,8 @@ struct TraceData {
 /// Resolve `pc` to a function name via the symbolizer, returning "?" when the
 /// symbolizer is absent or has no match. Mirrors heap_capture's use of
 /// `symbolizer.resolve` (name only — file/line are unused for heap frames).
-///
-/// # Safety
-/// `symbolizer` must be a valid `*mut Symbolizer` or null.
-unsafe fn resolve_name(symbolizer: *mut Symbolizer, pc: u64) -> Vec<u8> {
-    if symbolizer.is_null() {
-        return b"?".to_vec();
-    }
-    match unsafe { &*symbolizer }.resolve(pc) {
+fn resolve_name(symbolizer: Option<&Symbolizer>, pc: u64) -> Vec<u8> {
+    match symbolizer.and_then(|s| s.resolve(pc)) {
         Some(r) => r.name.into_bytes(),
         None => b"?".to_vec(),
     }
@@ -163,12 +152,8 @@ unsafe fn resolve_name(symbolizer: *mut Symbolizer, pc: u64) -> Vec<u8> {
 
 /// Build the interned tables from images + sites, including iid ordering (image
 /// paths first in the string pool, then function names as unique PCs resolve).
-///
-/// # Safety
-/// `symbolizer` valid-or-null; `images`/`sites` and their embedded pointers
-/// valid for their lengths.
-unsafe fn build_trace_data(
-    symbolizer: *mut Symbolizer,
+fn build_trace_data(
+    symbolizer: Option<&Symbolizer>,
     images: &[HeapImage],
     sites: &[HeapSite],
 ) -> TraceData {
@@ -177,12 +162,7 @@ unsafe fn build_trace_data(
     let mut strings: Vec<Vec<u8>> = Vec::with_capacity(images.len());
     let mut mappings: Vec<Mapping> = Vec::with_capacity(images.len());
     for (idx, img) in images.iter().enumerate() {
-        let path: &[u8] = if img.path_ptr.is_null() {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(img.path_ptr, img.path_len) }
-        };
-        strings.push(path.to_vec());
+        strings.push(img.path.to_vec());
         let iid = (idx + 1) as u64;
         mappings.push(Mapping {
             iid,
@@ -198,18 +178,12 @@ unsafe fn build_trace_data(
     let mut callstacks: Vec<Callstack> = Vec::new();
     let mut samples: Vec<Sample> = Vec::new();
     for (site_idx, site) in sites.iter().enumerate() {
-        let pcs: &[u64] = if site.pcs.is_null() {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(site.pcs, site.pc_count) }
-        };
-
-        let mut frame_iids: Vec<u64> = Vec::with_capacity(pcs.len());
-        for &pc in pcs {
+        let mut frame_iids: Vec<u64> = Vec::with_capacity(site.pcs.len());
+        for &pc in site.pcs {
             let frame_iid = match frame_by_pc.get(&pc) {
                 Some(&fid) => fid,
                 None => {
-                    let name = unsafe { resolve_name(symbolizer, pc) };
+                    let name = resolve_name(symbolizer, pc);
                     strings.push(name);
                     let fn_iid = strings.len() as u64; // 1-based index of just-pushed
 
@@ -350,87 +324,30 @@ fn wrap_trace_packet(
     w.bytes().to_vec()
 }
 
-/// Hand a heap buffer to the caller: writes its length to `*out_len` and
-/// returns a pointer freed with `sismo_heap_free`.
-fn into_raw(v: Vec<u8>, out_len: *mut usize) -> *mut u8 {
-    let boxed = v.into_boxed_slice(); // capacity == length
-    let len = boxed.len();
-    unsafe {
-        *out_len = len;
-    }
-    Box::into_raw(boxed) as *mut u8
-}
-
-// ---- FFI entry points ------------------------------------------------------
-
 /// Build the ProfilePacket, wrapped in a TracePacket body, from the aggregated
-/// sites + images. Returns a heap buffer (free with `sismo_heap_free`) and
-/// writes its length to `*out_len`.
-///
-/// # Safety
-/// `symbolizer` must be a valid `*mut Symbolizer` or null. `images`/`sites`
-/// must be valid for their lengths, as must every embedded `path_ptr`/`pcs`
-/// pointer. `out_len` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_heap_build_profile_packet(
+/// sites + images. `symbolizer` is `None` when frames should stay unsymbolized.
+pub fn build_profile_packet(
     pid: u32,
     sampling_interval: u64,
     timestamp_ns: u64,
-    symbolizer: *mut Symbolizer,
-    images: *const HeapImage,
-    images_len: usize,
-    sites: *const HeapSite,
-    sites_len: usize,
-    out_len: *mut usize,
-) -> *mut u8 {
-    let images: &[HeapImage] = if images.is_null() {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(images, images_len) }
-    };
-    let sites: &[HeapSite] = if sites.is_null() {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(sites, sites_len) }
-    };
-    let td = unsafe { build_trace_data(symbolizer, images, sites) };
+    symbolizer: Option<&Symbolizer>,
+    images: &[HeapImage],
+    sites: &[HeapSite],
+) -> Vec<u8> {
+    let td = build_trace_data(symbolizer, images, sites);
     let payload = encode_profile_packet(pid, sampling_interval, timestamp_ns, &td);
-    let body = wrap_trace_packet(
+    wrap_trace_packet(
         timestamp_ns,
         SEQ_INCREMENTAL_STATE_CLEARED,
         TP_PROFILE_PACKET,
         &payload,
-    );
-    into_raw(body, out_len)
+    )
 }
 
-/// Build the ClockSnapshot TracePacket body for `timestamp_ns`. Returns a heap
-/// buffer (free with `sismo_heap_free`) and writes its length to `*out_len`.
-///
-/// # Safety
-/// `out_len` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_heap_build_clock_snapshot_packet(
-    timestamp_ns: u64,
-    out_len: *mut usize,
-) -> *mut u8 {
+/// Build the ClockSnapshot TracePacket body for `timestamp_ns`.
+pub fn build_clock_snapshot_packet(timestamp_ns: u64) -> Vec<u8> {
     let payload = encode_clock_snapshot(timestamp_ns);
-    let body = wrap_trace_packet(timestamp_ns, 0, TP_CLOCK_SNAPSHOT, &payload);
-    into_raw(body, out_len)
-}
-
-/// Free a buffer returned by the `sismo_heap_build_*` functions.
-///
-/// # Safety
-/// `ptr`/`len` must be exactly what a `sismo_heap_build_*` call returned, freed
-/// at most once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sismo_heap_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    let slice = unsafe { slice::from_raw_parts_mut(ptr, len) };
-    drop(unsafe { Box::from_raw(slice as *mut [u8]) });
+    wrap_trace_packet(timestamp_ns, 0, TP_CLOCK_SNAPSHOT, &payload)
 }
 
 #[cfg(test)]
@@ -447,9 +364,7 @@ mod tests {
         // payload = 0A 05 08 06 10 96 01  0A 05 08 04 10 96 01
         // Wrapped: timestamp(8)=150: 40 96 01; clock_snapshot(6) tag=6<<3|2=0x32,
         //   len 14 (0x0E), then payload.
-        let mut len: usize = 0;
-        let ptr = unsafe { sismo_heap_build_clock_snapshot_packet(150, &mut len) };
-        let got = unsafe { slice::from_raw_parts(ptr, len) };
+        let got = build_clock_snapshot_packet(150);
         assert_eq!(
             got,
             &[
@@ -459,42 +374,16 @@ mod tests {
                 0x0A, 0x05, 0x08, 0x04, 0x10, 0x96, 0x01, // MONOTONIC_COARSE
             ]
         );
-        unsafe { sismo_heap_free(ptr, len) };
     }
 
     #[test]
     fn profile_packet_contains_interned_tables_and_sample() {
         // One image ("img" at base 0x1000), one site with one pc=0x1010,
-        // count=5, total=100. Null symbolizer -> function name "?".
-        let path = b"img";
-        let images = [HeapImage {
-            base_avma: 0x1000,
-            path_ptr: path.as_ptr(),
-            path_len: path.len(),
-        }];
+        // count=5, total=100. No symbolizer -> function name "?".
+        let images = [HeapImage { base_avma: 0x1000, path: b"img" }];
         let pcs = [0x1010u64];
-        let sites = [HeapSite {
-            pcs: pcs.as_ptr(),
-            pc_count: pcs.len(),
-            count: 5,
-            total_size: 100,
-        }];
-        let mut len: usize = 0;
-        let ptr = unsafe {
-            sismo_heap_build_profile_packet(
-                4242,
-                4096,
-                150,
-                std::ptr::null_mut(),
-                images.as_ptr(),
-                images.len(),
-                sites.as_ptr(),
-                sites.len(),
-                &mut len,
-            )
-        };
-        let got = unsafe { slice::from_raw_parts(ptr, len) }.to_vec();
-        unsafe { sismo_heap_free(ptr, len) };
+        let sites = [HeapSite { pcs: &pcs, count: 5, total_size: 100 }];
+        let got = build_profile_packet(4242, 4096, 150, None, &images, &sites);
 
         // String pool: image path "img" (iid 1) then function name "?" (iid 2).
         assert!(got.windows(3).any(|w| w == b"img"));
@@ -514,29 +403,14 @@ mod tests {
     fn frames_dedupe_by_pc_across_sites() {
         // Two sites sharing pc 0x2000; a third distinct pc 0x3000. Expect 2
         // unique frames, 2 callstacks, 2 samples. Null symbolizer.
-        let img = b"m";
-        let images = [HeapImage {
-            base_avma: 0x1000,
-            path_ptr: img.as_ptr(),
-            path_len: img.len(),
-        }];
+        let images = [HeapImage { base_avma: 0x1000, path: b"m" }];
         let pcs_a = [0x2000u64];
         let pcs_b = [0x2000u64, 0x3000u64];
         let sites = [
-            HeapSite {
-                pcs: pcs_a.as_ptr(),
-                pc_count: 1,
-                count: 1,
-                total_size: 10,
-            },
-            HeapSite {
-                pcs: pcs_b.as_ptr(),
-                pc_count: 2,
-                count: 2,
-                total_size: 20,
-            },
+            HeapSite { pcs: &pcs_a, count: 1, total_size: 10 },
+            HeapSite { pcs: &pcs_b, count: 2, total_size: 20 },
         ];
-        let td = unsafe { build_trace_data(std::ptr::null_mut(), &images, &sites) };
+        let td = build_trace_data(None, &images, &sites);
         assert_eq!(td.frames.len(), 2, "pc 0x2000 shared -> deduped");
         assert_eq!(td.callstacks.len(), 2);
         assert_eq!(td.samples.len(), 2);

@@ -35,9 +35,7 @@ use std::time::Duration;
 
 // Sibling Rust modules (direct calls, no FFI round-trip).
 use crate::symbolize::dyld_images::{load_target_modules, ImageList};
-use crate::heap::{
-    sismo_heap_build_clock_snapshot_packet, sismo_heap_build_profile_packet, sismo_heap_free,
-};
+use crate::heap::{build_clock_snapshot_packet, build_profile_packet};
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::symbolizer::Symbolizer;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
@@ -329,7 +327,7 @@ impl HeapCapture {
                 self.drain_into(&ring, &mut unwinder, &mut sizes_by_top_pc);
                 let snapshot_ts = now_ns();
                 self.sites_observed.store(sizes_by_top_pc.len() as u32, Ordering::Release);
-                self.emit_profile(&sizes_by_top_pc, &image_list, &mut symbolizer, snapshot_ts);
+                self.emit_profile(&sizes_by_top_pc, &image_list, &symbolizer, snapshot_ts);
                 unsafe { sismo_flush_done(flusher as *mut c_void) };
             }
 
@@ -349,7 +347,7 @@ impl HeapCapture {
                 self.drain_into(&ring, &mut unwinder, &mut sizes_by_top_pc);
                 let snapshot_ts = now_ns();
                 self.sites_observed.store(sizes_by_top_pc.len() as u32, Ordering::Release);
-                self.emit_profile(&sizes_by_top_pc, &image_list, &mut symbolizer, snapshot_ts);
+                self.emit_profile(&sizes_by_top_pc, &image_list, &symbolizer, snapshot_ts);
                 unsafe { sismo_stop_done(stopper as *mut c_void) };
                 self.running.store(false, Ordering::Release);
             }
@@ -433,7 +431,7 @@ impl HeapCapture {
         &self,
         sizes: &HashMap<u64, AllocStats>,
         image_list: &ImageList,
-        symbolizer: &mut Symbolizer,
+        symbolizer: &Symbolizer,
         snapshot_ts_ns: u64,
     ) {
         let slot = self.ds_slot.load(Ordering::Acquire);
@@ -446,50 +444,28 @@ impl HeapCapture {
         let images: Vec<HeapImage> = image_list
             .images()
             .iter()
-            .map(|(base, path)| HeapImage {
-                base_avma: *base,
-                path_ptr: path.as_ptr(),
-                path_len: path.len(),
-            })
+            .map(|(base, path)| HeapImage { base_avma: *base, path })
             .collect();
 
-        let mut sites: Vec<HeapSite> = Vec::with_capacity(sizes.len());
-        for s in sizes.values() {
-            sites.push(HeapSite {
-                pcs: s.pcs.as_ptr(),
-                pc_count: s.pc_count,
-                count: s.count,
-                total_size: s.total_size,
-            });
-        }
+        let sites: Vec<HeapSite> = sizes
+            .values()
+            .map(|s| HeapSite { pcs: &s.pcs[..s.pc_count], count: s.count, total_size: s.total_size })
+            .collect();
 
         // Clock snapshot first: it registers the MONOTONIC_COARSE clock that the
         // samples' timestamp is interpreted against.
-        let mut cs_len: usize = 0;
-        let cs = unsafe { sismo_heap_build_clock_snapshot_packet(snapshot_ts_ns, &mut cs_len) };
-        if !cs.is_null() {
-            unsafe { sismo_ds_emit(slot, cs, cs_len) };
-            unsafe { sismo_heap_free(cs, cs_len) };
-        }
+        let cs = build_clock_snapshot_packet(snapshot_ts_ns);
+        unsafe { sismo_ds_emit(slot, cs.as_ptr(), cs.len()) };
 
-        let mut pp_len: usize = 0;
-        let pp = unsafe {
-            sismo_heap_build_profile_packet(
-                pid,
-                sample_interval,
-                snapshot_ts_ns,
-                symbolizer,
-                images.as_ptr(),
-                images.len(),
-                sites.as_ptr(),
-                sites.len(),
-                &mut pp_len,
-            )
-        };
-        if !pp.is_null() {
-            unsafe { sismo_ds_emit(slot, pp, pp_len) };
-            unsafe { sismo_heap_free(pp, pp_len) };
-        }
+        let pp = build_profile_packet(
+            pid,
+            sample_interval,
+            snapshot_ts_ns,
+            Some(symbolizer),
+            &images,
+            &sites,
+        );
+        unsafe { sismo_ds_emit(slot, pp.as_ptr(), pp.len()) };
     }
 }
 
