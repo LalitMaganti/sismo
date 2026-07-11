@@ -34,20 +34,7 @@ impl DataRegions {
 
     /// The region containing `addr`, if any.
     pub fn find(&self, addr: u64) -> Option<&Region> {
-        let mut lo = 0usize;
-        let mut hi = self.regions.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let r = &self.regions[mid];
-            if addr < r.start {
-                hi = mid;
-            } else if addr >= r.end {
-                lo = mid + 1;
-            } else {
-                return Some(r);
-            }
-        }
-        None
+        crate::maps_common::find_range(&self.regions, addr, |r| (r.start, r.end))
     }
 }
 
@@ -89,8 +76,7 @@ fn parse_text(raw: &str) -> Vec<Region> {
 }
 
 fn from_pid(pid: u32) -> Option<DataRegions> {
-    let raw = std::fs::read(format!("/proc/{pid}/maps")).ok()?;
-    let raw = String::from_utf8_lossy(&raw);
+    let raw = crate::maps_common::read_maps_text(pid)?;
     Some(DataRegions { regions: parse_text(&raw) })
 }
 

@@ -52,20 +52,7 @@ impl ProcMaps {
 
     /// The executable file-backed mapping containing `addr`, if any.
     pub fn find(&self, addr: u64) -> Option<&Mapping> {
-        let mut lo = 0usize;
-        let mut hi = self.mappings.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let m = &self.mappings[mid];
-            if addr < m.start {
-                hi = mid;
-            } else if addr >= m.end {
-                lo = mid + 1;
-            } else {
-                return Some(m);
-            }
-        }
-        None
+        crate::maps_common::find_range(&self.mappings, addr, |m| (m.start, m.end))
     }
 }
 
@@ -157,9 +144,7 @@ fn parse_text(raw: &str, mut build_id_for: impl FnMut(&str) -> Vec<u8>) -> Vec<M
 
 /// Live parse of `/proc/<pid>/maps`.
 fn from_pid(pid: u32) -> Option<ProcMaps> {
-    // /proc files report size 0; read_to_end handles that.
-    let raw = std::fs::read(format!("/proc/{pid}/maps")).ok()?;
-    let raw = String::from_utf8_lossy(&raw);
+    let raw = crate::maps_common::read_maps_text(pid)?;
     let mappings = parse_text(&raw, |path| {
         read_build_id(path).unwrap_or_else(|| synth_build_id(path).to_vec())
     });

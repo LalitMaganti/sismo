@@ -7,6 +7,7 @@
 
 pub mod data_regions;
 pub mod disasm;
+mod maps_common;
 // macOS Mach-based module enumeration + mach-o reading.
 #[cfg(target_os = "macos")]
 pub mod dyld_images;
