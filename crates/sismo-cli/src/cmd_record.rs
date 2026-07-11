@@ -800,6 +800,13 @@ fn run_linux(config: &RecordConfig) -> c_int {
                 s.data_frames, s.samples
             );
         }
+        if s.offcpu_samples > 0 {
+            eprintln!(
+                "sismo record: off-CPU — {} blocking stacks, {} ms total off-CPU",
+                s.offcpu_samples,
+                s.offcpu_ns / 1_000_000
+            );
+        }
         precise
     };
 

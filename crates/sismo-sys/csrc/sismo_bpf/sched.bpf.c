@@ -31,6 +31,11 @@
 #define BPF_F_USER_STACK (1ULL << 8)
 #endif
 
+// Ignore sub-threshold off-CPU blocks: a thread that yields for a few µs isn't
+// a latency problem, and capturing a stack on every brief switch-out would
+// dominate the cost. Latency lives in the long waits.
+#define MIN_OFFCPU_NS 10000  // 10 µs
+
 struct sismo_counters {
   __u64 v[SISMO_MAX_COUNTERS];
 };
@@ -109,6 +114,33 @@ struct {
   __type(key, __u32);
   __type(value, struct sismo_kstack);
 } kstack_scratch SEC(".maps");
+
+// One thread's in-flight off-CPU block: its blocking stack (user PCs + resolved
+// kernel-symbol ids) captured when it was switched out, plus when. Keyed by tid;
+// emitted + deleted when the thread is switched back in. The value is too big
+// for the 512-byte BPF stack, so it is built in offcpu_scratch (per-CPU) and
+// copied into offcpu.
+struct sismo_offcpu_state {
+  __u64 start_ns;
+  __u32 nr_frames;
+  __u32 nr_kernel;
+  __u64 ustack[SISMO_MAX_STACK];
+  __u32 kids[SISMO_MAX_KERNEL_STACK];
+};
+struct {
+  // LRU so a long session self-bounds (like ksym_ids): an evicted in-flight
+  // block just drops that one off-CPU sample, no correctness issue.
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 10240);
+  __type(key, __u32);
+  __type(value, struct sismo_offcpu_state);
+} offcpu SEC(".maps");
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct sismo_offcpu_state);
+} offcpu_scratch SEC(".maps");
 
 // Resolve a kernel address to a symbol id, assigning + emitting a SISMO_EVT_KSYM
 // definition on first sight. The address is used only as a lookup key and to
@@ -209,6 +241,74 @@ static __always_inline struct sismo_counters *credit(struct task_struct *t,
   return tc;
 }
 
+// Switched OUT: capture `prev`'s blocking stack (bpf_get_task_stack walks an
+// arbitrary task, so no ctx and no reliance on `current` — prev is parked in
+// __schedule, so its stack is the block site) and remember when. Built in the
+// per-CPU scratch, then stored keyed by tid.
+static __always_inline void offcpu_record_block(struct task_struct *prev, __u32 tid) {
+  __u32 zero = 0;
+  struct sismo_offcpu_state *st = bpf_map_lookup_elem(&offcpu_scratch, &zero);
+  if (!st)
+    return;
+  st->start_ns = bpf_ktime_get_ns();
+
+  long un = bpf_get_task_stack(prev, st->ustack, sizeof(st->ustack), BPF_F_USER_STACK);
+  __u32 nu = (un > 0) ? (__u32)(un / 8) : 0;
+  if (nu > SISMO_MAX_STACK)
+    nu = SISMO_MAX_STACK;
+  st->nr_frames = nu;
+
+  // Kernel frames resolved to symbol ids now, so their KSYM definitions reach
+  // the ringbuf before the OFFCPU sample (emitted at wake) that references them.
+  struct sismo_kstack *ks = bpf_map_lookup_elem(&kstack_scratch, &zero);
+  __u32 nk = 0;
+  if (ks) {
+    long kn = bpf_get_task_stack(prev, ks->addr, sizeof(ks->addr), 0);
+    nk = (kn > 0) ? (__u32)(kn / 8) : 0;
+    if (nk > SISMO_MAX_KERNEL_STACK)
+      nk = SISMO_MAX_KERNEL_STACK;
+    for (int i = 0; i < SISMO_MAX_KERNEL_STACK && i < nk; i++)
+      st->kids[i] = resolve_ksym(ks->addr[i]);
+  }
+  st->nr_kernel = nk;
+
+  bpf_map_update_elem(&offcpu, &tid, st, BPF_ANY);
+}
+
+// Switched IN: if this thread has a pending block record, emit an OFFCPU sample
+// with the measured off-CPU duration (unless the block was too short) and clear
+// it.
+static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
+  struct sismo_offcpu_state *st = bpf_map_lookup_elem(&offcpu, &tid);
+  if (!st)
+    return;
+  __u64 now = bpf_ktime_get_ns();
+  __u64 delta = now - st->start_ns;
+  if (delta >= MIN_OFFCPU_NS) {
+    struct sismo_sample_rec *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (e) {
+      e->hdr.type = SISMO_EVT_OFFCPU;
+      e->hdr.tid = tid;
+      e->hdr.pid = tgid;
+      e->hdr.cpu = bpf_get_smp_processor_id();
+      e->hdr.timebase = 0;
+      e->hdr.nr_frames = st->nr_frames;
+      e->hdr.nr_kernel_frames = st->nr_kernel;
+      e->hdr.ts = now;
+      e->data_addr = delta; // off-CPU duration (ns) = the sample's weight
+#pragma unroll
+      for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
+        e->counters[s] = 0;
+      for (int i = 0; i < SISMO_MAX_STACK; i++)
+        e->stack[i] = (i < st->nr_frames) ? st->ustack[i] : 0;
+      for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
+        e->kernel_ids[i] = (i < st->nr_kernel) ? st->kids[i] : 0;
+      bpf_ringbuf_submit(e, 0);
+    }
+  }
+  bpf_map_delete_elem(&offcpu, &tid);
+}
+
 SEC("tp_btf/sched_switch")
 int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev,
              struct task_struct *next) {
@@ -216,13 +316,21 @@ int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev,
   read_advance(&dc);
 
   __u32 tgt = target_tgid();
-  __u32 tgid = BPF_CORE_READ(prev, tgid);
-  if (tgt != 0 && tgid != tgt)
-    return 0;
 
-  // Credit keeps the per-thread cumulative exact across run boundaries; the
-  // value is carried out by the next timer-tick PerfSample, so no emit here.
-  credit(prev, &dc);
+  // Outgoing thread (if in the target): credit its exact counter deltas — the
+  // value is carried out by the next timer-tick PerfSample, so no emit here —
+  // and record its off-CPU block.
+  __u32 prev_tgid = BPF_CORE_READ(prev, tgid);
+  if (tgt == 0 || prev_tgid == tgt) {
+    credit(prev, &dc);
+    offcpu_record_block(prev, (__u32)BPF_CORE_READ(prev, pid));
+  }
+
+  // Incoming thread (if in the target): close out its off-CPU block.
+  __u32 next_tgid = BPF_CORE_READ(next, tgid);
+  if (tgt == 0 || next_tgid == tgt) {
+    offcpu_emit_wake((__u32)BPF_CORE_READ(next, pid), next_tgid);
+  }
   return 0;
 }
 

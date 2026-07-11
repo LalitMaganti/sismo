@@ -16,6 +16,7 @@ pub const SISMO_MAX_COUNTERS: usize = 12;
 
 pub const SISMO_EVT_SAMPLE: u32 = 0;
 pub const SISMO_EVT_KSYM: u32 = 1;
+pub const SISMO_EVT_OFFCPU: u32 = 2;
 
 /// First field of every record; `type` dispatches on the leading u32.
 #[repr(C)]
@@ -718,6 +719,8 @@ pub struct Capture {
     data_regions: Option<DataRegions>,
     last_data_parse_ns: u64,
     data_frames: u64,
+    offcpu_samples: u64,
+    offcpu_ns: u64,
     sampler_precise_ip: u8,
     ds_slot: u32,
     active: AtomicBool,
@@ -923,6 +926,16 @@ impl Capture {
             self.handle_ksym(rec);
             return;
         }
+        if hdr.r#type == SISMO_EVT_OFFCPU {
+            // The blocking stack + off-CPU duration (in data_addr). Captured and
+            // symbolizable via the same path as on-CPU samples; the emit into
+            // the trace rides its own off-cpu-ns timebase (a separate perf
+            // sequence) — the next step. For now, account it.
+            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoSampleRec) };
+            self.offcpu_samples += 1;
+            self.offcpu_ns = self.offcpu_ns.saturating_add(rec.data_addr);
+            return;
+        }
         if hdr.r#type != SISMO_EVT_SAMPLE {
             return;
         }
@@ -972,6 +985,8 @@ pub struct LinuxBpfStats {
     pub threads: u64,
     pub busiest_cycles: u64,
     pub data_frames: u64,
+    pub offcpu_samples: u64,
+    pub offcpu_ns: u64,
 }
 
 // A raw Capture pointer smuggled into the worker thread. The Capture is heap-
@@ -1070,6 +1085,8 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         data_regions: None,
         last_data_parse_ns: 0,
         data_frames: 0,
+        offcpu_samples: 0,
+        offcpu_ns: 0,
         sampler_precise_ip: 0,
         ds_slot: u32::MAX,
         active: AtomicBool::new(false),
@@ -1268,6 +1285,8 @@ impl Capture {
             threads: self.acc.len() as u64,
             busiest_cycles: self.acc.values().copied().max().unwrap_or(0),
             data_frames: self.data_frames,
+            offcpu_samples: self.offcpu_samples,
+            offcpu_ns: self.offcpu_ns,
         };
         // The worker has joined, so the raw-pointer aliasing is over.
         unsafe {

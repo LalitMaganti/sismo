@@ -34,6 +34,12 @@ enum sismo_event_type {
   // of the sample that references the id, so userspace can name kernel frames
   // without ever seeing the address. See sismo_ksym_rec.
   SISMO_EVT_KSYM = 1,
+  // An off-CPU sample: one thread's blocking stack (captured at sched-switch-
+  // out, where its stack is parked in the scheduler = the block site) paired
+  // with how long it stayed off-CPU. Reuses sismo_sample_rec verbatim; the
+  // off-CPU duration in nanoseconds rides in `data_addr` (which has no meaning
+  // for off-CPU) and is the sample's weight. `counters[]` are 0.
+  SISMO_EVT_OFFCPU = 2,
 };
 
 struct sismo_hdr {
