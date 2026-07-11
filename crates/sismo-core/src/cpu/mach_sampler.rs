@@ -13,6 +13,7 @@
 
 use crate::proto::ProtoWriter;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
+use crate::worker_sdk::{now_ns, read_i32, read_u64};
 use crate::mach::{
     mach_vm_read_overwrite, thread_get_state, thread_resume, thread_suspend, MachPort, KERN_SUCCESS,
 };
@@ -40,23 +41,10 @@ const OFF_SYS_USEC: usize = 12;
 const TP_FIELD_PERF_SAMPLE: u32 = 66;
 const MAX_FRAMES: usize = 32;
 
-fn read_u64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-}
-fn read_i32(b: &[u8], off: usize) -> i32 {
-    i32::from_le_bytes(b[off..off + 4].try_into().unwrap())
-}
-
 /// Strip arm64 PAC bits (conservative 40-bit mask) before handing an address to
 /// the unwinder.
 fn strip_pac(v: u64) -> u64 {
     v & 0x0000_00FF_FFFF_FFFF
-}
-
-fn now_monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 /// Total user+system CPU time for `thread`, in microseconds, or None on failure.
@@ -153,7 +141,7 @@ pub fn sample_thread(
 
     // TracePacket body: timestamp + PerfSample (leaf-only: callstack_iid = 0).
     let mut w = ProtoWriter::new();
-    w.write_uint64(8, now_monotonic_ns());
+    w.write_uint64(8, now_ns());
     w.write_perf_sample(
         TP_FIELD_PERF_SAMPLE,
         0,        // cpu — core not tracked
@@ -183,8 +171,8 @@ mod tests {
 
     #[test]
     fn monotonic_clock_advances() {
-        let a = now_monotonic_ns();
-        let b = now_monotonic_ns();
+        let a = now_ns();
+        let b = now_ns();
         assert!(b >= a && a > 0);
     }
 }

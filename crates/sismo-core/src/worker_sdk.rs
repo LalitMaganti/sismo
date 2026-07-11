@@ -1,12 +1,32 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! The `Event` primitive the in-process capture workers (cpu, sched, heap) use:
-//! a Condvar-backed manual-reset event. The producer C ABI these workers emit
-//! through (`sismo_ds_*`) and its callback types live in [`crate::ffi`].
+//! Shared primitives for the in-process capture workers (cpu, sched, heap): the
+//! Condvar-backed manual-reset [`Event`], a monotonic clock read, and
+//! little-endian field readers for the fixed-layout mach structs they parse.
+//! The producer C ABI these workers emit through (`sismo_ds_*`) and its callback
+//! types live in [`crate::ffi`].
 
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
+
+/// Monotonic clock in nanoseconds. Matches the trace's MONOTONIC domain.
+#[cfg(unix)]
+pub fn now_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Little-endian u64 at byte offset `off`. Panics if `b` is too short.
+pub fn read_u64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+}
+
+/// Little-endian i32 at byte offset `off`. Panics if `b` is too short.
+pub fn read_i32(b: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+}
 
 /// Manual-reset event. Trampolines `set` to wake the worker; the worker
 /// `reset`s at the top of each loop and `wait`s/`wait_timeout`s at the bottom,

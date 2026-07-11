@@ -75,9 +75,7 @@ impl RingBuffer {
         }
 
         // Unique, short name (macOS PSHMNAMLEN = 31): "/smh_<pid>_<ts_lo_hex>".
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-        let ts_lo = ts.tv_nsec as u32;
+        let ts_lo = crate::worker_sdk::now_ns() as u32;
         let pid = unsafe { libc::getpid() };
         let name = format!("/smh_{pid}_{ts_lo:x}\0");
 

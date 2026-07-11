@@ -28,10 +28,6 @@ const U32_MAX: u32 = u32::MAX;
 const THREAD_IDENTIFIER_INFO: u32 = 4;
 const THREAD_IDENTIFIER_INFO_COUNT: u32 = 6;
 
-fn read_u64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-}
-
 unsafe fn thread_kernel_tid(thread: MachPort) -> u64 {
     let mut buf = [0u8; 24];
     let mut count = THREAD_IDENTIFIER_INFO_COUNT;
@@ -46,7 +42,7 @@ unsafe fn thread_kernel_tid(thread: MachPort) -> u64 {
 
 // Producer C ABI lives in ffi; the worker Event in worker_sdk.
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
-use crate::worker_sdk::Event;
+use crate::worker_sdk::{read_u64, Event};
 
 // The rest of the pipeline is already Rust — call the sibling modules directly
 // (no FFI round-trip): descriptor encoding, unwinder lifecycle, module loading,

@@ -21,7 +21,7 @@ use crate::proto::sched_protos::{
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::proto::sismo_config::{config_extract, sched_decode};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
-use crate::worker_sdk::Event;
+use crate::worker_sdk::{now_ns, Event};
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -56,12 +56,6 @@ const MAX_NEW_PROCESSES: usize = 128;
 
 use crate::sched::kdebug::{kdebug_drain, kdebug_read_thread_map, kdebug_start, kdebug_teardown};
 use crate::mach::{mach_timebase_info, TimebaseInfo};
-
-fn now_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
 
 // kd_buf event record — 64 bytes on arm64. Fields read directly.
 #[repr(C)]

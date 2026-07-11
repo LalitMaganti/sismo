@@ -40,7 +40,7 @@ use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::symbolizer::Symbolizer;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
-use crate::worker_sdk::Event;
+use crate::worker_sdk::{now_ns, read_u64, Event};
 
 const DS_NAME: &[u8] = b"sismo.heap";
 const U32_MAX: u32 = u32::MAX;
@@ -72,16 +72,6 @@ const OFF_REG_LR: usize = 56;
 const OFF_REG_FP: usize = 64;
 
 use crate::mach::{mach_task_self_, MachPort, KERN_SUCCESS};
-
-fn now_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-fn read_u64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-}
 
 /// An aggregated allocation site keyed by leaf PC.
 struct AllocStats {
