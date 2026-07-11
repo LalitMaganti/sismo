@@ -71,13 +71,7 @@ const OFF_REG_PC: usize = 48;
 const OFF_REG_LR: usize = 56;
 const OFF_REG_FP: usize = 64;
 
-type MachPort = u32;
-const KERN_SUCCESS: i32 = 0;
-
-// libc's mach_task_self_ is deprecated (mach2 crate); keep it hand-rolled.
-extern "C" {
-    static mach_task_self_: MachPort;
-}
+use crate::mach::{mach_task_self_, MachPort, KERN_SUCCESS};
 
 fn now_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };

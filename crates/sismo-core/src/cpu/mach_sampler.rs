@@ -13,9 +13,9 @@
 
 use crate::proto::ProtoWriter;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
-
-type MachPort = u32;
-const KERN_SUCCESS: i32 = 0;
+use crate::mach::{
+    mach_vm_read_overwrite, thread_get_state, thread_resume, thread_suspend, MachPort, KERN_SUCCESS,
+};
 
 // Mach flavors / counts.
 const THREAD_BASIC_INFO: u32 = 3;
@@ -39,21 +39,6 @@ const OFF_SYS_USEC: usize = 12;
 
 const TP_FIELD_PERF_SAMPLE: u32 = 66;
 const MAX_FRAMES: usize = 32;
-
-// libc lacks thread_suspend/resume/get_state + mach_vm_read_overwrite; keep
-// those hand-rolled. thread_info + clock_gettime come from libc.
-extern "C" {
-    fn thread_suspend(target: MachPort) -> i32;
-    fn thread_resume(target: MachPort) -> i32;
-    fn thread_get_state(target: MachPort, flavor: i32, state: *mut i32, count: *mut u32) -> i32;
-    fn mach_vm_read_overwrite(
-        target: MachPort,
-        address: u64,
-        size: u64,
-        data: u64,
-        out_size: *mut u64,
-    ) -> i32;
-}
 
 fn read_u64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
@@ -188,10 +173,7 @@ mod tests {
     fn cpu_time_of_own_thread_is_readable() {
         // pthread_mach_thread_np(pthread_self()) would give our port; simpler:
         // mach_thread_self() returns the calling thread's port.
-        extern "C" {
-            fn mach_thread_self() -> MachPort;
-        }
-        let t = unsafe { mach_thread_self() };
+        let t = unsafe { crate::mach::mach_thread_self() };
         let cpu = unsafe { thread_cpu_time_us(t) };
         assert!(cpu.is_some(), "own thread CPU time should be readable");
     }

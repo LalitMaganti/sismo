@@ -22,6 +22,9 @@ pub use sismo_symbolize as symbolize;
 
 // Perfetto C++ shim FFI (recording control plane + producer data-plane ABI).
 pub mod ffi;
+// Mach primitives the libc crate doesn't cover (absent or deprecated).
+#[cfg(target_os = "macos")]
+pub mod mach;
 // Shared capture-worker Event primitive.
 pub mod worker_sdk;
 // Well-known paths + session lock / recorder-pid / heap-dylib resolution.

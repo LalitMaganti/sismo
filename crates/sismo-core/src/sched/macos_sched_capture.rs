@@ -55,18 +55,7 @@ const MAX_NEW_PROCESSES: usize = 128;
 // ---- kdebug ring + timebase ------------------------------------------------
 
 use crate::sched::kdebug::{kdebug_drain, kdebug_read_thread_map, kdebug_start, kdebug_teardown};
-
-// libc's mach_timebase_info struct is deprecated (points at the mach2 crate),
-// so keep this one hand-rolled; clock_gettime comes from libc.
-extern "C" {
-    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
-}
-
-#[repr(C)]
-struct MachTimebaseInfo {
-    numer: u32,
-    denom: u32,
-}
+use crate::mach::{mach_timebase_info, TimebaseInfo};
 
 fn now_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -215,7 +204,7 @@ impl SchedCapture {
         let kernel_buffer_events = if kbe != 0 { kbe } else { self.config_kernel_buffer_events };
 
         // Heavy setup on the worker thread.
-        let mut tb = MachTimebaseInfo { numer: 1, denom: 1 };
+        let mut tb = TimebaseInfo { numer: 1, denom: 1 };
         unsafe { mach_timebase_info(&mut tb) };
         let (tb_n, tb_d) = (tb.numer as u64, tb.denom as u64);
 

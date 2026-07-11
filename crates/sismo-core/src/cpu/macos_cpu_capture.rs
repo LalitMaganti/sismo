@@ -13,6 +13,7 @@
 //! macOS/arm64 only; gated in lib.rs.
 
 use crate::proto::sismo_config::{config_extract, cpu_decode};
+use crate::mach::{mach_port_deallocate, mach_task_self_, mach_vm_deallocate, MachPort, KERN_SUCCESS};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -24,20 +25,10 @@ const U32_MAX: u32 = u32::MAX;
 
 // ---- Mach thread enumeration (task_for_pid + task_threads + thread_info) ----
 
-type MachPort = u32;
-const KERN_SUCCESS: i32 = 0;
 const THREAD_BASIC_INFO: u32 = 3;
 const THREAD_BASIC_INFO_COUNT: u32 = 10;
 const THREAD_IDENTIFIER_INFO: u32 = 4;
 const THREAD_IDENTIFIER_INFO_COUNT: u32 = 6;
-
-// libc's mach_task_self_ is deprecated (mach2 crate) and it lacks the
-// mach_*_deallocate calls; keep those hand-rolled.
-extern "C" {
-    static mach_task_self_: MachPort;
-    fn mach_port_deallocate(task: MachPort, name: MachPort) -> i32;
-    fn mach_vm_deallocate(target: MachPort, address: u64, size: u64) -> i32;
-}
 
 fn read_i32(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes(b[off..off + 4].try_into().unwrap())
