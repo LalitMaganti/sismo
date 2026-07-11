@@ -86,7 +86,7 @@ pub fn resolve_heap_dylib_path() -> Option<String> {
     // Most-specific first; index 1 (cargo dev tree) is the best-effort fallback.
     const LAYOUTS: [&str; 3] = [
         "../libexec/sismo/libsismo_heap.dylib",
-        "../../../zig-out/lib/libsismo_heap.dylib",
+        "../../../dev-install/lib/libsismo_heap.dylib",
         "../lib/libsismo_heap.dylib",
     ];
     const FALLBACK_INDEX: usize = 1;

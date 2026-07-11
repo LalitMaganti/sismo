@@ -13,7 +13,7 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     if target_os == "macos" {
         // The heap preload is a Rust cdylib (sismo-heap-preload/). Build it and
-        // install it where sismo_paths resolves it (zig-out/lib/libsismo_heap.dylib).
+        // install it where sismo_paths resolves it (dev-install/lib/libsismo_heap.dylib).
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -28,7 +28,7 @@ fn main() {
 
 /// Build the macOS heap preload cdylib (sismo-heap-preload/) in release (so it gets
 /// `panic = "abort"` — never unwind into the injected target) and install it as
-/// `zig-out/lib/libsismo_heap.dylib`, where `sismo_paths` resolves it. Nested
+/// `dev-install/lib/libsismo_heap.dylib`, where `sismo_paths` resolves it. Nested
 /// cargo is isolated: it uses the crate's own `sismo-heap-preload/target`, and we drop
 /// the outer build's CARGO env so it doesn't inherit our manifest/target.
 fn build_heap_preload(root: &PathBuf) {
@@ -45,8 +45,8 @@ fn build_heap_preload(root: &PathBuf) {
     assert!(status.success(), "sismo-heap-preload cdylib build failed");
 
     let src = root.join("crates/sismo-heap-preload/target/release/libsismo_heap_preload.dylib");
-    let dst_dir = root.join("zig-out/lib");
-    std::fs::create_dir_all(&dst_dir).expect("mkdir zig-out/lib");
+    let dst_dir = root.join("dev-install/lib");
+    std::fs::create_dir_all(&dst_dir).expect("mkdir dev-install/lib");
     std::fs::copy(&src, dst_dir.join("libsismo_heap.dylib")).expect("install libsismo_heap.dylib");
 
     println!("cargo:rerun-if-changed={}", root.join("crates/sismo-heap-preload/src").display());
