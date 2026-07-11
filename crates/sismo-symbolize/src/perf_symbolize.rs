@@ -17,7 +17,7 @@
 //! to the C++ shim; the symbolizer, disassembler, and proto writer are Rust
 //! siblings (direct calls, no FFI round-trip). POSIX-only (file append).
 
-use crate::disasm::sismo_disasm_module;
+use crate::disasm::{disasm_module, Arch};
 use sismo_proto::ProtoWriter;
 use crate::symbolizer::Symbolizer;
 use std::collections::HashSet;
@@ -38,10 +38,6 @@ const AS_FIELD_LINES: u32 = 2;
 const LINE_FIELD_FUNCTION_NAME: u32 = 1;
 const LINE_FIELD_SOURCE_FILE_NAME: u32 = 2;
 const LINE_FIELD_LINE_NUMBER: u32 = 3;
-
-// disasm arch tags (crate::disasm).
-const ARCH_X86_64: u32 = 0;
-const ARCH_AARCH64: u32 = 1;
 
 // ---- C++ trace_processor shim ----------------------------------------------
 
@@ -208,11 +204,11 @@ fn append_bytes(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
-fn current_arch() -> Option<u32> {
+fn current_arch() -> Option<Arch> {
     if cfg!(target_arch = "x86_64") {
-        Some(ARCH_X86_64)
+        Some(Arch::X86_64)
     } else if cfg!(target_arch = "aarch64") {
-        Some(ARCH_AARCH64)
+        Some(Arch::Aarch64)
     } else {
         None
     }
@@ -330,44 +326,27 @@ struct DisasmCtx {
     funcs: Vec<(u64, Vec<DisasmInsn>)>,
 }
 
-extern "C" fn on_insn(
-    ctx_opaque: *mut c_void,
-    func_start: u64,
-    insn_rel_pc: u64,
-    bytes_ptr: *const u8,
-    bytes_len: usize,
-    text_ptr: *const u8,
-    text_len: usize,
-) {
-    let ctx = unsafe { &mut *(ctx_opaque as *mut DisasmCtx) };
-    let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
-    let text = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
-    let insn = DisasmInsn { rel_pc: insn_rel_pc, bytes_hex: bytes_to_hex(bytes), text: text.to_vec() };
-    match ctx.funcs.iter_mut().find(|(k, _)| *k == func_start) {
-        Some((_, v)) => v.push(insn),
-        None => ctx.funcs.push((func_start, vec![insn])),
-    }
-}
-
-fn collect_module_disasm(sym: &Symbolizer, m: &Module, arch: u32, out: &mut Vec<AsmRecord>) {
-    let mut ctx = DisasmCtx { funcs: Vec::new() };
+fn collect_module_disasm(sym: &Symbolizer, m: &Module, arch: Arch, out: &mut Vec<AsmRecord>) {
     // rel_pcs are absolute avmas; disasm needs load_bias to reach the link-time
     // addresses. It tags decoded instructions back in avma space, so func_start
     // and insn rel_pcs still resolve and match the trace's rel_pc.
-    let rc = unsafe {
-        sismo_disasm_module(
-            m.name.as_ptr(),
-            m.name.len(),
-            arch,
-            m.load_bias,
-            m.rel_pcs.as_ptr(),
-            m.rel_pcs.len(),
-            on_insn,
-            &mut ctx as *mut DisasmCtx as *mut c_void,
-        )
-    };
-    if rc != 0 {
+    let decoded = disasm_module(Path::new(OsStr::from_bytes(&m.name)), arch, m.load_bias, &m.rel_pcs);
+    if decoded.is_empty() {
         return;
+    }
+
+    // Bucket by func_start, insertion-ordered (matches Zig's ArrayHashMap).
+    let mut ctx = DisasmCtx { funcs: Vec::new() };
+    for d in &decoded {
+        let insn = DisasmInsn {
+            rel_pc: d.rel_pc,
+            bytes_hex: bytes_to_hex(&d.bytes),
+            text: d.text.clone().into_bytes(),
+        };
+        match ctx.funcs.iter_mut().find(|(k, _)| *k == d.func_start) {
+            Some((_, v)) => v.push(insn),
+            None => ctx.funcs.push((d.func_start, vec![insn])),
+        }
     }
 
     for (func_start, insns) in &ctx.funcs {
