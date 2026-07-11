@@ -45,34 +45,38 @@ unsafe fn opt_slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     }
 }
 
-fn encode_process(p: &ProcessC) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    w.write_int64(1, p.pid); // Process.pid
-    if p.ppid != 0 {
-        w.write_int64(2, p.ppid);
+impl ProcessC {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        w.write_int64(1, self.pid); // Process.pid
+        if self.ppid != 0 {
+            w.write_int64(2, self.ppid);
+        }
+        let cmdline = unsafe { opt_slice(self.cmdline, self.cmdline_len) };
+        if !cmdline.is_empty() {
+            w.write_string(3, cmdline);
+        }
+        w.bytes().to_vec()
     }
-    let cmdline = unsafe { opt_slice(p.cmdline, p.cmdline_len) };
-    if !cmdline.is_empty() {
-        w.write_string(3, cmdline);
-    }
-    w.bytes().to_vec()
 }
 
-fn encode_thread(t: &ThreadC) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    w.write_int64(1, t.tid); // Thread.tid
-    w.write_int64(2, t.pid);
-    let comm = unsafe { opt_slice(t.comm, t.comm_len) };
-    if !comm.is_empty() {
-        w.write_string(3, comm);
+impl ThreadC {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        w.write_int64(1, self.tid); // Thread.tid
+        w.write_int64(2, self.pid);
+        let comm = unsafe { opt_slice(self.comm, self.comm_len) };
+        if !comm.is_empty() {
+            w.write_string(3, comm);
+        }
+        if self.is_main_thread {
+            w.write_uint32(4, 1);
+        }
+        if self.is_idle {
+            w.write_uint32(5, 1);
+        }
+        w.bytes().to_vec()
     }
-    if t.is_main_thread {
-        w.write_uint32(4, 1);
-    }
-    if t.is_idle {
-        w.write_uint32(5, 1);
-    }
-    w.bytes().to_vec()
 }
 
 /// Encode a GenericKernelProcessTree payload: repeated Process (field 1) then
@@ -81,10 +85,10 @@ fn encode_thread(t: &ThreadC) -> Vec<u8> {
 pub fn encode_kernel_process_tree(processes: &[ProcessC], threads: &[ThreadC]) -> Vec<u8> {
     let mut w = ProtoWriter::new();
     for p in processes {
-        w.write_message(1, &encode_process(p));
+        w.write_message(1, &p.encode());
     }
     for t in threads {
-        w.write_message(2, &encode_thread(t));
+        w.write_message(2, &t.encode());
     }
     w.bytes().to_vec()
 }
@@ -147,72 +151,78 @@ impl Instruction {
     }
 }
 
-fn encode_path_component(pc: &PathComponent) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    if let Some(v) = pc.field_id {
-        w.write_uint32(1, v);
+impl PathComponent {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        if let Some(v) = self.field_id {
+            w.write_uint32(1, v);
+        }
+        if let Some(v) = self.array_index {
+            w.write_uint32(2, v);
+        }
+        if let Some(v) = self.map_key_field_id {
+            w.write_uint32(3, v);
+        }
+        if self.is_repeated {
+            w.write_uint32(5, 1);
+        }
+        if let Some(v) = self.register_to_match {
+            w.write_uint32(6, v);
+        }
+        if let Some(v) = self.store_foreach_index_into_register {
+            w.write_uint32(7, v);
+        }
+        w.bytes().to_vec()
     }
-    if let Some(v) = pc.array_index {
-        w.write_uint32(2, v);
-    }
-    if let Some(v) = pc.map_key_field_id {
-        w.write_uint32(3, v);
-    }
-    if pc.is_repeated {
-        w.write_uint32(5, 1);
-    }
-    if let Some(v) = pc.register_to_match {
-        w.write_uint32(6, v);
-    }
-    if let Some(v) = pc.store_foreach_index_into_register {
-        w.write_uint32(7, v);
-    }
-    w.bytes().to_vec()
 }
 
-fn encode_select(s: &Select) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    if s.cursor != CURSOR_UNSPECIFIED {
-        w.write_uint32(1, s.cursor);
+impl Select {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        if self.cursor != CURSOR_UNSPECIFIED {
+            w.write_uint32(1, self.cursor);
+        }
+        for pc in &self.relative_path {
+            w.write_message(2, &pc.encode());
+        }
+        if self.create_if_not_exist {
+            w.write_uint32(3, 1);
+        }
+        w.bytes().to_vec()
     }
-    for pc in &s.relative_path {
-        w.write_message(2, &encode_path_component(pc));
-    }
-    if s.create_if_not_exist {
-        w.write_uint32(3, 1);
-    }
-    w.bytes().to_vec()
 }
 
-fn encode_instruction(ins: &Instruction) -> Vec<u8> {
-    let mut w = ProtoWriter::new();
-    match &ins.op {
-        Op::Select(s) => w.write_message(1, &encode_select(s)),
-        Op::RegLoad { cursor, dst_register } => {
-            let mut r = ProtoWriter::new();
-            if *cursor != CURSOR_UNSPECIFIED {
-                r.write_uint32(1, *cursor);
+impl Instruction {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        match &self.op {
+            Op::Select(s) => w.write_message(1, &s.encode()),
+            Op::RegLoad { cursor, dst_register } => {
+                let mut r = ProtoWriter::new();
+                if *cursor != CURSOR_UNSPECIFIED {
+                    r.write_uint32(1, *cursor);
+                }
+                r.write_uint32(2, *dst_register);
+                w.write_message(2, r.bytes());
             }
-            r.write_uint32(2, *dst_register);
-            w.write_message(2, r.bytes());
-        }
-        Op::Merge { skip_submessages } => {
-            let mut m = ProtoWriter::new();
-            if *skip_submessages {
-                m.write_uint32(1, 1);
+            Op::Merge { skip_submessages } => {
+                let mut m = ProtoWriter::new();
+                if *skip_submessages {
+                    m.write_uint32(1, 1);
+                }
+                w.write_message(3, m.bytes());
             }
-            w.write_message(3, m.bytes());
+            Op::Set => w.write_message(4, &[]),
+            Op::Del => w.write_message(5, &[]),
         }
-        Op::Set => w.write_message(4, &[]),
-        Op::Del => w.write_message(5, &[]),
+        if self.abort_level != ABORT_UNSET {
+            w.write_uint32(6, self.abort_level);
+        }
+        for n in &self.nested {
+            w.write_message(7, &n.encode());
+        }
+        w.bytes().to_vec()
     }
-    if ins.abort_level != ABORT_UNSET {
-        w.write_uint32(6, ins.abort_level);
-    }
-    for n in &ins.nested {
-        w.write_message(7, &encode_instruction(n));
-    }
-    w.bytes().to_vec()
 }
 
 fn encode_vm_program(version: u32, instructions: &[Instruction]) -> Vec<u8> {
@@ -221,7 +231,7 @@ fn encode_vm_program(version: u32, instructions: &[Instruction]) -> Vec<u8> {
         w.write_uint32(1, version);
     }
     for ins in instructions {
-        w.write_message(2, &encode_instruction(ins));
+        w.write_message(2, &ins.encode());
     }
     w.bytes().to_vec()
 }
