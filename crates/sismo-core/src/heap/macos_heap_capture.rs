@@ -40,7 +40,7 @@ use crate::proto::session_config::encode_data_source_descriptor;
 use crate::symbolize::symbolizer::Symbolizer;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
-use crate::worker_sdk::{now_ns, read_u64, Event};
+use crate::worker_sdk::{now_ns, read_u64, wait_for_setup, Event};
 
 const DS_NAME: &[u8] = b"sismo.heap";
 const U32_MAX: u32 = u32::MAX;
@@ -179,18 +179,7 @@ impl HeapCapture {
 
     fn run(&self) {
         // Wait for on_setup so we know which target to attach to.
-        while !self.exit_requested.load(Ordering::Acquire)
-            && !self.setup_received.load(Ordering::Acquire)
-        {
-            self.wakeup.reset();
-            if self.exit_requested.load(Ordering::Acquire)
-                || self.setup_received.load(Ordering::Acquire)
-            {
-                break;
-            }
-            self.wakeup.wait();
-        }
-        if self.exit_requested.load(Ordering::Acquire) {
+        if !wait_for_setup(&self.wakeup, &self.exit_requested, &self.setup_received) {
             return;
         }
 

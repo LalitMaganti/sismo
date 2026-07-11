@@ -21,7 +21,7 @@ use crate::proto::sched_protos::{
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::proto::sismo_config::{config_extract, sched_decode};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
-use crate::worker_sdk::{now_ns, Event};
+use crate::worker_sdk::{now_ns, wait_for_setup, Event};
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -179,18 +179,7 @@ extern "C" fn on_flush(_user_arg: *mut c_void, flusher: *mut c_void) {
 impl SchedCapture {
     fn run(&self) {
         // Wait for on_setup (carries the kdebug buffer sizing).
-        while !self.exit_requested.load(Ordering::Acquire)
-            && !self.setup_received.load(Ordering::Acquire)
-        {
-            self.wakeup.reset();
-            if self.exit_requested.load(Ordering::Acquire)
-                || self.setup_received.load(Ordering::Acquire)
-            {
-                break;
-            }
-            self.wakeup.wait();
-        }
-        if self.exit_requested.load(Ordering::Acquire) {
+        if !wait_for_setup(&self.wakeup, &self.exit_requested, &self.setup_received) {
             return;
         }
 

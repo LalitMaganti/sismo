@@ -42,7 +42,7 @@ unsafe fn thread_kernel_tid(thread: MachPort) -> u64 {
 
 // Producer C ABI lives in ffi; the worker Event in worker_sdk.
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
-use crate::worker_sdk::{read_u64, Event};
+use crate::worker_sdk::{read_u64, wait_for_setup, Event};
 
 // The rest of the pipeline is already Rust — call the sibling modules directly
 // (no FFI round-trip): descriptor encoding, unwinder lifecycle, module loading,
@@ -139,18 +139,7 @@ impl CpuCapture {
 
     fn run(&self) {
         // Wait for on_setup (carries target_pid).
-        while !self.exit_requested.load(Ordering::Acquire)
-            && !self.setup_received.load(Ordering::Acquire)
-        {
-            self.wakeup.reset();
-            if self.exit_requested.load(Ordering::Acquire)
-                || self.setup_received.load(Ordering::Acquire)
-            {
-                break;
-            }
-            self.wakeup.wait();
-        }
-        if self.exit_requested.load(Ordering::Acquire) {
+        if !wait_for_setup(&self.wakeup, &self.exit_requested, &self.setup_received) {
             return;
         }
 

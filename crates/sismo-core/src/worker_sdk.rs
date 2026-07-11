@@ -7,6 +7,7 @@
 //! The producer C ABI these workers emit through (`sismo_ds_*`) and its callback
 //! types live in [`crate::ffi`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -26,6 +27,20 @@ pub fn read_u64(b: &[u8], off: usize) -> u64 {
 /// Little-endian i32 at byte offset `off`. Panics if `b` is too short.
 pub fn read_i32(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+}
+
+/// Block a capture worker at the top of `run` until on_setup fires (via a
+/// `wakeup.set`) or exit is requested. Returns true if setup arrived, false if
+/// exit was requested first — in which case the worker should return.
+pub fn wait_for_setup(wakeup: &Event, exit_requested: &AtomicBool, setup_received: &AtomicBool) -> bool {
+    while !exit_requested.load(Ordering::Acquire) && !setup_received.load(Ordering::Acquire) {
+        wakeup.reset();
+        if exit_requested.load(Ordering::Acquire) || setup_received.load(Ordering::Acquire) {
+            break;
+        }
+        wakeup.wait();
+    }
+    !exit_requested.load(Ordering::Acquire)
 }
 
 /// Manual-reset event. Trampolines `set` to wake the worker; the worker
