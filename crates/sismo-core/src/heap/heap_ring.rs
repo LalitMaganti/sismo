@@ -15,46 +15,11 @@
 //! This is the RECORDER side (create + read); the target's heap-preload is the
 //! writer (attach + write). Both agree on this fixed shm layout. macOS-only.
 
-use std::os::raw::{c_int, c_uint, c_void};
+use libc::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const HEADER_BYTES: u64 = 8;
 const RECORD_ALIGN: u64 = 8;
-
-// macOS mmap/shm/open constants.
-const PROT_READ: c_int = 0x1;
-const PROT_WRITE: c_int = 0x2;
-const PROT_NONE: c_int = 0x0;
-const MAP_SHARED: c_int = 0x1;
-const MAP_PRIVATE: c_int = 0x2;
-const MAP_FIXED: c_int = 0x10;
-const MAP_ANON: c_int = 0x1000;
-const O_RDWR: c_int = 0x0002;
-const O_CREAT: c_int = 0x0200;
-const O_EXCL: c_int = 0x0800;
-
-extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
-    fn munmap(addr: *mut c_void, len: usize) -> c_int;
-    // shm_open is variadic on Darwin (mode must land on the stack) — declare it so.
-    fn shm_open(name: *const u8, oflag: c_int, ...) -> c_int;
-    fn shm_unlink(name: *const u8) -> c_int;
-    fn ftruncate(fd: c_int, len: i64) -> c_int;
-    fn close(fd: c_int) -> c_int;
-    fn getpid() -> c_int;
-    fn getpagesize() -> c_int;
-    fn clock_gettime(clk_id: c_int, tp: *mut Timespec) -> c_int;
-}
-const CLOCK_MONOTONIC: c_int = 6;
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
-fn map_failed() -> *mut c_void {
-    usize::MAX as *mut c_void // (void*)-1
-}
 
 fn align_up(n: u64, a: u64) -> u64 {
     (n + a - 1) & !(a - 1)
@@ -104,28 +69,29 @@ impl RingBuffer {
     /// one page). The shm is unlinked immediately; only the fd keeps it alive
     /// (SCM_RIGHTS-passable to the target).
     pub fn create(ring_size: u64) -> Result<RingBuffer, RingError> {
-        let page_size = unsafe { getpagesize() } as u64;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         if ring_size == 0 || (ring_size & (ring_size - 1)) != 0 || ring_size < page_size {
             return Err(RingError::InvalidSize);
         }
 
         // Unique, short name (macOS PSHMNAMLEN = 31): "/smh_<pid>_<ts_lo_hex>".
-        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
         let ts_lo = ts.tv_nsec as u32;
-        let pid = unsafe { getpid() };
+        let pid = unsafe { libc::getpid() };
         let name = format!("/smh_{pid}_{ts_lo:x}\0");
 
-        let flags = O_RDWR | O_CREAT | O_EXCL;
-        let fd = unsafe { shm_open(name.as_ptr(), flags, 0o600 as c_uint) };
+        // shm_open's mode is variadic on Darwin, so pass it as c_uint.
+        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
+        let fd = unsafe { libc::shm_open(name.as_ptr() as *const c_char, flags, 0o600 as c_uint) };
         if fd < 0 {
             return Err(RingError::ShmCreate);
         }
-        unsafe { shm_unlink(name.as_ptr()) };
+        unsafe { libc::shm_unlink(name.as_ptr() as *const c_char) };
 
         let file_size = page_size + ring_size;
-        if unsafe { ftruncate(fd, file_size as i64) } != 0 {
-            unsafe { close(fd) };
+        if unsafe { libc::ftruncate(fd, file_size as i64) } != 0 {
+            unsafe { libc::close(fd) };
             return Err(RingError::Truncate);
         }
         Self::map_into(fd, ring_size, page_size, file_size)
@@ -135,29 +101,29 @@ impl RingBuffer {
         let region_bytes = (file_size + ring_size) as usize;
         // Reserve the address range with PROT_NONE so the two MAP_FIXED maps land.
         let region = unsafe {
-            mmap(std::ptr::null_mut(), region_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0)
+            libc::mmap(std::ptr::null_mut(), region_bytes, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
         };
-        if region == map_failed() {
+        if region == libc::MAP_FAILED {
             return Err(RingError::ReserveAddrSpace);
         }
         let region = region as *mut u8;
 
         // meta + first data view at fd offset 0.
         let r1 = unsafe {
-            mmap(region as *mut c_void, file_size as usize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0)
+            libc::mmap(region as *mut c_void, file_size as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_FIXED, fd, 0)
         };
-        if r1 == map_failed() || r1 as *mut u8 != region {
-            unsafe { munmap(region as *mut c_void, region_bytes) };
+        if r1 == libc::MAP_FAILED || r1 as *mut u8 != region {
+            unsafe { libc::munmap(region as *mut c_void, region_bytes) };
             return Err(RingError::MmapMeta);
         }
 
         // Mirror of the data block at fd offset page_size, right after view 1.
         let mirror = unsafe { region.add(file_size as usize) };
         let r2 = unsafe {
-            mmap(mirror as *mut c_void, ring_size as usize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, page_size as i64)
+            libc::mmap(mirror as *mut c_void, ring_size as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_FIXED, fd, page_size as i64)
         };
-        if r2 == map_failed() || r2 as *mut u8 != mirror {
-            unsafe { munmap(region as *mut c_void, region_bytes) };
+        if r2 == libc::MAP_FAILED || r2 as *mut u8 != mirror {
+            unsafe { libc::munmap(region as *mut c_void, region_bytes) };
             return Err(RingError::MmapMirror);
         }
 
@@ -272,8 +238,8 @@ impl RingBuffer {
 impl Drop for RingBuffer {
     fn drop(&mut self) {
         unsafe {
-            munmap(self.region as *mut c_void, self.region_bytes);
-            close(self.fd);
+            libc::munmap(self.region as *mut c_void, self.region_bytes);
+            libc::close(self.fd);
         }
     }
 }
