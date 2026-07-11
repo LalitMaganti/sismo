@@ -103,6 +103,8 @@ extern "C" {
         user_arg: *mut c_void,
     ) -> u32;
     pub fn sismo_ds_emit(slot: u32, packet_bytes: *const u8, packet_len: usize);
+    // Emit on the slot's second sequence (the off-CPU stream, own timebase).
+    pub fn sismo_ds_emit_offcpu(slot: u32, packet_bytes: *const u8, packet_len: usize);
     pub fn sismo_stop_done(handle: *mut c_void);
     pub fn sismo_flush_done(handle: *mut c_void);
 }
@@ -128,9 +130,13 @@ mod stubs {
     #[no_mangle]
     pub unsafe extern "C" fn sismo_ds_emit(_slot: u32, _b: *const u8, _l: usize) {}
     #[no_mangle]
+    pub unsafe extern "C" fn sismo_ds_emit_offcpu(_slot: u32, _b: *const u8, _l: usize) {}
+    #[no_mangle]
     pub unsafe extern "C" fn sismo_stop_done(_h: *mut c_void) {}
     #[no_mangle]
     pub unsafe extern "C" fn sismo_flush_done(_h: *mut c_void) {}
 }
 #[cfg(test)]
-pub use stubs::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
+pub use stubs::{
+    sismo_ds_emit, sismo_ds_emit_offcpu, sismo_ds_register, sismo_flush_done, sismo_stop_done,
+};

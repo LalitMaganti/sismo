@@ -686,7 +686,7 @@ impl Interner {
 
 use crate::symbolize::data_regions::DataRegions;
 use crate::symbolize::proc_maps::ProcMaps;
-use crate::ffi::sismo_ds_emit;
+use crate::ffi::{sismo_ds_emit, sismo_ds_emit_offcpu};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // TracePacket / defaults field tags + constants.
@@ -712,6 +712,9 @@ pub struct Capture {
     maps_tried: bool,
     last_maps_ns: u64,
     interner: Interner,
+    // The off-CPU stream is a second perf sequence with its own timebase, so it
+    // interns into its own iid space.
+    offcpu_interner: Interner,
     ksym_names: HashMap<u32, Vec<u8>>, // id -> bare function name
     counters: Vec<Counter>,
     active_slots: Vec<u8>, // indices into `counters`; [0] is the timebase
@@ -725,6 +728,7 @@ pub struct Capture {
     ds_slot: u32,
     active: AtomicBool,
     need_defaults: AtomicBool,
+    offcpu_need_defaults: AtomicBool,
     flush_req: AtomicUsize,
     stop_req: AtomicUsize,
 }
@@ -920,6 +924,56 @@ impl Capture {
         unsafe { sismo_ds_emit(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
     }
 
+    // The off-CPU sequence's PerfSampleDefaults: the same thread-scoped setup,
+    // but its own timebase (off-cpu-ns) and no follower counters.
+    fn emit_offcpu_defaults(&mut self) {
+        let mut w = ProtoWriter::new();
+        w.write_perf_defaults_packet(
+            b"off-cpu-ns",
+            0,
+            &[],
+            SAMPLE_SCOPE_THREAD,
+            BUILTIN_CLOCK_MONOTONIC,
+            SEQ_INCREMENTAL_STATE_CLEARED,
+        );
+        unsafe { sismo_ds_emit_offcpu(self.ds_slot, w.bytes().as_ptr(), w.bytes().len()) };
+    }
+
+    // Emit an off-CPU sample: the blocking stack, weighted by the off-CPU
+    // duration (rec.data_addr) as the timebase count, on the off-CPU sequence.
+    // Interning goes into that sequence's own iid space (swap the active
+    // interner around the shared intern_callstack).
+    fn emit_offcpu_sample(&mut self, rec: &SismoSampleRec) {
+        if self.offcpu_need_defaults.swap(false, Ordering::AcqRel) {
+            self.offcpu_interner.reset();
+            self.emit_offcpu_defaults();
+        }
+
+        std::mem::swap(&mut self.interner, &mut self.offcpu_interner);
+        let mut idw = ProtoWriter::new();
+        let cs_iid = self.intern_callstack(rec, &mut idw);
+        std::mem::swap(&mut self.interner, &mut self.offcpu_interner);
+
+        let mut tp = ProtoWriter::new();
+        tp.write_uint64(8, rec.hdr.ts);
+        tp.write_uint32(13, SEQ_NEEDS_INCREMENTAL_STATE);
+        if !idw.bytes().is_empty() {
+            tp.write_message(12, idw.bytes());
+        }
+        tp.write_perf_sample(
+            TP_FIELD_PERF_SAMPLE,
+            rec.hdr.cpu,
+            rec.hdr.pid,
+            rec.hdr.tid,
+            cs_iid,
+            rec.data_addr, // timebase_count = off-CPU duration (ns) = the weight
+            &[],
+            0,
+            None,
+        );
+        unsafe { sismo_ds_emit_offcpu(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
+    }
+
     fn handle(&mut self, hdr: &SismoHdr) {
         if hdr.r#type == SISMO_EVT_KSYM {
             let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoKsymRec) };
@@ -927,13 +981,14 @@ impl Capture {
             return;
         }
         if hdr.r#type == SISMO_EVT_OFFCPU {
-            // The blocking stack + off-CPU duration (in data_addr). Captured and
-            // symbolizable via the same path as on-CPU samples; the emit into
-            // the trace rides its own off-cpu-ns timebase (a separate perf
-            // sequence) — the next step. For now, account it.
+            // The blocking stack + off-CPU duration (in data_addr). Emitted onto
+            // the off-CPU sequence — same data source, own timebase.
             let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoSampleRec) };
             self.offcpu_samples += 1;
             self.offcpu_ns = self.offcpu_ns.saturating_add(rec.data_addr);
+            if self.active.load(Ordering::Acquire) {
+                self.emit_offcpu_sample(rec);
+            }
             return;
         }
         if hdr.r#type != SISMO_EVT_SAMPLE {
@@ -1000,6 +1055,7 @@ extern "C" fn on_setup(_user: *mut c_void, _cfg: *const c_void, _cfg_len: usize)
 extern "C" fn on_start(user: *mut c_void) {
     let c = unsafe { &*(user as *mut Capture) };
     c.need_defaults.store(true, Ordering::Release);
+    c.offcpu_need_defaults.store(true, Ordering::Release);
     c.active.store(true, Ordering::Release);
 }
 
@@ -1078,6 +1134,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         maps_tried: false,
         last_maps_ns: 0,
         interner: Interner::new(),
+        offcpu_interner: Interner::new(),
         ksym_names: HashMap::new(),
         counters: Vec::new(),
         active_slots: Vec::new(),
@@ -1091,6 +1148,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         ds_slot: u32::MAX,
         active: AtomicBool::new(false),
         need_defaults: AtomicBool::new(false),
+        offcpu_need_defaults: AtomicBool::new(false),
         flush_req: AtomicUsize::new(0),
         stop_req: AtomicUsize::new(0),
     }));

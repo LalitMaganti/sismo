@@ -125,6 +125,12 @@ uint32_t sismo_ds_register(const uint8_t* desc_bytes, size_t desc_len,
                            SismoDsOnFlush on_flush,
                            void*          user_arg);
 
+// Emit on a data source's SECOND sequence (the off-CPU sample stream), so it
+// can carry its own PerfSampleDefaults / timebase. Same slot, same producer.
+void sismo_ds_emit_offcpu(uint32_t slot,
+                          const uint8_t* packet_bytes,
+                          size_t packet_len);
+
 void sismo_ds_emit(uint32_t slot,
                    const uint8_t* packet_bytes,
                    size_t packet_len);

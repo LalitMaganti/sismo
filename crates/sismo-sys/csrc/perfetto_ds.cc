@@ -35,6 +35,11 @@
 #include "perfetto/tracing/data_source.h"
 #include "perfetto/tracing/tracing.h"
 #include "protos/perfetto/common/data_source_descriptor.gen.h"
+// For the off-CPU stream's second trace writer (same data source, own sequence).
+#include "perfetto/tracing/buffer_exhausted_policy.h"
+#include "perfetto/tracing/trace_writer_base.h"
+#include "perfetto/tracing/internal/data_source_type.h"
+#include "perfetto/tracing/internal/tracing_muxer.h"
 
 namespace {
 
@@ -104,6 +109,17 @@ class SismoSlot : public perfetto::DataSource<SismoSlot<Slot>> {
         cb.on_flush(cb.user_arg, static_cast<void*>(fn));
     }
 };
+
+// A second trace writer per slot for a data source's off-CPU sample stream:
+// the SAME data source, but its own sequence, so it can carry its own
+// PerfSampleDefaults (an off-cpu-ns timebase, distinct from the on-CPU cycle
+// counter on the primary sequence). Created lazily on first emit from within
+// Trace() — which yields the active instance — and reused on the emitting
+// thread thereafter. Bound to one instance; recreated if the instance changes
+// (a session restart). One emitter thread per slot, matching how the primary
+// stream is emitted.
+std::array<std::unique_ptr<perfetto::TraceWriterBase>, kMaxSlots> g_aux_writer;
+std::array<uint32_t, kMaxSlots> g_aux_instance{};
 
 // Idempotent guard around `Tracing::Initialize`. The consumer side
 // (sismo_consumer.cc) also calls `Tracing::Initialize`; the SDK
@@ -213,6 +229,39 @@ extern "C" void sismo_ds_emit(uint32_t slot,
         default: break;
     }
 #undef EMIT_SLOT
+}
+
+// Like sismo_ds_emit, but on the slot's SECOND sequence (the off-CPU stream).
+// The bytes are a full TracePacket (PerfSampleDefaults or PerfSample) whose
+// perf samples ride the off-cpu-ns timebase this sequence declares.
+extern "C" void sismo_ds_emit_offcpu(uint32_t slot,
+                                     const uint8_t* packet_bytes,
+                                     size_t packet_len) {
+  if (!packet_bytes || packet_len == 0) return;
+
+#define EMIT_AUX_SLOT(N)                                                        \
+  case N:                                                                       \
+    SismoSlot<N>::Trace([&](typename SismoSlot<N>::TraceContext ctx) {          \
+      uint32_t idx = ctx.instance_index();                                      \
+      perfetto::internal::DataSourceStaticState* ss =                          \
+          perfetto::DataSourceHelper<SismoSlot<N>>::type().static_state();      \
+      if (!g_aux_writer[N] || g_aux_instance[N] != idx) {                       \
+        perfetto::internal::DataSourceState* inst = ss->TryGet(idx);           \
+        if (!inst) return;                                                      \
+        g_aux_writer[N] =                                                       \
+            perfetto::internal::TracingMuxer::Get()->CreateTraceWriter(         \
+                ss, idx, inst, perfetto::BufferExhaustedPolicy::kDrop);         \
+        g_aux_instance[N] = idx;                                                \
+      }                                                                         \
+      auto packet = g_aux_writer[N]->NewTracePacket();                          \
+      packet->AppendRawProtoBytes(packet_bytes, packet_len);                    \
+    });                                                                         \
+    break;
+  switch (slot) {
+    SISMO_FOR_EACH_SLOT(EMIT_AUX_SLOT)
+    default: break;
+  }
+#undef EMIT_AUX_SLOT
 }
 
 extern "C" void sismo_stop_done(void* handle) {
