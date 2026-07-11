@@ -633,7 +633,9 @@ const TP_FIELD_TRUSTED_PACKET_SEQUENCE_ID: u32 = 10;
 const TP_FIELD_TRACK_EVENT: u32 = 11;
 const TP_FIELD_TIMESTAMP_CLOCK_ID: u32 = 58;
 const TP_FIELD_TRACK_DESCRIPTOR: u32 = 60;
-const BUILTIN_CLOCK_BOOTTIME: u32 = 6;
+// Perfetto builtin clock enum; must match the domain now_ns() reads and the
+// main trace's timebase (linux_bpf_capture declares MONOTONIC too).
+const BUILTIN_CLOCK_MONOTONIC: u32 = 3;
 const TE_FIELD_TYPE: u32 = 9;
 const TE_FIELD_TRACK_UUID: u32 = 11;
 const TE_FIELD_NAME: u32 = 23;
@@ -677,17 +679,8 @@ fn append_source_asm_sidecar(trace_path: &str, src_paths: &[Vec<u8>], asm_record
 }
 
 fn now_ns() -> u64 {
-    #[repr(C)]
-    struct Timespec {
-        tv_sec: i64,
-        tv_nsec: i64,
-    }
-    extern "C" {
-        fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
-    }
-    const CLOCK_MONOTONIC: i32 = 6; // Darwin; on Linux MONOTONIC=1 (both fine — relative clock)
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -733,7 +726,7 @@ fn write_track_descriptor(out: &mut ProtoWriter, timestamp_ns: u64) {
 
     let mut tp = ProtoWriter::new();
     tp.write_uint64(TP_FIELD_TIMESTAMP, timestamp_ns);
-    tp.write_uint32(TP_FIELD_TIMESTAMP_CLOCK_ID, BUILTIN_CLOCK_BOOTTIME);
+    tp.write_uint32(TP_FIELD_TIMESTAMP_CLOCK_ID, BUILTIN_CLOCK_MONOTONIC);
     tp.write_uint32(TP_FIELD_TRUSTED_PACKET_SEQUENCE_ID, SEQUENCE_ID);
     tp.write_message(TP_FIELD_TRACK_DESCRIPTOR, td.bytes());
     out.write_message(TP_FIELD_TRACE_PACKET, tp.bytes());
@@ -788,7 +781,7 @@ fn write_event(
 
     let mut tp = ProtoWriter::new();
     tp.write_uint64(TP_FIELD_TIMESTAMP, timestamp_ns);
-    tp.write_uint32(TP_FIELD_TIMESTAMP_CLOCK_ID, BUILTIN_CLOCK_BOOTTIME);
+    tp.write_uint32(TP_FIELD_TIMESTAMP_CLOCK_ID, BUILTIN_CLOCK_MONOTONIC);
     tp.write_uint32(TP_FIELD_TRUSTED_PACKET_SEQUENCE_ID, SEQUENCE_ID);
     tp.write_message(TP_FIELD_TRACK_EVENT, te.bytes());
     out.write_message(TP_FIELD_TRACE_PACKET, tp.bytes());
