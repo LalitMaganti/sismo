@@ -26,16 +26,15 @@ const U32_MAX: u32 = u32::MAX;
 
 type MachPort = u32;
 const KERN_SUCCESS: i32 = 0;
-const THREAD_BASIC_INFO: i32 = 3;
+const THREAD_BASIC_INFO: u32 = 3;
 const THREAD_BASIC_INFO_COUNT: u32 = 10;
-const THREAD_IDENTIFIER_INFO: i32 = 4;
+const THREAD_IDENTIFIER_INFO: u32 = 4;
 const THREAD_IDENTIFIER_INFO_COUNT: u32 = 6;
 
+// libc's mach_task_self_ is deprecated (mach2 crate) and it lacks the
+// mach_*_deallocate calls; keep those hand-rolled.
 extern "C" {
     static mach_task_self_: MachPort;
-    fn task_for_pid(target_tport: MachPort, pid: i32, t: *mut MachPort) -> i32;
-    fn task_threads(task: MachPort, act_list: *mut *mut MachPort, act_count: *mut u32) -> i32;
-    fn thread_info(target: MachPort, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
     fn mach_port_deallocate(task: MachPort, name: MachPort) -> i32;
     fn mach_vm_deallocate(target: MachPort, address: u64, size: u64) -> i32;
 }
@@ -50,7 +49,7 @@ fn read_u64(b: &[u8], off: usize) -> u64 {
 unsafe fn thread_cpu_time_us(thread: MachPort) -> Option<u64> {
     let mut buf = [0u8; 40];
     let mut count = THREAD_BASIC_INFO_COUNT;
-    if unsafe { thread_info(thread, THREAD_BASIC_INFO, buf.as_mut_ptr() as *mut i32, &mut count) }
+    if unsafe { libc::thread_info(thread, THREAD_BASIC_INFO, buf.as_mut_ptr() as *mut i32, &mut count) }
         != KERN_SUCCESS
     {
         return None;
@@ -64,7 +63,7 @@ unsafe fn thread_kernel_tid(thread: MachPort) -> u64 {
     let mut buf = [0u8; 24];
     let mut count = THREAD_IDENTIFIER_INFO_COUNT;
     if unsafe {
-        thread_info(thread, THREAD_IDENTIFIER_INFO, buf.as_mut_ptr() as *mut i32, &mut count)
+        libc::thread_info(thread, THREAD_IDENTIFIER_INFO, buf.as_mut_ptr() as *mut i32, &mut count)
     } != KERN_SUCCESS
     {
         return 0;
@@ -202,7 +201,7 @@ impl CpuCapture {
         self.target_pid.store(target_pid, Ordering::Release);
 
         let mut task: MachPort = 0;
-        if unsafe { task_for_pid(mach_task_self_, target_pid as i32, &mut task) } != KERN_SUCCESS {
+        if unsafe { libc::task_for_pid(mach_task_self_, target_pid as i32, &mut task) } != KERN_SUCCESS {
             eprintln!(
                 "cpu_sampler: task_for_pid({target_pid}) failed — need sudo or the\n  com.apple.security.cs.debugger entitlement."
             );
@@ -244,7 +243,7 @@ impl CpuCapture {
             if self.running.load(Ordering::Acquire) {
                 let mut list: *mut MachPort = std::ptr::null_mut();
                 let mut count: u32 = 0;
-                let rc = unsafe { task_threads(task, &mut list, &mut count) };
+                let rc = unsafe { libc::task_threads(task, &mut list, &mut count) };
                 if rc != KERN_SUCCESS {
                     if threadlist_was_ok {
                         eprintln!("cpu_sampler: threadList failed (suppressing until recovery)");
