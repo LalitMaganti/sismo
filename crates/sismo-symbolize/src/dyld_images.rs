@@ -37,8 +37,8 @@ const ERR_TASK_INFO: u32 = 1;
 const ERR_EMPTY: u32 = 2;
 const ERR_VM_READ: u32 = 3;
 
+// libc lacks mach_vm_read_overwrite; task_info comes from libc.
 extern "C" {
-    fn task_info(target: MachPort, flavor: u32, task_info_out: *mut i32, count: *mut u32) -> i32;
     fn mach_vm_read_overwrite(
         target: MachPort,
         address: u64,
@@ -112,7 +112,7 @@ impl ImageList {
         let mut info = TaskDyldInfo::default();
         let mut count = (std::mem::size_of::<TaskDyldInfo>() / 4) as u32;
         let rc = unsafe {
-            task_info(task, TASK_DYLD_INFO, &mut info as *mut TaskDyldInfo as *mut i32, &mut count)
+            libc::task_info(task, TASK_DYLD_INFO, &mut info as *mut TaskDyldInfo as *mut i32, &mut count)
         };
         if rc != KERN_SUCCESS {
             return Err(ERR_TASK_INFO);
