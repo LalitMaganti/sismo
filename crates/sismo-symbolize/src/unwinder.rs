@@ -280,4 +280,3 @@ fn register_macho(
     inner.add_module(module);
     AddModule::Added
 }
-

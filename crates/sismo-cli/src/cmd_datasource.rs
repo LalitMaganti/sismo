@@ -124,7 +124,7 @@ fn block_until_stopped() {
 
 #[derive(clap::Args)]
 pub struct DatasourceArgs {
-    /// One or more of: macos_sched, macos_cpu_samples, heap, all-privileged.
+    /// One or more of: sched, cpu, heap, all-privileged.
     #[arg(required = true)]
     names: Vec<String>,
 }

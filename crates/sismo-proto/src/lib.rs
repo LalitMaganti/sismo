@@ -230,7 +230,6 @@ mod reader_tests {
     }
 }
 
-
 impl ProtoWriter {
     /// Write a TracePacket carrying PerfSampleDefaults, ready to hand to
     /// sismo_ds_emit.

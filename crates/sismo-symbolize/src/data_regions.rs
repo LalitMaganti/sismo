@@ -135,7 +135,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn find_locates_containing_region() {
         let regions = DataRegions {

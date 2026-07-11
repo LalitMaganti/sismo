@@ -11,10 +11,6 @@
 //! Carries its own tiny copies of the wire layout + ring (attach/write side) +
 //! control protocol (listen/accept side) so it links nothing heavy — it must be
 //! safe to inject into any process. No allocation on the malloc hot path.
-//!
-//! Migration in progress: the pure/self-contained pieces (sampler, wire) land
-//! first with tests; the ring/protocol server side, the interposer, and the
-//! build swap follow.
 
 pub mod protocol;
 pub mod ring;

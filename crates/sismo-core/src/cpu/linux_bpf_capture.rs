@@ -4,7 +4,6 @@
 //! Linux BPF CPU collector. Per-thread PMU counters + timer-tick stack sampling,
 //! scoped to the workload, emitted as thread-scoped Perfetto PerfSamples.
 
-
 use std::os::raw::{c_char, c_int, c_void};
 
 // ---- wire format (mirrors src/c/sismo_bpf/sismo_bpf.h) ---------------------

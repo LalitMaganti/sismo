@@ -140,7 +140,6 @@ extern "C" fn on_flush(_user_arg: *mut c_void, flusher: *mut c_void) {
     }
 }
 
-
 impl CpuCapture {
     fn park_until_exit(&self) {
         loop {

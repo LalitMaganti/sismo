@@ -322,7 +322,7 @@ struct DisasmInsn {
 }
 
 struct DisasmCtx {
-    // Insertion-ordered func_start -> instructions (matches Zig's ArrayHashMap).
+    // func_start -> instructions, kept in insertion order for deterministic emit.
     funcs: Vec<(u64, Vec<DisasmInsn>)>,
 }
 
@@ -335,7 +335,7 @@ fn collect_module_disasm(sym: &Symbolizer, m: &Module, arch: Arch, out: &mut Vec
         return;
     }
 
-    // Bucket by func_start, insertion-ordered (matches Zig's ArrayHashMap).
+    // Bucket by func_start, preserving first-seen order for deterministic emit.
     let mut ctx = DisasmCtx { funcs: Vec::new() };
     for d in &decoded {
         let insn = DisasmInsn {
@@ -372,8 +372,6 @@ fn collect_module_disasm(sym: &Symbolizer, m: &Module, arch: Arch, out: &mut Vec
 
         out.push(AsmRecord {
             func: fname.to_vec(),
-            module: m.name.clone(),
-            build_id_hex: m.build_id_hex.clone(),
             json: js,
         });
     }
@@ -662,10 +660,6 @@ const MAX_CHUNK_BYTES: usize = 192 * 1024;
 /// `[{a,b,t,l}, …]` array; the sidecar only chunks + frames it.
 struct AsmRecord {
     func: Vec<u8>,
-    #[allow(dead_code)]
-    module: Vec<u8>,
-    #[allow(dead_code)]
-    build_id_hex: Vec<u8>,
     json: Vec<u8>,
 }
 

@@ -197,6 +197,7 @@ pub unsafe fn accept_and_receive(listener: &Listener) -> Result<AttachState, Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::os::raw::c_char;
 
     #[test]
@@ -214,9 +215,14 @@ mod tests {
 
     // Full SCM_RIGHTS roundtrip: bind a listener, connect from a thread that
     // sends an AttachConfig + a real fd, and confirm accept_and_receive gets a
-    // working fd (reads back the bytes the sender wrote through it).
+    // working fd (reads back the bytes the sender wrote through it). macOS-gated:
+    // the socket bind + sockaddr layout use Darwin values (the listener only runs
+    // inside the injected dylib on macOS).
+    #[cfg(target_os = "macos")]
     const SOL_SOCKET: c_int = 0xffff;
+    #[cfg(target_os = "macos")]
     const SCM_RIGHTS: c_int = 0x01;
+    #[cfg(target_os = "macos")]
     extern "C" {
         fn connect(fd: c_int, addr: *const c_void, len: u32) -> c_int;
         fn sendmsg(fd: c_int, msg: *const Msghdr, flags: c_int) -> isize;
@@ -225,6 +231,7 @@ mod tests {
         fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn scm_rights_roundtrip_transfers_a_working_fd() {
         let pid: i32 = 0x5EED; // unlikely to collide with a real recorder socket

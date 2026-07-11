@@ -8,9 +8,9 @@
 //!     overwrites in flight-recorder mode).
 //!
 //! The VmProgram is built once from a fixed structure (no runtime inputs);
-//! `sismo_macos_sched_vm_program` writes it into a caller buffer. The process
-//! tree is built per-drain from flattened FFI arrays. Both are covered by
-//! byte-exact tests.
+//! `macos_sched_vm_program` returns its bytes. The process tree is built
+//! per-drain from staged process/thread slices. Both are covered by byte-exact
+//! tests.
 
 use crate::ProtoWriter;
 use std::slice;
@@ -76,12 +76,8 @@ fn encode_thread(t: &ThreadC) -> Vec<u8> {
 }
 
 /// Encode a GenericKernelProcessTree payload: repeated Process (field 1) then
-/// repeated Thread (field 2). Writes into out[..cap]; returns the length, or 0
-/// if too small.
-///
-/// # Safety
-/// `processes`/`threads` valid for their counts (and each embedded
-/// cmdline/comm pointer valid for its len or null); `out` writable for `cap`.
+/// repeated Thread (field 2). Each entry's embedded cmdline/comm pointer must be
+/// valid for its length (or null).
 pub fn encode_kernel_process_tree(processes: &[ProcessC], threads: &[ThreadC]) -> Vec<u8> {
     let mut w = ProtoWriter::new();
     for p in processes {

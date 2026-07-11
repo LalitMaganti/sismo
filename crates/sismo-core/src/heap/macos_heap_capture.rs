@@ -162,7 +162,6 @@ extern "C" fn on_flush(user_arg: *mut c_void, flusher: *mut c_void) {
     self_.wakeup.set();
 }
 
-
 impl HeapCapture {
     /// Setup-failure path: park honoring stop, flush, and exit so the
     /// orchestrator's shutdown still joins us cleanly.

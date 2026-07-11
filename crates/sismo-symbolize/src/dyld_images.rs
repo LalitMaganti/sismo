@@ -48,8 +48,8 @@ extern "C" {
     ) -> i32;
 }
 
-// Only the tests read the caller's own task (production always passes a
-// task_for_pid'd port in from Zig).
+// Only the tests read the caller's own task (production passes a task_for_pid'd
+// port in from the capture worker).
 #[cfg(test)]
 extern "C" {
     static mach_task_self_: MachPort;
@@ -268,8 +268,8 @@ fn arch_string(cputype: u32, cpusubtype: u32) -> Option<&'static [u8]> {
 /// image's base. Returns the sorted `ImageList` for the caller to reuse (e.g.
 /// heap mappings); `Err(ERR_*)` on enumerate failure.
 ///
-/// This folds what was a Zig setup loop into one Rust call: the dyld read, the
-/// mach-o parse, and the symbolizer/unwinder registration are all Rust-side.
+/// The dyld read, the mach-o parse, and the symbolizer/unwinder registration
+/// all happen here, so the `__TEXT` bytes never cross a module boundary.
 pub fn load_target_modules(
     task: MachPort,
     mut symbolizer: Option<&mut Symbolizer>,

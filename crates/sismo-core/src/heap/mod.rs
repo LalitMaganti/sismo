@@ -141,8 +141,8 @@ struct TraceData {
 }
 
 /// Resolve `pc` to a function name via the symbolizer, returning "?" when the
-/// symbolizer is absent or has no match. Mirrors heap_capture's use of
-/// `symbolizer.resolve` (name only — file/line are unused for heap frames).
+/// symbolizer is absent or has no match. Name only — file/line are unused for
+/// heap frames.
 fn resolve_name(symbolizer: Option<&Symbolizer>, pc: u64) -> Vec<u8> {
     match symbolizer.and_then(|s| s.resolve(pc)) {
         Some(r) => r.name.into_bytes(),

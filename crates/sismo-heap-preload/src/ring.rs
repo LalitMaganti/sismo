@@ -209,7 +209,9 @@ impl Drop for RingBuffer {
     }
 }
 
-#[cfg(test)]
+// macOS-gated: these exercise shm_open/mmap with Darwin flag values (the ring
+// runs only inside the injected dylib on macOS).
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::os::raw::c_uint;
