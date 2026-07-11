@@ -79,6 +79,30 @@ pub struct Listener {
 }
 
 impl Listener {
+    /// Bind + listen on the per-PID socket. Called once at preload load.
+    pub fn listen(pid: i32) -> Result<Listener, ProtocolError> {
+        let mut path = [0u8; 128];
+        socket_path(pid, &mut path).ok_or(ProtocolError::PathTooLong)?;
+        // Pre-clean a stale socket from a prior run.
+        unsafe { libc::unlink(path.as_ptr() as *const c_char) };
+
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(ProtocolError::SocketCreate);
+        }
+        let sa = fill_sockaddr(pid).ok_or(ProtocolError::PathTooLong)?;
+        let sa_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        if unsafe { libc::bind(fd, &sa as *const libc::sockaddr_un as *const libc::sockaddr, sa_len) } != 0 {
+            unsafe { libc::close(fd) };
+            return Err(ProtocolError::SocketBind);
+        }
+        if unsafe { libc::listen(fd, 1) } != 0 {
+            unsafe { libc::close(fd) };
+            return Err(ProtocolError::SocketListen);
+        }
+        Ok(Listener { fd, path })
+    }
+
     #[allow(dead_code)]
     pub fn close(&mut self) {
         unsafe {
@@ -86,30 +110,6 @@ impl Listener {
             libc::close(self.fd);
         }
     }
-}
-
-/// Bind + listen on the per-PID socket. Called once at preload load.
-pub fn listen_for_attach(pid: i32) -> Result<Listener, ProtocolError> {
-    let mut path = [0u8; 128];
-    socket_path(pid, &mut path).ok_or(ProtocolError::PathTooLong)?;
-    // Pre-clean a stale socket from a prior run.
-    unsafe { libc::unlink(path.as_ptr() as *const c_char) };
-
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(ProtocolError::SocketCreate);
-    }
-    let sa = fill_sockaddr(pid).ok_or(ProtocolError::PathTooLong)?;
-    let sa_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-    if unsafe { libc::bind(fd, &sa as *const libc::sockaddr_un as *const libc::sockaddr, sa_len) } != 0 {
-        unsafe { libc::close(fd) };
-        return Err(ProtocolError::SocketBind);
-    }
-    if unsafe { libc::listen(fd, 1) } != 0 {
-        unsafe { libc::close(fd) };
-        return Err(ProtocolError::SocketListen);
-    }
-    Ok(Listener { fd, path })
 }
 
 /// The result of a successful attach: the control connection (close ⇒ EOF ⇒
@@ -130,51 +130,53 @@ impl AttachState {
     }
 }
 
-/// Block until the recorder connects + sends the handshake. Returns the config
-/// + the received shm fd.
-///
-/// # Safety
-/// `listener` must be a live listener from `listen_for_attach`.
-pub unsafe fn accept_and_receive(listener: &Listener) -> Result<AttachState, ProtocolError> {
-    let conn = unsafe { libc::accept(listener.fd, std::ptr::null_mut(), std::ptr::null_mut()) };
-    if conn < 0 {
-        return Err(ProtocolError::SocketAccept);
-    }
+impl Listener {
+    /// Block until the recorder connects + sends the handshake. Returns the
+    /// config + the received shm fd.
+    ///
+    /// # Safety
+    /// `self` must be a live listener (from [`Listener::listen`]).
+    pub unsafe fn accept_and_receive(&self) -> Result<AttachState, ProtocolError> {
+        let conn = unsafe { libc::accept(self.fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if conn < 0 {
+            return Err(ProtocolError::SocketAccept);
+        }
 
-    let mut config = AttachConfig { version: 0, ring_size: 0, sample_interval: 0, reserved: [0; 16] };
-    let mut iov = libc::iovec {
-        iov_base: &mut config as *mut AttachConfig as *mut c_void,
-        iov_len: std::mem::size_of::<AttachConfig>(),
-    };
-    let mut cbuf = [0u8; CMSG_DATA_OFFSET + std::mem::size_of::<c_int>()];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.as_mut_ptr() as *mut c_void;
-    // msg_controllen is size_t on Linux, socklen_t on macOS; `as _` covers both.
-    #[allow(clippy::unnecessary_cast)]
-    {
-        msg.msg_controllen = cbuf.len() as _;
-    }
+        let mut config = AttachConfig { version: 0, ring_size: 0, sample_interval: 0, reserved: [0; 16] };
+        let mut iov = libc::iovec {
+            iov_base: &mut config as *mut AttachConfig as *mut c_void,
+            iov_len: std::mem::size_of::<AttachConfig>(),
+        };
+        let mut cbuf = [0u8; CMSG_DATA_OFFSET + std::mem::size_of::<c_int>()];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut c_void;
+        // msg_controllen is size_t on Linux, socklen_t on macOS; `as _` covers both.
+        #[allow(clippy::unnecessary_cast)]
+        {
+            msg.msg_controllen = cbuf.len() as _;
+        }
 
-    let n = unsafe { libc::recvmsg(conn, &mut msg, 0) };
-    if n != std::mem::size_of::<AttachConfig>() as isize {
-        unsafe { libc::close(conn) };
-        return Err(ProtocolError::RecvFailed);
+        let n = unsafe { libc::recvmsg(conn, &mut msg, 0) };
+        if n != std::mem::size_of::<AttachConfig>() as isize {
+            unsafe { libc::close(conn) };
+            return Err(ProtocolError::RecvFailed);
+        }
+        // msg_controllen is size_t on Linux, socklen_t on macOS; normalize to usize.
+        #[allow(clippy::unnecessary_cast)]
+        let controllen = msg.msg_controllen as usize;
+        if controllen < CMSG_DATA_OFFSET + std::mem::size_of::<c_int>() {
+            unsafe { libc::close(conn) };
+            return Err(ProtocolError::NoFdReceived);
+        }
+        let shm_fd = i32::from_ne_bytes(cbuf[CMSG_DATA_OFFSET..CMSG_DATA_OFFSET + 4].try_into().unwrap());
+        if shm_fd < 0 {
+            unsafe { libc::close(conn) };
+            return Err(ProtocolError::NoFdReceived);
+        }
+        Ok(AttachState { conn_fd: conn, shm_fd, config })
     }
-    // msg_controllen is size_t on Linux, socklen_t on macOS; normalize to usize.
-    #[allow(clippy::unnecessary_cast)]
-    let controllen = msg.msg_controllen as usize;
-    if controllen < CMSG_DATA_OFFSET + std::mem::size_of::<c_int>() {
-        unsafe { libc::close(conn) };
-        return Err(ProtocolError::NoFdReceived);
-    }
-    let shm_fd = i32::from_ne_bytes(cbuf[CMSG_DATA_OFFSET..CMSG_DATA_OFFSET + 4].try_into().unwrap());
-    if shm_fd < 0 {
-        unsafe { libc::close(conn) };
-        return Err(ProtocolError::NoFdReceived);
-    }
-    Ok(AttachState { conn_fd: conn, shm_fd, config })
 }
 
 #[cfg(test)]
@@ -203,7 +205,7 @@ mod tests {
     #[test]
     fn scm_rights_roundtrip_transfers_a_working_fd() {
         let pid: i32 = 0x5EED; // unlikely to collide with a real recorder socket
-        let listener = listen_for_attach(pid).expect("listen");
+        let listener = Listener::listen(pid).expect("listen");
 
         let sender = std::thread::spawn(move || {
             // Give the main thread a beat to reach accept().
@@ -239,7 +241,7 @@ mod tests {
             (s, wr, rd)
         });
 
-        let attach = unsafe { accept_and_receive(&listener) }.expect("accept");
+        let attach = unsafe { listener.accept_and_receive() }.expect("accept");
         assert_eq!(attach.config.ring_size, 65536);
         assert_eq!(attach.config.sample_interval, 4096);
         assert!(attach.shm_fd >= 0);

@@ -96,7 +96,7 @@ fn sample_size_for(size: u64) -> u64 {
 extern "C" fn listener_thread(_: *mut c_void) -> *mut c_void {
     set_in_capture(true); // never re-enter the shim from this thread
     let pid = unsafe { libc::getpid() };
-    let listener = match protocol::listen_for_attach(pid) {
+    let listener = match protocol::Listener::listen(pid) {
         Ok(l) => l,
         Err(_) => {
             log(b"sismo-heap: listenForAttach failed\n");
@@ -105,7 +105,7 @@ extern "C" fn listener_thread(_: *mut c_void) -> *mut c_void {
     };
 
     loop {
-        let mut attach = match unsafe { protocol::accept_and_receive(&listener) } {
+        let mut attach = match unsafe { listener.accept_and_receive() } {
             Ok(a) => a,
             Err(_) => {
                 sleep_us(50_000); // brief backoff; EINTR/EBADF shouldn't kill the listener
