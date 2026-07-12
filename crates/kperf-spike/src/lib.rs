@@ -296,16 +296,21 @@ fn kperf_pet_start(pid: i32, period_ns: u64) -> Result<(), String> {
     step(kperf_set_indexed(b"kperf.action.ucallstack_depth\0", ACTION_ID, UCALLSTACK_DEPTH), "kperf.action.ucallstack_depth")?;
     // Restrict the action to the target pid. This call is byte-identical to
     // kperf.framework's kperf_action_filter_set_by_pid (verified by disassembly)
-    // and the value reads back correctly (see the readback in run()).
-    //
-    // The filter WORKS — but only on the on-core path on this xnu. Controlled test
-    // (KPERF_SPIKE_NO_PET, 4 competing busy procs): the on-core timer saw exactly
-    // 1 pid (the target); PET saw 881. The published xnu source (macOS 11 xnu-7195,
-    // macOS 14 xnu-10063) routes PET through kperf_sample with ctx.cur_pid = the
-    // sampled pid, which DOES filter — so PET honored pid_filter in those versions;
-    // xnu-12377 changed the PET path to bypass it. Net: for PET we filter by pid in
-    // userspace; the Phase-B context-switch (on-core) off-CPU path will filter in
-    // the kernel via this same knob.
+    // and reads back correctly (see the readback in run()). It works — but NOT for
+    // PET *user* stacks, which is exactly what this spike decodes. Root cause, from
+    // xnu-12377 source (osfmk/kperf, identical in 7195/10063/12377 — not a regression):
+    //   * The pid_filter check lives ONLY in kperf_sample() (the kernel-stack entry):
+    //       if (pid_filter != -1 && pid_filter != ctx->cur_pid) return SAMPLE_CONTINUE;
+    //   * kperf_sample_user() (the user-stack entry) has NO pid_filter check.
+    //   * On-core (kptimer_sample_curcpu) calls ONLY kperf_sample(...PEND_USER); the
+    //     user sample is pended via AST from inside kperf_sample AFTER the pid check
+    //     passes, so non-target user stacks are never taken. -> on-core IS filtered.
+    //   * PET (kppet_sample_thread) calls kperf_sample_user() DIRECTLY (the thread is
+    //     off-core, can't be AST-pended), bypassing the gate. -> PET user stacks are
+    //     NOT filtered; kernel stacks under PET still are.
+    // Verified here (KPERF_SPIKE_NO_PET, 4 busy procs + busy target): PET -> 881 pids,
+    // on-core -> 1. So for the PET off-CPU path we filter by pid in userspace; the
+    // Phase-B context-switch trigger is on-core and should inherit the kernel filter.
     step(kperf_set_indexed(b"kperf.action.filter_by_pid\0", ACTION_ID, pid as u64), "kperf.action.filter_by_pid")?;
     // One timer firing the action; period is in mach ticks.
     step(kperf_set_u32(b"kperf.timer.count\0", 1), "kperf.timer.count")?;
@@ -477,11 +482,11 @@ pub fn run(pid: i32, secs: u64, period_ns: u64) -> Result<usize, String> {
         100_000
     ];
     let mut total = 0usize;
-    // On xnu-12377 the PET path does not apply the action's pid_filter (the
-    // on-core path does — see the note in kperf_pet_start). So for PET we filter
-    // to the target pid in userspace using the pid reported in each THREADINFO
-    // event. Count distinct pids seen for context (a useful regression signal:
-    // ~hundreds under PET, 1 on-core), but the per-thread summary is TARGET-ONLY.
+    // PET user-stack samples are not pid-filtered by the kernel (kperf_sample_user
+    // has no pid_filter check; see the note in kperf_pet_start), so we filter to
+    // the target pid in userspace using the pid in each THREADINFO event. Count
+    // distinct pids for context (a regression signal: ~hundreds under PET, 1
+    // on-core), but the per-thread summary is TARGET-ONLY.
     let target_pid = pid as u64;
     let mut distinct_pids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // Per (target) tid: (sample count, most recent stack).
@@ -532,7 +537,7 @@ pub fn run(pid: i32, secs: u64, period_ns: u64) -> Result<usize, String> {
         }
     }
     eprintln!(
-        "kperf-spike: {} distinct pid(s) sampled (PET ignores action pid_filter on xnu-12377; on-core honors it; filtered to target in userspace)",
+        "kperf-spike: {} distinct pid(s) sampled (kperf_sample_user has no pid_filter; PET calls it directly so user stacks aren't filtered; on-core pends via AST behind the filter; filtered to target in userspace)",
         distinct_pids.len()
     );
     // Per-thread summary for the TARGET pid only (userspace-filtered). The
