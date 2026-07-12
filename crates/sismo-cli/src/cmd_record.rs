@@ -32,11 +32,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 // Capture workers (Rust siblings, macOS in-process sources).
 #[cfg(target_os = "macos")]
-use sismo_core::cpu::macos_cpu_capture::CpuCapture;
-#[cfg(target_os = "macos")]
 use sismo_core::heap::macos_heap_capture::HeapCapture;
 #[cfg(target_os = "macos")]
-use sismo_core::sched::macos_sched_capture::SchedCapture;
+use sismo_core::sched::ring_host::{RingConfig, RingHost};
 
 // ---- C++ shim (traced service + consumer session + producer init) ----------
 
@@ -432,20 +430,24 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         }
     };
 
-    // Capture workers (in-process only).
-    let mut sched: Option<Box<SchedCapture>> = if sched_mode == SourceMode::InProcess {
-        let c = SchedCapture::start();
+    // The kdebug ring + kperf are machine singletons, so sched, off-CPU, and
+    // on-CPU (the ring users) share one in-process host. off-CPU rides the sched
+    // pillar; on-CPU rides the cpu pillar.
+    if (sched_mode == SourceMode::InProcess) != (cpu_mode == SourceMode::InProcess)
+        && sched_mode != SourceMode::Off
+        && cpu_mode != SourceMode::Off
+        && (sched_mode == SourceMode::External || cpu_mode == SourceMode::External)
+    {
+        eprintln!(
+            "sismo record: WARNING — sched and cpu share the machine-global kdebug\n  ring; mixing in-process and external for them can conflict. Prefer the\n  same mode (or --all-external) for both."
+        );
+    }
+    let host_sched = sched_mode == SourceMode::InProcess;
+    let host_oncpu = cpu_mode == SourceMode::InProcess;
+    let mut ring: Option<Box<RingHost>> = if host_sched || host_oncpu {
+        let c = RingHost::start(RingConfig { sched: host_sched, offcpu: host_sched, oncpu: host_oncpu });
         if c.is_none() {
-            eprintln!("sismo record: sched capture init failed");
-        }
-        c
-    } else {
-        None
-    };
-    let mut cpu: Option<Box<CpuCapture>> = if cpu_mode == SourceMode::InProcess {
-        let c = CpuCapture::start(0);
-        if c.is_none() {
-            eprintln!("sismo record: cpu capture init failed");
+            eprintln!("sismo record: ring host init failed");
         }
         c
     } else {
@@ -502,16 +504,17 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
             external_names.push("sismo.heap");
         }
     }
-    if cpu.is_some() || cpu_mode == SourceMode::External {
+    if host_oncpu || cpu_mode == SourceMode::External {
+        // on-CPU kperf timer samples (via the ring host).
         entries.push(DataSourceEntry::sismo_vendor(b"sismo.macos_cpu_samples", &cpu_cfg, 0));
         if cpu_mode == SourceMode::External {
             external_names.push("sismo.macos_cpu_samples");
         }
     }
-    if sched.is_some() || sched_mode == SourceMode::External {
+    if host_sched || sched_mode == SourceMode::External {
         // ProtoVM DST for GenericKernelProcessTree.
         entries.push(DataSourceEntry::sismo_vendor(b"sismo.macos_sched", &sched_cfg, 4 * 1024));
-        // The sched worker also registers the off-CPU PerfSample DS; enable it so
+        // The ring host also registers the off-CPU PerfSample DS; enable it so
         // its packets are captured (it only emits when target_pid is set).
         entries.push(DataSourceEntry::sismo_vendor(b"sismo.macos_offcpu", &[], 0));
         if sched_mode == SourceMode::External {
@@ -521,7 +524,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
     if entries.is_empty() {
         eprintln!("sismo record: no data sources enabled — recording would be empty. Drop one of the --no-* flags.");
-        shutdown_captures(&mut heap, &mut cpu, &mut sched);
+        shutdown_captures(&mut heap, &mut ring);
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -545,7 +548,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     let session = unsafe { sismo_consumer_session_create() };
     if session.is_null() {
         eprintln!("sismo record: session_create failed");
-        shutdown_captures(&mut heap, &mut cpu, &mut sched);
+        shutdown_captures(&mut heap, &mut ring);
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -553,7 +556,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     if setup_rc != 0 {
         eprintln!("sismo record: session_setup rc={setup_rc} (TraceConfig failed to parse)");
         unsafe { sismo_consumer_session_destroy(session) };
-        shutdown_captures(&mut heap, &mut cpu, &mut sched);
+        shutdown_captures(&mut heap, &mut ring);
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -571,7 +574,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
             }
             eprintln!("  start a sidecar with `sudo sismo datasource <name>` (or `all-privileged`) and re-run.");
             unsafe { sismo_consumer_session_destroy(session) };
-            shutdown_captures(&mut heap, &mut cpu, &mut sched);
+            shutdown_captures(&mut heap, &mut ring);
             teardown_early(svc, lock_fd);
             return 0;
         }
@@ -585,7 +588,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     if unsafe { pipe(pipe_fds.as_mut_ptr()) } != 0 {
         eprintln!("sismo record: pipe() failed");
         unsafe { sismo_consumer_session_destroy(session) };
-        shutdown_captures(&mut heap, &mut cpu, &mut sched);
+        shutdown_captures(&mut heap, &mut ring);
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -632,7 +635,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     }
 
     // Capture shutdowns (with stats).
-    shutdown_captures(&mut heap, &mut cpu, &mut sched);
+    shutdown_captures(&mut heap, &mut ring);
 
     // Join the exit watcher (it has fired 'X' or is about to), then tear down.
     let _ = watch.join();
@@ -652,24 +655,16 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
 /// each handle out with `Option::take`, so calling it again is a no-op — the
 /// error paths and the final teardown can all call it.
 #[cfg(target_os = "macos")]
-fn shutdown_captures(
-    heap: &mut Option<Box<HeapCapture>>,
-    cpu: &mut Option<Box<CpuCapture>>,
-    sched: &mut Option<Box<SchedCapture>>,
-) {
+fn shutdown_captures(heap: &mut Option<Box<HeapCapture>>, ring: &mut Option<Box<RingHost>>) {
     if let Some(c) = heap.take() {
         let s = c.shutdown();
         eprintln!("sismo record: heap — {} records, ~{} bytes, {} sites", s.records, s.bytes_alloc, s.sites);
     }
-    if let Some(c) = cpu.take() {
-        let s = c.shutdown();
-        eprintln!("sismo record: cpu — {} samples ({} active)", s.samples, s.active_samples);
-    }
-    if let Some(c) = sched.take() {
+    if let Some(c) = ring.take() {
         let s = c.shutdown();
         eprintln!(
-            "sismo record: sched — {} events emitted across {} drains, {} off-CPU samples",
-            s.events_emitted, s.drain_calls, s.offcpu_samples
+            "sismo record: sched — {} events across {} drains; on-CPU {} samples; off-CPU {} samples",
+            s.sched_events, s.drain_calls, s.oncpu_samples, s.offcpu_samples
         );
     }
 }

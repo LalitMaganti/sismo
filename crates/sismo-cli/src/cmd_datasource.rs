@@ -155,55 +155,27 @@ pub fn run(args: DatasourceArgs) -> i32 {
 #[cfg(target_os = "macos")]
 mod macos_run {
     use super::{block_until_stopped, install_stop_handlers, Kind};
-    use sismo_core::cpu::macos_cpu_capture::CpuCapture;
-    use sismo_core::heap::macos_heap_capture::HeapCapture;
-    use sismo_core::sched::macos_sched_capture::SchedCapture;
     use sismo_core::ffi::sismo_init;
+    use sismo_core::heap::macos_heap_capture::HeapCapture;
+    use sismo_core::sched::ring_host::{RingConfig, RingHost};
     use sismo_core::sismo_paths::PRODUCER_SOCK;
     use std::ffi::CString;
     use std::os::raw::c_int;
 
+    // sched + cpu (and off-CPU) share the machine-global kdebug ring + kperf, so
+    // they run in ONE ring host; heap is independent.
     enum Slot {
-        Sched(Box<SchedCapture>),
-        Cpu(Box<CpuCapture>),
+        Ring(Box<RingHost>),
         Heap(Box<HeapCapture>),
-    }
-
-    /// Register one kind's capture worker. `None` on registration failure.
-    fn register(kind: Kind) -> Option<Slot> {
-        match kind {
-            Kind::Sched => {
-                let c = SchedCapture::start()?;
-                eprintln!("sismo datasource: sismo.macos_sched registered");
-                Some(Slot::Sched(c))
-            }
-            Kind::Cpu => {
-                let c = CpuCapture::start(0)?;
-                eprintln!("sismo datasource: sismo.macos_cpu_samples registered");
-                Some(Slot::Cpu(c))
-            }
-            Kind::Heap => {
-                let c = HeapCapture::start()?;
-                eprintln!("sismo datasource: sismo.heap registered");
-                Some(Slot::Heap(c))
-            }
-        }
     }
 
     fn shutdown(slot: Slot) {
         match slot {
-            Slot::Sched(c) => {
+            Slot::Ring(c) => {
                 let s = c.shutdown();
                 eprintln!(
-                    "sismo datasource: sismo.macos_sched stopped — {} events / {} drains / {} off-CPU",
-                    s.events_emitted, s.drain_calls, s.offcpu_samples
-                );
-            }
-            Slot::Cpu(c) => {
-                let s = c.shutdown();
-                eprintln!(
-                    "sismo datasource: sismo.macos_cpu_samples stopped — {} samples ({} active)",
-                    s.samples, s.active_samples
+                    "sismo datasource: ring stopped — {} sched events / {} drains; on-CPU {} / off-CPU {}",
+                    s.sched_events, s.drain_calls, s.oncpu_samples, s.offcpu_samples
                 );
             }
             Slot::Heap(c) => {
@@ -224,24 +196,42 @@ mod macos_run {
 
         install_stop_handlers();
 
-        // Register each requested kind. A single failure tears down what's
-        // already up (partial state is useless when the full set was expected).
+        let has_sched = kinds.contains(&Kind::Sched);
+        let has_cpu = kinds.contains(&Kind::Cpu);
+        let has_heap = kinds.contains(&Kind::Heap);
+
+        // A single failure tears down what's already up (partial state is useless
+        // when the full set was expected).
         let mut slots: Vec<Slot> = Vec::new();
-        for &kind in kinds {
-            match register(kind) {
-                Some(s) => slots.push(s),
-                None => {
-                    eprintln!("sismo datasource: capture init failed — tearing down");
-                    for s in slots.into_iter().rev() {
-                        shutdown(s);
-                    }
-                    return 1;
+        let fail = |slots: Vec<Slot>| -> c_int {
+            eprintln!("sismo datasource: capture init failed — tearing down");
+            for s in slots.into_iter().rev() {
+                shutdown(s);
+            }
+            1
+        };
+
+        if has_sched || has_cpu {
+            match RingHost::start(RingConfig { sched: has_sched, offcpu: has_sched, oncpu: has_cpu }) {
+                Some(c) => {
+                    eprintln!("sismo datasource: kdebug ring host registered (sched={has_sched} cpu={has_cpu})");
+                    slots.push(Slot::Ring(c));
                 }
+                None => return fail(slots),
+            }
+        }
+        if has_heap {
+            match HeapCapture::start() {
+                Some(c) => {
+                    eprintln!("sismo datasource: sismo.heap registered");
+                    slots.push(Slot::Heap(c));
+                }
+                None => return fail(slots),
             }
         }
 
         eprintln!(
-            "sismo datasource: {} data source(s) registered; blocking until SIGINT/SIGTERM",
+            "sismo datasource: {} producer(s) registered; blocking until SIGINT/SIGTERM",
             slots.len()
         );
         block_until_stopped();

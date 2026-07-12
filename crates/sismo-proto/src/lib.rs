@@ -22,6 +22,18 @@ impl ProtoWriter {
         Self { buf: Vec::new() }
     }
 
+    /// A writer pre-sized to `cap` bytes — for a scratch writer reused across
+    /// many packets (pair with [`ProtoWriter::clear`]) so encoding a packet is
+    /// allocation-free once the buffer is warm.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { buf: Vec::with_capacity(cap) }
+    }
+
+    /// Truncate to empty, keeping the allocation so the next packet reuses it.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.buf
     }

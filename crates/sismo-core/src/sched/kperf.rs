@@ -4,8 +4,14 @@
 //! macOS kperf control plane. kperf is a private, system-global singleton — one
 //! action/timer table shared across the whole machine. This module owns driving
 //! it (via the `kperf.*` sysctls) so the features that use it (off-CPU lazy.wait
-//! today; on-CPU timer sampling + PMU counters next) configure it through one
+//! and on-CPU timer sampling today; PMU counters next) configure it through one
 //! place instead of each poking sysctls.
+//!
+//! Both samplers ride ONE kperf configuration: [`arm`] takes a [`KperfConfig`]
+//! and sets up whichever actions are requested (off-CPU lazy.wait, on-CPU
+//! timer), each pid-filtered, in a single `sampling=1` transaction. This is why
+//! it's a shared control plane and not two independent arm calls — kperf has one
+//! action table, so the ring host configures both together.
 //!
 //! All constants here are cross-checked against xnu source by
 //! `tools/verify_kperf_constants.py` — run it when bumping macOS.
@@ -17,13 +23,12 @@ use std::ffi::c_void;
 
 // kperf samplers bitmask (osfmk/kperf/action.h).
 pub(crate) const SAMPLER_TH_INFO: u32 = 1 << 0;
-#[allow(dead_code)] // used by the Stage-2 on-CPU consumer
 pub(crate) const SAMPLER_KSTACK: u32 = 1 << 2;
 pub(crate) const SAMPLER_USTACK: u32 = 1 << 3;
 
-// Action ids are 1-based (0 = "no action").
-const OFFCPU_ACTION_ID: u64 = 1;
+// Callstack depths requested per action.
 const UCALLSTACK_DEPTH: u64 = 128;
+const KCALLSTACK_DEPTH: u64 = 128;
 
 // ---- sysctl helpers --------------------------------------------------------
 
@@ -92,32 +97,84 @@ pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
 
 // ---- feature arming --------------------------------------------------------
 
-/// Arm the lazy.wait off-CPU sampler for `pid`, sampling waits longer than
-/// `threshold_ns`. No timer/PET — the scheduler triggers it on wakeup. Assumes
-/// the kdebug ring is already up and keeps DBG_PERF. (When on-CPU sampling lands
-/// this grows into a shared multi-action configure step; today off-CPU is the
-/// only kperf user, so it owns action 1.)
-pub(crate) fn arm_lazy_wait(pid: i32, threshold_ns: u64) -> Result<(), String> {
+/// What to arm on the shared kperf singleton. Both samplers are pid-filtered to
+/// `pid` (this restricts the kernel `kperf_sample` entry — the check PET bypasses
+/// but the on-core timer and lazy.wait paths honor). Each `Some` enables one
+/// action; the actions get sequential 1-based ids.
+pub(crate) struct KperfConfig {
+    pub pid: i32,
+    /// Off-CPU: sample a thread's blocking stack when it wakes from a wait
+    /// longer than this many ns. Scheduler-triggered (no timer).
+    pub offcpu_threshold_ns: Option<u64>,
+    /// On-CPU: sample the running thread on each CPU every this many ns via a
+    /// kperf timer (per-CPU on-core sampling, NOT PET — so pid_filter applies).
+    pub oncpu_period_ns: Option<u64>,
+}
+
+/// Configure kperf for `cfg` and start sampling. Assumes the kdebug ring is
+/// already up and keeps DBG_PERF (the sample events land there). Sets every
+/// requested action, the lazy/timer triggers, then flips `sampling=1` as the
+/// final step. Idempotent-ish: callers pair this with [`disarm`].
+pub(crate) fn arm(cfg: &KperfConfig) -> Result<(), String> {
     let step = |r: Result<(), i32>, what: &str| r.map_err(|e| format!("{what} failed (errno {e})"));
+
+    // One action per enabled sampler, ids 1-based in declaration order.
+    let mut next_id = 1u64;
+    let offcpu_id = cfg.offcpu_threshold_ns.map(|_| {
+        let id = next_id;
+        next_id += 1;
+        id
+    });
+    let oncpu_id = cfg.oncpu_period_ns.map(|_| {
+        let id = next_id;
+        next_id += 1;
+        id
+    });
+    let action_count = next_id - 1;
+    if action_count == 0 {
+        return Err("kperf arm called with no samplers enabled".into());
+    }
+
     step(set_u32(b"kperf.reset\0", 1), "kperf.reset")?;
-    step(set_u32(b"kperf.action.count\0", 1), "kperf.action.count")?;
-    step(
-        set_indexed(b"kperf.action.samplers\0", OFFCPU_ACTION_ID, (SAMPLER_USTACK | SAMPLER_TH_INFO) as u64),
-        "kperf.action.samplers",
-    )?;
-    step(
-        set_indexed(b"kperf.action.ucallstack_depth\0", OFFCPU_ACTION_ID, UCALLSTACK_DEPTH),
-        "kperf.action.ucallstack_depth",
-    )?;
-    step(
-        set_indexed(b"kperf.action.filter_by_pid\0", OFFCPU_ACTION_ID, pid as u64),
-        "kperf.action.filter_by_pid",
-    )?;
-    step(
-        set_u64(b"kperf.lazy.wait_time_threshold\0", ns_to_ticks(threshold_ns)),
-        "kperf.lazy.wait_time_threshold",
-    )?;
-    step(set_u32(b"kperf.lazy.wait_action\0", OFFCPU_ACTION_ID as u32), "kperf.lazy.wait_action")?;
+    step(set_u32(b"kperf.action.count\0", action_count as u32), "kperf.action.count")?;
+
+    // Off-CPU samples the blocking user stack only (lazy.wait fires in the
+    // scheduler, where the kernel stack is just the scheduler). On-CPU also takes
+    // the kernel stack (KSTACK) so a timer-interrupted syscall shows kernel time,
+    // matching the Linux CPU-samples timeline. TH_INFO carries the pid on both.
+    let configure = |id: u64, kernel: bool| -> Result<(), String> {
+        let mut samplers = SAMPLER_USTACK | SAMPLER_TH_INFO;
+        if kernel {
+            samplers |= SAMPLER_KSTACK;
+        }
+        step(set_indexed(b"kperf.action.samplers\0", id, samplers as u64), "kperf.action.samplers")?;
+        step(set_indexed(b"kperf.action.ucallstack_depth\0", id, UCALLSTACK_DEPTH), "kperf.action.ucallstack_depth")?;
+        if kernel {
+            step(set_indexed(b"kperf.action.kcallstack_depth\0", id, KCALLSTACK_DEPTH), "kperf.action.kcallstack_depth")?;
+        }
+        step(set_indexed(b"kperf.action.filter_by_pid\0", id, cfg.pid as u64), "kperf.action.filter_by_pid")?;
+        Ok(())
+    };
+    if let Some(id) = offcpu_id {
+        configure(id, false)?;
+    }
+    if let Some(id) = oncpu_id {
+        configure(id, true)?;
+    }
+
+    if let (Some(id), Some(threshold_ns)) = (offcpu_id, cfg.offcpu_threshold_ns) {
+        step(set_u64(b"kperf.lazy.wait_time_threshold\0", ns_to_ticks(threshold_ns)), "kperf.lazy.wait_time_threshold")?;
+        step(set_u32(b"kperf.lazy.wait_action\0", id as u32), "kperf.lazy.wait_action")?;
+    }
+    if let (Some(id), Some(period_ns)) = (oncpu_id, cfg.oncpu_period_ns) {
+        // One timer (id 0), firing every period, driving the on-CPU action. A
+        // plain kperf timer is per-CPU on-core — it samples whatever runs on each
+        // CPU when it fires — so it stays inside the pid_filter (unlike PET).
+        step(set_u32(b"kperf.timer.count\0", 1), "kperf.timer.count")?;
+        step(set_indexed(b"kperf.timer.period\0", 0, ns_to_ticks(period_ns)), "kperf.timer.period")?;
+        step(set_indexed(b"kperf.timer.action\0", 0, id), "kperf.timer.action")?;
+    }
+
     step(set_u32(b"kperf.sampling\0", 1), "kperf.sampling")?;
     Ok(())
 }
