@@ -30,12 +30,13 @@ const KERN_KDENABLE: i32 = 3;
 const KERN_KDSETBUF: i32 = 4;
 const KERN_KDSETUP: i32 = 6;
 const KERN_KDREMOVE: i32 = 7;
-const KERN_KDSETREG: i32 = 8;
 const KERN_KDREADTR: i32 = 10;
-
-// KDBG_CLASSTYPE keeps a whole debug CLASS (vs sismo's KDBG_SUBCLSTYPE). We keep
-// the DBG_PERF class so only kperf's sample events land in the ring.
-const KDBG_CLASSTYPE: u32 = 0x0001_0000;
+// Modern per-(class,subclass) bitmap filter. Command number + bitmap size taken
+// from the macOS 26.2 SDK (sys/sysctl.h: KERN_KDSET_TYPEFILTER=22; sys/
+// kdebug_private.h: KDBG_TYPEFILTER_BITMAP_SIZE=(256*256)/8). This is what this
+// xnu actually honors — the old KDSETREG class-range empties the ring.
+const KERN_KDSET_TYPEFILTER: i32 = 22;
+const TYPEFILTER_BITMAP_SIZE: usize = (256 * 256) / 8; // 8192
 
 // ---- kperf sample events in the kdebug stream (osfmk/kperf/buffer.h) --------
 
@@ -189,18 +190,28 @@ unsafe fn kd_set_int(cmd: i32, value: i32) -> i32 {
     libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0)
 }
 
-#[repr(C)]
-struct KdRegType {
-    reg_type: u32,
-    value1: u32,
-    value2: u32,
-    value3: u32,
-    value4: u32,
+/// Install a typefilter bitmap that keeps only class `class_id` (all subclasses).
+/// The bitmap is indexed by csc = (class<<8)|subclass (SDK: KDBG_CSC_*); we set
+/// the 256 contiguous bits for the class. Passed via oldp+oldlenp like the other
+/// kdebug write commands. Setting a typefilter enables KDBG_TYPEFILTER_CHECK, so
+/// only matching (class,subclass) events land in the ring.
+fn kdebug_set_class_typefilter(class_id: u32) -> Result<(), i32> {
+    let mut bitmap = vec![0u8; TYPEFILTER_BITMAP_SIZE];
+    let base = (class_id as usize) << 8; // csc of subclass 0
+    for csc in base..base + 256 {
+        bitmap[csc >> 3] |= 1 << (csc & 7);
+    }
+    let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDSET_TYPEFILTER];
+    let mut len = bitmap.len();
+    let rc = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, bitmap.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc == 0 { Ok(()) } else { Err(errno()) }
 }
 
-/// Size the kdebug buffer and (optionally) keep only the DBG_PERF class, then
-/// enable. When `filter` is false we capture *all* classes — used for diagnosis,
-/// to see whether kperf emits anything into the ring and under what class.
+/// Size the kdebug buffer and (optionally) keep only the DBG_PERF class via a
+/// typefilter, then enable. When `filter` is false we capture *all* classes —
+/// used for diagnosis, to see what kperf emits into the ring and under what class.
 fn kdebug_start(buffer_events: i32, filter: bool) -> Result<(), String> {
     unsafe {
         let _ = kd_void(KERN_KDREMOVE);
@@ -211,16 +222,11 @@ fn kdebug_start(buffer_events: i32, filter: bool) -> Result<(), String> {
             return Err(format!("KDSETUP failed (errno {})", errno()));
         }
         if filter {
-            // CLASSTYPE keeps events with kdlog_beg <= debugid < kdlog_end where
-            // kdlog_beg=value1<<24, kdlog_end=value2<<24. To keep exactly class
-            // DBG_PERF (0x25) the upper bound must be DBG_PERF+1 (0x26) — passing
-            // 0 gave an empty range that dropped everything.
-            let mut reg = KdRegType { reg_type: KDBG_CLASSTYPE, value1: DBG_PERF, value2: DBG_PERF + 1, value3: 0, value4: 0 };
-            let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDSETREG];
-            let mut len = std::mem::size_of::<KdRegType>();
-            if libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, &mut reg as *mut KdRegType as *mut c_void, &mut len, std::ptr::null_mut(), 0) < 0 {
+            // The old KDSETREG class-range empties the ring on this xnu; the
+            // per-(class,subclass) typefilter is what it honors. Keep DBG_PERF.
+            if let Err(e) = kdebug_set_class_typefilter(DBG_PERF) {
                 let _ = kd_void(KERN_KDREMOVE);
-                return Err(format!("KDSETREG(DBG_PERF) failed (errno {})", errno()));
+                return Err(format!("KDSET_TYPEFILTER(DBG_PERF) failed (errno {e})"));
             }
         }
         if kd_set_int(KERN_KDENABLE, 1) < 0 {
@@ -377,19 +383,19 @@ pub fn run(pid: i32, secs: u64, period_ns: u64) -> Result<usize, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("must run as root (kperf/kdebug sysctls need it)".into());
     }
-    // In-kernel DBG_PERF class filter is OFF by default: on this xnu (12377)
-    // KDSETREG(KDBG_CLASSTYPE) drops *all* events regardless of the range we
-    // pass (both value2=0 and value2=DBG_PERF+1 emptied the ring), so the
-    // published class-range semantics don't hold here. We instead filter by
-    // class in userspace (on_event checks class==DBG_PERF). Narrowing the
-    // kernel-side filter — needed so kperf coexists with DBG_MACH_SCHED on the
-    // one unified ring — is a Phase-B task to settle against verified source
-    // (likely the modern typefilter, KDBG_TYPEFILTER, not the old setreg range).
-    // Opt in with KPERF_SPIKE_KFILTER=1 to experiment.
-    let use_kernel_filter = std::env::var("KPERF_SPIKE_KFILTER").is_ok();
+    // In-kernel DBG_PERF class filter is ON by default via a kdebug typefilter
+    // (KERN_KDSET_TYPEFILTER) — the old KDSETREG class-range empties the ring on
+    // this xnu, so we use the per-(class,subclass) bitmap the kernel honors. This
+    // is what lets kperf coexist with DBG_MACH_SCHED on the one unified ring.
+    // Set KPERF_SPIKE_CAPTURE_ALL=1 to disable it and histogram every class.
+    let use_kernel_filter = std::env::var("KPERF_SPIKE_CAPTURE_ALL").is_err();
 
     // ~500k events of ring headroom.
     kdebug_start(500_000, use_kernel_filter)?;
+    eprintln!(
+        "kperf-spike: kernel class typefilter (DBG_PERF only): {}",
+        if use_kernel_filter { "ON" } else { "OFF (capture all)" }
+    );
     if let Err(e) = kperf_pet_start(pid, period_ns) {
         kdebug_teardown();
         return Err(e);
