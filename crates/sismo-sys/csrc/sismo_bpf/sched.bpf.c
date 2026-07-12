@@ -241,18 +241,21 @@ static __always_inline struct sismo_counters *credit(struct task_struct *t,
   return tc;
 }
 
-// Switched OUT: capture `prev`'s blocking stack (bpf_get_task_stack walks an
-// arbitrary task, so no ctx and no reliance on `current` — prev is parked in
-// __schedule, so its stack is the block site) and remember when. Built in the
-// per-CPU scratch, then stored keyed by tid.
-static __always_inline void offcpu_record_block(struct task_struct *prev, __u32 tid) {
+// Switched OUT: capture the outgoing thread's blocking stack and remember when.
+// Uses bpf_get_stack(ctx, ...) — the context's SAVED registers point at the
+// block site (the outgoing thread is parked in __schedule, its user regs saved
+// at syscall entry), which is what perf/offcputime use. bpf_get_task_stack
+// instead walks from where the CPU is *now* (inside the helper) and returns an
+// empty user stack for a task that still looks on-CPU here. Built in the per-CPU
+// scratch, then stored keyed by tid.
+static __always_inline void offcpu_record_block(void *ctx, __u32 tid) {
   __u32 zero = 0;
   struct sismo_offcpu_state *st = bpf_map_lookup_elem(&offcpu_scratch, &zero);
   if (!st)
     return;
   st->start_ns = bpf_ktime_get_ns();
 
-  long un = bpf_get_task_stack(prev, st->ustack, sizeof(st->ustack), BPF_F_USER_STACK);
+  long un = bpf_get_stack(ctx, st->ustack, sizeof(st->ustack), BPF_F_USER_STACK);
   __u32 nu = (un > 0) ? (__u32)(un / 8) : 0;
   if (nu > SISMO_MAX_STACK)
     nu = SISMO_MAX_STACK;
@@ -263,7 +266,7 @@ static __always_inline void offcpu_record_block(struct task_struct *prev, __u32 
   struct sismo_kstack *ks = bpf_map_lookup_elem(&kstack_scratch, &zero);
   __u32 nk = 0;
   if (ks) {
-    long kn = bpf_get_task_stack(prev, ks->addr, sizeof(ks->addr), 0);
+    long kn = bpf_get_stack(ctx, ks->addr, sizeof(ks->addr), 0);
     nk = (kn > 0) ? (__u32)(kn / 8) : 0;
     if (nk > SISMO_MAX_KERNEL_STACK)
       nk = SISMO_MAX_KERNEL_STACK;
@@ -323,7 +326,7 @@ int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev,
   __u32 prev_tgid = BPF_CORE_READ(prev, tgid);
   if (tgt == 0 || prev_tgid == tgt) {
     credit(prev, &dc);
-    offcpu_record_block(prev, (__u32)BPF_CORE_READ(prev, pid));
+    offcpu_record_block(ctx, (__u32)BPF_CORE_READ(prev, pid));
   }
 
   // Incoming thread (if in the target): close out its off-CPU block.
