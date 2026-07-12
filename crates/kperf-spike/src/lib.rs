@@ -55,6 +55,14 @@ const PERF_CALLSTACK: u32 = 2;
 // PERF_CALLSTACK codes (user stacks; kernel KHDR=5/KDATA=3 are ignored here).
 const PERF_CS_UDATA: u32 = 4;
 const PERF_CS_UHDR: u32 = 6;
+// PERF_LAZY (subclass 9): the "lazy" event-driven samplers. PERF_LZ_WAITSAMPLE
+// (code 1) fires when a thread wakes from a wait > kperf.lazy.wait_time_threshold
+// and carries BUF_DATA(wait_time, runnable_time, running_time) in arg1/2/3, all
+// mach-abs ticks (osfmk/kperf/lazy.c, buffer.h). This is the off-CPU trigger:
+// it runs on-core in the waking thread's context, so the kd_buf tid (arg5) IS the
+// woken thread and the action's pid_filter is honored in-kernel.
+const PERF_LAZY: u32 = 9;
+const PERF_LZ_WAITSAMPLE: u32 = 1;
 
 // ---- kperf samplers bitmask (osfmk/kperf/action.h) -------------------------
 
@@ -105,6 +113,25 @@ fn kperf_set_u32(name: &[u8], value: u32) -> Result<(), i32> {
             std::ptr::null_mut(),
             &value as *const u32 as *mut c_void,
             std::mem::size_of::<u32>(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+/// Set a scalar `kperf.*` knob that takes a u64 (CTLTYPE_QUAD), e.g.
+/// kperf.lazy.wait_time_threshold.
+fn kperf_set_u64(name: &[u8], value: u64) -> Result<(), i32> {
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &value as *const u64 as *mut c_void,
+            std::mem::size_of::<u64>(),
         )
     };
     if rc == 0 {
@@ -199,6 +226,13 @@ fn ns_to_ticks(ns: u64) -> u64 {
     unsafe { mach_timebase_info(&mut tb) };
     // ns = ticks * numer / denom  ->  ticks = ns * denom / numer.
     (ns as u128 * tb.denom as u128 / tb.numer as u128) as u64
+}
+
+fn ticks_to_ns(ticks: u64) -> u64 {
+    let mut tb = MachTimebase { numer: 1, denom: 1 };
+    unsafe { mach_timebase_info(&mut tb) };
+    // ns = ticks * numer / denom.
+    (ticks as u128 * tb.numer as u128 / tb.denom as u128) as u64
 }
 
 // ---- kdebug ring (KERN_KDEBUG) ---------------------------------------------
@@ -328,6 +362,37 @@ fn kperf_pet_start(pid: i32, period_ns: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Arm the kperf "lazy wait" off-CPU sampler: when a thread wakes from a wait
+/// longer than `threshold_ns`, kperf samples it — capturing its blocking user
+/// stack and the wait duration. No timer/PET: the scheduler triggers it. It runs
+/// ON-CORE in the waking thread's context, so (unlike PET) the action pid_filter
+/// IS honored end to end — the kernel does zero work for non-target threads and
+/// for waits below the threshold. This is the macOS analog of the Linux
+/// sched_switch off-CPU path (block stack + duration), voluntary blocks only.
+fn kperf_lazy_wait_start(pid: i32, threshold_ns: u64) -> Result<(), String> {
+    let step = |r: Result<(), i32>, what: &str| -> Result<(), String> {
+        r.map_err(|e| format!("{what} failed (errno {e})"))
+    };
+    step(kperf_set_u32(b"kperf.reset\0", 1), "kperf.reset")?;
+    // One action: user stack + thread info, restricted to the target pid.
+    step(kperf_set_u32(b"kperf.action.count\0", 1), "kperf.action.count")?;
+    step(
+        kperf_set_indexed(b"kperf.action.samplers\0", ACTION_ID, (SAMPLER_USTACK | SAMPLER_TH_INFO) as u64),
+        "kperf.action.samplers",
+    )?;
+    step(kperf_set_indexed(b"kperf.action.ucallstack_depth\0", ACTION_ID, UCALLSTACK_DEPTH), "kperf.action.ucallstack_depth")?;
+    step(kperf_set_indexed(b"kperf.action.filter_by_pid\0", ACTION_ID, pid as u64), "kperf.action.filter_by_pid")?;
+    // Only sample waits longer than the threshold. Stored as mach-abs ticks
+    // (compared directly against thread_get_last_wait_duration in lazy.c).
+    step(kperf_set_u64(b"kperf.lazy.wait_time_threshold\0", ns_to_ticks(threshold_ns)), "kperf.lazy.wait_time_threshold")?;
+    // Arm: fire ACTION_ID on wait-wakeups over the threshold.
+    step(kperf_set_u32(b"kperf.lazy.wait_action\0", ACTION_ID as u32), "kperf.lazy.wait_action")?;
+    eprintln!("kperf-spike: mode = lazy.wait (off-CPU, threshold {threshold_ns}ns)");
+    // Go.
+    step(kperf_set_u32(b"kperf.sampling\0", 1), "kperf.sampling")?;
+    Ok(())
+}
+
 fn kperf_stop() {
     let _ = kperf_set_u32(b"kperf.sampling\0", 0);
     let _ = kperf_set_u32(b"kperf.reset\0", 1);
@@ -421,12 +486,175 @@ impl Decoder {
     }
 }
 
-/// Run the spike: sample `pid` for `secs` seconds and print reassembled user
-/// stacks. Returns the number of completed samples.
-pub fn run(pid: i32, secs: u64, period_ns: u64) -> Result<usize, String> {
+/// A completed off-CPU sample: a thread's blocking user stack paired with how
+/// long it was blocked. Mirrors the Linux SISMO_EVT_OFFCPU record (stack +
+/// duration weight).
+pub struct OffCpuSample {
+    pub pid: u64,
+    pub tid: u64,
+    pub wait_ns: u64,
+    pub frames: Vec<u64>,
+}
+
+/// Decoder for the lazy.wait off-CPU stream. Every event is emitted in the woken
+/// thread's own context (on-core), so the kd_buf tid (arg5) IS the sampled thread
+/// — we key everything on it. A WAITSAMPLE records the wait duration; the pended
+/// user callstack that follows (same tid) closes it into an OffCpuSample.
+#[derive(Default)]
+struct LazyDecoder {
+    /// tid -> wait_time (mach ticks) from the last WAITSAMPLE, awaiting its stack.
+    pending_wait: std::collections::HashMap<u64, u64>,
+    /// tid -> pid from THREADINFO (for reporting; pid_filter already restricts).
+    pid_of: std::collections::HashMap<u64, u64>,
+    /// tid -> user callstack being reassembled.
+    building: std::collections::HashMap<u64, Pending>,
+}
+
+impl LazyDecoder {
+    fn on_event(&mut self, e: &KdBuf) -> Option<OffCpuSample> {
+        if class_of(e.debugid) != DBG_PERF {
+            return None;
+        }
+        let tid = e.arg5;
+        match (subclass_of(e.debugid), code_of(e.debugid)) {
+            // WAITSAMPLE: BUF_DATA(wait_time, runnable_time, running_time) — arg1 is
+            // the off-CPU duration in mach ticks. Emitted before the pended stack.
+            (PERF_LAZY, PERF_LZ_WAITSAMPLE) => {
+                self.pending_wait.insert(tid, e.arg1);
+                None
+            }
+            (PERF_THREADINFO, PERF_TI_DATA) => {
+                self.pid_of.insert(tid, e.arg1); // arg1 = pid
+                None
+            }
+            (PERF_CALLSTACK, PERF_CS_UHDR) => {
+                let want = e.arg2 as usize;
+                self.building.insert(tid, Pending { want, frames: Vec::with_capacity(want) });
+                None
+            }
+            (PERF_CALLSTACK, PERF_CS_UDATA) => {
+                let done = {
+                    let p = self.building.get_mut(&tid)?;
+                    for pc in [e.arg1, e.arg2, e.arg3, e.arg4] {
+                        if p.frames.len() < p.want {
+                            p.frames.push(pc);
+                        }
+                    }
+                    if p.frames.len() < p.want {
+                        return None;
+                    }
+                    self.building.remove(&tid).unwrap()
+                };
+                // Pair the closed stack with this thread's pending wait duration.
+                // With only lazy.wait armed, every user stack has one; skip orphans.
+                let wait_ticks = self.pending_wait.remove(&tid)?;
+                let pid = self.pid_of.get(&tid).copied().unwrap_or(0);
+                Some(OffCpuSample { pid, tid, wait_ns: ticks_to_ns(wait_ticks), frames: done.frames })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Entry point. Default mode is lazy.wait off-CPU capture (`third_ns` = the wait
+/// threshold in ns); set KPERF_SPIKE_PET=1 for the legacy PET snapshot mode
+/// (`third_ns` = the timer period in ns).
+pub fn run(pid: i32, secs: u64, third_ns: u64) -> Result<usize, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("must run as root (kperf/kdebug sysctls need it)".into());
     }
+    if std::env::var("KPERF_SPIKE_PET").is_ok() {
+        run_pet(pid, secs, third_ns)
+    } else {
+        run_lazy_wait(pid, secs, third_ns)
+    }
+}
+
+/// Lazy.wait off-CPU capture: arm the wait sampler and print the target's
+/// blocking stacks with off-CPU durations. Returns the number of off-CPU samples.
+fn run_lazy_wait(pid: i32, secs: u64, threshold_ns: u64) -> Result<usize, String> {
+    // Keep only DBG_PERF in the ring (kdebug typefilter).
+    kdebug_start(500_000, true)?;
+    if let Err(e) = kperf_lazy_wait_start(pid, threshold_ns) {
+        kdebug_teardown();
+        return Err(e);
+    }
+    eprintln!("kperf-spike: off-CPU capture of pid {pid} for {secs}s…");
+    let thr = kperf_get_u64(b"kperf.lazy.wait_time_threshold\0").unwrap_or(0);
+    eprintln!(
+        "kperf-spike: readback lazy.wait_action={:?} lazy.wait_time_threshold={thr} ticks (~{}ns) action.filter_by_pid={:?}",
+        kperf_get_u32(b"kperf.lazy.wait_action\0"),
+        ticks_to_ns(thr),
+        kperf_get_indexed(b"kperf.action.filter_by_pid\0", ACTION_ID),
+    );
+
+    let mut decoder = LazyDecoder::default();
+    let mut buf = vec![
+        KdBuf { timestamp: 0, arg1: 0, arg2: 0, arg3: 0, arg4: 0, arg5: 0, debugid: 0, cpuid: 0, unused: 0 };
+        100_000
+    ];
+    let mut total = 0usize;
+    let mut total_events = 0u64;
+    let target_pid = pid as u64;
+    let mut distinct_pids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // tid -> (block count, total off-CPU ns, most recent block stack).
+    let mut per_tid: std::collections::HashMap<u64, (u64, u64, Vec<u64>)> = std::collections::HashMap::new();
+    let mut shown = 0u32;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        let n = match kdebug_drain(&mut buf) {
+            Some(n) => n,
+            None => {
+                eprintln!("kperf-spike: KDREADTR failed (errno {})", errno());
+                break;
+            }
+        };
+        for e in &buf[..n] {
+            total_events += 1;
+            if let Some(s) = decoder.on_event(e) {
+                total += 1;
+                distinct_pids.insert(s.pid);
+                if shown < 8 {
+                    shown += 1;
+                    eprintln!(
+                        "kperf-spike:   off-CPU pid {} tid {} blocked {}µs, {} frames",
+                        s.pid, s.tid, s.wait_ns / 1000, s.frames.len()
+                    );
+                }
+                let ent = per_tid.entry(s.tid).or_insert((0, 0, Vec::new()));
+                ent.0 += 1;
+                ent.1 += s.wait_ns;
+                ent.2 = s.frames;
+            }
+        }
+    }
+    kperf_stop();
+    kdebug_teardown();
+
+    eprintln!("kperf-spike: drained {total_events} kdebug events, {total} off-CPU samples");
+    eprintln!(
+        "kperf-spike: {} distinct pid(s) — in-kernel pid_filter should make this 1",
+        distinct_pids.len()
+    );
+    eprintln!("kperf-spike: target pid {target_pid}: {} blocked tid(s):", per_tid.len());
+    let mut tids: Vec<_> = per_tid.into_iter().collect();
+    tids.sort_by_key(|&(_, (c, _, _))| std::cmp::Reverse(c));
+    for (tid, (count, total_ns, frames)) in tids.iter() {
+        eprintln!(
+            "kperf-spike:   tid {tid}: {count} blocks, {}µs off-CPU total, block site:",
+            total_ns / 1000
+        );
+        for (i, line) in symbolize(pid, frames).iter().enumerate() {
+            eprintln!("kperf-spike:       {i:>2}  {line}");
+        }
+    }
+    Ok(total)
+}
+
+/// Legacy PET snapshot: sample every thread each `period_ns` tick and print the
+/// target's reassembled user stacks. Returns the number of completed samples.
+fn run_pet(pid: i32, secs: u64, period_ns: u64) -> Result<usize, String> {
     // In-kernel DBG_PERF class filter is ON by default via a kdebug typefilter
     // (KERN_KDSET_TYPEFILTER) — the old KDSETREG class-range empties the ring on
     // this xnu, so we use the per-(class,subclass) bitmap the kernel honors. This
