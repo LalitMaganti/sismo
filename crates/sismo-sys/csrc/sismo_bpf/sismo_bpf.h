@@ -39,6 +39,13 @@ enum sismo_event_type {
   // with how long it stayed off-CPU. Reuses sismo_sample_rec verbatim; the
   // off-CPU duration in nanoseconds rides in `data_addr` (which has no meaning
   // for off-CPU) and is the sample's weight. `counters[]` are 0.
+  //
+  // Shared cross-backend contract (Linux eBPF here, macOS kperf lazy.wait,
+  // Windows ETW): VOLUNTARY blocks only — the thread went to sleep (state !=
+  // TASK_RUNNING), not involuntary preemption. Emitted once per completed
+  // off-CPU interval over MIN_OFFCPU_NS, scoped to the target pid in-kernel,
+  // carrying the blocking user stack + duration weight. macOS/Windows produce
+  // the identical record from their native wait/cswitch triggers.
   SISMO_EVT_OFFCPU = 2,
 };
 

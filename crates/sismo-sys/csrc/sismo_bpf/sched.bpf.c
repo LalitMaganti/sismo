@@ -36,6 +36,13 @@
 // dominate the cost. Latency lives in the long waits.
 #define MIN_OFFCPU_NS 10000  // 10 µs
 
+// Voluntary blocking only: we count a switch-out as off-CPU when the outgoing
+// thread went to sleep (its state != TASK_RUNNING), not when it was involuntarily
+// preempted while still runnable. This matches macOS kperf lazy.wait (which only
+// fires on wait-wakeups) and the Windows ETW wait-reason filter — one consistent
+// "wait analysis" semantic across backends. TASK_RUNNING is 0.
+#define TASK_RUNNING 0
+
 struct sismo_counters {
   __u64 v[SISMO_MAX_COUNTERS];
 };
@@ -322,11 +329,14 @@ int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev,
 
   // Outgoing thread (if in the target): credit its exact counter deltas — the
   // value is carried out by the next timer-tick PerfSample, so no emit here —
-  // and record its off-CPU block.
+  // and, if it went to sleep (voluntary block, not preemption), record its
+  // off-CPU block. Counter crediting happens for every switch-out; only the
+  // off-CPU block is gated on prev actually blocking.
   __u32 prev_tgid = BPF_CORE_READ(prev, tgid);
   if (tgt == 0 || prev_tgid == tgt) {
     credit(prev, &dc);
-    offcpu_record_block(ctx, (__u32)BPF_CORE_READ(prev, pid));
+    if (BPF_CORE_READ(prev, __state) != TASK_RUNNING)
+      offcpu_record_block(ctx, (__u32)BPF_CORE_READ(prev, pid));
   }
 
   // Incoming thread (if in the target): close out its off-CPU block.

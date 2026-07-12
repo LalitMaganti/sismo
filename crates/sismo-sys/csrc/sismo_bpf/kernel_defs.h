@@ -41,6 +41,8 @@ typedef __u64 __le64;
 struct task_struct {
   int pid;
   int tgid;
+  unsigned int __state;  // scheduler state (5.14+; 0 == TASK_RUNNING). Read at
+                         // sched_switch to tell a voluntary block from preemption.
   char comm[16];
 } __attribute__((preserve_access_index));
 
