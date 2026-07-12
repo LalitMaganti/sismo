@@ -496,17 +496,19 @@ impl RingHost {
                     pid: target_pid as i32,
                     offcpu_threshold_ns: want_offcpu.then_some(threshold_ns),
                     oncpu_period_ns: want_oncpu.then_some(period_ns),
+                    pmu: None, // PMU counter selection not yet wired to config/CLI
                 };
-                if let Err(e) = arm(&kcfg) {
-                    eprintln!("ring_host: kperf sampling disabled — arm failed: {e}");
-                } else {
-                    if want_offcpu {
-                        eprintln!("ring_host: off-CPU armed for pid {target_pid} (wait threshold {}us)", threshold_ns / 1_000);
-                        offcpu = Some(OffCpuConsumer::new(self.offcpu_ctl.clone().unwrap(), task));
-                    }
-                    if want_oncpu {
-                        eprintln!("ring_host: on-CPU armed for pid {target_pid} (timer {}us)", period_ns / 1_000);
-                        oncpu = Some(OnCpuConsumer::new(self.oncpu_ctl.clone().unwrap(), task, period_ns));
+                match arm(&kcfg) {
+                    Err(e) => eprintln!("ring_host: kperf sampling disabled — arm failed: {e}"),
+                    Ok(_counter_count) => {
+                        if want_offcpu {
+                            eprintln!("ring_host: off-CPU armed for pid {target_pid} (wait threshold {}us)", threshold_ns / 1_000);
+                            offcpu = Some(OffCpuConsumer::new(self.offcpu_ctl.clone().unwrap(), task));
+                        }
+                        if want_oncpu {
+                            eprintln!("ring_host: on-CPU armed for pid {target_pid} (timer {}us)", period_ns / 1_000);
+                            oncpu = Some(OnCpuConsumer::new(self.oncpu_ctl.clone().unwrap(), task, period_ns));
+                        }
                     }
                 }
             }
