@@ -21,6 +21,10 @@ use std::collections::HashMap;
 // ---- kperf event codes (osfmk/kperf/buffer.h) ------------------------------
 
 const DBG_PERF: u32 = 0x25;
+/// This feature's kdebug typefilter contribution: all of the DBG_PERF class
+/// (csc = 0x2500..0x25ff), i.e. every kperf subclass. The ring host unions this
+/// with the sched consumer's range.
+pub(crate) const DBG_PERF_CSC_RANGE: (u16, u16) = (0x2500, 0x25ff);
 const PERF_THREADINFO: u32 = 1;
 const PERF_TI_DATA: u32 = 1; // BUF_DATA(PERF_TI_DATA, pid, tid, dq_addr, runmode)
 const PERF_CALLSTACK: u32 = 2;

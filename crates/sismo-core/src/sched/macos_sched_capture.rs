@@ -38,6 +38,10 @@ const DS_NAME: &[u8] = b"sismo.macos_sched";
 const OFFCPU_DS_NAME: &[u8] = b"sismo.macos_offcpu";
 const DEFAULT_OFFCPU_THRESHOLD_US: u32 = 500; // ignore waits < 0.5ms by default
 const MAX_CPUS: usize = 256;
+// The sched consumer's kdebug filter contribution: DBG_MACH_SCHED, i.e. class
+// DBG_MACH (1), subclass 0x40. csc = (class<<8)|subclass. Off-CPU adds
+// DBG_PERF_CSC_RANGE when enabled; the ring captures the union.
+const SCHED_CSC: u16 = (1 << 8) | 0x40;
 
 // Field tags.
 const TP_FIELD_GENERIC_KERNEL_TASK_STATE: u32 = 117;
@@ -62,7 +66,8 @@ const MAX_NEW_PROCESSES: usize = 128;
 
 // ---- kdebug ring + timebase ------------------------------------------------
 
-use crate::sched::kdebug::{kdebug_drain, kdebug_read_thread_map, kdebug_start, kdebug_teardown};
+use crate::sched::kdebug::KdebugRing;
+use crate::sched::kperf_offcpu::DBG_PERF_CSC_RANGE;
 use crate::mach::{mach_timebase_info, TimebaseInfo};
 
 // kd_buf event record — 64 bytes on arm64. Fields read directly.
@@ -242,16 +247,24 @@ impl SchedCapture {
         unsafe { mach_timebase_info(&mut tb) };
         let (tb_n, tb_d) = (tb.numer as u64, tb.denom as u64);
 
-        let mut setup_failed = false;
-        // Keep DBG_PERF in the ring too when off-CPU capture is enabled.
-        if kdebug_start(kernel_buffer_events, target_pid != 0).is_err() {
-            eprintln!("macos_sched_capture: kdebug.start failed");
-            setup_failed = true;
+        // Open the shared kdebug ring with the union of its consumers' csc
+        // filters: sched always, plus DBG_PERF for off-CPU when a target pid is
+        // configured. The ring's Drop tears the session down when run() returns.
+        let mut csc_ranges: Vec<(u16, u16)> = vec![(SCHED_CSC, SCHED_CSC)];
+        if target_pid != 0 {
+            csc_ranges.push(DBG_PERF_CSC_RANGE);
         }
+        let ring = match KdebugRing::open(kernel_buffer_events, &csc_ranges) {
+            Ok(r) => Some(r),
+            Err(_) => {
+                eprintln!("macos_sched_capture: kdebug ring open failed");
+                None
+            }
+        };
 
         // Off-CPU: task_for_pid the target, arm kperf lazy.wait, build the emitter.
         let mut offcpu: Option<OffCpu> = None;
-        if target_pid != 0 && !setup_failed {
+        if target_pid != 0 && ring.is_some() {
             let mut task: MachPort = 0;
             if unsafe { libc::task_for_pid(mach_task_self_, target_pid as i32, &mut task) } != KERN_SUCCESS {
                 eprintln!(
@@ -291,20 +304,23 @@ impl SchedCapture {
         let mut pending = vec![PendingSwitch::default(); MAX_CPUS];
         let mut cache = PtCache::default();
 
+        let ring_ref = ring.as_ref();
         loop {
             self.wakeup.reset();
             if self.exit_requested.load(Ordering::Acquire) {
                 break;
             }
 
-            if self.running.load(Ordering::Acquire) && !setup_failed {
-                self.drain_once(slot, tb_n, tb_d, &mut event_buf, &mut thread_map_buf, &mut pending, &mut cache, offcpu.as_mut());
+            if let Some(r) = ring_ref {
+                if self.running.load(Ordering::Acquire) {
+                    self.drain_once(r, slot, tb_n, tb_d, &mut event_buf, &mut thread_map_buf, &mut pending, &mut cache, offcpu.as_mut());
+                }
             }
 
             let stopper = self.pending_stopper.swap(0, Ordering::AcqRel);
             if stopper != 0 {
-                if !setup_failed {
-                    self.drain_once(slot, tb_n, tb_d, &mut event_buf, &mut thread_map_buf, &mut pending, &mut cache, offcpu.as_mut());
+                if let Some(r) = ring_ref {
+                    self.drain_once(r, slot, tb_n, tb_d, &mut event_buf, &mut thread_map_buf, &mut pending, &mut cache, offcpu.as_mut());
                 }
                 unsafe { sismo_stop_done(stopper as *mut c_void) };
                 self.running.store(false, Ordering::Release);
@@ -325,6 +341,7 @@ impl SchedCapture {
     #[allow(clippy::too_many_arguments)]
     fn drain_once(
         &self,
+        ring: &KdebugRing,
         slot: u32,
         tb_n: u64,
         tb_d: u64,
@@ -339,7 +356,7 @@ impl SchedCapture {
         let evt_bytes = unsafe {
             std::slice::from_raw_parts_mut(event_buf.as_mut_ptr() as *mut u8, std::mem::size_of_val(event_buf))
         };
-        let n_evt = kdebug_drain(evt_bytes).unwrap_or(0);
+        let n_evt = ring.drain(evt_bytes).unwrap_or(0);
         let t_drain = now_ns();
 
         let thr_bytes = unsafe {
@@ -348,7 +365,7 @@ impl SchedCapture {
                 std::mem::size_of_val(thread_map_buf),
             )
         };
-        let n_thr = kdebug_read_thread_map(thr_bytes).unwrap_or(0);
+        let n_thr = ring.read_thread_map(thr_bytes).unwrap_or(0);
         let thread_map = &thread_map_buf[..n_thr.min(thread_map_buf.len())];
 
         self.refresh_and_emit_tree(slot, thread_map, cache);
@@ -650,8 +667,9 @@ impl SchedCapture {
         if let Some(h) = handle {
             let _ = h.join();
         }
-        disarm(); // stop kperf lazy.wait before dropping the kdebug session
-        kdebug_teardown();
+        // The worker's KdebugRing drops (tearing the session down) when its run()
+        // returns during the join above; here we only need to stop kperf.
+        disarm();
         SchedStats {
             events_emitted: self.events_emitted.load(Ordering::Relaxed),
             drain_calls: self.drain_calls.load(Ordering::Relaxed),
