@@ -396,24 +396,27 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
             pid
         }
         None => {
-            let heap_dylib = match sismo_core::sismo_paths::resolve_heap_dylib_path() {
-                Some(p) => p,
-                None => {
-                    eprintln!("sismo record: failed to resolve heap dylib path");
-                    teardown_early(svc, lock_fd);
-                    return 0;
-                }
-            };
             let workload_cmd = config.workload[0].as_str();
             let workload_args: Vec<&str> = config.workload[1..].iter().map(String::as_str).collect();
-            let pid = match maybe_spawn(
-                workload_cmd,
-                &workload_args,
-                &[
-                    ("DYLD_INSERT_LIBRARIES", &heap_dylib),
-                    ("PERFETTO_PRODUCER_SOCK_NAME", PRODUCER_SOCK),
-                ],
-            ) {
+
+            // Only DYLD-insert the heap preload when in-process heap capture is
+            // on; otherwise the workload runs unmodified (and doesn't need the
+            // dylib built). sched/cpu/off-CPU attach out-of-process and don't
+            // require any injection.
+            let mut env: Vec<(&str, &str)> = vec![("PERFETTO_PRODUCER_SOCK_NAME", PRODUCER_SOCK)];
+            let heap_dylib: String;
+            if heap_mode == SourceMode::InProcess {
+                heap_dylib = match sismo_core::sismo_paths::resolve_heap_dylib_path() {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("sismo record: failed to resolve heap dylib path");
+                        teardown_early(svc, lock_fd);
+                        return 0;
+                    }
+                };
+                env.push(("DYLD_INSERT_LIBRARIES", heap_dylib.as_str()));
+            }
+            let pid = match maybe_spawn(workload_cmd, &workload_args, &env) {
                 Some(p) => p,
                 None => {
                     eprintln!("sismo record: failed to spawn '{workload_cmd}' — exiting");
