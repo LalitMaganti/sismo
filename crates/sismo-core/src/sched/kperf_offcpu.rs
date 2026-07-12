@@ -14,7 +14,7 @@
 use crate::ffi::sismo_ds_emit;
 use crate::mach::{mach_timebase_info, MachPort, TimebaseInfo};
 use crate::proto::ProtoWriter;
-use crate::symbolize::dyld_images::{read_macho, ImageList};
+use crate::symbolize::dyld_images::{read_macho_meta, ImageList};
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -259,24 +259,23 @@ struct Module {
     uuid: [u8; 16],
 }
 
-/// Enumerate the target's mach-o images into a base-sorted module table.
+/// Enumerate the target's mach-o images into a base-sorted module table. Reads
+/// only each image's metadata (UUID + __TEXT vmsize), not its bytes. The end is
+/// base + __TEXT vmsize — NOT clamped to the next image's base: under the dyld
+/// shared cache image headers are packed together, so a next-base clamp would
+/// truncate ranges and make in-cache frames miss.
 fn load_modules(task: MachPort) -> Vec<Module> {
     let list = match ImageList::enumerate(task) {
         Ok(l) => l,
         Err(_) => return Vec::new(),
     };
-    let mut imgs: Vec<(u64, Vec<u8>)> = list.images().to_vec();
-    imgs.sort_by_key(|(b, _)| *b);
-    let n = imgs.len();
-    let mut mods = Vec::with_capacity(n);
-    for idx in 0..n {
-        let base = imgs[idx].0;
-        let next = if idx + 1 < n { imgs[idx + 1].0 } else { u64::MAX };
-        if let Some(m) = read_macho(task, base) {
-            let end = base.wrapping_add(m.text_vmsize).min(next);
-            mods.push(Module { base, end, path: imgs[idx].1.clone(), uuid: m.uuid });
+    let mut mods = Vec::with_capacity(list.len());
+    for (base, path) in list.images() {
+        if let Some((uuid, text_vmsize)) = read_macho_meta(task, *base) {
+            mods.push(Module { base: *base, end: base.wrapping_add(text_vmsize), path: path.clone(), uuid });
         }
     }
+    mods.sort_by_key(|m| m.base);
     mods
 }
 
@@ -419,6 +418,9 @@ pub struct OffCpuEmitter {
     need_defaults: bool,
     tb_numer: u64,
     tb_denom: u64,
+    /// Samples since the last module reload — bounds reload frequency so a
+    /// persistently-unmappable frame (JIT, etc.) can't reload every sample.
+    since_reload: u64,
 }
 
 impl OffCpuEmitter {
@@ -433,6 +435,7 @@ impl OffCpuEmitter {
             need_defaults: true,
             tb_numer,
             tb_denom,
+            since_reload: 0,
         }
     }
 
@@ -461,9 +464,15 @@ impl OffCpuEmitter {
             self.emit_defaults();
             self.need_defaults = false;
         }
-        // A dlopen after startup can leave frames unmapped — re-enumerate once.
-        if s.frames.iter().any(|&pc| pc != 0 && find_module(&self.modules, pc).is_none()) {
+        // A dlopen after startup can leave frames unmapped — re-enumerate, but at
+        // most once every 512 samples so an always-unmappable frame can't reload
+        // on every sample.
+        self.since_reload = self.since_reload.saturating_add(1);
+        if self.since_reload > 512
+            && s.frames.iter().any(|&pc| pc != 0 && find_module(&self.modules, pc).is_none())
+        {
             self.modules = load_modules(self.task);
+            self.since_reload = 0;
         }
 
         let mut idw = ProtoWriter::new();

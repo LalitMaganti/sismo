@@ -241,6 +241,56 @@ pub fn read_macho(task: MachPort, base_avma: u64) -> Option<MachoImage> {
     Some(MachoImage { text: buf, text_vmsize, cputype, cpusubtype, uuid })
 }
 
+/// Read only a mach-o image's `LC_UUID` + `__TEXT` vmsize (header + load
+/// commands; NOT the `__TEXT` slab). For callers that need mapping metadata but
+/// not the bytes — e.g. off-CPU Perfetto Mapping emission — this avoids the
+/// multi-MB `__TEXT` read `read_macho` does. `None` if not a 64-bit mach-o or no
+/// `__TEXT`.
+pub fn read_macho_meta(task: MachPort, base_avma: u64) -> Option<([u8; 16], u64)> {
+    let mut hdr = [0u8; 32];
+    match unsafe { vm_read(task, base_avma, &mut hdr) } {
+        Some(n) if n >= 32 => {}
+        _ => return None,
+    }
+    if read_u32(&hdr, 0) != MH_MAGIC_64 {
+        return None;
+    }
+    let ncmds = read_u32(&hdr, 16);
+    let sizeofcmds = read_u32(&hdr, 20) as usize;
+    let mut cmds = vec![0u8; sizeofcmds];
+    match unsafe { vm_read(task, base_avma + 32, &mut cmds) } {
+        Some(n) if n >= sizeofcmds => {}
+        _ => return None,
+    }
+    let mut text_vmsize: u64 = 0;
+    let mut uuid = [0u8; 16];
+    let mut off = 0usize;
+    for _ in 0..ncmds {
+        if off + 8 > cmds.len() {
+            break;
+        }
+        let cmd = read_u32(&cmds, off);
+        let cmdsize = read_u32(&cmds, off + 4) as usize;
+        if cmdsize == 0 || off + cmdsize > cmds.len() {
+            break;
+        }
+        if cmd == LC_SEGMENT_64 && cmdsize >= 72 {
+            let segname = &cmds[off + 8..off + 24];
+            let nlen = segname.iter().position(|&b| b == 0).unwrap_or(16);
+            if &segname[..nlen] == b"__TEXT" {
+                text_vmsize = read_u64(&cmds, off + 32);
+            }
+        } else if cmd == LC_UUID && cmdsize >= 24 {
+            uuid.copy_from_slice(&cmds[off + 8..off + 24]);
+        }
+        off += cmdsize;
+    }
+    if text_vmsize == 0 {
+        return None;
+    }
+    Some((uuid, text_vmsize))
+}
+
 /// Map (cputype, cpusubtype) to wholesym's arch string, or None for unknown.
 /// (<mach/machine.h>: CPU_TYPE_X86_64 = 0x01000007, CPU_TYPE_ARM64 = 0x0100000C;
 /// the top byte of cpusubtype is feature bits.)
