@@ -135,6 +135,29 @@ fn kperf_set_indexed(name: &[u8], id: u64, value: u64) -> Result<(), i32> {
     }
 }
 
+/// Read an indexed `kperf.*` knob using the get-set convention kperf.framework's
+/// `kperf_sysctl_get_uint32` uses (confirmed by disassembly): a 16-byte buffer
+/// `[index, 0]` is passed as BOTH newp (supplies the index) and oldp (receives
+/// the value in slot 1). Returns the stored value.
+fn kperf_get_indexed(name: &[u8], index: u64) -> Option<u64> {
+    let mut inputs: [u64; 2] = [index, 0];
+    let mut oldlen = std::mem::size_of::<[u64; 2]>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            inputs.as_mut_ptr() as *mut c_void,
+            &mut oldlen,
+            inputs.as_ptr() as *mut c_void,
+            std::mem::size_of::<[u64; 2]>(),
+        )
+    };
+    if rc == 0 {
+        Some(inputs[1])
+    } else {
+        None
+    }
+}
+
 fn errno() -> i32 {
     unsafe { *libc::__error() }
 }
@@ -271,7 +294,13 @@ fn kperf_pet_start(pid: i32, period_ns: u64) -> Result<(), String> {
         "kperf.action.samplers",
     )?;
     step(kperf_set_indexed(b"kperf.action.ucallstack_depth\0", ACTION_ID, UCALLSTACK_DEPTH), "kperf.action.ucallstack_depth")?;
-    // Only the target process.
+    // Restrict the action to the target pid. This call is byte-identical to
+    // kperf.framework's kperf_action_filter_set_by_pid (verified by disassembly)
+    // and the value reads back correctly (see the readback in run()) — but PET's
+    // all-thread sweep does NOT honor it, so we still get system-wide samples and
+    // filter to the pid in userspace. The action pid_filter only gates on-core
+    // samples (timer / the Phase-B kdebug-cswitch trigger), not PET. We set it
+    // anyway so the on-core path inherits it later.
     step(kperf_set_indexed(b"kperf.action.filter_by_pid\0", ACTION_ID, pid as u64), "kperf.action.filter_by_pid")?;
     // One timer firing the action; period is in mach ticks.
     step(kperf_set_u32(b"kperf.timer.count\0", 1), "kperf.timer.count")?;
@@ -415,6 +444,15 @@ pub fn run(pid: i32, secs: u64, period_ns: u64) -> Result<usize, String> {
         "kperf-spike: ns_to_ticks({period_ns})={} mach ticks",
         ns_to_ticks(period_ns)
     );
+    // Confirm the per-action knobs actually stored (via the framework's get-set
+    // convention). filter_by_pid should read back as the target pid; samplers
+    // should be USTACK|KSTACK|TH_INFO (0xd) — cross-checks the 1-based action id.
+    eprintln!(
+        "kperf-spike: action[{ACTION_ID}] readback: samplers={:?} filter_by_pid={:?} (target {pid}) ucallstack_depth={:?}",
+        kperf_get_indexed(b"kperf.action.samplers\0", ACTION_ID),
+        kperf_get_indexed(b"kperf.action.filter_by_pid\0", ACTION_ID),
+        kperf_get_indexed(b"kperf.action.ucallstack_depth\0", ACTION_ID),
+    );
 
     // Ring-content histograms: which classes/codes actually land in the ring —
     // motivates the Phase-B kernel-side filter (DBG_PERF is ~half the traffic).
@@ -429,10 +467,11 @@ pub fn run(pid: i32, secs: u64, period_ns: u64) -> Result<usize, String> {
         100_000
     ];
     let mut total = 0usize;
-    // The kernel filter_by_pid knob is currently ineffective on this xnu (we get
-    // system-wide PET samples), so filter to the target pid in userspace using
-    // the pid reported in each THREADINFO event. Count distinct pids/tids seen
-    // for context, but the per-thread summary is TARGET-ONLY.
+    // PET is system-wide by design — the action's pid_filter is stored but not
+    // applied to the all-thread sweep (proven: readback shows the pid, yet we see
+    // ~hundreds of pids). So filter to the target pid in userspace using the pid
+    // reported in each THREADINFO event. Count distinct pids seen for context,
+    // but the per-thread summary is TARGET-ONLY.
     let target_pid = pid as u64;
     let mut distinct_pids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // Per (target) tid: (sample count, most recent stack).
@@ -483,7 +522,7 @@ pub fn run(pid: i32, secs: u64, period_ns: u64) -> Result<usize, String> {
         }
     }
     eprintln!(
-        "kperf-spike: {} distinct pid(s) sampled system-wide (kernel filter_by_pid ineffective)",
+        "kperf-spike: {} distinct pid(s) sampled system-wide (PET ignores action pid_filter by design; filtered to target in userspace)",
         distinct_pids.len()
     );
     // Per-thread summary for the TARGET pid only (userspace-filtered). The
