@@ -21,6 +21,8 @@ use crate::proto::sched_protos::{
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::proto::sismo_config::{config_extract, sched_decode};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
+use crate::sched::kperf_offcpu::{arm_lazy_wait, disarm, KdEvent, LazyDecoder, OffCpuEmitter};
+use crate::mach::{mach_task_self_, MachPort, KERN_SUCCESS};
 use crate::worker_sdk::{now_ns, wait_for_setup, Event};
 use std::collections::HashMap;
 use std::os::raw::c_void;
@@ -29,6 +31,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const DS_NAME: &[u8] = b"sismo.macos_sched";
+// Second data source: off-CPU PerfSamples decoded from kperf lazy.wait on the
+// same kdebug ring. Registered by this worker; emits only when a target pid is
+// configured.
+const OFFCPU_DS_NAME: &[u8] = b"sismo.macos_offcpu";
+const DEFAULT_OFFCPU_THRESHOLD_US: u32 = 500; // ignore waits < 0.5ms by default
 const MAX_CPUS: usize = 256;
 
 // Field tags.
@@ -114,6 +121,12 @@ struct PendingSwitch {
     incoming_pri: u32,
 }
 
+/// Off-CPU state carried across drains (worker thread only, so not Sync).
+struct OffCpu {
+    decoder: LazyDecoder,
+    emitter: OffCpuEmitter,
+}
+
 /// First-seen name cache. Threads keyed by mach tid, processes by pid.
 #[derive(Default)]
 struct PtCache {
@@ -132,9 +145,18 @@ pub struct SchedCapture {
 
     setup_received: AtomicBool,
     setup_kernel_buffer_events: AtomicI32,
+    // Non-zero enables kperf lazy.wait off-CPU capture for this pid on the shared
+    // kdebug session; threshold_us 0 → the worker's default.
+    setup_target_pid: AtomicU32,
+    setup_offcpu_threshold_us: AtomicU32,
 
     events_emitted: AtomicU64,
     drain_calls: AtomicU64,
+
+    // Off-CPU data source (kperf lazy.wait). Registered alongside the sched DS.
+    offcpu_ds_slot: AtomicU32,
+    offcpu_running: AtomicBool,
+    offcpu_samples: AtomicU64,
 
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -147,8 +169,10 @@ extern "C" fn on_setup(user_arg: *mut c_void, dsc_bytes: *const c_void, dsc_size
     let self_ = as_ref(user_arg);
     if !dsc_bytes.is_null() {
         let dsc = unsafe { std::slice::from_raw_parts(dsc_bytes as *const u8, dsc_size) };
-        if let Some(kbe) = config_extract(dsc).map(sched_decode) {
+        if let Some((kbe, target_pid, threshold_us)) = config_extract(dsc).map(sched_decode) {
             self_.setup_kernel_buffer_events.store(kbe, Ordering::Release);
+            self_.setup_target_pid.store(target_pid, Ordering::Release);
+            self_.setup_offcpu_threshold_us.store(threshold_us, Ordering::Release);
         }
     }
     self_.setup_received.store(true, Ordering::Release);
@@ -176,6 +200,28 @@ extern "C" fn on_flush(_user_arg: *mut c_void, flusher: *mut c_void) {
     }
 }
 
+// Off-CPU DS trampolines. Its packets are produced in the sched worker's drain
+// loop (gated by the sched DS lifecycle), so setup/stop/flush just track the
+// running flag and ack inline — nothing off-CPU-specific is buffered.
+extern "C" fn offcpu_on_setup(_user_arg: *mut c_void, _dsc: *const c_void, _sz: usize) {}
+
+extern "C" fn offcpu_on_start(user_arg: *mut c_void) {
+    as_ref(user_arg).offcpu_running.store(true, Ordering::Release);
+}
+
+extern "C" fn offcpu_on_stop(user_arg: *mut c_void, stopper: *mut c_void) {
+    as_ref(user_arg).offcpu_running.store(false, Ordering::Release);
+    if !stopper.is_null() {
+        unsafe { sismo_stop_done(stopper) };
+    }
+}
+
+extern "C" fn offcpu_on_flush(_user_arg: *mut c_void, flusher: *mut c_void) {
+    if !flusher.is_null() {
+        unsafe { sismo_flush_done(flusher) };
+    }
+}
+
 impl SchedCapture {
     fn run(&self) {
         // Wait for on_setup (carries the kdebug buffer sizing).
@@ -185,6 +231,10 @@ impl SchedCapture {
 
         let kbe = self.setup_kernel_buffer_events.load(Ordering::Acquire);
         let kernel_buffer_events = if kbe != 0 { kbe } else { self.config_kernel_buffer_events };
+        let target_pid = self.setup_target_pid.load(Ordering::Acquire);
+        let threshold_us = self.setup_offcpu_threshold_us.load(Ordering::Acquire);
+        let threshold_ns =
+            (if threshold_us != 0 { threshold_us } else { DEFAULT_OFFCPU_THRESHOLD_US }) as u64 * 1_000;
 
         // Heavy setup on the worker thread.
         let mut tb = TimebaseInfo { numer: 1, denom: 1 };
@@ -192,9 +242,33 @@ impl SchedCapture {
         let (tb_n, tb_d) = (tb.numer as u64, tb.denom as u64);
 
         let mut setup_failed = false;
-        if kdebug_start(kernel_buffer_events).is_err() {
+        // Keep DBG_PERF in the ring too when off-CPU capture is enabled.
+        if kdebug_start(kernel_buffer_events, target_pid != 0).is_err() {
             eprintln!("macos_sched_capture: kdebug.start failed");
             setup_failed = true;
+        }
+
+        // Off-CPU: task_for_pid the target, arm kperf lazy.wait, build the emitter.
+        let mut offcpu: Option<OffCpu> = None;
+        if target_pid != 0 && !setup_failed {
+            let mut task: MachPort = 0;
+            if unsafe { libc::task_for_pid(mach_task_self_, target_pid as i32, &mut task) } != KERN_SUCCESS {
+                eprintln!(
+                    "macos_sched: off-CPU disabled — task_for_pid({target_pid}) failed (need sudo or the debugger entitlement)"
+                );
+            } else if let Err(e) = arm_lazy_wait(target_pid as i32, threshold_ns) {
+                eprintln!("macos_sched: off-CPU disabled — arm lazy.wait failed: {e}");
+            } else {
+                eprintln!(
+                    "macos_sched: off-CPU armed for pid {target_pid} (wait threshold {}us)",
+                    threshold_ns / 1_000
+                );
+                let offcpu_slot = self.offcpu_ds_slot.load(Ordering::Acquire);
+                offcpu = Some(OffCpu {
+                    decoder: LazyDecoder::default(),
+                    emitter: OffCpuEmitter::new(offcpu_slot, task),
+                });
+            }
         }
 
         let slot = self.ds_slot.load(Ordering::Acquire);
@@ -223,13 +297,13 @@ impl SchedCapture {
             }
 
             if self.running.load(Ordering::Acquire) && !setup_failed {
-                self.drain_once(slot, tb_n, tb_d, &mut event_buf, &mut thread_map_buf, &mut pending, &mut cache);
+                self.drain_once(slot, tb_n, tb_d, &mut event_buf, &mut thread_map_buf, &mut pending, &mut cache, offcpu.as_mut());
             }
 
             let stopper = self.pending_stopper.swap(0, Ordering::AcqRel);
             if stopper != 0 {
                 if !setup_failed {
-                    self.drain_once(slot, tb_n, tb_d, &mut event_buf, &mut thread_map_buf, &mut pending, &mut cache);
+                    self.drain_once(slot, tb_n, tb_d, &mut event_buf, &mut thread_map_buf, &mut pending, &mut cache, offcpu.as_mut());
                 }
                 unsafe { sismo_stop_done(stopper as *mut c_void) };
                 self.running.store(false, Ordering::Release);
@@ -257,6 +331,7 @@ impl SchedCapture {
         thread_map_buf: &mut [KdThreadMap],
         pending: &mut [PendingSwitch],
         cache: &mut PtCache,
+        offcpu: Option<&mut OffCpu>,
     ) {
         let t0 = now_ns();
         // KdBuf / KdThreadMap are repr(C) POD; kdebug reads raw bytes into them.
@@ -280,6 +355,28 @@ impl SchedCapture {
 
         let events = &event_buf[..n_evt.min(event_buf.len())];
         let emitted = self.emit_batch(slot, events, thread_map, cache, tb_n, tb_d, pending);
+
+        // Second demux pass over the same events: DBG_PERF → off-CPU samples.
+        if let Some(oc) = offcpu {
+            if self.offcpu_running.load(Ordering::Acquire) {
+                for e in events {
+                    let ev = KdEvent {
+                        debugid: e.debugid,
+                        timestamp: e.timestamp,
+                        arg1: e.arg1,
+                        arg2: e.arg2,
+                        arg3: e.arg3,
+                        arg4: e.arg4,
+                        arg5: e.arg5,
+                        cpuid: e.cpuid,
+                    };
+                    if let Some(s) = oc.decoder.on_event(&ev) {
+                        oc.emitter.emit(&s);
+                        self.offcpu_samples.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         let t_end = now_ns();
 
         self.events_emitted.fetch_add(emitted, Ordering::Relaxed);
@@ -490,8 +587,13 @@ impl SchedCapture {
             pending_stopper: AtomicUsize::new(0),
             setup_received: AtomicBool::new(false),
             setup_kernel_buffer_events: AtomicI32::new(0),
+            setup_target_pid: AtomicU32::new(0),
+            setup_offcpu_threshold_us: AtomicU32::new(0),
             events_emitted: AtomicU64::new(0),
             drain_calls: AtomicU64::new(0),
+            offcpu_ds_slot: AtomicU32::new(u32::MAX),
+            offcpu_running: AtomicBool::new(false),
+            offcpu_samples: AtomicU64::new(0),
             thread: Mutex::new(None),
         });
 
@@ -511,6 +613,25 @@ impl SchedCapture {
         }
         cap.ds_slot.store(slot, Ordering::Release);
 
+        // Second DS for off-CPU PerfSamples (no ProtoVM program). Non-fatal if it
+        // fails to register — the sched timeline still works, off-CPU just won't
+        // have a sink. Shares the worker via the same user_arg; its own callbacks.
+        let offcpu_desc = encode_data_source_descriptor(OFFCPU_DS_NAME, true, false, &[]);
+        let offcpu_slot = unsafe {
+            sismo_ds_register(
+                offcpu_desc.as_ptr(),
+                offcpu_desc.len(),
+                offcpu_on_setup,
+                offcpu_on_start,
+                offcpu_on_stop,
+                offcpu_on_flush,
+                cap_addr as *mut c_void,
+            )
+        };
+        if offcpu_slot != u32::MAX {
+            cap.offcpu_ds_slot.store(offcpu_slot, Ordering::Release);
+        }
+
         let handle = std::thread::spawn(move || {
             let self_ = unsafe { &*(cap_addr as *const SchedCapture) };
             self_.run();
@@ -528,10 +649,12 @@ impl SchedCapture {
         if let Some(h) = handle {
             let _ = h.join();
         }
+        disarm(); // stop kperf lazy.wait before dropping the kdebug session
         kdebug_teardown();
         SchedStats {
             events_emitted: self.events_emitted.load(Ordering::Relaxed),
             drain_calls: self.drain_calls.load(Ordering::Relaxed),
+            offcpu_samples: self.offcpu_samples.load(Ordering::Relaxed),
         }
     }
 }
@@ -540,6 +663,7 @@ impl SchedCapture {
 pub struct SchedStats {
     pub events_emitted: u64,
     pub drain_calls: u64,
+    pub offcpu_samples: u64,
 }
 
 #[cfg(test)]

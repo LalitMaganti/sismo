@@ -71,25 +71,29 @@ the incoming thread's switch-in, compute `delta`, and if `delta ≥ MIN_OFFCPU_N
 emit `SISMO_EVT_OFFCPU`. Kernel frames are interned to symbol ids in-kernel so no
 kernel address (KASLR) leaves the kernel.
 
-## macOS (implemented as a spike; fold into `macos_sched_capture`)
+## macOS (implemented)
 
-`crates/kperf-spike` (default mode). Arm `kperf.lazy.wait_action = <action>` +
-`kperf.lazy.wait_time_threshold` (mach-abs ticks) with an action that samples
-`USTACK | TH_INFO`, `filter_by_pid = target`. No timer/PET. `osfmk/kperf/lazy.c`
+`crates/sismo-core/src/sched/kperf_offcpu.rs`, driven by the sched worker
+(`macos_sched_capture.rs`). The sched worker owns the single kdebug ring; its
+filter (`kdebug.rs`, `KERN_KDSET_TYPEFILTER`) keeps **both** `DBG_MACH_SCHED` and
+`DBG_PERF` when a `target_pid` is configured. It arms `kperf.lazy.wait_action` +
+`kperf.lazy.wait_time_threshold` (mach ticks) with an action sampling
+`USTACK | TH_INFO`, `filter_by_pid = target` (no timer/PET). `osfmk/kperf/lazy.c`
 `kperf_lazy_wait_sample` fires on-core when a thread wakes from a wait over the
-threshold: it emits `PERF_LZ_WAITSAMPLE(wait_time, runnable_time, running_time)`
-(mach ticks) and, via `SAMPLE_FLAG_PEND_USER` → `kperf_sample` (pid-filtered),
-the blocking user stack. Decoder pairs each `WAITSAMPLE` with the pended user
-callstack for the same tid (the kd_buf tid is the woken thread, since on-core).
+threshold, emitting `PERF_LZ_WAITSAMPLE(wait_time, …)` (mach ticks) and, via
+`SAMPLE_FLAG_PEND_USER` → `kperf_sample` (pid-filtered), the blocking user stack.
 
-Verified: 3 threads sleeping 20 ms → per-block durations ~20–25 ms, block site
-`time_sleep → __semwait_signal`, **1 distinct pid** (in-kernel filter), ~300×
-less ring traffic than PET.
+The worker's drain loop demuxes: `DBG_MACH_SCHED` → the task-state timeline
+(existing), `DBG_PERF` → `LazyDecoder`, which pairs each `WAITSAMPLE` with the
+thread's pended user callstack (the kd_buf tid is the woken thread, since
+on-core). `OffCpuEmitter` symbolizes via the target's dyld image list (base/end/
+path/UUID → Perfetto `Mapping`s, absolute-PC frames) and emits a PerfSample on a
+dedicated `sismo.macos_offcpu` data source, timebase `off-cpu-ns`, the off-CPU
+duration as the weight — the same interned-callstack shape as the Linux path.
 
-Next step: fold the arming + `LazyDecoder` into
-`crates/sismo-core/src/sched/macos_sched_capture.rs` as a second decoder on the
-one kdebug session (demux `DBG_MACH_SCHED` vs `DBG_PERF`), emitting the shared
-`SISMO_EVT_OFFCPU` record.
+Verified as a spike (now removed): 3 threads sleeping 20 ms → per-block durations
+~20–25 ms, block site `time_sleep → __semwait_signal`, **1 distinct pid**
+(in-kernel filter), ~300× less ring traffic than PET.
 
 ## Windows ETW (design — not yet implemented)
 

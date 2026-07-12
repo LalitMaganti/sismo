@@ -22,13 +22,19 @@ const KERN_KDENABLE: i32 = 3;
 const KERN_KDSETBUF: i32 = 4;
 const KERN_KDSETUP: i32 = 6;
 const KERN_KDREMOVE: i32 = 7;
-const KERN_KDSETREG: i32 = 8;
 const KERN_KDREADTR: i32 = 10;
 const KERN_KDREADCURTHRMAP: i32 = 21;
-// DBG_MACH / DBG_MACH_SCHED class+subclass filter, KDBG_SUBCLSTYPE reg type.
+// KERN_KDSET_TYPEFILTER (=22, macOS SDK sys/sysctl.h): install a per-(class,
+// subclass) bitmap filter. The old KDSETREG class/subclass-range reg empties the
+// ring on xnu-12377 for a *class* range; the typefilter is what this kernel
+// honors and it lets us keep DBG_MACH_SCHED and DBG_PERF at once (one ring for
+// both sched events and kperf off-CPU samples).
+const KERN_KDSET_TYPEFILTER: i32 = 22;
+const TYPEFILTER_BITMAP_SIZE: usize = (256 * 256) / 8; // 8192; indexed by csc=(class<<8)|subclass
+// Classes/subclasses we keep. csc = (class<<8) | subclass.
 const DBG_MACH: u32 = 1;
-const DBG_MACH_SCHED: u32 = 0x40;
-const KDBG_SUBCLSTYPE: u32 = 0x0002_0000;
+const DBG_MACH_SCHED: u32 = 0x40; // subclass within DBG_MACH
+const DBG_PERF: u32 = 0x25; // kperf's whole class (off-CPU: THREADINFO, CALLSTACK, LAZY)
 
 const KD_THREADMAP_ENTRY_SIZE: usize = 32; // sizeof(kd_threadmap): u64 + i32 + [20]u8, 8-aligned
 
@@ -36,19 +42,38 @@ const KD_THREADMAP_ENTRY_SIZE: usize = 32; // sizeof(kd_threadmap): u64 + i32 + 
 pub enum StartError {
     /// KDSETBUF or KDSETUP failed.
     Setup,
-    /// KDSETREG (the DBG_MACH_SCHED filter) failed.
+    /// KDSET_TYPEFILTER (the class/subclass filter) failed.
     SetReg,
     /// KDENABLE failed.
     Enable,
 }
 
-#[repr(C)]
-struct KdRegType {
-    reg_type: u32,
-    value1: u32,
-    value2: u32,
-    value3: u32,
-    value4: u32,
+/// Install a typefilter keeping DBG_MACH_SCHED, plus all of DBG_PERF when
+/// `include_perf`. Returns false on sysctl failure. The 8192-byte bitmap is
+/// passed via oldp+oldlenp, like the other kdebug write commands.
+fn install_typefilter(include_perf: bool) -> bool {
+    let mut bitmap = vec![0u8; TYPEFILTER_BITMAP_SIZE];
+    let mut set = |csc: usize| bitmap[csc >> 3] |= 1 << (csc & 7);
+    // DBG_MACH_SCHED: class DBG_MACH, subclass DBG_MACH_SCHED.
+    set(((DBG_MACH as usize) << 8) | DBG_MACH_SCHED as usize);
+    if include_perf {
+        let base = (DBG_PERF as usize) << 8;
+        for csc in base..base + 256 {
+            set(csc);
+        }
+    }
+    let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDSET_TYPEFILTER];
+    let mut len = bitmap.len();
+    unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bitmap.as_mut_ptr() as *mut c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) == 0
+    }
 }
 
 unsafe fn sysctl_void(cmd: i32) -> i32 {
@@ -65,10 +90,10 @@ unsafe fn sysctl_set_int(cmd: i32, value: i32) -> i32 {
     }
 }
 
-/// Tear down any prior session, size the buffer, install the DBG_MACH_SCHED
-/// filter, and enable capture. Calls the KERN_KDEBUG sysctls, which need root
-/// (they return EPERM otherwise).
-pub fn kdebug_start(buffer_events: i32) -> Result<(), StartError> {
+/// Tear down any prior session, size the buffer, install the class/subclass
+/// typefilter (DBG_MACH_SCHED, plus DBG_PERF when `include_perf`), and enable
+/// capture. Calls the KERN_KDEBUG sysctls, which need root (EPERM otherwise).
+pub fn kdebug_start(buffer_events: i32, include_perf: bool) -> Result<(), StartError> {
     unsafe {
         let _ = sysctl_void(KERN_KDREMOVE); // idempotent teardown
         if sysctl_set_int(KERN_KDSETBUF, buffer_events) < 0 {
@@ -77,24 +102,7 @@ pub fn kdebug_start(buffer_events: i32) -> Result<(), StartError> {
         if sysctl_void(KERN_KDSETUP) < 0 {
             return Err(StartError::Setup);
         }
-        let mut reg = KdRegType {
-            reg_type: KDBG_SUBCLSTYPE,
-            value1: DBG_MACH,
-            value2: DBG_MACH_SCHED,
-            value3: 0,
-            value4: 0,
-        };
-        let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDSETREG];
-        let mut len = std::mem::size_of::<KdRegType>();
-        if libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as u32,
-            &mut reg as *mut KdRegType as *mut c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        ) < 0
-        {
+        if !install_typefilter(include_perf) {
             let _ = sysctl_void(KERN_KDREMOVE);
             return Err(StartError::SetReg);
         }
@@ -150,7 +158,7 @@ mod tests {
     fn start_without_root_fails_cleanly() {
         // cargo test runs unprivileged, so the KERN_KDEBUG sysctls return EPERM.
         // We just need the call path to not crash and to report failure.
-        assert!(kdebug_start(1000).is_err(), "kdebug start should fail without root");
+        assert!(kdebug_start(1000, true).is_err(), "kdebug start should fail without root");
         kdebug_teardown(); // must be a harmless no-op
     }
 

@@ -483,7 +483,9 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     // Per-DS sismo configs (field 2000 of each DataSourceConfig).
     let cpu_cfg = sismo_config::cpu_encode(target_pid as u32, 0);
     let heap_cfg = sismo_config::heap_encode(target_pid as u32, 0, 0);
-    let sched_cfg = sismo_config::sched_encode(0);
+    // target_pid enables kperf lazy.wait off-CPU capture on the shared kdebug
+    // session; threshold 0 lets the worker pick its default.
+    let sched_cfg = sismo_config::sched_encode(0, target_pid as u32, 0);
 
     // Build the entries + external-name list.
     let mut entries: Vec<DataSourceEntry> = Vec::new();
@@ -506,8 +508,12 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     if sched.is_some() || sched_mode == SourceMode::External {
         // ProtoVM DST for GenericKernelProcessTree.
         entries.push(DataSourceEntry::sismo_vendor(b"sismo.macos_sched", &sched_cfg, 4 * 1024));
+        // The sched worker also registers the off-CPU PerfSample DS; enable it so
+        // its packets are captured (it only emits when target_pid is set).
+        entries.push(DataSourceEntry::sismo_vendor(b"sismo.macos_offcpu", &[], 0));
         if sched_mode == SourceMode::External {
             external_names.push("sismo.macos_sched");
+            external_names.push("sismo.macos_offcpu");
         }
     }
     if entries.is_empty() {
@@ -658,7 +664,10 @@ fn shutdown_captures(
     }
     if let Some(c) = sched.take() {
         let s = c.shutdown();
-        eprintln!("sismo record: sched — {} events emitted across {} drains", s.events_emitted, s.drain_calls);
+        eprintln!(
+            "sismo record: sched — {} events emitted across {} drains, {} off-CPU samples",
+            s.events_emitted, s.drain_calls, s.offcpu_samples
+        );
     }
 }
 

@@ -195,8 +195,8 @@ mod macos_run {
             Slot::Sched(c) => {
                 let s = c.shutdown();
                 eprintln!(
-                    "sismo datasource: sismo.macos_sched stopped — {} events / {} drains",
-                    s.events_emitted, s.drain_calls
+                    "sismo datasource: sismo.macos_sched stopped — {} events / {} drains / {} off-CPU",
+                    s.events_emitted, s.drain_calls, s.offcpu_samples
                 );
             }
             Slot::Cpu(c) => {

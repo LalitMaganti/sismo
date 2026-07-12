@@ -87,27 +87,37 @@ pub fn heap_decode(bytes: &[u8]) -> (u32, u64, u64) {
 }
 
 // ---- sismo.macos_sched -----------------------------------------------------
-// Field: kernel_buffer_events = 1 (int32, encoded as the i64 sign-extension so
-// negatives round-trip).
+// Fields: kernel_buffer_events = 1 (int32, encoded as the i64 sign-extension so
+// negatives round-trip), target_pid = 2 (uint32), offcpu_wait_threshold_us = 3
+// (uint32). A non-zero target_pid enables kperf lazy.wait off-CPU capture for
+// that pid on the shared kdebug session; threshold 0 lets the worker default it.
 
-pub fn sched_encode(kernel_buffer_events: i32) -> Vec<u8> {
+pub fn sched_encode(kernel_buffer_events: i32, target_pid: u32, offcpu_wait_threshold_us: u32) -> Vec<u8> {
     let mut w = ProtoWriter::new();
     if kernel_buffer_events != 0 {
         // int32 sign-extended to i64 then bit-cast to u64, so negatives round-trip.
         w.write_uint64(1, (kernel_buffer_events as i64) as u64);
     }
+    if target_pid != 0 {
+        w.write_uint32(2, target_pid);
+    }
+    if offcpu_wait_threshold_us != 0 {
+        w.write_uint32(3, offcpu_wait_threshold_us);
+    }
     w.bytes().to_vec()
 }
 
-/// Decodes `kernel_buffer_events` (0 if absent).
-pub fn sched_decode(bytes: &[u8]) -> i32 {
-    let mut kernel_buffer_events = 0i32;
-    each_varint_field(bytes, |field, val| {
-        if field == 1 {
-            kernel_buffer_events = (val as i64) as i32; // truncate back to i32
-        }
+/// Decodes `(kernel_buffer_events, target_pid, offcpu_wait_threshold_us)`
+/// (0 for absent fields).
+pub fn sched_decode(bytes: &[u8]) -> (i32, u32, u32) {
+    let (mut kbe, mut target_pid, mut threshold_us) = (0i32, 0u32, 0u32);
+    each_varint_field(bytes, |field, val| match field {
+        1 => kbe = (val as i64) as i32, // truncate back to i32
+        2 => target_pid = val as u32,
+        3 => threshold_us = val as u32,
+        _ => {}
     });
-    kernel_buffer_events
+    (kbe, target_pid, threshold_us)
 }
 
 #[cfg(test)]
@@ -128,8 +138,10 @@ mod tests {
     #[test]
     fn sched_roundtrips_including_negative() {
         for v in [256 * 1024i32, -5, 0] {
-            assert_eq!(sched_decode(&sched_encode(v)), v);
+            assert_eq!(sched_decode(&sched_encode(v, 0, 0)), (v, 0, 0));
         }
+        // target_pid + threshold round-trip alongside the buffer size.
+        assert_eq!(sched_decode(&sched_encode(-5, 4242, 500)), (-5, 4242, 500));
     }
 
     #[test]
