@@ -51,8 +51,12 @@ CHECKS = [
     ("PERF_LAZY", 9, "buffer", r"#define\s+PERF_LAZY\s+\((\d+)\)", LIT),
     # kperf event codes — the numeric arg to each *_CODE(n) macro.
     ("PERF_TI_DATA", 1, "buffer", r"#define\s+PERF_TI_DATA\s+PERF_TI_CODE\((\d+)\)", LIT),
+    ("PERF_CS_KDATA", 3, "buffer", r"#define\s+PERF_CS_KDATA\s+PERF_CS_CODE\((\d+)\)", LIT),
     ("PERF_CS_UDATA", 4, "buffer", r"#define\s+PERF_CS_UDATA\s+PERF_CS_CODE\((\d+)\)", LIT),
+    ("PERF_CS_KHDR", 5, "buffer", r"#define\s+PERF_CS_KHDR\s+PERF_CS_CODE\((\d+)\)", LIT),
     ("PERF_CS_UHDR", 6, "buffer", r"#define\s+PERF_CS_UHDR\s+PERF_CS_CODE\((\d+)\)", LIT),
+    # on-CPU timer trigger (the event that precedes each timer sample's stack).
+    ("PERF_TM_FIRE", 0, "buffer", r"#define\s+PERF_TM_FIRE\s+PERF_TM_CODE\((\d+)\)", LIT),
     ("PERF_LZ_WAITSAMPLE", 1, "buffer", r"#define\s+PERF_LZ_WAITSAMPLE\s+PERF_LZ_CODE\((\d+)\)", LIT),
     # kperf samplers (osfmk/kperf/action.h).
     ("SAMPLER_TH_INFO", 1 << 0, "action", r"#define\s+SAMPLER_TH_INFO\s+\(1U?\s*<<\s*(\d+)\)", SHIFT),
