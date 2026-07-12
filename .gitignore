@@ -26,3 +26,6 @@ __pycache__/
 
 # clangd / IDE compile database.
 compile_commands.json
+
+# Local working docs / design notes — not committed.
+working-docs/
