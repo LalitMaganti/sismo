@@ -12,11 +12,11 @@
 //! macOS-only; gated in sched/mod.rs.
 
 use crate::ffi::sismo_ds_emit;
-use crate::mach::{mach_timebase_info, MachPort, TimebaseInfo};
+use crate::mach::MachPort;
 use crate::proto::ProtoWriter;
+use crate::sched::kperf::{ticks_to_ns, timebase};
 use crate::symbolize::dyld_images::{read_macho_meta, ImageList};
 use std::collections::HashMap;
-use std::ffi::c_void;
 
 // ---- kperf event codes (osfmk/kperf/buffer.h) ------------------------------
 
@@ -29,11 +29,6 @@ const PERF_CS_UHDR: u32 = 6;
 const PERF_LAZY: u32 = 9;
 const PERF_LZ_WAITSAMPLE: u32 = 1; // BUF_DATA(wait_time, runnable_time, running_time), mach ticks
 
-// kperf samplers (osfmk/kperf/action.h).
-const SAMPLER_TH_INFO: u32 = 1 << 0;
-const SAMPLER_USTACK: u32 = 1 << 3;
-const ACTION_ID: u64 = 1; // 1-based; 0 = "no action"
-const UCALLSTACK_DEPTH: u64 = 128;
 const MAX_FRAMES: usize = 256; // guard against a garbage UHDR nframes
 
 // Perfetto sequence/scope/clock constants (mirror linux_bpf_capture.rs).
@@ -42,105 +37,6 @@ const SEQ_NEEDS_INCREMENTAL_STATE: u32 = 2;
 const BUILTIN_CLOCK_MONOTONIC: u32 = 3;
 const SAMPLE_SCOPE_THREAD: u32 = 2;
 const TP_FIELD_PERF_SAMPLE: u32 = 66;
-
-// ---- kperf sysctl helpers --------------------------------------------------
-
-fn errno() -> i32 {
-    unsafe { *libc::__error() }
-}
-
-fn kperf_set_u32(name: &[u8], value: u32) -> Result<(), i32> {
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr() as *const libc::c_char,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &value as *const u32 as *mut c_void,
-            std::mem::size_of::<u32>(),
-        )
-    };
-    if rc == 0 { Ok(()) } else { Err(errno()) }
-}
-
-fn kperf_set_u64(name: &[u8], value: u64) -> Result<(), i32> {
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr() as *const libc::c_char,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &value as *const u64 as *mut c_void,
-            std::mem::size_of::<u64>(),
-        )
-    };
-    if rc == 0 { Ok(()) } else { Err(errno()) }
-}
-
-/// Indexed kperf knob: the kernel reads `[id, value]` as two u64s.
-fn kperf_set_indexed(name: &[u8], id: u64, value: u64) -> Result<(), i32> {
-    let inputs: [u64; 2] = [id, value];
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr() as *const libc::c_char,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            inputs.as_ptr() as *mut c_void,
-            std::mem::size_of::<[u64; 2]>(),
-        )
-    };
-    if rc == 0 { Ok(()) } else { Err(errno()) }
-}
-
-fn timebase() -> (u64, u64) {
-    let mut tb = TimebaseInfo { numer: 1, denom: 1 };
-    unsafe { mach_timebase_info(&mut tb) };
-    (tb.numer as u64, tb.denom as u64)
-}
-
-fn ns_to_ticks(ns: u64) -> u64 {
-    let (n, d) = timebase();
-    (ns as u128 * d as u128 / n as u128) as u64
-}
-
-fn ticks_to_ns(ticks: u64) -> u64 {
-    let (n, d) = timebase();
-    (ticks as u128 * n as u128 / d as u128) as u64
-}
-
-// ---- control plane ---------------------------------------------------------
-
-/// Arm the lazy.wait off-CPU sampler for `pid`, sampling waits longer than
-/// `threshold_ns`. No timer/PET — the scheduler triggers it on wakeup. Assumes
-/// the kdebug ring is already up (the sched worker owns it) and keeps DBG_PERF.
-pub fn arm_lazy_wait(pid: i32, threshold_ns: u64) -> Result<(), String> {
-    let step = |r: Result<(), i32>, what: &str| r.map_err(|e| format!("{what} failed (errno {e})"));
-    step(kperf_set_u32(b"kperf.reset\0", 1), "kperf.reset")?;
-    step(kperf_set_u32(b"kperf.action.count\0", 1), "kperf.action.count")?;
-    step(
-        kperf_set_indexed(b"kperf.action.samplers\0", ACTION_ID, (SAMPLER_USTACK | SAMPLER_TH_INFO) as u64),
-        "kperf.action.samplers",
-    )?;
-    step(
-        kperf_set_indexed(b"kperf.action.ucallstack_depth\0", ACTION_ID, UCALLSTACK_DEPTH),
-        "kperf.action.ucallstack_depth",
-    )?;
-    step(
-        kperf_set_indexed(b"kperf.action.filter_by_pid\0", ACTION_ID, pid as u64),
-        "kperf.action.filter_by_pid",
-    )?;
-    step(
-        kperf_set_u64(b"kperf.lazy.wait_time_threshold\0", ns_to_ticks(threshold_ns)),
-        "kperf.lazy.wait_time_threshold",
-    )?;
-    step(kperf_set_u32(b"kperf.lazy.wait_action\0", ACTION_ID as u32), "kperf.lazy.wait_action")?;
-    step(kperf_set_u32(b"kperf.sampling\0", 1), "kperf.sampling")?;
-    Ok(())
-}
-
-/// Stop kperf sampling and clear its state (idempotent; ignores errors).
-pub fn disarm() {
-    let _ = kperf_set_u32(b"kperf.sampling\0", 0);
-    let _ = kperf_set_u32(b"kperf.reset\0", 1);
-}
 
 // ---- decode ----------------------------------------------------------------
 

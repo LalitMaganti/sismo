@@ -21,7 +21,8 @@ use crate::proto::sched_protos::{
 use crate::proto::session_config::encode_data_source_descriptor;
 use crate::proto::sismo_config::{config_extract, sched_decode};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
-use crate::sched::kperf_offcpu::{arm_lazy_wait, disarm, KdEvent, LazyDecoder, OffCpuEmitter};
+use crate::sched::kperf::{arm_lazy_wait, disarm};
+use crate::sched::kperf_offcpu::{KdEvent, LazyDecoder, OffCpuEmitter};
 use crate::mach::{mach_task_self_, MachPort, KERN_SUCCESS};
 use crate::worker_sdk::{now_ns, wait_for_setup, Event};
 use std::collections::HashMap;

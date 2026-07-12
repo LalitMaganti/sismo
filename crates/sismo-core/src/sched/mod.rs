@@ -10,6 +10,9 @@ pub mod kdebug;
 // macOS sched (kdebug) capture worker.
 #[cfg(target_os = "macos")]
 pub mod macos_sched_capture;
+// macOS kperf control plane (the shared action/timer table).
+#[cfg(target_os = "macos")]
+pub mod kperf;
 // macOS kperf lazy.wait off-CPU capture (decoded off the shared kdebug ring).
 #[cfg(target_os = "macos")]
 pub mod kperf_offcpu;
