@@ -129,6 +129,11 @@ struct {
 // copied into offcpu.
 struct sismo_offcpu_state {
   __u64 start_ns;
+  // The futex user-address this thread is blocked on, if it went off-CPU inside
+  // a futex() syscall (0 otherwise). Lock identity: every contended pthread /
+  // Go / JVM lock funnels through futex(), so the uaddr clusters waits by lock
+  // instance regardless of language. Captured from futex_wait[tid] at block.
+  __u64 futex_uaddr;
   __u32 nr_frames;
   __u32 nr_kernel;
   __u64 ustack[SISMO_MAX_STACK];
@@ -148,6 +153,28 @@ struct {
   __type(key, __u32);
   __type(value, struct sismo_offcpu_state);
 } offcpu_scratch SEC(".maps");
+
+// tid -> the futex uaddr the thread is currently inside a futex() syscall on.
+// Set on syscall entry, cleared on exit, so a lookup is non-zero only while the
+// thread is actually parked in a futex — which is exactly when a voluntary
+// off-CPU block through futex is a lock/condvar wait. A non-futex block (read,
+// nanosleep) finds nothing here and carries uaddr 0.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 10240);
+  __type(key, __u32);
+  __type(value, __u64);
+} futex_wait SEC(".maps");
+
+// Fixed-offset view of the syscalls/sys_enter_futex tracepoint record (the
+// format is UAPI-stable, so no CO-RE): 8 bytes of common fields, then the
+// syscall nr, then the futex() args. We only need uaddr (arg0, offset 16).
+struct sys_enter_futex_ctx {
+  __u64 _common;
+  __s32 __syscall_nr;
+  __u32 _pad0;
+  __u64 uaddr;
+};
 
 // Resolve a kernel address to a symbol id, assigning + emitting a SISMO_EVT_KSYM
 // definition on first sight. The address is used only as a lookup key and to
@@ -262,6 +289,9 @@ static __always_inline void offcpu_record_block(void *ctx, __u32 tid) {
     return;
   st->start_ns = bpf_ktime_get_ns();
 
+  __u64 *fu = bpf_map_lookup_elem(&futex_wait, &tid);
+  st->futex_uaddr = fu ? *fu : 0;
+
   long un = bpf_get_stack(ctx, st->ustack, sizeof(st->ustack), BPF_F_USER_STACK);
   __u32 nu = (un > 0) ? (__u32)(un / 8) : 0;
   if (nu > SISMO_MAX_STACK)
@@ -309,6 +339,9 @@ static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
 #pragma unroll
       for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
         e->counters[s] = 0;
+      // counters[] are meaningless for an off-CPU sample; slot 0 carries the
+      // futex uaddr (lock identity), 0 for a non-lock block.
+      e->counters[0] = st->futex_uaddr;
       for (int i = 0; i < SISMO_MAX_STACK; i++)
         e->stack[i] = (i < st->nr_frames) ? st->ustack[i] : 0;
       for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
@@ -344,6 +377,31 @@ int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev,
   if (tgt == 0 || next_tgid == tgt) {
     offcpu_emit_wake((__u32)BPF_CORE_READ(next, pid), next_tgid);
   }
+  return 0;
+}
+
+// Track which futex uaddr each target thread is parked on. Set on entry, cleared
+// on exit; offcpu_record_block reads it so a block inside futex() is tagged with
+// the lock instance. Storing all futex ops (not just WAIT) is fine: only a
+// WAIT-family op actually blocks off-CPU, and clearing on exit bounds staleness
+// so a later non-futex block never sees a stale uaddr.
+SEC("tracepoint/syscalls/sys_enter_futex")
+int on_futex_enter(struct sys_enter_futex_ctx *ctx) {
+  __u32 tgt = target_tgid();
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  if (tgt != 0 && tgid != tgt)
+    return 0;
+  __u32 tid = (__u32)pid_tgid;
+  __u64 uaddr = ctx->uaddr;
+  bpf_map_update_elem(&futex_wait, &tid, &uaddr, BPF_ANY);
+  return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_futex")
+int on_futex_exit(void *ctx) {
+  __u32 tid = (__u32)bpf_get_current_pid_tgid();
+  bpf_map_delete_elem(&futex_wait, &tid);
   return 0;
 }
 

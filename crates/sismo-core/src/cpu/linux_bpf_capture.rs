@@ -968,7 +968,7 @@ impl Capture {
             cs_iid,
             rec.data_addr, // timebase_count = off-CPU duration (ns) = the weight
             &[],
-            0,
+            rec.counters[0], // data_address = futex uaddr (lock identity), 0 if not a lock
             None,
         );
         unsafe { sismo_ds_emit_offcpu(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
@@ -1260,6 +1260,19 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         let link = unsafe { bpf_program__attach(ss) };
         if !link.is_null() {
             c.links.push(link);
+        }
+    }
+
+    // Futex enter/exit: tag off-CPU blocks with the lock (futex uaddr). Best
+    // effort — a kernel that refuses the syscall tracepoints just loses lock
+    // identity, not the off-CPU stacks.
+    for name in [c"on_futex_enter".as_ptr(), c"on_futex_exit".as_ptr()] {
+        let prog = unsafe { bpf_object__find_program_by_name(obj, name) };
+        if !prog.is_null() {
+            let link = unsafe { bpf_program__attach(prog) };
+            if !link.is_null() {
+                c.links.push(link);
+            }
         }
     }
 
