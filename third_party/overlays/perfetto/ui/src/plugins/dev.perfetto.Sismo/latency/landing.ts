@@ -31,14 +31,17 @@ import {
   loadCpuTriage,
   loadHeaviestFunctions,
   loadRunnableSummary,
+  loadWaitBreakdown,
   type CpuTriage,
   type HeaviestFunctionRow,
   type RunnableSummary,
+  type WaitBreakdown,
 } from '../cpu_data';
 import {
   renderLatencyTriageBlock,
   renderWaitKindBlock,
 } from './thread_time';
+import {renderWaitTypeBlock} from './wait_types';
 import {renderBlameBlock} from './blame';
 import {loadChurn, renderChurnBlock, type ChurnSummary} from './churn';
 
@@ -55,6 +58,7 @@ export class LatencyLandingPage
   private readonly queue = new SerialTaskQueue();
   private readonly triageSlot = new QuerySlot<CpuTriage>(this.queue);
   private readonly fnSlot = new QuerySlot<HeaviestFunctionRow[]>(this.queue);
+  private readonly waitSlot = new QuerySlot<WaitBreakdown>(this.queue);
   private readonly detailSlot = new QuerySlot<RunnableSummary>(this.queue);
   private readonly churnSlot = new QuerySlot<ChurnSummary>(this.queue);
 
@@ -80,6 +84,13 @@ export class LatencyLandingPage
       ),
       this.threadTimeBlocks(trace, priv, key, scope, onNavigate),
       this.block(
+        this.waitSlot,
+        key,
+        () => loadWaitBreakdown(trace.engine, priv),
+        'What kind of wait was it?',
+        (d) => renderWaitTypeBlock(d, onNavigate),
+      ),
+      this.block(
         this.detailSlot,
         key,
         () => loadRunnableSummary(trace.engine, priv),
@@ -99,6 +110,7 @@ export class LatencyLandingPage
   onremove(): void {
     this.triageSlot.dispose();
     this.fnSlot.dispose();
+    this.waitSlot.dispose();
     this.detailSlot.dispose();
     this.churnSlot.dispose();
   }

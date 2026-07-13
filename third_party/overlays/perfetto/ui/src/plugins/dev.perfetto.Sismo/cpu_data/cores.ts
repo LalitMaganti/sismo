@@ -28,6 +28,7 @@ import {
   LATENCY_MODULE_BASE,
   LATENCY_MODULE_CONTENTION,
   LATENCY_MODULE_LOCKS,
+  LATENCY_MODULE_WAIT_TYPES,
 } from './latency_sql';
 import {
   clipDurExpr,
@@ -1253,4 +1254,52 @@ export async function loadLockDetail(
     sites,
     waiters,
   };
+}
+
+// ---- Wait-type breakdown (the quality axis) -------------------------------
+
+export interface WaitTypeRow {
+  // 'lock' | 'signaling' | 'disk' | 'network' | 'pipe' | 'sleep' | 'poll' |
+  // 'memory' | 'other'
+  readonly type: string;
+  readonly waitNs: bigint;
+  readonly waits: number;
+}
+
+export interface WaitBreakdown {
+  readonly hasPriv: boolean;
+  readonly totalNs: bigint;
+  readonly types: ReadonlyArray<WaitTypeRow>;
+}
+
+// Split the profiled threads' blocked (voluntary) off-CPU time by WHAT they
+// waited on. Involuntary preemption is excluded (it's the runnable-delay story,
+// not a wait-for). Reads the shared _sismo_wait table.
+export async function loadWaitBreakdown(
+  engine: Engine,
+  priv: PrivilegedSet,
+): Promise<WaitBreakdown> {
+  if (priv.upids.length === 0) {
+    return {hasPriv: false, totalNs: 0n, types: []};
+  }
+  await engine.query(`INCLUDE PERFETTO MODULE ${LATENCY_MODULE_WAIT_TYPES};`);
+  const res = await engine.query(`
+    SELECT wait_type, CAST(sum(w) AS INT) AS ns, count(*) AS waits
+    FROM _sismo_wait
+    WHERE wait_type != 'scheduling'
+    GROUP BY wait_type
+    ORDER BY sum(w) DESC
+  `);
+  const types: WaitTypeRow[] = [];
+  let totalNs = 0n;
+  for (
+    const it = res.iter({wait_type: STR, ns: LONG_NULL, waits: NUM});
+    it.valid();
+    it.next()
+  ) {
+    const waitNs = it.ns ?? 0n;
+    totalNs += waitNs;
+    types.push({type: it.wait_type, waitNs, waits: it.waits});
+  }
+  return {hasPriv: true, totalNs, types};
 }

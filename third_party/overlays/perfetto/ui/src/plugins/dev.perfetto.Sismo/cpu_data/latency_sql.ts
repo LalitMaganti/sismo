@@ -215,10 +215,58 @@ WHERE d.site != '?'
   AND d.site NOT GLOB '*cond*wait*';
 `;
 
+// `_sismo_wait` — every off-CPU sample of the profiled threads tagged with WHAT
+// it was waiting for (the wait-type axis: lock / signaling / disk / network /
+// pipe / sleep / poll / memory / other), weighted by the off-cpu-ns delta. The
+// type comes from the trimmed kernel wait primitive (the caller of schedule,
+// from sismo.offcpu), except futex waits, which the uaddr splits into real
+// mutex contention (in _sismo_locks) vs condvar/signaling. Involuntary
+// preemption (runnable, not a wait-for) is bucketed 'scheduling' so the blocked
+// breakdown can exclude it. Powers the Summary's kind-of-wait breakdown and the
+// flamegraph type lens. GLOBs are best-effort kernel-name matches.
+const WAIT_TYPES = `
+INCLUDE PERFETTO MODULE sismo.latency;
+INCLUDE PERFETTO MODULE sismo.offcpu;
+INCLUDE PERFETTO MODULE sismo.locks;
+
+CREATE PERFETTO TABLE _sismo_offcpu_waits AS
+SELECT p.utid AS utid, p.callsite_id AS leaf_cs, p.data_address AS lock,
+  max(0, coalesce(
+    c.value - lag(c.value) OVER (PARTITION BY p.utid ORDER BY p.ts), 0)) AS w
+FROM perf_sample p
+JOIN _sismo_priv pv ON pv.utid = p.utid
+JOIN thread_counter_track tct ON tct.utid = p.utid AND tct.name = 'off-cpu-ns'
+JOIN counter c ON c.track_id = tct.id AND c.ts = p.ts;
+
+CREATE PERFETTO TABLE _sismo_wait AS
+SELECT ow.utid AS utid, ow.w AS w,
+  CASE
+    WHEN tr.kind = 'involuntary' THEN 'scheduling'
+    WHEN ow.lock != 0 AND ow.lock IN (SELECT lock_addr FROM _sismo_locks)
+      THEN 'lock'
+    WHEN ow.lock != 0 THEN 'signaling'
+    WHEN pf.name GLOB '*nanosleep*' OR pf.name GLOB '*schedule_timeout*'
+      OR pf.name GLOB 'hrtimer*' THEN 'sleep'
+    WHEN pf.name GLOB 'pipe_*' OR pf.name GLOB '*anon_pipe*' THEN 'pipe'
+    WHEN pf.name GLOB 'sk_wait*' OR pf.name GLOB 'tcp_*'
+      OR pf.name GLOB 'unix_stream*' OR pf.name GLOB 'inet_*' THEN 'network'
+    WHEN pf.name GLOB 'io_schedule*' OR pf.name GLOB '*wait_on_page*'
+      OR pf.name GLOB 'folio_wait*' OR pf.name GLOB '*blk_*' THEN 'disk'
+    WHEN pf.name GLOB '*epoll*' OR pf.name GLOB 'do_select'
+      OR pf.name GLOB 'do_poll' THEN 'poll'
+    WHEN pf.name GLOB '*swap_page*' OR pf.name GLOB '*_reclaim*' THEN 'memory'
+    ELSE 'other'
+  END AS wait_type
+FROM _sismo_offcpu_waits ow
+LEFT JOIN _sismo_offcpu_trim tr ON tr.leaf_cs = ow.leaf_cs
+LEFT JOIN _sismo_lock_cs pf ON pf.cs = tr.trimmed_cs;
+`;
+
 export const LATENCY_MODULE_BASE = 'sismo.latency';
 export const LATENCY_MODULE_CONTENTION = 'sismo.latency_contention';
 export const LATENCY_MODULE_OFFCPU = 'sismo.offcpu';
 export const LATENCY_MODULE_LOCKS = 'sismo.locks';
+export const LATENCY_MODULE_WAIT_TYPES = 'sismo.wait_types';
 
 // The package to register on the engine in the plugin's onTraceLoad.
 export const LATENCY_SQL_PACKAGE = {
@@ -228,5 +276,6 @@ export const LATENCY_SQL_PACKAGE = {
     {name: LATENCY_MODULE_CONTENTION, sql: LATENCY_CONTENTION},
     {name: LATENCY_MODULE_OFFCPU, sql: OFFCPU_TRIM},
     {name: LATENCY_MODULE_LOCKS, sql: LOCKS},
+    {name: LATENCY_MODULE_WAIT_TYPES, sql: WAIT_TYPES},
   ],
 };
