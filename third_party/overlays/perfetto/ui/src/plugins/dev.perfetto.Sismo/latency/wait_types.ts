@@ -84,7 +84,7 @@ export function renderWaitTypeBlock(
   }));
 
   const deeper: DeeperAction[] = [
-    {label: 'Where the wait went', onclick: () => onNavigate('where')},
+    {label: 'Which code was waiting', onclick: () => onNavigate('where')},
     ...(d.types[0]?.type === 'lock'
       ? [{label: 'Locks', icon: 'lock', onclick: () => onNavigate('locks')}]
       : []),

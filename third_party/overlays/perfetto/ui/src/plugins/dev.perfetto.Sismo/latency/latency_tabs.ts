@@ -49,7 +49,7 @@ const RESOURCES_TAB = 'resources';
 
 const FIXED_TABS: ReadonlyArray<FixedTab> = [
   {key: OVERVIEW_TAB, title: 'Summary', icon: 'dashboard'},
-  {key: 'where', title: 'Where the wait went', icon: 'donut_large'},
+  {key: 'where', title: 'Which code was waiting', icon: 'donut_large'},
   {key: RESOURCES_TAB, title: 'What you waited on', icon: 'category'},
   {key: 'scheduling', title: 'Why you waited for a core', icon: 'developer_board'},
 ];

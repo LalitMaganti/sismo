@@ -63,7 +63,7 @@ export function renderLatencyTriageBlock(
   // a meaningful share was on-core (mirrors CPU triage's link over to Latency).
   const deeper: DeeperAction[] = [
     {
-      label: 'Where the wait went',
+      label: 'Which code was waiting',
       onclick: () => onNavigate('where'),
     },
     ...(1 - off >= 0.2
@@ -116,7 +116,7 @@ export function renderWaitKindBlock(
         'yet the exact call.',
       answer,
       deeper: {
-        label: 'Where the wait went',
+        label: 'Which code was waiting',
         onclick: () => onNavigate('where'),
       },
     },
