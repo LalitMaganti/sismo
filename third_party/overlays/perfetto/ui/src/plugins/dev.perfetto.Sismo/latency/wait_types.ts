@@ -30,8 +30,8 @@ import {EmptyState} from '../../../widgets/empty_state';
 const TYPE_META: Record<string, {label: string; tab: string}> = {
   lock: {label: 'Locks', tab: 'locks'},
   signaling: {label: 'Signaling / queues', tab: 'where'},
-  network: {label: 'Network I/O', tab: 'where'},
-  disk: {label: 'Disk I/O', tab: 'where'},
+  network: {label: 'Network I/O', tab: 'network'},
+  disk: {label: 'Disk I/O', tab: 'disk'},
   pipe: {label: 'Pipes / IPC', tab: 'where'},
   sleep: {label: 'Sleep / timers', tab: 'where'},
   poll: {label: 'Poll / epoll', tab: 'where'},

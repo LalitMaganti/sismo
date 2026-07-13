@@ -26,9 +26,11 @@ import type {PrivilegedSet} from '../privileged_set';
 import {LatencyLandingPage} from './landing';
 import {LatencyWhoTab} from './who_tab';
 import {LatencyWhereTab} from './where_tab';
-import {LatencyLocksTab} from './locks_tab';
-import {LatencyNetworkTab} from './network_tab';
-import {LatencyDiskTab} from './disk_tab';
+import {
+  LatencyResourcesTab,
+  RESOURCE_FACETS,
+  type ResourceFacet,
+} from './resources_tab';
 
 interface LatencyTabsAttrs {
   readonly trace: Trace;
@@ -43,20 +45,34 @@ interface FixedTab {
   readonly icon: string;
 }
 
+const RESOURCES_TAB = 'resources';
+
 const FIXED_TABS: ReadonlyArray<FixedTab> = [
   {key: OVERVIEW_TAB, title: 'Summary', icon: 'dashboard'},
   {key: 'where', title: 'Where the wait went', icon: 'donut_large'},
-  {key: 'locks', title: 'Locks', icon: 'lock'},
-  {key: 'network', title: 'Network', icon: 'lan'},
-  {key: 'disk', title: 'Disk', icon: 'hard_drive'},
+  {key: RESOURCES_TAB, title: 'What you waited on', icon: 'category'},
   {key: 'who', title: 'Who it waited on', icon: 'groups'},
 ];
 
 export class LatencyTabsView implements m.ClassComponent<LatencyTabsAttrs> {
   private active: string = OVERVIEW_TAB;
+  // Which resource facet the "What you waited on" tab shows (Locks / Network /
+  // Disk are sub-tabs, not top-level).
+  private facet: ResourceFacet = 'locks';
   // Tabs opened at least once; the Tabs widget keeps opened content mounted, so
   // an unopened tab never queries but a visited one keeps its state.
   private readonly visited = new Set<string>([OVERVIEW_TAB]);
+
+  // Deep-links from the Summary / other tabs address a facet (locks/network/
+  // disk) directly; route those to the resources tab + the right sub-tab.
+  private navigate(key: string): void {
+    if ((RESOURCE_FACETS as readonly string[]).includes(key)) {
+      this.active = RESOURCES_TAB;
+      this.facet = key as ResourceFacet;
+    } else {
+      this.active = key;
+    }
+  }
 
   view({attrs}: m.CVnode<LatencyTabsAttrs>): m.Children {
     this.visited.add(this.active);
@@ -81,34 +97,26 @@ export class LatencyTabsView implements m.ClassComponent<LatencyTabsAttrs> {
       return m(LatencyLandingPage, {
         trace: attrs.trace,
         priv: attrs.priv,
-        onNavigate: (k) => {
-          this.active = k;
-        },
+        onNavigate: (k) => this.navigate(k),
       });
     }
     if (tab.key === 'where') {
       return m(LatencyWhereTab, {
         trace: attrs.trace,
         priv: attrs.priv,
-        onNavigate: (k) => {
-          this.active = k;
-        },
+        onNavigate: (k) => this.navigate(k),
       });
     }
-    if (tab.key === 'locks') {
-      return m(LatencyLocksTab, {
+    if (tab.key === RESOURCES_TAB) {
+      return m(LatencyResourcesTab, {
         trace: attrs.trace,
         priv: attrs.priv,
-        onNavigate: (k) => {
-          this.active = k;
+        facet: this.facet,
+        onFacetChange: (f) => {
+          this.facet = f;
         },
+        onNavigate: (k) => this.navigate(k),
       });
-    }
-    if (tab.key === 'network') {
-      return m(LatencyNetworkTab, {trace: attrs.trace, priv: attrs.priv});
-    }
-    if (tab.key === 'disk') {
-      return m(LatencyDiskTab, {trace: attrs.trace, priv: attrs.priv});
     }
     if (tab.key === 'who') {
       return m(LatencyWhoTab, {trace: attrs.trace, priv: attrs.priv});
