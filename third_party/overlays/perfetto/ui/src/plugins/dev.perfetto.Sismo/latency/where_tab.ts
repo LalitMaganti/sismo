@@ -166,9 +166,10 @@ export class LatencyWhereTab implements m.ClassComponent<WhereAttrs> {
             {icon: 'lightbulb', intent: Intent.Primary},
             m(
               'span',
-              'For who released the lock / woke you and who held the cores, see ',
-              actionLink('Who it waited on', 'open_in_new', () =>
-                attrs.onNavigate('who'),
+              'If your threads were ready to run but stuck waiting for a CPU ' +
+                'instead of blocked here, see ',
+              actionLink('Why you waited for a core', 'open_in_new', () =>
+                attrs.onNavigate('scheduling'),
               ),
               '.',
             ),

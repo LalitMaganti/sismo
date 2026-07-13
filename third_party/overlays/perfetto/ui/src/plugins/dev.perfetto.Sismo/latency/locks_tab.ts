@@ -36,7 +36,7 @@ import {
   type LockRow,
 } from '../cpu_data';
 import {fmtDuration, fmtCount} from '../format';
-import {loadingBody, renderBar, actionLink} from '../page_common';
+import {loadingBody, renderBar} from '../page_common';
 import type {PrivilegedSet} from '../privileged_set';
 
 interface LocksTabAttrs {
@@ -107,19 +107,6 @@ export class LatencyLocksTab implements m.ClassComponent<LocksTabAttrs> {
       {title, subtitle},
       this.renderLead(attrs.trace, d),
       this.renderTable(attrs.trace, d),
-      m(
-        Callout,
-        {icon: 'lightbulb', intent: Intent.Primary},
-        m(
-          'span',
-          'For who released each lock (the thread that woke your blocked ' +
-            'thread), see ',
-          actionLink('Who it waited on', 'open_in_new', () =>
-            attrs.onNavigate('who'),
-          ),
-          '.',
-        ),
-      ),
     );
   }
 
@@ -237,19 +224,6 @@ export class LatencyLocksTab implements m.ClassComponent<LocksTabAttrs> {
           ),
         m('.pf-sismo-page__tab-pane-label', 'Threads that blocked on it'),
         renderWaiters(attrs.trace, detail),
-        m(
-          Callout,
-          {icon: 'lightbulb', intent: Intent.Primary},
-          m(
-            'span',
-            'The thread that released this lock is the one that woke each ' +
-              'blocked waiter — see ',
-            actionLink('Who it waited on', 'open_in_new', () =>
-              attrs.onNavigate('who'),
-            ),
-            '.',
-          ),
-        ),
       ),
     ];
   }

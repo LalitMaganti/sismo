@@ -24,7 +24,7 @@ import {EmptyState} from '../../../widgets/empty_state';
 import {Tabs, type TabsTab} from '../../../widgets/tabs';
 import type {PrivilegedSet} from '../privileged_set';
 import {LatencyLandingPage} from './landing';
-import {LatencyWhoTab} from './who_tab';
+import {LatencySchedulingTab} from './who_tab';
 import {LatencyWhereTab} from './where_tab';
 import {
   LatencyResourcesTab,
@@ -51,7 +51,7 @@ const FIXED_TABS: ReadonlyArray<FixedTab> = [
   {key: OVERVIEW_TAB, title: 'Summary', icon: 'dashboard'},
   {key: 'where', title: 'Where the wait went', icon: 'donut_large'},
   {key: RESOURCES_TAB, title: 'What you waited on', icon: 'category'},
-  {key: 'who', title: 'Who it waited on', icon: 'groups'},
+  {key: 'scheduling', title: 'Why you waited for a core', icon: 'developer_board'},
 ];
 
 export class LatencyTabsView implements m.ClassComponent<LatencyTabsAttrs> {
@@ -118,8 +118,8 @@ export class LatencyTabsView implements m.ClassComponent<LatencyTabsAttrs> {
         onNavigate: (k) => this.navigate(k),
       });
     }
-    if (tab.key === 'who') {
-      return m(LatencyWhoTab, {trace: attrs.trace, priv: attrs.priv});
+    if (tab.key === 'scheduling') {
+      return m(LatencySchedulingTab, {trace: attrs.trace, priv: attrs.priv});
     }
     return m(EmptyState, {
       icon: 'construction',

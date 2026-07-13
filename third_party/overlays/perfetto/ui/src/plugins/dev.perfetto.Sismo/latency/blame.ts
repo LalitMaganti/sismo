@@ -82,7 +82,10 @@ export function renderBlameBlock(
       question: QUESTION,
       description: DESCRIPTION,
       answer,
-      deeper: {label: 'Who it waited on', onclick: () => onNavigate('who')},
+      deeper: {
+        label: 'Why you waited for a core',
+        onclick: () => onNavigate('scheduling'),
+      },
     },
     [
       m(Meter, {

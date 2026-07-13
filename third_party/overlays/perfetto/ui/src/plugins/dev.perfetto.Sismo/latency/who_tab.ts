@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// "Who it waited on" — the Latency deep-dive that answers L3 in full: which
-// context process/thread held the CPU while your threads were runnable, plus
-// idle-state residency (a wakeup-latency source). The wakeup-causality graph
-// ("who WOKE you") lands here later, once wakeup edges are captured.
+// The scheduling side of latency: "Why you waited for a core" — the runnable-
+// but-not-scheduled delay (who held the CPU while your threads were ready) plus
+// idle-state residency. A distinct problem from waiting on a resource, so it's
+// its own tab. The lock releaser / waker ("who woke you") is NOT here — it's an
+// attribute of the resource wait and belongs in the lock facet's drill.
 
 import m from 'mithril';
 import type {Trace} from '../../../public/trace';
@@ -31,7 +32,6 @@ import {
   type CpuIdleStateRow,
   type LatencyDetail,
   type OccupantShare,
-  type WakerRow,
 } from '../cpu_data';
 import {fmtDuration, fmtPercent} from '../format';
 import {loadingBody, renderProcessLink, renderThreadLink} from '../page_common';
@@ -42,12 +42,51 @@ import {
 } from '../../dev.perfetto.SismoWidgets/meter';
 import type {PrivilegedSet} from '../privileged_set';
 
-interface WhoTabAttrs {
+interface LatencyDetailAttrs {
   readonly trace: Trace;
   readonly priv: PrivilegedSet;
 }
 
-export class LatencyWhoTab implements m.ClassComponent<WhoTabAttrs> {
+// Both tabs below read the one scheduling-detail load; this shares the fetch and
+// the no-priv / no-sched fallbacks.
+function withDetail(
+  slot: QuerySlot<LatencyDetail>,
+  attrs: LatencyDetailAttrs,
+  render: (trace: Trace, d: LatencyDetail) => m.Children,
+): m.Children {
+  const {trace, priv} = attrs;
+  let data: LatencyDetail | undefined;
+  try {
+    data = slot.use({
+      key: {upids: [...priv.upids]},
+      queryFn: () => loadLatencyDetail(trace.engine, priv),
+    }).data;
+  } catch (e) {
+    return m(
+      Callout,
+      {icon: 'error', intent: Intent.Danger},
+      e instanceof Error ? e.message : 'Failed to load scheduling detail',
+    );
+  }
+  if (data === undefined) return loadingBody('Reading the trace…');
+  if (!data.hasSched) {
+    return m(
+      Callout,
+      {icon: 'info', intent: Intent.Primary},
+      'This trace has no scheduling data, so there is nothing to attribute ' +
+        'the waiting to. Re-record with the sched data source.',
+    );
+  }
+  return m('.pf-sismo-tab__body', render(trace, data));
+}
+
+// "Why you waited for a core" — the runnable-but-not-scheduled delay
+// (self-contention vs other processes) plus idle-state residency. The scheduling
+// side of latency: you were ready to run but couldn't get a CPU — a different
+// problem from waiting on a resource.
+export class LatencySchedulingTab
+  implements m.ClassComponent<LatencyDetailAttrs>
+{
   private readonly queue = new SerialTaskQueue();
   private readonly detailSlot = new QuerySlot<LatencyDetail>(this.queue);
 
@@ -55,36 +94,13 @@ export class LatencyWhoTab implements m.ClassComponent<WhoTabAttrs> {
     this.detailSlot.dispose();
   }
 
-  view({attrs}: m.CVnode<WhoTabAttrs>): m.Children {
-    const {trace, priv} = attrs;
-    let data: LatencyDetail | undefined;
-    try {
-      data = this.detailSlot.use({
-        key: {upids: [...priv.upids]},
-        queryFn: () => loadLatencyDetail(trace.engine, priv),
-      }).data;
-    } catch (e) {
-      return m(
-        Callout,
-        {icon: 'error', intent: Intent.Danger},
-        e instanceof Error ? e.message : 'Failed to load blame detail',
-      );
-    }
-    if (data === undefined) return loadingBody('Reading the trace…');
-    if (!data.hasSched) {
-      return m(
-        Callout,
-        {icon: 'info', intent: Intent.Primary},
-        'This trace has no scheduling data, so there is nothing to attribute ' +
-          'the waiting to. Re-record with the sched data source.',
-      );
-    }
-    return m('.pf-sismo-tab__body', [
-      this.renderRunnableDelay(trace, data),
-      this.renderWakers(trace, data),
-      this.renderIdleStates(data.idleStates),
+  view({attrs}: m.CVnode<LatencyDetailAttrs>): m.Children {
+    return withDetail(this.detailSlot, attrs, (trace, d) => [
+      renderRunnableDelay(trace, d),
+      renderIdleStates(d.idleStates),
     ]);
   }
+}
 
   // "Why your threads waited for a core" — the runnable-but-not-scheduled delay,
   // attributed intra-process-first. The common cause of a multithreaded app
@@ -92,7 +108,7 @@ export class LatencyWhoTab implements m.ClassComponent<WhoTabAttrs> {
   // / oversubscription), not another process. So this leads with your threads,
   // then other processes, then notes whether a core was even free (a placement
   // problem, not contention).
-  private renderRunnableDelay(trace: Trace, d: LatencyDetail): m.Children {
+function renderRunnableDelay(trace: Trace, d: LatencyDetail): m.Children {
     const title = 'Why your threads waited for a core';
     const subtitle =
       'When a thread was ready to run but not scheduled — what held the cores ' +
@@ -179,57 +195,7 @@ export class LatencyWhoTab implements m.ClassComponent<WhoTabAttrs> {
     );
   }
 
-  // "Who woke you" — the causal side of a voluntary block. When one of your
-  // threads was blocked (on a lock, a condvar, a pipe, …), the wakeup that ended
-  // the block names the thread that did it. Timer/IRQ wakeups (a sleep or
-  // timeout expiring) have no meaningful waker, so they're summarised, not
-  // blamed on whatever happened to run.
-  private renderWakers(trace: Trace, d: LatencyDetail): m.Children {
-    const subtitle =
-      'When a thread blocked and later woke, this names who woke it and sums ' +
-      'the time it was blocked first. Locks, condvars and pipes show up as the ' +
-      'thread that released them.';
-    if (!d.hasPriv) {
-      return m(
-        Section,
-        {title: 'Who woke you', subtitle},
-        m(
-          Callout,
-          {icon: 'info', intent: Intent.Primary},
-          'No profiled processes detected — record with `sismo record` to tag ' +
-            'the processes you’re profiling.',
-        ),
-      );
-    }
-    const w = d.wakers;
-    const total = Number(w.threadNs) + Number(w.timerIrqNs);
-    if (total === 0) {
-      return m(
-        Section,
-        {title: 'Who woke you', subtitle},
-        m(EmptyState, {
-          icon: 'notifications_off',
-          title:
-            'No wakeup data — the trace has no sched_wakeup events to attribute ' +
-            'blocks to a waker.',
-        }),
-      );
-    }
-    const irqFrac = Number(w.timerIrqNs) / total;
-    const note =
-      `Of the blocked time with a recorded wakeup, ${fmtPercent(1 - irqFrac, 0)} ` +
-      `ended when another thread woke you; ${fmtPercent(irqFrac, 0)} ended on a ` +
-      'timer or device IRQ — a sleep or timeout expiring, with no thread to ' +
-      'blame.';
-    return m(
-      Section,
-      {title: 'Who woke you', subtitle},
-      m(Callout, {icon: 'insights', intent: Intent.Primary}, note),
-      renderWakerTable(trace, w.threadWakers),
-    );
-  }
-
-  private renderIdleStates(rows: ReadonlyArray<CpuIdleStateRow>): m.Children {
+function renderIdleStates(rows: ReadonlyArray<CpuIdleStateRow>): m.Children {
     const subtitle =
       'Time each CPU spent in each cpuidle (C-)state. Deeper states save more ' +
       'power but take longer to wake from — a source of wakeup latency.';
@@ -269,47 +235,6 @@ export class LatencyWhoTab implements m.ClassComponent<WhoTabAttrs> {
         }),
       ),
     );
-  }
-}
-
-function renderWakerTable(
-  trace: Trace,
-  rows: ReadonlyArray<WakerRow>,
-): m.Children {
-  if (rows.length === 0) {
-    return m(EmptyState, {
-      icon: 'notifications_off',
-      title:
-        'Nothing woke you from a block — every wait ended on its own (a timer ' +
-        'or timeout), not because another thread signalled you.',
-    });
-  }
-  const data = rows.map((r) => [
-    m(
-      GridCell,
-      {wrap: true},
-      renderThreadLink(trace, r.threadName, r.tid, r.utid),
-    ),
-    m(GridCell, {wrap: true}, r.processName ?? '—'),
-    m(GridCell, {align: 'right'}, fmtDuration(trace, r.wokeNs)),
-    m(GridCell, {align: 'right'}, `${r.wakeups}`),
-  ]);
-  return m(
-    Card,
-    {className: 'pf-sismo-page__table-card'},
-    m(Grid, {
-      columns: [
-        {key: 'thread', header: m(GridHeaderCell, 'Woke you')},
-        {key: 'process', header: m(GridHeaderCell, 'Process')},
-        {
-          key: 'blocked',
-          header: m(GridHeaderCell, 'Time you were blocked first'),
-        },
-        {key: 'wakeups', header: m(GridHeaderCell, 'Wakeups')},
-      ],
-      rowData: data,
-    }),
-  );
 }
 
 // A ranked list of occupants (your threads, or other processes) by their share
