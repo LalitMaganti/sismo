@@ -148,7 +148,8 @@ roots AS (
   FROM perf_sample p
   JOIN thread_counter_track tct ON tct.utid = p.utid AND tct.name = 'off-cpu-ns'
   JOIN counter c ON c.track_id = tct.id AND c.ts = p.ts
-  WHERE p.data_address != 0 AND p.callsite_id IS NOT NULL
+  -- Locks only: positive futex uaddrs. Network peers set bit 63 (negative).
+  WHERE p.data_address > 0 AND p.callsite_id IS NOT NULL
 ),
 chain(leaf, cur, depth) AS (
   SELECT cs, cs, 0 FROM roots
@@ -179,7 +180,8 @@ FROM perf_sample p
 JOIN _sismo_priv pv ON pv.utid = p.utid
 JOIN thread_counter_track tct ON tct.utid = p.utid AND tct.name = 'off-cpu-ns'
 JOIN counter c ON c.track_id = tct.id AND c.ts = p.ts
-WHERE p.data_address != 0;
+-- Locks only: positive futex uaddrs. Network peers set bit 63 (negative).
+WHERE p.data_address > 0;
 
 CREATE PERFETTO TABLE _sismo_locks AS
 WITH offw AS (
@@ -242,6 +244,10 @@ CREATE PERFETTO TABLE _sismo_wait AS
 SELECT ow.utid AS utid, ow.leaf_cs AS leaf_cs, ow.w AS w,
   CASE
     WHEN tr.kind = 'involuntary' THEN 'scheduling'
+    -- A block_id with bit 63 set is a TCP peer (stamped by the tcp_recvmsg
+    -- kprobe), stored as a negative int64 — a definitive network signal that
+    -- beats the schedule_timeout kernel primitive (which else reads as 'sleep').
+    WHEN ow.lock < 0 THEN 'network'
     WHEN ow.lock != 0 AND ow.lock IN (SELECT lock_addr FROM _sismo_locks)
       THEN 'lock'
     WHEN ow.lock != 0 THEN 'signaling'
@@ -260,6 +266,23 @@ SELECT ow.utid AS utid, ow.leaf_cs AS leaf_cs, ow.w AS w,
 FROM _sismo_offcpu_waits ow
 LEFT JOIN _sismo_offcpu_trim tr ON tr.leaf_cs = ow.leaf_cs
 LEFT JOIN _sismo_lock_cs pf ON pf.cs = tr.trimmed_cs;
+
+-- Per-peer network waits (bit-63-tagged block_id = a TCP peer). Cluster the
+-- profiled threads' blocking recvs by the remote they wait on: the network
+-- analog of _sismo_locks. addr is the low 32 bits (be32, so octet1 = &0xff),
+-- port is bits 32..47. Keyed by the raw peer id for the drill.
+CREATE PERFETTO TABLE _sismo_net AS
+SELECT ow.lock AS peer_id,
+  printf('%d.%d.%d.%d',
+    (ow.lock & 0xff), ((ow.lock >> 8) & 0xff),
+    ((ow.lock >> 16) & 0xff), ((ow.lock >> 24) & 0xff)) AS addr,
+  ((ow.lock >> 32) & 0xffff) AS port,
+  CAST(sum(ow.w) AS INT) AS wait_ns,
+  count(*) AS blocks,
+  count(DISTINCT ow.utid) AS threads
+FROM _sismo_offcpu_waits ow
+WHERE ow.lock < 0
+GROUP BY ow.lock;
 
 -- Dominant wait type per off-CPU leaf callsite (by weight), derived from the
 -- one _sismo_wait classifier — so the flamegraph type filter narrows by

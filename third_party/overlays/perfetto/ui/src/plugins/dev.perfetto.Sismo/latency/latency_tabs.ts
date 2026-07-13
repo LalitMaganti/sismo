@@ -27,6 +27,7 @@ import {LatencyLandingPage} from './landing';
 import {LatencyWhoTab} from './who_tab';
 import {LatencyWhereTab} from './where_tab';
 import {LatencyLocksTab} from './locks_tab';
+import {LatencyNetworkTab} from './network_tab';
 
 interface LatencyTabsAttrs {
   readonly trace: Trace;
@@ -45,6 +46,7 @@ const FIXED_TABS: ReadonlyArray<FixedTab> = [
   {key: OVERVIEW_TAB, title: 'Summary', icon: 'dashboard'},
   {key: 'where', title: 'Where the wait went', icon: 'donut_large'},
   {key: 'locks', title: 'Locks', icon: 'lock'},
+  {key: 'network', title: 'Network', icon: 'lan'},
   {key: 'who', title: 'Who it waited on', icon: 'groups'},
 ];
 
@@ -99,6 +101,9 @@ export class LatencyTabsView implements m.ClassComponent<LatencyTabsAttrs> {
           this.active = k;
         },
       });
+    }
+    if (tab.key === 'network') {
+      return m(LatencyNetworkTab, {trace: attrs.trace, priv: attrs.priv});
     }
     if (tab.key === 'who') {
       return m(LatencyWhoTab, {trace: attrs.trace, priv: attrs.priv});

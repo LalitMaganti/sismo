@@ -1303,3 +1303,117 @@ export async function loadWaitBreakdown(
   }
   return {hasPriv: true, totalNs, types};
 }
+
+// ---- Network waits (peer = who you're blocked on) -------------------------
+
+export interface NetPeerRow {
+  // The raw tagged block_id (bit 63 set); the drill key.
+  readonly peerId: bigint;
+  readonly addr: string;   // dotted IPv4
+  readonly port: number;
+  readonly waitNs: bigint;
+  readonly blocks: number;
+  readonly threads: number;
+}
+
+export interface NetworkPeers {
+  readonly hasPriv: boolean;
+  readonly totalWaitNs: bigint;
+  readonly peers: ReadonlyArray<NetPeerRow>;
+}
+
+export interface NetWaiterRow {
+  readonly threadName: string;
+  readonly threads: number;
+  readonly waitNs: bigint;
+  readonly blocks: number;
+}
+
+export interface NetPeerDetail {
+  readonly peerId: bigint;
+  readonly waitNs: bigint;
+  readonly blocks: number;
+  readonly threads: number;
+  readonly waiters: ReadonlyArray<NetWaiterRow>;
+}
+
+// Rank the remotes the profiled threads blocked on in recv, by wall-clock lost
+// waiting. Reads the shared _sismo_net table.
+export async function loadNetworkPeers(
+  engine: Engine,
+  priv: PrivilegedSet,
+): Promise<NetworkPeers> {
+  if (priv.upids.length === 0) {
+    return {hasPriv: false, totalWaitNs: 0n, peers: []};
+  }
+  await engine.query(`INCLUDE PERFETTO MODULE ${LATENCY_MODULE_WAIT_TYPES};`);
+  const res = await engine.query(`
+    SELECT peer_id, addr, port, wait_ns, blocks, threads
+    FROM _sismo_net ORDER BY wait_ns DESC
+  `);
+  const peers: NetPeerRow[] = [];
+  let totalWaitNs = 0n;
+  for (
+    const it = res.iter({
+      peer_id: LONG,
+      addr: STR,
+      port: NUM,
+      wait_ns: LONG_NULL,
+      blocks: NUM,
+      threads: NUM,
+    });
+    it.valid();
+    it.next()
+  ) {
+    const waitNs = it.wait_ns ?? 0n;
+    totalWaitNs += waitNs;
+    peers.push({
+      peerId: it.peer_id,
+      addr: it.addr,
+      port: it.port,
+      waitNs,
+      blocks: it.blocks,
+      threads: it.threads,
+    });
+  }
+  return {hasPriv: true, totalWaitNs, peers};
+}
+
+// The threads that blocked on one peer, rolled up by name.
+export async function loadNetPeerDetail(
+  engine: Engine,
+  peerId: bigint,
+): Promise<NetPeerDetail> {
+  await engine.query(`INCLUDE PERFETTO MODULE ${LATENCY_MODULE_WAIT_TYPES};`);
+  const res = await engine.query(`
+    SELECT coalesce(th.name, 'utid ' || ow.utid) AS nm,
+           count(DISTINCT ow.utid) AS threads,
+           CAST(sum(ow.w) AS INT) AS wait_ns, count(*) AS blocks
+    FROM _sismo_offcpu_waits ow
+    JOIN thread th ON th.utid = ow.utid
+    WHERE ow.lock = ${peerId}
+    GROUP BY coalesce(th.name, 'utid ' || ow.utid)
+    ORDER BY sum(ow.w) DESC
+  `);
+  const waiters: NetWaiterRow[] = [];
+  let waitNs = 0n;
+  let blocks = 0;
+  const utids = new Set<string>();
+  for (
+    const it = res.iter({nm: STR, threads: NUM, wait_ns: LONG_NULL, blocks: NUM});
+    it.valid();
+    it.next()
+  ) {
+    waitNs += it.wait_ns ?? 0n;
+    blocks += it.blocks;
+    utids.add(it.nm);
+    waiters.push({
+      threadName: it.nm,
+      threads: it.threads,
+      waitNs: it.wait_ns ?? 0n,
+      blocks: it.blocks,
+    });
+  }
+  const threads = waiters.reduce((n, w) => n + w.threads, 0);
+  return {peerId, waitNs, blocks, threads, waiters};
+}
