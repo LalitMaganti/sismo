@@ -17,6 +17,11 @@ pub const SISMO_MAX_COUNTERS: usize = 12;
 pub const SISMO_EVT_SAMPLE: u32 = 0;
 pub const SISMO_EVT_KSYM: u32 = 1;
 pub const SISMO_EVT_OFFCPU: u32 = 2;
+pub const SISMO_EVT_FILE: u32 = 3;
+
+// block_id (off-CPU slot 0) tag bits: which kind of thing the block waits on.
+const BLOCK_ID_NET: u64 = 1 << 63; // TCP peer (rest of the bits: packed 5-tuple)
+const BLOCK_ID_FILE: u64 = 1 << 62; // interned file id (low bits)
 
 /// First field of every record; `type` dispatches on the leading u32.
 #[repr(C)]
@@ -716,6 +721,7 @@ pub struct Capture {
     // interns into its own iid space.
     offcpu_interner: Interner,
     ksym_names: HashMap<u32, Vec<u8>>, // id -> bare function name
+    file_names: HashMap<u32, Vec<u8>>, // interned file id -> base name
     counters: Vec<Counter>,
     active_slots: Vec<u8>, // indices into `counters`; [0] is the timebase
     focus: Option<FocusPreset>,
@@ -960,6 +966,16 @@ impl Capture {
         if !idw.bytes().is_empty() {
             tp.write_message(12, idw.bytes());
         }
+        // For a disk block, slot 0 is a bit-62-tagged file id: resolve it to the
+        // file name and ship it as data_symbol (the queryable label), like the
+        // cache focus does for a memory region.
+        let block_id = rec.counters[0];
+        let data_symbol: Option<&[u8]> = if block_id & BLOCK_ID_FILE != 0 {
+            let fid = (block_id & 0x3fff_ffff) as u32;
+            self.file_names.get(&fid).map(|v| v.as_slice())
+        } else {
+            None
+        };
         tp.write_perf_sample(
             TP_FIELD_PERF_SAMPLE,
             rec.hdr.cpu,
@@ -968,8 +984,8 @@ impl Capture {
             cs_iid,
             rec.data_addr, // timebase_count = off-CPU duration (ns) = the weight
             &[],
-            rec.counters[0], // data_address = futex uaddr (lock identity), 0 if not a lock
-            None,
+            block_id,     // data_address = block identity (futex uaddr / peer / file id)
+            data_symbol,  // set only for disk blocks (the file name)
         );
         unsafe { sismo_ds_emit_offcpu(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
     }
@@ -978,6 +994,11 @@ impl Capture {
         if hdr.r#type == SISMO_EVT_KSYM {
             let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoKsymRec) };
             self.handle_ksym(rec);
+            return;
+        }
+        if hdr.r#type == SISMO_EVT_FILE {
+            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoKsymRec) };
+            self.handle_file(rec);
             return;
         }
         if hdr.r#type == SISMO_EVT_OFFCPU {
@@ -1020,6 +1041,18 @@ impl Capture {
             name = &name[..p];
         }
         self.ksym_names.insert(rec.id, name.to_vec());
+    }
+
+    // A file-name definition (reuses the ksym rec layout): the base name for an
+    // interned file id, referenced by disk off-CPU blocks.
+    fn handle_file(&mut self, rec: &SismoKsymRec) {
+        if self.file_names.contains_key(&rec.id) {
+            return;
+        }
+        let raw: &[u8] =
+            unsafe { std::slice::from_raw_parts(rec.name.as_ptr() as *const u8, SISMO_KSYM_NAME_MAX) };
+        let name = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
+        self.file_names.insert(rec.id, name.to_vec());
     }
 }
 
@@ -1140,6 +1173,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         interner: Interner::new(),
         offcpu_interner: Interner::new(),
         ksym_names: HashMap::new(),
+        file_names: HashMap::new(),
         counters: Vec::new(),
         active_slots: Vec::new(),
         focus,
@@ -1272,6 +1306,8 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         c"on_futex_exit".as_ptr(),
         c"on_tcp_recvmsg".as_ptr(),
         c"on_tcp_recvmsg_ret".as_ptr(),
+        c"on_vfs_read".as_ptr(),
+        c"on_vfs_read_ret".as_ptr(),
     ] {
         let prog = unsafe { bpf_object__find_program_by_name(obj, name) };
         if !prog.is_null() {

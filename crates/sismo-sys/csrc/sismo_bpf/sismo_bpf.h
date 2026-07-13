@@ -39,9 +39,9 @@ enum sismo_event_type {
   // with how long it stayed off-CPU. Reuses sismo_sample_rec verbatim; the
   // off-CPU duration in nanoseconds rides in `data_addr` (which has no meaning
   // for off-CPU) and is the sample's weight. `counters[]` are 0, except slot 0
-  // which carries the block identity — the futex uaddr for a lock wait, or the
-  // packed TCP peer (host_port<<32 | be32 addr) for a blocking recv — 0 when
-  // the block is unnamed.
+  // which carries the block identity — the futex uaddr for a lock wait, the
+  // bit-63-tagged TCP peer for a blocking recv, or a bit-62-tagged interned
+  // file id for a blocking file read — 0 when the block is unnamed.
   //
   // Shared cross-backend contract (Linux eBPF here, macOS kperf lazy.wait,
   // Windows ETW): VOLUNTARY blocks only — the thread went to sleep (state !=
@@ -50,6 +50,12 @@ enum sismo_event_type {
   // carrying the blocking user stack + duration weight. macOS/Windows produce
   // the identical record from their native wait/cswitch triggers.
   SISMO_EVT_OFFCPU = 2,
+  // A file-name definition: the (id, base name) for a file the BPF program saw
+  // a blocking read on for the first time. Same (id, name) shape as
+  // SISMO_EVT_KSYM (reuses sismo_ksym_rec); emitted once ahead of the OFFCPU
+  // sample that references the id in slot 0, so userspace can resolve the file
+  // name for a disk block without shipping a string per sample.
+  SISMO_EVT_FILE = 3,
 };
 
 struct sismo_hdr {

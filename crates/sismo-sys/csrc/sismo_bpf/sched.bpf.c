@@ -177,6 +177,29 @@ struct {
   __type(value, __u64);
 } net_peer SEC(".maps");
 
+// tid -> the bit-62-tagged interned file id the thread is inside a blocking
+// file read on. Same set-on-entry / clear-on-return pattern as net_peer.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 10240);
+  __type(key, __u32);
+  __type(value, __u64);
+} disk_file SEC(".maps");
+
+// inode pointer -> interned file id (like ksym_ids), + its monotonic allocator.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 8192);
+  __type(key, __u64);
+  __type(value, __u32);
+} file_ids SEC(".maps");
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u64);
+} file_next SEC(".maps");
+
 // Fixed-offset view of the syscalls/sys_enter_futex tracepoint record (the
 // format is UAPI-stable, so no CO-RE): 8 bytes of common fields, then the
 // syscall nr, then the futex() args. We only need uaddr (arg0, offset 16).
@@ -215,6 +238,35 @@ static __always_inline __u32 resolve_ksym(__u64 addr) {
     // lookup). Emits "name+0xoff/0xsize"; userspace keeps the bare name.
     __u64 args[1] = {addr};
     bpf_snprintf(k->name, sizeof(k->name), "%pB", args, sizeof(args));
+    bpf_ringbuf_submit(k, 0);
+  }
+  return id;
+}
+
+// Intern a file (keyed by its inode pointer) to an id, emitting a SISMO_EVT_FILE
+// definition (id + base name from the dentry) on first sight — the same
+// ship-an-id-once pattern as resolve_ksym, so a disk block references a file by
+// id instead of carrying a string. Returns the id, or 0 if none could be minted.
+static __always_inline __u32 resolve_file(struct file *file) {
+  struct inode *inode = BPF_CORE_READ(file, f_inode);
+  __u64 key = (__u64)inode;
+  __u32 *idp = bpf_map_lookup_elem(&file_ids, &key);
+  if (idp)
+    return *idp;
+
+  __u32 zero = 0;
+  __u64 *next = bpf_map_lookup_elem(&file_next, &zero);
+  if (!next)
+    return 0;
+  __u32 id = (__u32)__sync_fetch_and_add(next, 1) + 1;
+  bpf_map_update_elem(&file_ids, &key, &id, BPF_ANY);
+
+  struct sismo_ksym_rec *k = bpf_ringbuf_reserve(&events, sizeof(*k), 0);
+  if (k) {
+    k->type = SISMO_EVT_FILE;
+    k->id = id;
+    const unsigned char *namep = BPF_CORE_READ(file, f_path.dentry, d_name.name);
+    bpf_probe_read_kernel_str(k->name, sizeof(k->name), namep);
     bpf_ringbuf_submit(k, 0);
   }
   return id;
@@ -300,11 +352,13 @@ static __always_inline void offcpu_record_block(void *ctx, __u32 tid) {
     return;
   st->start_ns = bpf_ktime_get_ns();
 
-  // A block names at most one waited-on thing: the futex uaddr, else the TCP
-  // peer. Mutually exclusive in practice (a thread is in one syscall).
+  // A block names at most one waited-on thing: the futex uaddr, the TCP peer,
+  // or the file id (a thread is in one syscall; the S_ISREG filter keeps sockets
+  // out of disk_file). Fixed precedence, defensively.
   __u64 *fu = bpf_map_lookup_elem(&futex_wait, &tid);
   __u64 *pe = bpf_map_lookup_elem(&net_peer, &tid);
-  st->block_id = fu ? *fu : (pe ? *pe : 0);
+  __u64 *df = bpf_map_lookup_elem(&disk_file, &tid);
+  st->block_id = fu ? *fu : (pe ? *pe : (df ? *df : 0));
 
   long un = bpf_get_stack(ctx, st->ustack, sizeof(st->ustack), BPF_F_USER_STACK);
   __u32 nu = (un > 0) ? (__u32)(un / 8) : 0;
@@ -449,6 +503,38 @@ SEC("kretprobe/tcp_recvmsg")
 int BPF_KRETPROBE(on_tcp_recvmsg_ret) {
   __u32 tid = (__u32)bpf_get_current_pid_tgid();
   bpf_map_delete_elem(&net_peer, &tid);
+  return 0;
+}
+
+// Blocking file read: tag a read that parks off-CPU (page-cache miss / direct
+// I/O waiting on the device) with the file it reads. Only regular files —
+// sockets/pipes go through vfs_read too but are named by peer / classified by
+// their own primitive, so we skip them. file is arg0 of vfs_read.
+SEC("kprobe/vfs_read")
+int BPF_KPROBE(on_vfs_read, struct file *file) {
+  __u32 tgt = target_tgid();
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  if (tgt != 0 && tgid != tgt)
+    return 0;
+  __u16 mode = BPF_CORE_READ(file, f_inode, i_mode);
+  if ((mode & 0170000) != 0100000 /* S_ISREG */)
+    return 0;
+  __u32 id = resolve_file(file);
+  if (id == 0)
+    return 0;
+  __u32 tid = (__u32)pid_tgid;
+  // Bit 62 tags block_id as a file id (bit 63 is a network peer); a futex uaddr
+  // is a userspace address < 2^48 and sets neither.
+  __u64 tagged = (1ULL << 62) | (__u64)id;
+  bpf_map_update_elem(&disk_file, &tid, &tagged, BPF_ANY);
+  return 0;
+}
+
+SEC("kretprobe/vfs_read")
+int BPF_KRETPROBE(on_vfs_read_ret) {
+  __u32 tid = (__u32)bpf_get_current_pid_tgid();
+  bpf_map_delete_elem(&disk_file, &tid);
   return 0;
 }
 

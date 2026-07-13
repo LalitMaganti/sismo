@@ -68,6 +68,25 @@ struct sock {
   struct sock_common __sk_common;
 } __attribute__((preserve_access_index));
 
+// The file/inode fields the vfs_read kprobe reads: i_mode to keep only regular
+// files, the inode pointer as a stable identity key, and the dentry base name.
+struct qstr {
+  const unsigned char *name;
+} __attribute__((preserve_access_index));
+struct dentry {
+  struct qstr d_name;
+} __attribute__((preserve_access_index));
+struct path {
+  struct dentry *dentry;
+} __attribute__((preserve_access_index));
+struct inode {
+  __u16 i_mode;  // umode_t
+} __attribute__((preserve_access_index));
+struct file {
+  struct path f_path;
+  struct inode *f_inode;
+} __attribute__((preserve_access_index));
+
 // perf_event program context. We forward it to bpf_get_stack and read `addr`
 // (the PERF_SAMPLE_ADDR data linear address). The kernel rewrites loads from
 // this context type (convert_ctx_access for BPF_PROG_TYPE_PERF_EVENT), so only
