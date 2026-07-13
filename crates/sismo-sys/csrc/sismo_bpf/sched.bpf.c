@@ -129,11 +129,11 @@ struct {
 // copied into offcpu.
 struct sismo_offcpu_state {
   __u64 start_ns;
-  // The futex user-address this thread is blocked on, if it went off-CPU inside
-  // a futex() syscall (0 otherwise). Lock identity: every contended pthread /
-  // Go / JVM lock funnels through futex(), so the uaddr clusters waits by lock
-  // instance regardless of language. Captured from futex_wait[tid] at block.
-  __u64 futex_uaddr;
+  // What this block is waiting ON, when we can name it: the futex uaddr (lock
+  // identity) for a futex wait, or the packed peer (host_port<<32 | be32 addr)
+  // for a blocking TCP recv. 0 when the block carries no such id. A block is a
+  // futex OR a socket, never both; the wait-type classifier tells them apart.
+  __u64 block_id;
   __u32 nr_frames;
   __u32 nr_kernel;
   __u64 ustack[SISMO_MAX_STACK];
@@ -165,6 +165,17 @@ struct {
   __type(key, __u32);
   __type(value, __u64);
 } futex_wait SEC(".maps");
+
+// tid -> the packed TCP peer (host_port<<32 | be32 daddr) the thread is inside
+// tcp_recvmsg on. Same pattern as futex_wait: set on kprobe entry, cleared on
+// return, so a blocking recv that goes off-CPU is tagged with the remote it's
+// waiting on. IPv4 only for now (a u64 can't hold a v6 address).
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 10240);
+  __type(key, __u32);
+  __type(value, __u64);
+} net_peer SEC(".maps");
 
 // Fixed-offset view of the syscalls/sys_enter_futex tracepoint record (the
 // format is UAPI-stable, so no CO-RE): 8 bytes of common fields, then the
@@ -289,8 +300,11 @@ static __always_inline void offcpu_record_block(void *ctx, __u32 tid) {
     return;
   st->start_ns = bpf_ktime_get_ns();
 
+  // A block names at most one waited-on thing: the futex uaddr, else the TCP
+  // peer. Mutually exclusive in practice (a thread is in one syscall).
   __u64 *fu = bpf_map_lookup_elem(&futex_wait, &tid);
-  st->futex_uaddr = fu ? *fu : 0;
+  __u64 *pe = bpf_map_lookup_elem(&net_peer, &tid);
+  st->block_id = fu ? *fu : (pe ? *pe : 0);
 
   long un = bpf_get_stack(ctx, st->ustack, sizeof(st->ustack), BPF_F_USER_STACK);
   __u32 nu = (un > 0) ? (__u32)(un / 8) : 0;
@@ -340,8 +354,8 @@ static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
       for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
         e->counters[s] = 0;
       // counters[] are meaningless for an off-CPU sample; slot 0 carries the
-      // futex uaddr (lock identity), 0 for a non-lock block.
-      e->counters[0] = st->futex_uaddr;
+      // block identity (futex uaddr or packed TCP peer), 0 when unnamed.
+      e->counters[0] = st->block_id;
       for (int i = 0; i < SISMO_MAX_STACK; i++)
         e->stack[i] = (i < st->nr_frames) ? st->ustack[i] : 0;
       for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
@@ -402,6 +416,39 @@ SEC("tracepoint/syscalls/sys_exit_futex")
 int on_futex_exit(void *ctx) {
   __u32 tid = (__u32)bpf_get_current_pid_tgid();
   bpf_map_delete_elem(&futex_wait, &tid);
+  return 0;
+}
+
+// Blocking TCP recv: read the peer 5-tuple off the sock on entry so a recv that
+// parks off-CPU (waiting for data) is tagged with the remote it waits on. sk is
+// arg0 of tcp_recvmsg on every kernel. IPv4 only; a v6 peer stores 0 (unnamed).
+SEC("kprobe/tcp_recvmsg")
+int BPF_KPROBE(on_tcp_recvmsg, struct sock *sk) {
+  __u32 tgt = target_tgid();
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  if (tgt != 0 && tgid != tgt)
+    return 0;
+  __u32 tid = (__u32)pid_tgid;
+  __u64 peer = 0;
+  __u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+  if (family == 2 /* AF_INET */) {
+    __u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);   // be32
+    __u16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);   // be16
+    __u16 port = (__u16)((dport >> 8) | (dport << 8));        // -> host order
+    // Bit 63 tags this block_id as a network peer, not a futex uaddr (userspace
+    // addresses are canonical < 2^48, so they never set it) — so the classifier
+    // can tell network from lock without another field. port in 32..47, addr low.
+    peer = (1ULL << 63) | ((__u64)port << 32) | (__u64)daddr;
+  }
+  bpf_map_update_elem(&net_peer, &tid, &peer, BPF_ANY);
+  return 0;
+}
+
+SEC("kretprobe/tcp_recvmsg")
+int BPF_KRETPROBE(on_tcp_recvmsg_ret) {
+  __u32 tid = (__u32)bpf_get_current_pid_tgid();
+  bpf_map_delete_elem(&net_peer, &tid);
   return 0;
 }
 

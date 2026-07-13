@@ -1263,10 +1263,16 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         }
     }
 
-    // Futex enter/exit: tag off-CPU blocks with the lock (futex uaddr). Best
-    // effort — a kernel that refuses the syscall tracepoints just loses lock
-    // identity, not the off-CPU stacks.
-    for name in [c"on_futex_enter".as_ptr(), c"on_futex_exit".as_ptr()] {
+    // Futex enter/exit + tcp_recvmsg entry/return: tag off-CPU blocks with what
+    // they wait on (the lock's futex uaddr, or the TCP peer). Best effort — a
+    // kernel that refuses any of these just loses that identity, not the
+    // off-CPU stacks.
+    for name in [
+        c"on_futex_enter".as_ptr(),
+        c"on_futex_exit".as_ptr(),
+        c"on_tcp_recvmsg".as_ptr(),
+        c"on_tcp_recvmsg_ret".as_ptr(),
+    ] {
         let prog = unsafe { bpf_object__find_program_by_name(obj, name) };
         if !prog.is_null() {
             let link = unsafe { bpf_program__attach(prog) };

@@ -46,6 +46,28 @@ struct task_struct {
   char comm[16];
 } __attribute__((preserve_access_index));
 
+// x86_64 struct pt_regs — the kprobe context. BPF_KPROBE reads syscall args from
+// it (PT_REGS_PARM1 = di). Stable ABI layout; this object is built x86-only.
+struct pt_regs {
+  unsigned long r15, r14, r13, r12, rbp, rbx;
+  unsigned long r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi;
+  unsigned long orig_rax, rip, cs, eflags, rsp, ss;
+};
+
+// Just the socket 5-tuple fields the tcp_recvmsg kprobe reads, by name — CO-RE
+// relocates their real offsets (they live in unions/anon structs in the kernel).
+// skc_daddr / skc_dport are network byte order.
+struct sock_common {
+  __be32 skc_daddr;
+  __be32 skc_rcv_saddr;
+  __u16 skc_num;
+  __be16 skc_dport;
+  __u16 skc_family;
+} __attribute__((preserve_access_index));
+struct sock {
+  struct sock_common __sk_common;
+} __attribute__((preserve_access_index));
+
 // perf_event program context. We forward it to bpf_get_stack and read `addr`
 // (the PERF_SAMPLE_ADDR data linear address). The kernel rewrites loads from
 // this context type (convert_ctx_access for BPF_PROG_TYPE_PERF_EVENT), so only

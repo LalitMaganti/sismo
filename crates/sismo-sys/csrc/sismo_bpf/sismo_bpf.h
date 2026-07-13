@@ -38,7 +38,10 @@ enum sismo_event_type {
   // out, where its stack is parked in the scheduler = the block site) paired
   // with how long it stayed off-CPU. Reuses sismo_sample_rec verbatim; the
   // off-CPU duration in nanoseconds rides in `data_addr` (which has no meaning
-  // for off-CPU) and is the sample's weight. `counters[]` are 0.
+  // for off-CPU) and is the sample's weight. `counters[]` are 0, except slot 0
+  // which carries the block identity — the futex uaddr for a lock wait, or the
+  // packed TCP peer (host_port<<32 | be32 addr) for a blocking recv — 0 when
+  // the block is unnamed.
   //
   // Shared cross-backend contract (Linux eBPF here, macOS kperf lazy.wait,
   // Windows ETW): VOLUNTARY blocks only — the thread went to sleep (state !=
