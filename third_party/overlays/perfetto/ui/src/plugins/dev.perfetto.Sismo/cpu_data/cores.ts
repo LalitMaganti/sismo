@@ -1417,3 +1417,113 @@ export async function loadNetPeerDetail(
   const threads = waiters.reduce((n, w) => n + w.threads, 0);
   return {peerId, waitNs, blocks, threads, waiters};
 }
+
+// ---- Disk waits (file = what you're blocked reading) ----------------------
+
+export interface DiskFileRow {
+  readonly fileId: bigint;   // the drill key (tagged block_id)
+  readonly name: string;     // base file name
+  readonly waitNs: bigint;
+  readonly blocks: number;
+  readonly threads: number;
+}
+
+export interface DiskFiles {
+  readonly hasPriv: boolean;
+  readonly totalWaitNs: bigint;
+  readonly files: ReadonlyArray<DiskFileRow>;
+}
+
+export interface DiskReaderRow {
+  readonly threadName: string;
+  readonly threads: number;
+  readonly waitNs: bigint;
+  readonly blocks: number;
+}
+
+export interface DiskFileDetail {
+  readonly fileId: bigint;
+  readonly name: string;
+  readonly waitNs: bigint;
+  readonly blocks: number;
+  readonly threads: number;
+  readonly readers: ReadonlyArray<DiskReaderRow>;
+}
+
+// Rank the files the profiled threads blocked reading, by wall-clock lost on the
+// device. Reads the shared _sismo_disk table.
+export async function loadDiskFiles(
+  engine: Engine,
+  priv: PrivilegedSet,
+): Promise<DiskFiles> {
+  if (priv.upids.length === 0) {
+    return {hasPriv: false, totalWaitNs: 0n, files: []};
+  }
+  await engine.query(`INCLUDE PERFETTO MODULE ${LATENCY_MODULE_WAIT_TYPES};`);
+  const res = await engine.query(`
+    SELECT file_id, name, wait_ns, blocks, threads
+    FROM _sismo_disk ORDER BY wait_ns DESC
+  `);
+  const files: DiskFileRow[] = [];
+  let totalWaitNs = 0n;
+  for (
+    const it = res.iter({
+      file_id: LONG,
+      name: STR,
+      wait_ns: LONG_NULL,
+      blocks: NUM,
+      threads: NUM,
+    });
+    it.valid();
+    it.next()
+  ) {
+    const waitNs = it.wait_ns ?? 0n;
+    totalWaitNs += waitNs;
+    files.push({
+      fileId: it.file_id,
+      name: it.name,
+      waitNs,
+      blocks: it.blocks,
+      threads: it.threads,
+    });
+  }
+  return {hasPriv: true, totalWaitNs, files};
+}
+
+// The threads that blocked reading one file, rolled up by name.
+export async function loadDiskFileDetail(
+  engine: Engine,
+  fileId: bigint,
+  name: string,
+): Promise<DiskFileDetail> {
+  await engine.query(`INCLUDE PERFETTO MODULE ${LATENCY_MODULE_WAIT_TYPES};`);
+  const res = await engine.query(`
+    SELECT coalesce(th.name, 'utid ' || ow.utid) AS nm,
+           count(DISTINCT ow.utid) AS threads,
+           CAST(sum(ow.w) AS INT) AS wait_ns, count(*) AS blocks
+    FROM _sismo_offcpu_waits ow
+    JOIN thread th ON th.utid = ow.utid
+    WHERE ow.lock = ${fileId}
+    GROUP BY coalesce(th.name, 'utid ' || ow.utid)
+    ORDER BY sum(ow.w) DESC
+  `);
+  const readers: DiskReaderRow[] = [];
+  let waitNs = 0n;
+  let blocks = 0;
+  for (
+    const it = res.iter({nm: STR, threads: NUM, wait_ns: LONG_NULL, blocks: NUM});
+    it.valid();
+    it.next()
+  ) {
+    waitNs += it.wait_ns ?? 0n;
+    blocks += it.blocks;
+    readers.push({
+      threadName: it.nm,
+      threads: it.threads,
+      waitNs: it.wait_ns ?? 0n,
+      blocks: it.blocks,
+    });
+  }
+  const threads = readers.reduce((n, r) => n + r.threads, 0);
+  return {fileId, name, waitNs, blocks, threads, readers};
+}

@@ -149,7 +149,7 @@ roots AS (
   JOIN thread_counter_track tct ON tct.utid = p.utid AND tct.name = 'off-cpu-ns'
   JOIN counter c ON c.track_id = tct.id AND c.ts = p.ts
   -- Locks only: positive futex uaddrs. Network peers set bit 63 (negative).
-  WHERE p.data_address > 0 AND p.callsite_id IS NOT NULL
+  WHERE p.data_address > 0 AND p.data_symbol IS NULL AND p.callsite_id IS NOT NULL
 ),
 chain(leaf, cur, depth) AS (
   SELECT cs, cs, 0 FROM roots
@@ -181,7 +181,7 @@ JOIN _sismo_priv pv ON pv.utid = p.utid
 JOIN thread_counter_track tct ON tct.utid = p.utid AND tct.name = 'off-cpu-ns'
 JOIN counter c ON c.track_id = tct.id AND c.ts = p.ts
 -- Locks only: positive futex uaddrs. Network peers set bit 63 (negative).
-WHERE p.data_address > 0;
+WHERE p.data_address > 0 AND p.data_symbol IS NULL;
 
 CREATE PERFETTO TABLE _sismo_locks AS
 WITH offw AS (
@@ -233,6 +233,7 @@ INCLUDE PERFETTO MODULE sismo.locks;
 
 CREATE PERFETTO TABLE _sismo_offcpu_waits AS
 SELECT p.utid AS utid, p.callsite_id AS leaf_cs, p.data_address AS lock,
+  p.data_symbol AS fname,
   max(0, coalesce(
     c.value - lag(c.value) OVER (PARTITION BY p.utid ORDER BY p.ts), 0)) AS w
 FROM perf_sample p
@@ -248,6 +249,10 @@ SELECT ow.utid AS utid, ow.leaf_cs AS leaf_cs, ow.w AS w,
     -- kprobe), stored as a negative int64 — a definitive network signal that
     -- beats the schedule_timeout kernel primitive (which else reads as 'sleep').
     WHEN ow.lock < 0 THEN 'network'
+    -- A blocking file read carries the file name in data_symbol (set by the
+    -- vfs_read interner) — a definitive disk signal, before the futex branches
+    -- (its bit-62 block_id is positive and would else read as 'signaling').
+    WHEN ow.fname IS NOT NULL THEN 'disk'
     WHEN ow.lock != 0 AND ow.lock IN (SELECT lock_addr FROM _sismo_locks)
       THEN 'lock'
     WHEN ow.lock != 0 THEN 'signaling'
@@ -283,6 +288,18 @@ SELECT ow.lock AS peer_id,
 FROM _sismo_offcpu_waits ow
 WHERE ow.lock < 0
 GROUP BY ow.lock;
+
+-- Per-file disk waits: cluster the profiled threads' blocking reads by the file
+-- they read (data_symbol = the base name, from the vfs_read interner). The
+-- disk analog of _sismo_locks / _sismo_net; keyed by the file id (block_id).
+CREATE PERFETTO TABLE _sismo_disk AS
+SELECT ow.lock AS file_id, ow.fname AS name,
+  CAST(sum(ow.w) AS INT) AS wait_ns,
+  count(*) AS blocks,
+  count(DISTINCT ow.utid) AS threads
+FROM _sismo_offcpu_waits ow
+WHERE ow.fname IS NOT NULL
+GROUP BY ow.lock, ow.fname;
 
 -- Dominant wait type per off-CPU leaf callsite (by weight), derived from the
 -- one _sismo_wait classifier — so the flamegraph type filter narrows by
