@@ -239,7 +239,7 @@ JOIN thread_counter_track tct ON tct.utid = p.utid AND tct.name = 'off-cpu-ns'
 JOIN counter c ON c.track_id = tct.id AND c.ts = p.ts;
 
 CREATE PERFETTO TABLE _sismo_wait AS
-SELECT ow.utid AS utid, ow.w AS w,
+SELECT ow.utid AS utid, ow.leaf_cs AS leaf_cs, ow.w AS w,
   CASE
     WHEN tr.kind = 'involuntary' THEN 'scheduling'
     WHEN ow.lock != 0 AND ow.lock IN (SELECT lock_addr FROM _sismo_locks)
@@ -260,6 +260,19 @@ SELECT ow.utid AS utid, ow.w AS w,
 FROM _sismo_offcpu_waits ow
 LEFT JOIN _sismo_offcpu_trim tr ON tr.leaf_cs = ow.leaf_cs
 LEFT JOIN _sismo_lock_cs pf ON pf.cs = tr.trimmed_cs;
+
+-- Dominant wait type per off-CPU leaf callsite (by weight), derived from the
+-- one _sismo_wait classifier — so the flamegraph type filter narrows by
+-- callsite_id against a few-hundred-row table (fast) with no duplicated rules.
+CREATE PERFETTO TABLE _sismo_wait_leaf AS
+SELECT leaf_cs, wait_type FROM (
+  SELECT leaf_cs, wait_type,
+    row_number() OVER (PARTITION BY leaf_cs ORDER BY sum(w) DESC) AS rn
+  FROM _sismo_wait
+  WHERE leaf_cs IS NOT NULL
+  GROUP BY leaf_cs, wait_type
+)
+WHERE rn = 1;
 `;
 
 export const LATENCY_MODULE_BASE = 'sismo.latency';

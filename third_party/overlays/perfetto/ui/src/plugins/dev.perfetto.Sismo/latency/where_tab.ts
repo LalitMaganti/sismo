@@ -42,12 +42,16 @@ import {
   type BuiltTree,
   type CtNode,
 } from '../cpu/flamegraph_tree';
+import {Button, ButtonVariant} from '../../../widgets/button';
+import {MenuItem, PopupMenu} from '../../../widgets/menu';
 import {breakdownGrid, type BreakdownGridRow} from '../cpu/grid';
 import {segmentedSwitcher} from '../cpu/segmented';
 import {buildBlockedFunctionMetric, sampleScopePredicates} from '../stack_timeline';
 import {Setting, oneOf} from '../settings';
 import {fmtDurationNs, fmtPercent} from '../format';
 import {loadingBody, actionLink} from '../page_common';
+import {loadWaitBreakdown, type WaitBreakdown} from '../cpu_data';
+import {waitTypeLabel} from './wait_types';
 import type {PrivilegedSet} from '../privileged_set';
 
 interface WhereAttrs {
@@ -82,15 +86,21 @@ const VIEW_TITLE: Record<View, string> = {
   functions: 'Functions',
 };
 
+// 'all' = no type filter; otherwise a wait_type from _sismo_wait_leaf.
+const ALL_TYPES = 'all';
+
 export class LatencyWhereTab implements m.ClassComponent<WhereAttrs> {
   private readonly queue = new SerialTaskQueue();
   private readonly treeSlot = new QuerySlot<BuiltTree>(this.queue);
   private readonly fnSlot = new QuerySlot<ReadonlyArray<BreakdownGridRow>>(
     this.queue,
   );
+  // Available wait types (to populate the filter with only the ones present).
+  private readonly typesSlot = new QuerySlot<WaitBreakdown>(this.queue);
 
   private kind: Kind = kindSetting.get();
   private activeView: View = viewSetting.get();
+  private waitType: string = ALL_TYPES;
 
   private fgState?: FlamegraphState;
   private fgMetrics = [buildBlockedFunctionMetric([])];
@@ -99,21 +109,32 @@ export class LatencyWhereTab implements m.ClassComponent<WhereAttrs> {
   onremove(): void {
     this.treeSlot.dispose();
     this.fnSlot.dispose();
+    this.typesSlot.dispose();
   }
 
   // Rebuild the (single) metric + reset flamegraph state when the scope (priv +
-  // kind) changes, so a kind switch re-runs against the new predicate set.
+  // kind + wait-type filter) changes, so a switch re-runs against the new
+  // predicate set.
   private ensureScope(priv: PrivilegedSet): void {
-    const key = `${priv.upids.join(',')}|${this.kind}`;
+    const key = `${priv.upids.join(',')}|${this.kind}|${this.waitType}`;
     if (key === this.scopeKey && this.fgState !== undefined) return;
     this.scopeKey = key;
-    this.fgMetrics = [buildBlockedFunctionMetric(this.scopePredicates(priv))];
+    const filtered = this.waitType !== ALL_TYPES;
+    this.fgMetrics = [
+      buildBlockedFunctionMetric(this.scopePredicates(priv), filtered),
+    ];
     this.fgState = Flamegraph.updateState(undefined, this.fgMetrics);
   }
 
   private scopePredicates(priv: PrivilegedSet): string[] {
     const preds = [...sampleScopePredicates(priv)];
     if (this.kind === 'blocked') preds.push(`t.kind = 'voluntary'`);
+    if (this.waitType !== ALL_TYPES) {
+      preds.push(
+        `p.callsite_id IN (SELECT leaf_cs FROM _sismo_wait_leaf ` +
+          `WHERE wait_type = '${this.waitType}')`,
+      );
+    }
     return preds;
   }
 
@@ -121,7 +142,7 @@ export class LatencyWhereTab implements m.ClassComponent<WhereAttrs> {
     this.ensureScope(attrs.priv);
     return m(
       '.pf-sismo-tab',
-      this.renderBars(),
+      this.renderBars(attrs),
       m(
         '.pf-sismo-tab__body',
         m(
@@ -157,7 +178,7 @@ export class LatencyWhereTab implements m.ClassComponent<WhereAttrs> {
     );
   }
 
-  private renderBars(): m.Children {
+  private renderBars(attrs: WhereAttrs): m.Children {
     return m(
       '.pf-sismo-tab__modebar',
       segmentedSwitcher<Kind>(
@@ -183,6 +204,42 @@ export class LatencyWhereTab implements m.ClassComponent<WhereAttrs> {
           viewSetting.set(v);
         },
       ),
+      this.renderTypeFilter(attrs),
+    );
+  }
+
+  // The wait-type lens: narrow the tree to one kind of wait (a lock, a sleep,
+  // disk, …). Only the types present in the trace are offered.
+  private renderTypeFilter(attrs: WhereAttrs): m.Children {
+    const b = this.typesSlot.use({
+      key: {upids: [...attrs.priv.upids]},
+      queryFn: () => loadWaitBreakdown(attrs.trace.engine, attrs.priv),
+    }).data;
+    const present = b?.types.map((t) => t.type) ?? [];
+    const label =
+      this.waitType === ALL_TYPES
+        ? 'All types'
+        : waitTypeLabel(this.waitType);
+    const item = (type: string, text: string) =>
+      m(MenuItem, {
+        label: text,
+        icon: this.waitType === type ? 'check' : undefined,
+        onclick: () => {
+          this.waitType = type;
+        },
+      });
+    return m(
+      PopupMenu,
+      {
+        trigger: m(Button, {
+          label: `Type: ${label}`,
+          icon: 'filter_list',
+          rightIcon: 'arrow_drop_down',
+          variant: ButtonVariant.Outlined,
+        }),
+      },
+      item(ALL_TYPES, 'All types'),
+      present.map((t) => item(t, waitTypeLabel(t))),
     );
   }
 

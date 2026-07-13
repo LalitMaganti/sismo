@@ -1114,6 +1114,10 @@ function blockedFunctionStatement(where: string): string {
 
 export function buildBlockedFunctionMetric(
   wherePredicates: ReadonlyArray<string>,
+  // When the caller filters by wait type it references _sismo_wait_leaf, which
+  // lives in sismo.wait_types — pulled in only then so the unfiltered tree
+  // doesn't build the classifier.
+  includeWaitTypes = false,
 ): QueryFlamegraphMetric {
   const where = ['p.callsite_id is not null', ...wherePredicates].join(
     '\n            and ',
@@ -1124,6 +1128,9 @@ export function buildBlockedFunctionMetric(
     nameColumnLabel: 'Blocking function',
     dependencySql:
       `INCLUDE PERFETTO MODULE ${OFFCPU_TRIM_MODULE};\n` +
+      (includeWaitTypes
+        ? 'INCLUDE PERFETTO MODULE sismo.wait_types;\n'
+        : '') +
       'include perfetto module linux.perf.samples;\n' +
       'include perfetto module callstacks.stack_profile;',
     statement: blockedFunctionStatement(where),

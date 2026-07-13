@@ -43,6 +43,10 @@ function meta(type: string): {label: string; tab: string} {
   return TYPE_META[type] ?? {label: type, tab: 'where'};
 }
 
+export function waitTypeLabel(type: string): string {
+  return meta(type).label;
+}
+
 export function renderWaitTypeBlock(
   d: WaitBreakdown,
   onNavigate: (tab: string) => void,
