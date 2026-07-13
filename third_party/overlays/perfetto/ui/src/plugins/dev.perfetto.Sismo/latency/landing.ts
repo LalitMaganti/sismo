@@ -29,9 +29,11 @@ import type {PrivilegedSet} from '../privileged_set';
 import {loadingBlock} from '../cpu/block';
 import {
   loadCpuTriage,
-  loadLatencyDetail,
+  loadHeaviestFunctions,
+  loadRunnableSummary,
   type CpuTriage,
-  type LatencyDetail,
+  type HeaviestFunctionRow,
+  type RunnableSummary,
 } from '../cpu_data';
 import {
   renderLatencyTriageBlock,
@@ -43,7 +45,7 @@ import {loadChurn, renderChurnBlock, type ChurnSummary} from './churn';
 interface LatencyLandingAttrs {
   readonly trace: Trace;
   readonly priv: PrivilegedSet;
-  // Switch to a fixed deep-dive tab ('where' | 'why' | 'who').
+  // Switch to a fixed deep-dive tab ('where' | 'who').
   readonly onNavigate: (tab: string) => void;
 }
 
@@ -52,7 +54,8 @@ export class LatencyLandingPage
 {
   private readonly queue = new SerialTaskQueue();
   private readonly triageSlot = new QuerySlot<CpuTriage>(this.queue);
-  private readonly detailSlot = new QuerySlot<LatencyDetail>(this.queue);
+  private readonly fnSlot = new QuerySlot<HeaviestFunctionRow[]>(this.queue);
+  private readonly detailSlot = new QuerySlot<RunnableSummary>(this.queue);
   private readonly churnSlot = new QuerySlot<ChurnSummary>(this.queue);
 
   view({attrs}: m.CVnode<LatencyLandingAttrs>): m.Children {
@@ -79,7 +82,7 @@ export class LatencyLandingPage
       this.block(
         this.detailSlot,
         key,
-        () => loadLatencyDetail(trace.engine, priv),
+        () => loadRunnableSummary(trace.engine, priv),
         'Who or what was making you wait?',
         (d) => renderBlameBlock(d, onNavigate),
       ),
@@ -95,6 +98,7 @@ export class LatencyLandingPage
 
   onremove(): void {
     this.triageSlot.dispose();
+    this.fnSlot.dispose();
     this.detailSlot.dispose();
     this.churnSlot.dispose();
   }
@@ -126,8 +130,22 @@ export class LatencyLandingPage
         loadingBlock('What was it waiting for?'),
       ];
     }
+    // The busiest on-CPU function, if it's already loaded — the block renders
+    // fine without it and picks it up on the next redraw.
+    let topFn: {name: string; share: number} | undefined;
+    try {
+      const fns = this.fnSlot.use({
+        key,
+        queryFn: () => loadHeaviestFunctions(trace.engine, priv, 1),
+      }).data;
+      if (fns !== undefined && fns.length > 0) {
+        topFn = {name: fns[0].name, share: fns[0].share};
+      }
+    } catch {
+      topFn = undefined;
+    }
     return [
-      renderLatencyTriageBlock(trace, data, scope, onNavigate),
+      renderLatencyTriageBlock(trace, data, scope, onNavigate, topFn),
       renderWaitKindBlock(data, scope, onNavigate),
     ];
   }

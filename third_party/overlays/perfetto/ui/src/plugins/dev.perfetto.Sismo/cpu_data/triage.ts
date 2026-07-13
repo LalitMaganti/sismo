@@ -50,8 +50,7 @@ export async function loadCpuTriage(
                THEN ts.dur ELSE 0 END) AS other
     FROM thread_state ts
     JOIN thread th USING (utid)
-    WHERE ts.dur > 0
-      AND NOT (th.utid IN (SELECT utid FROM thread WHERE is_idle))
+    WHERE ts.dur > 0 AND th.is_idle = 0
       ${upidFilter}
   `);
   const r = res.firstRow({

@@ -28,6 +28,7 @@ import {
 import {setupByThreadWorkspace} from './thread_workspace';
 import {registerSismoFlamegraphTab} from './stack_timeline';
 import {registerSismoDetailTab} from './detail_tab';
+import {LATENCY_SQL_PACKAGE} from './cpu_data/latency_sql';
 
 export default class implements PerfettoPlugin {
   static readonly id = 'dev.perfetto.Sismo';
@@ -37,6 +38,15 @@ export default class implements PerfettoPlugin {
   static readonly dependencies = [SismoWidgets, SchedPlugin, ThreadPlugin];
 
   async onTraceLoad(trace: Trace): Promise<void> {
+    // Register the latency SQL package on this trace's engine. Cheap — the
+    // module bodies only run on the first INCLUDE, so the heavy occupancy table
+    // stays deferred to the first latency query, not trace load.
+    try {
+      await trace.engine.registerSqlPackages(LATENCY_SQL_PACKAGE);
+    } catch (e) {
+      console.warn('Sismo: failed to register latency SQL package', e);
+    }
+
     trace.pages.registerPage({
       route: '/sismo',
       render: (subpage) => m(SismoPage, {trace, subpage}),

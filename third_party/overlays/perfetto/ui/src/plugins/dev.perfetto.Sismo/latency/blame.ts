@@ -12,27 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// L3 — "Who or what was making you wait?" The privileged-vs-context payoff: of
-// the time your threads were runnable but not scheduled, which context process
-// held a core instead. Reuses the tested loadLatencyDetail blame query; this is
-// a compact summary that hands off to the full "Who it waited on" tab.
+// L3 — "Who or what was making you wait?" Of the time your threads were
+// runnable but not scheduled, what held the cores instead — led by your OWN
+// threads (self-contention: too many hot threads for the cores), the common
+// cause, then other processes. Hands off to the full "Who it waited on" tab.
 
 import m from 'mithril';
-import type {LatencyDetail} from '../cpu_data';
+import type {RunnableSummary} from '../cpu_data';
 import {fmtPercent} from '../format';
 import {questionBlock} from '../cpu/block';
 import {Meter, meterReadout, type MeterColor} from '../../dev.perfetto.SismoWidgets/meter';
 
 const QUESTION = 'Who or what was making you wait?';
 const DESCRIPTION =
-  'Of the time your threads were runnable but not scheduled, this attributes ' +
-  'each slice to whatever context process held a core instead.';
+  'Of the time your threads were runnable but not scheduled, this splits the ' +
+  'CPU that ran instead into your own threads (self-contention) versus other ' +
+  'processes.';
 
+// Reads the cheap RunnableSummary (a flat sum + a whole-trace CPU-share proxy),
+// so the landing pays no interval_intersect on page load. The precise
+// per-runnable-window attribution is the "Who it waited on" tab's job.
 export function renderBlameBlock(
-  d: LatencyDetail,
+  r: RunnableSummary,
   onNavigate: (tab: string) => void,
 ): m.Children {
-  if (!d.hasPriv) {
+  if (!r.hasPriv) {
     return questionBlock({
       question: QUESTION,
       description: DESCRIPTION,
@@ -42,63 +46,52 @@ export function renderBlameBlock(
     });
   }
 
-  const rows = d.blame;
-  const total = rows.reduce((a, r) => a + Number(r.blockedNs), 0);
-  if (rows.length === 0 || total === 0) {
+  if (r.totalNs === 0n) {
     return questionBlock({
       question: QUESTION,
       description: DESCRIPTION,
       answer:
-        'Nothing held a core while your threads were runnable — they got a CPU ' +
-        'as soon as they were ready.',
+        'Nothing kept your threads off a core — they were scheduled as soon as ' +
+        'they became runnable.',
     });
   }
 
-  const sorted = [...rows].sort((a, b) => Number(b.blockedNs) - Number(a.blockedNs));
-  const top = sorted.slice(0, 3);
-  const topNs = top.reduce((a, r) => a + Number(r.blockedNs), 0);
-  const otherNs = total - topNs;
-  const topFrac = Number(top[0].blockedNs) / total;
-  const colors: MeterColor[] = ['primary', 'secondary', 'info'];
+  const selfPct = fmtPercent(r.selfFrac, 0);
+  const ctxPct = fmtPercent(r.contextFrac, 0);
+  const answer =
+    r.selfFrac >= r.contextFrac
+      ? `Mostly your own threads — ${selfPct} of the CPU used while your ` +
+        'threads were ready to run was other threads of the same process ' +
+        '(self-contention: more hot threads than cores)' +
+        (r.topSelfLabel ? `, led by "${r.topSelfLabel}".` : '.')
+      : `Mostly other processes — ${ctxPct} of the CPU used while your ` +
+        'threads were ready belonged to other processes on the machine.';
 
+  const colors: [MeterColor, MeterColor] = ['primary', 'info'];
   const bar = [
-    ...top.map((r, i) => ({color: colors[i], frac: Number(r.blockedNs) / total})),
-    ...(otherNs > 0 ? [{color: 'idle' as MeterColor, frac: otherNs / total}] : []),
+    {color: colors[0], frac: r.selfFrac},
+    {color: colors[1], frac: r.contextFrac},
   ];
   const legend = [
-    ...top.map((r, i) => ({
-      color: colors[i],
-      label: r.name,
-      value: fmtPercent(Number(r.blockedNs) / total, 0),
-    })),
-    ...(otherNs > 0
-      ? [
-          {
-            color: 'idle' as MeterColor,
-            label: `${rows.length - top.length} other context processes`,
-            value: fmtPercent(otherNs / total, 0),
-          },
-        ]
-      : []),
+    {color: colors[0], label: 'Your own threads', value: selfPct},
+    {color: colors[1], label: 'Other processes', value: ctxPct},
   ];
 
   return questionBlock(
     {
       question: QUESTION,
       description: DESCRIPTION,
-      answer:
-        `For ${fmtPercent(topFrac, 0)} of the CPU time you lost while ` +
-        `runnable, "${top[0].name}" was running instead — a context process.`,
+      answer,
       deeper: {label: 'Who it waited on', onclick: () => onNavigate('who')},
     },
     [
       m(Meter, {
-        label: 'Held a core while you were runnable',
+        label: 'What held the cores while you were runnable',
         help:
-          'For each context process: its share of the CPU time it held while ' +
-          'one of your threads was runnable but waiting. Colours are roles, ' +
-          'not a good/bad scale.',
-        primary: meterReadout(fmtPercent(topFrac, 0), ` was "${top[0].name}"`),
+          'Share of the CPU that ran during your threads’ runnable-but-not-' +
+          'scheduled windows: your own threads versus other processes. Colours ' +
+          'are roles, not a good/bad scale.',
+        primary: meterReadout(selfPct, ' was your own threads'),
         bar,
         legend,
       }),

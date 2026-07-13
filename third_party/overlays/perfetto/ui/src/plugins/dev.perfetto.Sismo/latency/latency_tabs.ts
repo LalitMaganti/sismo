@@ -25,6 +25,8 @@ import {Tabs, type TabsTab} from '../../../widgets/tabs';
 import type {PrivilegedSet} from '../privileged_set';
 import {LatencyLandingPage} from './landing';
 import {LatencyWhoTab} from './who_tab';
+import {LatencyWhereTab} from './where_tab';
+import {LatencyLocksTab} from './locks_tab';
 
 interface LatencyTabsAttrs {
   readonly trace: Trace;
@@ -41,8 +43,8 @@ interface FixedTab {
 
 const FIXED_TABS: ReadonlyArray<FixedTab> = [
   {key: OVERVIEW_TAB, title: 'Summary', icon: 'dashboard'},
-  {key: 'where', title: 'Where the wall-clock went', icon: 'donut_large'},
-  {key: 'why', title: 'Why it waited', icon: 'help_outline'},
+  {key: 'where', title: 'Where the wait went', icon: 'donut_large'},
+  {key: 'locks', title: 'Locks', icon: 'lock'},
   {key: 'who', title: 'Who it waited on', icon: 'groups'},
 ];
 
@@ -73,6 +75,24 @@ export class LatencyTabsView implements m.ClassComponent<LatencyTabsAttrs> {
   private content(attrs: LatencyTabsAttrs, tab: FixedTab): m.Children {
     if (tab.key === OVERVIEW_TAB) {
       return m(LatencyLandingPage, {
+        trace: attrs.trace,
+        priv: attrs.priv,
+        onNavigate: (k) => {
+          this.active = k;
+        },
+      });
+    }
+    if (tab.key === 'where') {
+      return m(LatencyWhereTab, {
+        trace: attrs.trace,
+        priv: attrs.priv,
+        onNavigate: (k) => {
+          this.active = k;
+        },
+      });
+    }
+    if (tab.key === 'locks') {
+      return m(LatencyLocksTab, {
         trace: attrs.trace,
         priv: attrs.priv,
         onNavigate: (k) => {

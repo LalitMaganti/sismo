@@ -21,20 +21,20 @@ import {
 import type {PrivilegedSet} from '../privileged_set';
 import {privInClause, privNotInClause} from './sql';
 import type {
-  CpuBlameRow,
   CpuCoreRow,
   CpuIdleStateRow,
   CpuProcessRow,
-  CpuThreadBlameRow,
   CpuThreadRow,
+  RunnableDelay,
+  WakerSummary,
 } from './cores';
 import {
-  loadBlame,
   loadIdleStates,
   loadPerCore,
   loadProcessRows,
-  loadThreadBlame,
+  loadRunnableDelay,
   loadThreadRows,
+  loadWakers,
 } from './cores';
 import type {MicroarchData} from './microarch';
 import {EMPTY_MICROARCH, loadMicroarch} from './microarch';
@@ -417,8 +417,13 @@ export interface LatencyDetail {
   idleStates: CpuIdleStateRow[];
   // Other processes/threads that held the CPU while one of your threads was
   // runnable-but-not-running — i.e. what your scheduling latency is owed to.
-  blame: CpuBlameRow[];
-  threadBlame: CpuThreadBlameRow[];
+  // Why your threads sat runnable-but-not-scheduled: self-contention (your own
+  // threads) vs other processes vs an idle core going unused. Intra-process is
+  // the common case, so this leads the "who made you wait" story.
+  runnable: RunnableDelay;
+  // Who woke your threads out of a voluntary block (the causal side of waiting),
+  // split thread-context vs timer/IRQ.
+  wakers: WakerSummary;
 }
 
 export async function loadLatencyDetail(
@@ -430,11 +435,31 @@ export async function loadLatencyDetail(
   );
   const hasSched = hasSchedRes.firstRow({has_sched: NUM}).has_sched === 1;
   const hasPriv = priv.upids.length > 0;
+  const noWakers: WakerSummary = {
+    threadWakers: [],
+    threadNs: 0n,
+    timerIrqNs: 0n,
+  };
+  const noRunnable: RunnableDelay = {
+    hasPriv,
+    totalNs: 0n,
+    selfFrac: 0,
+    contextFrac: 0,
+    idleAvailFrac: 0,
+    selfThreads: [],
+    contextProcs: [],
+  };
   if (!hasSched) {
-    return {hasSched: false, hasPriv, blame: [], threadBlame: [], idleStates: []};
+    return {
+      hasSched: false,
+      hasPriv,
+      idleStates: [],
+      runnable: noRunnable,
+      wakers: noWakers,
+    };
   }
-  const blame = await loadBlame(engine, priv, 20);
-  const threadBlame = await loadThreadBlame(engine, priv, 20);
   const idleStates = await loadIdleStates(engine);
-  return {hasSched: true, hasPriv, blame, threadBlame, idleStates};
+  const runnable = await loadRunnableDelay(engine, priv);
+  const wakers = await loadWakers(engine, priv, 12);
+  return {hasSched: true, hasPriv, idleStates, runnable, wakers};
 }

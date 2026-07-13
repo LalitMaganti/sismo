@@ -1071,3 +1071,195 @@ export function buildSampleFlamegraphMetrics(
   }
   return metrics;
 }
+
+// ---- Off-CPU (blocking-stack) flamegraph ------------------------------------
+//
+// The off-CPU collector emits a second perf sequence: one sample per blocking
+// interval, carrying the stack the thread blocked on, with the wait DURATION in
+// a per-thread counter track named `off-cpu-ns` at the sample's ts. So the
+// natural weight here is wait time, not sample count — a `_..._weighted` tree
+// where each sample contributes its blocked nanoseconds.
+
+export const OFFCPU_COUNTER = 'off-cpu-ns';
+
+// Matches sismo.offcpu in cpu_data/latency_sql.ts (registered on the engine).
+const OFFCPU_TRIM_MODULE = 'sismo.offcpu';
+
+// The blocked-function tree: off-CPU samples re-rooted at the caller of the
+// scheduler (via _sismo_offcpu_trim) so the leaf is the real blocking call, not
+// the bpf/sched_switch tail, weighted by wait duration. Answers "which function
+// is blocked, and for that function, which call inside it blocks" as a call
+// tree. Reads the trim table from the sismo.offcpu module.
+function blockedFunctionStatement(where: string): string {
+  return `
+    select
+      id,
+      parent_id as parentId,
+      name,
+      mapping_name,
+      ${KERNEL_CODE_TYPE},
+      source_file || ':' || line_number as source_location,
+      self_value as value
+    from _callstacks_for_callsites_weighted!((
+      select t.trimmed_cs as callsite_id, cnt.value as value
+      from perf_sample p
+      join thread_counter_track tct
+        on tct.utid = p.utid and tct.name = '${OFFCPU_COUNTER}'
+      join counter cnt on cnt.track_id = tct.id and cnt.ts = p.ts
+      join _sismo_offcpu_trim t on t.leaf_cs = p.callsite_id
+      where ${where}
+    ))
+  `;
+}
+
+export function buildBlockedFunctionMetric(
+  wherePredicates: ReadonlyArray<string>,
+): QueryFlamegraphMetric {
+  const where = ['p.callsite_id is not null', ...wherePredicates].join(
+    '\n            and ',
+  );
+  return {
+    name: 'Wait time',
+    unit: 'ns',
+    nameColumnLabel: 'Blocking function',
+    dependencySql:
+      `INCLUDE PERFETTO MODULE ${OFFCPU_TRIM_MODULE};\n` +
+      'include perfetto module linux.perf.samples;\n' +
+      'include perfetto module callstacks.stack_profile;',
+    statement: blockedFunctionStatement(where),
+    unaggregatableProperties: [
+      {name: 'mapping_name', displayName: 'Mapping'},
+      {name: 'code_type', displayName: 'Code type'},
+    ],
+    aggregatableProperties: [
+      {
+        name: 'source_location',
+        displayName: 'Source location',
+        mergeAggregation: 'ONE_OR_SUMMARY' as const,
+      },
+    ],
+  };
+}
+
+// The blocked-nanoseconds weight for a scoped set of off-CPU samples: join each
+// sample to its `off-cpu-ns` reading (same utid + ts) and weight the tree by it.
+function offCpuDurationStatement(where: string): string {
+  return `
+    select
+      id,
+      parent_id as parentId,
+      name,
+      mapping_name,
+      ${KERNEL_CODE_TYPE},
+      source_file || ':' || line_number as source_location,
+      self_value as value
+    from _callstacks_for_callsites_weighted!((
+      select p.callsite_id as callsite_id, cnt.value as value
+      from perf_sample p
+      join thread_counter_track tct
+        on tct.utid = p.utid and tct.name = '${OFFCPU_COUNTER}'
+      join counter cnt on cnt.track_id = tct.id and cnt.ts = p.ts
+      where ${where}
+    ))
+  `;
+}
+
+// Same duration weight as a breakdown sample stream (one row per sample) so the
+// thread/process breakdown machinery applies unchanged.
+function offCpuDurationStream(
+  where: string,
+  top: BreakdownGroup,
+  bottom: BreakdownGroup,
+): string {
+  return `
+    select ${top.grp} as grp, ${top.label} as label,
+      ${top.pgrp} as pgrp, ${top.plabel} as plabel,
+      ${bottom.label} as blabel, ${bottom.plabel} as bplabel,
+      p.callsite_id as cs, cnt.value as w
+    from perf_sample p
+    join thread_counter_track tct
+      on tct.utid = p.utid and tct.name = '${OFFCPU_COUNTER}'
+    join counter cnt on cnt.track_id = tct.id and cnt.ts = p.ts
+    ${ALWAYS_JOIN}
+    where ${where}
+  `;
+}
+
+// The off-CPU sample flamegraph metrics: "Wait time" (duration-weighted, the
+// default) and "Blocking events" (one weight per blocking interval). Mirrors
+// buildSampleFlamegraphMetrics but with no hardware-counter weightings — the
+// off-CPU sequence carries no follower counters — and thread/process as the only
+// breakdown dimensions.
+export function buildOffCpuFlamegraphMetrics(
+  wherePredicates: ReadonlyArray<string>,
+  breakdownBy?: BreakdownKind,
+  nodeActions?: ReadonlyArray<FlamegraphOptionalAction>,
+  breakdownBottom?: BreakdownKind,
+): QueryFlamegraphMetric[] {
+  const where = ['p.callsite_id is not null', ...wherePredicates].join(
+    '\n            and ',
+  );
+  const topDim = axisDim(breakdownBy);
+  const bottomDim = axisDim(breakdownBottom);
+  const hasTop = topDim !== undefined;
+  const hasBottom = bottomDim !== undefined;
+  const top = topDim ? breakdownGroupCols(topDim) : NONE_GROUP;
+  const bottom = bottomDim ? breakdownGroupCols(bottomDim) : NONE_GROUP;
+  const broken = hasTop || hasBottom;
+  const opts = {hasTop, hasBottom};
+  const dimensions =
+    breakdownBy === undefined
+      ? undefined
+      : [
+          {key: 'none', label: 'None'},
+          {key: 'thread', label: 'Thread'},
+          {key: 'process', label: 'Process'},
+          {key: 'process_thread', label: 'Process › Thread'},
+        ];
+  const unaggregatableProperties = [
+    {name: 'mapping_name', displayName: 'Mapping'},
+    {name: 'code_type', displayName: 'Code type'},
+  ];
+  const aggregatableProperties = [
+    {
+      name: 'source_location',
+      displayName: 'Source location',
+      mergeAggregation: 'ONE_OR_SUMMARY' as const,
+    },
+  ];
+  const deps =
+    'include perfetto module linux.perf.samples;\n' +
+    'include perfetto module callstacks.stack_profile;';
+  const metrics: QueryFlamegraphMetric[] = [
+    {
+      name: 'Wait time',
+      unit: 'ns',
+      nameColumnLabel: 'Symbol',
+      dependencySql: deps,
+      statement: broken
+        ? breakdownTreeStatement(offCpuDurationStream(where, top, bottom), opts)
+        : offCpuDurationStatement(where),
+      breakdownDimensions: dimensions,
+      breakdownLeafDimensions: dimensions,
+      unaggregatableProperties,
+      aggregatableProperties,
+    },
+    {
+      name: 'Blocking events',
+      unit: '',
+      nameColumnLabel: 'Symbol',
+      dependencySql: deps,
+      statement: broken
+        ? breakdownTreeStatement(sampleCountStream(where, top, bottom), opts)
+        : flatStatement(where),
+      breakdownDimensions: dimensions,
+      breakdownLeafDimensions: dimensions,
+      unaggregatableProperties,
+      aggregatableProperties,
+    },
+  ];
+  if (nodeActions !== undefined && nodeActions.length > 0) {
+    return metrics.map((mt) => ({...mt, optionalNodeActions: nodeActions}));
+  }
+  return metrics;
+}

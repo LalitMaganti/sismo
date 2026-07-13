@@ -114,6 +114,15 @@
     flex-wrap: wrap;
   }
 
+  // The domain + region-of-interest selectors sit together on the left; the
+  // Open-timeline button stays on the right.
+  &__header-selectors {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
   // "Analysing [CPU ▾]" — the muted lead-in makes it clear the dropdown picks
   // the analysis domain rather than being a bare label.
   &__domain-selector {
@@ -1889,4 +1898,53 @@
   font-weight: 400;
   font-style: italic;
   color: var(--pf-color-text-muted);
+}
+
+// "Where the wall-clock went": per-thread running/waiting bars.
+.pf-sismo-wall-threads {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+
+  &__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  &__name {
+    flex: 0 0 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--pf-font-size-s);
+  }
+
+  &__bar {
+    flex: 1 1 auto;
+    display: flex;
+    height: 14px;
+    min-width: 2px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--pf-color-background-secondary);
+  }
+
+  &__run {
+    background: #3478f6; // running (on-CPU)
+    min-width: 0;
+  }
+
+  &__wait {
+    background: var(--pf-color-border); // waiting (off-CPU) — muted, not alarming
+    min-width: 0;
+  }
+
+  &__val {
+    flex: 0 0 110px;
+    text-align: right;
+    font-size: var(--pf-font-size-s);
+    color: var(--pf-color-text-muted);
+  }
 }

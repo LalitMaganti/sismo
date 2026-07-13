@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Mon, 13 Jul 2026 10:35:56 +0100
+Subject: nopr: expose registerSqlPackages on the Engine interface + proxy
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Plugins ship their own INCLUDE-able SQL modules via
+engine.registerSqlPackages, but it lived only on EngineBase — not the
+Engine interface or the trace-scoped EngineProxy. Add the interface
+declaration and the proxy delegation.
+---
+ ui/src/trace_processor/engine.ts | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/ui/src/trace_processor/engine.ts b/ui/src/trace_processor/engine.ts
+index a9845a8a..ca9cdb2b 100644
+--- a/ui/src/trace_processor/engine.ts
++++ b/ui/src/trace_processor/engine.ts
+@@ -141,6 +141,13 @@ export interface Engine {
+   getProxy(tag: string): EngineProxy;
+   readonly numRequestsPending: number;
+   readonly failed: string | undefined;
++
++  // Register a PerfettoSQL package (a set of INCLUDE-able modules) on this
++  // engine. Lets plugins ship their own stdlib-style modules.
++  registerSqlPackages(pkg: {
++    name: string;
++    modules: ReadonlyArray<{name: string; sql: string}>;
++  }): Promise<void>;
+ }
+ 
+ // Abstract interface of a trace proccessor.
+@@ -886,6 +893,13 @@ export class EngineProxy implements Engine, Disposable {
+     return this.engine.destroySummarizer(summarizerId);
+   }
+ 
++  registerSqlPackages(pkg: {
++    name: string;
++    modules: ReadonlyArray<{name: string; sql: string}>;
++  }): Promise<void> {
++    return this.engine.registerSqlPackages(pkg);
++  }
++
+   get engineId(): string {
+     return this.engine.id;
+   }

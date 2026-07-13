@@ -67,7 +67,11 @@ export class DomainShell implements m.ClassComponent<DomainShellAttrs> {
           '.pf-sismo-page__header',
           m(
             '.pf-sismo-page__header-row',
-            renderDomainSelector(attrs.nav, attrs.caps, attrs.onNavigate),
+            m(
+              '.pf-sismo-page__header-selectors',
+              renderDomainSelector(attrs.nav, attrs.caps, attrs.onNavigate),
+              renderRegionSelector(),
+            ),
             m(Button, {
               label: 'Open timeline',
               icon: 'timeline',
@@ -81,6 +85,35 @@ export class DomainShell implements m.ClassComponent<DomainShellAttrs> {
       ),
     );
   }
+}
+
+// The region of interest every analysis is scoped to. A framing device for now:
+// only "Full trace" exists, so the concept is visible and everything reads as
+// "…in this region". Later this grows a brushed time range and, once flows are
+// captured, a selected operation (an RPC/frame span).
+function renderRegionSelector(): m.Children {
+  return m(
+    '.pf-sismo-page__domain-selector',
+    m('span.pf-sismo-page__selector-label', 'Region of interest'),
+    m(
+      PopupMenu,
+      {
+        trigger: m(Button, {
+          label: 'Full trace',
+          icon: 'crop_free',
+          rightIcon: 'arrow_drop_down',
+          variant: ButtonVariant.Outlined,
+          title: 'Scope the analysis to a region (full trace only, for now)',
+        }),
+      },
+      m(MenuItem, {
+        label: 'Full trace',
+        icon: 'check',
+        // The only region today; selecting it is a no-op.
+        onclick: () => {},
+      }),
+    ),
+  );
 }
 
 // The "CPU ▾" picker. Renders the WHOLE tree — available, parked, and

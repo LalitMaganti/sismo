@@ -46,7 +46,7 @@ export async function loadChurn(
       JOIN thread th USING (utid)
       WHERE ts.dur > 0
         AND ts.state NOT IN ('Running', 'R', 'R+')
-        AND NOT (th.utid IN (SELECT utid FROM thread WHERE is_idle))
+        AND th.is_idle = 0
         AND th.upid ${scope}
     )
     SELECT

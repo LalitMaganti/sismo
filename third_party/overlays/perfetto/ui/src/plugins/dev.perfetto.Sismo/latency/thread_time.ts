@@ -37,12 +37,15 @@ export function renderLatencyTriageBlock(
   d: CpuTriage,
   scope: string,
   onNavigate: (tab: string) => void,
+  // The busiest on-CPU function, so the overview names WHAT was running, not
+  // just how much (mirrors the CPU section's function-first framing).
+  topFn?: {name: string; share: number},
 ): m.Children {
   const s = triageShares(d);
   const off = s.offCpu ?? 0;
   const onPct = fmtPercent(s.onCpu, 0);
   const offPct = fmtPercent(s.offCpu, 0);
-  const answer =
+  const base =
     off >= 0.5
       ? `${offPct} of the wall-clock was spent off-CPU — this is mostly a ` +
         'waiting problem. The blocks below break the wait down.'
@@ -50,12 +53,17 @@ export function renderLatencyTriageBlock(
         ? `Almost all the time was on the CPU (${onPct}) — this is really a ` +
           'compute story; the CPU section breaks down where it went.'
         : `${onPct} running on the CPU, ${offPct} waiting off it.`;
+  const answer =
+    topFn !== undefined && (s.onCpu ?? 0) > 0.05
+      ? `${base} Of the running time, ${fmtPercent(topFn.share, 0)} was in ` +
+        `"${topFn.name}".`
+      : base;
 
   // Always offer the per-thread breakdown; add the reciprocal CPU hand-off when
   // a meaningful share was on-core (mirrors CPU triage's link over to Latency).
   const deeper: DeeperAction[] = [
     {
-      label: 'Where the wall-clock went',
+      label: 'Where the wait went',
       onclick: () => onNavigate('where'),
     },
     ...(1 - off >= 0.2
@@ -108,8 +116,8 @@ export function renderWaitKindBlock(
         'yet the exact call.',
       answer,
       deeper: {
-        label: 'Why it waited',
-        onclick: () => onNavigate('why'),
+        label: 'Where the wait went',
+        onclick: () => onNavigate('where'),
       },
     },
     [renderOffCpuBreakdownMeter(d, scope)],
