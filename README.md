@@ -1,9 +1,17 @@
 # sismo
 
-*Simple, cross-platform performance debugging for native developers.*
+*Simple, cross-platform tooling to debug your program's performance and
+understand what it's doing.*
 
-**WARNING: this is still a very experimental project and is expected
-to evolve significantly over time.**
+> [!WARNING]
+> **This is a personal playground project, not intended for production
+> use.** It's early, very experimental, and expected to change a lot.
+>
+> - **"sismo" is a codename** and will almost certainly change — don't
+>   read anything into the name.
+> - It will likely be **upstreamed into
+>   [Perfetto](https://github.com/google/perfetto)** at some point, so
+>   treat everything here as provisional.
 
 ## What?
 
@@ -11,8 +19,8 @@ sismo is an opinionated view on how profiling and tracing should work for
 anyone developing applications targeting Linux, Mac or Windows. This
 includes CLIs, servers, desktop GUIs etc.
 
-The goal is to give you everything you might need to debug your app in
-many contexts:
+The goal is to give you everything you might need to both debug your app's
+performance and understand what it's doing, in many contexts:
 
 ```sh
 # Run a program and record everything until it exits (or Ctrl-C cuts
@@ -33,18 +41,18 @@ sismo snapshot --output ./incident.pftrace
 sismo record --pid 12345
 ```
 
-You can then visualize it on https://ui.perfetto.dev.
+You can then visualize the resulting trace at [ui.perfetto.dev](https://ui.perfetto.dev).
 <!-- TODO(lalitm): switch to sismo UI when ready. -->
 
 Concretely, sismo can collect:
 
-* CPU profiling: understand where your program is spending time by sampling
+* **CPU profiling**: understand where your program is spending time by sampling
   stack traces.
-* Memory profiling: isolate where your program is allocating too much memory
+* **Memory profiling**: isolate where your program is allocating too much memory
   or is leaking.
-* App-specific details: using language bindings in C/C++/Rust/Zig/Java/Kotlin/Go,
-  you can annotate what your program is doing with rich trees of context.
-* Kernel scheduling: gain insight into the relationships between threads
+* **App-specific details** (planned): language bindings in C/C++/Rust/Zig/Java/Kotlin/Go
+  will let you annotate what your program is doing with rich trees of context.
+* **Kernel scheduling**: gain insight into the relationships between threads
   of your process, or how your app might be contending with others on the
   system.
 
@@ -52,17 +60,23 @@ Concretely, sismo can collect:
 
 In my full time job at Google, I work on [Perfetto](https://github.com/google/perfetto),
 a performance profiling and tracing tool. So on the surface, it might seem weird that I'm
-developing *another* performance debugging tool in my spare time.
+developing *another* tool for debugging performance and understanding what your program
+is doing in my spare time.
 
-But in my head, Perfetto and sismo are two *very* distinct project:
+But in my head, Perfetto and sismo play two *very* distinct roles:
 * Perfetto is a *platform*: a set of components which can be assembled together
   in many different ways depending on the problem you are tackling. Its power comes from
-  flexibility, but it's also has a *steep* learning curve. It makes sense to invest if
-  you look at performance all the time but otherwise, it can just be too much
+  flexibility, but it also has a *steep* learning curve. It makes sense to invest if
+  you look at performance all the time, but otherwise it can just be too much.
 * sismo is a *product*: my opinion on what an average developer needs when they
   start looking at performance. That makes it far less flexible than Perfetto,
-  but also far simpler: any engineer should be able to pick up sismo and start
+  but also far simpler: any engineer should be able to pick it up and start
   being productive within minutes.
+
+These roles aren't in tension with sismo eventually living inside Perfetto: the
+most natural home for an opinionated, product-shaped layer is on top of the very
+platform it's built from. That's why I expect sismo to be upstreamed into Perfetto
+in the future rather than staying a separate project forever.
 
 sismo is more akin to a *Linux distribution*: it picks and chooses which components
 from the ecosystem are useful and pulls them together into something coherent.
