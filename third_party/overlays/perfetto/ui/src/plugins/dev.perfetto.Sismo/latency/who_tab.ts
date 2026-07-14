@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The scheduling side of latency: "Why you waited for a core" — the runnable-
+// The scheduling side of latency: "Who else competed for the CPU" — the runnable-
 // but-not-scheduled delay (who held the CPU while your threads were ready) plus
 // idle-state residency. A distinct problem from waiting on a resource, so it's
 // its own tab. The lock releaser / waker ("who woke you") is NOT here — it's an
@@ -80,7 +80,7 @@ function withDetail(
   return m('.pf-sismo-tab__body', render(trace, data));
 }
 
-// "Why you waited for a core" — the runnable-but-not-scheduled delay
+// "Who else competed for the CPU" — the runnable-but-not-scheduled delay
 // (self-contention vs other processes) plus idle-state residency. The scheduling
 // side of latency: you were ready to run but couldn't get a CPU — a different
 // problem from waiting on a resource.
@@ -102,14 +102,14 @@ export class LatencySchedulingTab
   }
 }
 
-  // "Why your threads waited for a core" — the runnable-but-not-scheduled delay,
+  // "Who else competed for the CPU" — the runnable-but-not-scheduled delay,
   // attributed intra-process-first. The common cause of a multithreaded app
   // sitting runnable is its OWN other threads holding the cores (self-contention
   // / oversubscription), not another process. So this leads with your threads,
   // then other processes, then notes whether a core was even free (a placement
   // problem, not contention).
 function renderRunnableDelay(trace: Trace, d: LatencyDetail): m.Children {
-    const title = 'Why your threads waited for a core';
+    const title = 'Who else competed for the CPU';
     const subtitle =
       'When a thread was ready to run but not scheduled — what held the cores ' +
       'instead. Your own threads (self-contention) are the usual cause; shares ' +

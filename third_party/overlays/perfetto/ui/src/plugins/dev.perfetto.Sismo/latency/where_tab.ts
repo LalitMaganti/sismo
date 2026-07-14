@@ -168,7 +168,7 @@ export class LatencyWhereTab implements m.ClassComponent<WhereAttrs> {
               'span',
               'If your threads were ready to run but stuck waiting for a CPU ' +
                 'instead of blocked here, see ',
-              actionLink('Why you waited for a core', 'open_in_new', () =>
+              actionLink('Who else competed for the CPU', 'open_in_new', () =>
                 attrs.onNavigate('scheduling'),
               ),
               '.',

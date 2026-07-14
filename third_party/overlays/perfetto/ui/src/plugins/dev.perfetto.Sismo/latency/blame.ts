@@ -83,7 +83,7 @@ export function renderBlameBlock(
       description: DESCRIPTION,
       answer,
       deeper: {
-        label: 'Why you waited for a core',
+        label: 'Who else competed for the CPU',
         onclick: () => onNavigate('scheduling'),
       },
     },
