@@ -49,14 +49,14 @@ const RESOURCES_TAB = 'resources';
 
 const FIXED_TABS: ReadonlyArray<FixedTab> = [
   {key: OVERVIEW_TAB, title: 'Summary', icon: 'dashboard'},
-  {key: 'where', title: 'Which code was waiting', icon: 'donut_large'},
-  {key: RESOURCES_TAB, title: 'What you waited on', icon: 'category'},
+  {key: 'where', title: 'What code was waiting', icon: 'donut_large'},
+  {key: RESOURCES_TAB, title: 'What resources were you waiting on', icon: 'category'},
   {key: 'scheduling', title: 'Who else competed for the CPU', icon: 'developer_board'},
 ];
 
 export class LatencyTabsView implements m.ClassComponent<LatencyTabsAttrs> {
   private active: string = OVERVIEW_TAB;
-  // Which resource facet the "What you waited on" tab shows (Locks / Network /
+  // Which resource facet the "What resources were you waiting on" tab shows (Locks / Network /
   // Disk are sub-tabs, not top-level).
   private facet: ResourceFacet = 'locks';
   // Tabs opened at least once; the Tabs widget keeps opened content mounted, so

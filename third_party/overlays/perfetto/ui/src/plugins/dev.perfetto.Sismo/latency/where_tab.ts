@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// "Which code was waiting" — the off-CPU (waiting) analogue of the CPU section's
+// "What code was waiting" — the off-CPU (waiting) analogue of the CPU section's
 // "Where the cycles went": one tab, three views over the SAME wait-time-weighted
 // data — a Flamegraph, an expandable Call tree, and a flat Functions ranking.
 // Every off-CPU stack is re-rooted at the call that entered the scheduler (the

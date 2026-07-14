@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// "What you waited on" — the per-resource facets of the wait: which lock, which
+// "What resources were you waiting on" — the per-resource facets of the wait: which lock, which
 // peer, which file your threads blocked on. One tab with a segmented switcher
 // over Locks / Network / Disk, mirroring the CPU page's "How were cycles spent"
 // (cache / branch / backend). Controlled: the parent owns the selected facet so
