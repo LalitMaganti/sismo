@@ -84,8 +84,11 @@ pub fn resolve_heap_dylib_path() -> Option<String> {
     let bin_dir = exe.parent()?;
 
     // Most-specific first; index 1 (cargo dev tree) is the best-effort fallback.
-    const LAYOUTS: [&str; 3] = [
+    // For a cargo-built binary at `crates/sismo/target/debug/sismo`, the repo
+    // root is four levels up from `bin_dir`.
+    const LAYOUTS: [&str; 4] = [
         "../libexec/sismo/libsismo_heap.dylib",
+        "../../../../dev-install/lib/libsismo_heap.dylib",
         "../../../dev-install/lib/libsismo_heap.dylib",
         "../lib/libsismo_heap.dylib",
     ];

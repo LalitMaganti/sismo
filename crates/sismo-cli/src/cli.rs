@@ -21,7 +21,8 @@ struct Cli {
 enum Commands {
     /// Spawn a command (or attach to --pid) and record sched + CPU samples +
     /// heap into a single Perfetto trace. Stops on SIGINT, target exit, or
-    /// --duration. Requires sudo on macOS for kdebug + task_for_pid.
+    /// --duration. On macOS, task attach needs `sismo doctor --fix`; kdebug
+    /// scheduler/CPU collection needs a privileged external datasource.
     Record(crate::record_args::RecordArgs),
 
     /// Launch a command with sismo's dormant heap client preloaded, so it can
@@ -34,6 +35,9 @@ enum Commands {
 
     /// Run a daemonized data-source producer for an external `sismo record`.
     Datasource(crate::cmd_datasource::DatasourceArgs),
+
+    /// Diagnose local setup problems and optionally apply safe fixes.
+    Doctor(crate::cmd_doctor::DoctorArgs),
 }
 
 /// Parse the process argv (`args[0]` is the exe) and run the chosen subcommand,
@@ -55,5 +59,6 @@ pub fn run(args: &[String]) -> i32 {
         Some(Commands::Prepare(a)) => crate::cmd_prepare::run(a),
         Some(Commands::Snapshot(a)) => crate::cmd_snapshot::run(a),
         Some(Commands::Datasource(a)) => crate::cmd_datasource::run(a),
+        Some(Commands::Doctor(a)) => crate::cmd_doctor::run(a),
     }
 }

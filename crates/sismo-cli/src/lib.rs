@@ -14,6 +14,8 @@ pub mod cmd_record;
 // `sismo datasource` subcommand (daemonized privileged producer). POSIX-only.
 #[cfg(not(target_os = "windows"))]
 pub mod cmd_datasource;
+// `sismo doctor` subcommand (diagnostics + safe setup fixes).
+pub mod cmd_doctor;
 // `sismo prepare` subcommand (DYLD-insert the heap client + exec). POSIX-only.
 #[cfg(not(target_os = "windows"))]
 pub mod cmd_prepare;

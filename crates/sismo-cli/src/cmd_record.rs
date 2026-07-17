@@ -333,7 +333,9 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         }
     }
 
-    // Privilege warning for in-process privileged sources.
+    // kdebug/kperf are root-only. Heap task access is different: an
+    // unprivileged binary with the debugger entitlement (installed by
+    // `sismo doctor --fix`) can capture it, so do not classify heap as root-only.
     if unsafe { libc::geteuid() } != 0 {
         let mut unmet: Vec<&str> = Vec::new();
         if sched_mode == SourceMode::InProcess {
@@ -342,16 +344,13 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         if cpu_mode == SourceMode::InProcess {
             unmet.push("cpu");
         }
-        if heap_mode == SourceMode::InProcess {
-            unmet.push("heap");
-        }
         if !unmet.is_empty() {
-            eprintln!("sismo record: WARNING — running unprivileged. The following data\n  sources need root and will fail to capture:");
+            eprintln!("sismo record: WARNING — the following in-process macOS data\n  sources use root-only kdebug/kperf and will fail to capture:");
             for n in &unmet {
                 eprintln!("    {n}");
             }
             eprintln!(
-                "  options:\n    1. re-run with `sudo`     (simple — everything in one process as root)\n    2. pass --external-{{X}}    + run `sudo sismo datasource X` in another\n                                  shell (or --all-external + `sudo sismo\n                                  datasource all-privileged`)\n    3. pass --no-{{X}}          to skip the data source silently"
+                "  options:\n    1. pass --external-{{X}} and run `sudo sismo datasource <name>`\n       separately in another terminal\n    2. pass --no-{{X}} to skip the data source silently"
             );
         }
     }
