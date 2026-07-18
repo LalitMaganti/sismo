@@ -35,6 +35,10 @@ pub struct GoPclntab {
     nfunc: usize,
     funcname_off: usize,
     functab_off: usize,
+    /// Base of `pctab`, the pool of pc-value tables. `_func.pcsp` is an offset
+    /// into this pool naming the table that gives a function's stack-frame size
+    /// (SP delta) at each PC — the input a frame-pointer-less Go unwind needs.
+    pctab_off: usize,
 }
 
 impl GoPclntab {
@@ -67,16 +71,18 @@ impl GoPclntab {
         // rd(16) = nfiles, rd(24) = textStart (0 on disk — use .text vaddr).
         let funcname_off = rd(32)? as usize;
         // rd(40) cuOffset, rd(48) filetabOffset, rd(56) pctabOffset.
+        let pctab_off = rd(56)? as usize;
         let functab_off = rd(64)? as usize; // pclnOffset → the functab array
         // The functab has nfunc entries + 1 sentinel, each 8 bytes (go1.18+).
         let functab_bytes = nfunc.checked_add(1)?.checked_mul(8)?;
         if nfunc == 0
             || funcname_off >= data.len()
+            || pctab_off >= data.len()
             || functab_off.checked_add(functab_bytes)? > data.len()
         {
             return None;
         }
-        Some(GoPclntab { data, text_off, nfunc, funcname_off, functab_off })
+        Some(GoPclntab { data, text_off, nfunc, funcname_off, functab_off, pctab_off })
     }
 
     /// The i'th functab entry: `(entryoff, funcoff)` — entryoff relative to
@@ -100,16 +106,15 @@ impl GoPclntab {
         cstr_at(&self.data, self.funcname_off + nameoff as usize)
     }
 
-    /// Resolve a link-time address to `(function name, offset into function)`, or
-    /// `None` if it is outside every Go function.
-    pub fn resolve(&self, addr: u64) -> Option<(&str, u64)> {
-        let q = u32::try_from(addr.checked_sub(self.text_off)?).ok()?;
+    /// The functab `(entryoff, funcoff)` of the Go function containing `q` (a
+    /// textStart-relative PC), or `None` if `q` is outside every Go function.
+    fn find_func(&self, q: u32) -> Option<(u32, u32)> {
         // Binary search the functab (entryoff ascending) for the last entry with
         // entryoff <= q; the sentinel (index nfunc) bounds the final function.
-        let (mut lo, mut hi) = (0usize, self.nfunc); // search among real entries
         if q < self.functab(0).0 || q >= self.functab(self.nfunc).0 {
             return None; // before the first function or past the text end
         }
+        let (mut lo, mut hi) = (0usize, self.nfunc);
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
             if self.functab(mid).0 <= q {
@@ -118,13 +123,86 @@ impl GoPclntab {
                 hi = mid;
             }
         }
-        let (entryoff, funcoff) = self.functab(lo);
+        Some(self.functab(lo))
+    }
+
+    /// Resolve a link-time address to `(function name, offset into function)`, or
+    /// `None` if it is outside every Go function.
+    pub fn resolve(&self, addr: u64) -> Option<(&str, u64)> {
+        let q = u32::try_from(addr.checked_sub(self.text_off)?).ok()?;
+        let (entryoff, funcoff) = self.find_func(q)?;
         let name = self.func_name(funcoff)?;
         Some((name, (q - entryoff) as u64))
     }
 
+    /// The stack-frame size (SP delta, in bytes) at link-time address `addr`,
+    /// from the function's `pcsp` pc-value table. This is the amount to add to
+    /// SP to reach the caller's frame when unwinding a Go stack without frame
+    /// pointers. `None` outside every Go function; the frame size is 0 in a
+    /// function's prologue/epilogue and for frameless leaves.
+    pub fn frame_size(&self, addr: u64) -> Option<i32> {
+        let q = u32::try_from(addr.checked_sub(self.text_off)?).ok()?;
+        let (entryoff, funcoff) = self.find_func(q)?;
+        // _func layout (go1.18+): entryOff u32 @0, nameOff i32 @4, args i32 @8,
+        // deferreturn u32 @12, pcsp u32 @16.
+        let pcsp_pos = self.functab_off + funcoff as usize + 16;
+        let pcsp = u32::from_le_bytes(self.data.get(pcsp_pos..pcsp_pos + 4)?.try_into().ok()?);
+        pcvalue(&self.data, self.pctab_off.checked_add(pcsp as usize)?, entryoff, q)
+    }
+
     pub fn len(&self) -> usize {
         self.nfunc
+    }
+}
+
+/// Decode a Go pc-value table to the value in effect at `target` (a textStart-
+/// relative PC), starting from function entry `entry`. The table is a sequence
+/// of `(value-delta, pc-delta)` steps: the value delta is a zig-zag-encoded
+/// signed varint, the pc delta an unsigned varint (× the amd64 pc quantum of 1).
+/// The value starts at -1 and each step holds over `[pc, pc + pcdelta)`. A
+/// zero value-delta that isn't the first step ends the table.
+fn pcvalue(data: &[u8], table_off: usize, entry: u32, target: u32) -> Option<i32> {
+    let mut cur = table_off;
+    let mut val: i32 = -1;
+    let mut pc: u32 = entry;
+    let mut first = true;
+    loop {
+        let uvdelta = read_uvarint(data, &mut cur)?;
+        if uvdelta == 0 && !first {
+            return None; // reached the end without covering target
+        }
+        first = false;
+        // Zig-zag decode the signed value delta.
+        let vdelta = if uvdelta & 1 != 0 {
+            !(uvdelta >> 1) as i32
+        } else {
+            (uvdelta >> 1) as i32
+        };
+        val = val.wrapping_add(vdelta);
+        let pcdelta = read_uvarint(data, &mut cur)?; // pc quantum is 1 on amd64
+        pc = pc.wrapping_add(pcdelta as u32);
+        if target < pc {
+            return Some(val);
+        }
+    }
+}
+
+/// Read a base-128 unsigned varint (Go's `readvarint`: 7 bits/byte, low group
+/// first, high bit = continue), advancing `cur`. `None` on truncation.
+fn read_uvarint(data: &[u8], cur: &mut usize) -> Option<u32> {
+    let mut result: u32 = 0;
+    let mut shift = 0u32;
+    loop {
+        let b = *data.get(*cur)?;
+        *cur += 1;
+        result |= ((b & 0x7f) as u32).checked_shl(shift)?;
+        if b & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 32 {
+            return None;
+        }
     }
 }
 
@@ -264,5 +342,58 @@ mod tests {
             "expected main.sismo_wl_leaf among {} names",
             names.len()
         );
+    }
+
+    #[test]
+    fn read_uvarint_multibyte() {
+        // 0xac,0x02 = (0x2c) | (0x02 << 7) = 44 + 256 = 300.
+        let b = [0xac, 0x02];
+        let mut c = 0;
+        assert_eq!(read_uvarint(&b, &mut c), Some(300));
+        assert_eq!(c, 2);
+    }
+
+    #[test]
+    fn pcvalue_decodes_a_known_table() {
+        // A hand-built pcsp table: frame size 0 over [0,3), 32 over [3,13), 0
+        // over [13,18), then the terminating zero value-delta. Value deltas are
+        // zig-zag varints (+1→2, +32→64, -32→63), pc deltas plain varints.
+        let table = [2u8, 3, 64, 10, 63, 5, 0];
+        assert_eq!(pcvalue(&table, 0, 0, 1), Some(0));
+        assert_eq!(pcvalue(&table, 0, 0, 5), Some(32));
+        assert_eq!(pcvalue(&table, 0, 0, 15), Some(0));
+        // Past the covered range: the table ends without covering the target.
+        assert_eq!(pcvalue(&table, 0, 0, 20), None);
+    }
+
+    // Decode real pcsp tables from the stripped Go binary and check every frame
+    // size is sane — exercises the varint/zig-zag decode against a real toolchain.
+    #[test]
+    fn frame_size_sane_on_go_binary() {
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../../out/matrix/bin/go-stripped");
+        if !std::path::Path::new(bin).exists() {
+            return; // matrix not built here
+        }
+        let pcln = GoPclntab::from_path(bin).unwrap();
+        let mut checked = 0;
+        for i in 0..pcln.nfunc {
+            let e0 = pcln.functab(i).0;
+            let e1 = pcln.functab(i + 1).0;
+            if e1 <= e0 || e1 - e0 < 32 {
+                continue; // skip tiny/degenerate entries
+            }
+            let mid = e0 + (e1 - e0) / 2;
+            if let Some(fs) = pcln.frame_size(mid as u64 + pcln.text_off) {
+                assert!(
+                    (0..100_000).contains(&fs),
+                    "insane frame size {fs} for func {i}"
+                );
+                checked += 1;
+                if checked >= 20 {
+                    break;
+                }
+            }
+        }
+        assert!(checked > 0, "decoded no frame sizes from the Go binary");
     }
 }
