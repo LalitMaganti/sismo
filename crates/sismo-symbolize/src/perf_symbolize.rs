@@ -738,11 +738,14 @@ fn report_interpreter_runtimes(stats: &[ModuleStat]) {
 fn print_runtime_diagnostic(name: &[u8], rt: Runtime) {
     match rt {
         Runtime::Python => {
+            // PY-1 recovers Python frames by default, so this is no longer a
+            // "your code is invisible" warning — it names where the Python
+            // frames come from and what still isn't covered.
             eprintln!("\nsismo record: {} — CPython interpreter detected.", s(name));
-            eprintln!("    the profile shows only the native interpreter frames; your Python");
-            eprintln!("    functions are invisible. Recovering them needs sismo to read the");
-            eprintln!("    interpreter's frame state directly (planned, PY-1). Until then the");
-            eprintln!("    Python call stack is not available.");
+            eprintln!("    Python frames are recovered from the interpreter frame state");
+            eprintln!("    (_Py_DebugOffsets, PY-1) on CPython 3.14; source line numbers and");
+            eprintln!("    native C-extension frames are not mapped, and other interpreter");
+            eprintln!("    versions fall back to native frames only.");
         }
         Runtime::NodeV8 => {
             eprintln!("\nsismo record: {} — Node/V8 JIT runtime detected.", s(name));
