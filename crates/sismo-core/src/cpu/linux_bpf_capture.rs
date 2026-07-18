@@ -18,6 +18,11 @@ pub const SISMO_EVT_SAMPLE: u32 = 0;
 pub const SISMO_EVT_KSYM: u32 = 1;
 pub const SISMO_EVT_OFFCPU: u32 = 2;
 pub const SISMO_EVT_FILE: u32 = 3;
+pub const SISMO_EVT_SAMPLE_UNWIND: u32 = 4;
+
+/// Bytes of the raw user-stack snapshot in `SismoUnwindRec` (perf's default
+/// PERF_SAMPLE_STACK_USER size).
+pub const SISMO_STACK_SNAP_MAX: usize = 8192;
 
 // block_id (off-CPU slot 0) tag bits: which kind of thing the block waits on.
 const BLOCK_ID_NET: u64 = 1 << 63; // TCP peer (rest of the bits: packed 5-tuple)
@@ -46,6 +51,22 @@ pub struct SismoSampleRec {
     pub counters: [u64; SISMO_MAX_COUNTERS],
     pub stack: [u64; SISMO_MAX_STACK],
     pub kernel_ids: [u32; SISMO_MAX_KERNEL_STACK],
+}
+
+/// SISMO_EVT_SAMPLE_UNWIND. Composes `SismoSampleRec` verbatim (byte-identical
+/// leading bytes) plus the user pt_regs at sample time and a bounded raw copy
+/// of the user stack from the captured stack pointer — captured for a later
+/// host-side DWARF-unwind step. Not yet consumed: today's processing runs the
+/// embedded `sample` through the exact same path as SISMO_EVT_SAMPLE.
+#[repr(C)]
+pub struct SismoUnwindRec {
+    pub sample: SismoSampleRec,
+    pub regs_ip: u64,
+    pub regs_sp: u64,
+    pub regs_bp: u64,
+    pub stack_len: u32,
+    pub stack_trunc: u32,
+    pub stack_bytes: [u8; SISMO_STACK_SNAP_MAX],
 }
 
 /// SISMO_EVT_KSYM. One-time (id -> resolved name) mapping.
@@ -758,6 +779,9 @@ pub struct Capture {
     data_frames: u64,
     offcpu_samples: u64,
     offcpu_ns: u64,
+    // NAT-1: count of SISMO_EVT_SAMPLE_UNWIND records seen, for the
+    // SISMO_DEBUG_UNWIND verification hook.
+    unwind_snapshots: u64,
     sampler_precise_ip: u8,
     ds_slot: u32,
     active: AtomicBool,
@@ -1039,6 +1063,26 @@ impl Capture {
         unsafe { sismo_ds_emit_offcpu(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
     }
 
+    /// Process a plain SISMO_EVT_SAMPLE payload: run/counter bookkeeping, then
+    /// (if a session is active) emit it as a PerfSample. Also the body of a
+    /// SISMO_EVT_SAMPLE_UNWIND record's embedded `.sample` — that record's
+    /// regs/stack snapshot rides along unused for now, so its FP frames must
+    /// be processed identically to a plain sample (NAT-1: no host-side
+    /// unwinding wired up yet).
+    fn process_sample(&mut self, rec: &SismoSampleRec) {
+        self.samples += 1;
+        self.acc.insert(rec.hdr.tid, rec.counters[0]);
+
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        if self.need_defaults.swap(false, Ordering::AcqRel) {
+            self.interner.reset();
+            self.emit_defaults();
+        }
+        self.emit_sample(rec);
+    }
+
     fn handle(&mut self, hdr: &SismoHdr) {
         if hdr.r#type == SISMO_EVT_KSYM {
             let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoKsymRec) };
@@ -1061,21 +1105,23 @@ impl Capture {
             }
             return;
         }
+        if hdr.r#type == SISMO_EVT_SAMPLE_UNWIND {
+            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoUnwindRec) };
+            self.unwind_snapshots += 1;
+            if self.unwind_snapshots <= 3 && std::env::var_os("SISMO_DEBUG_UNWIND").is_some() {
+                eprintln!(
+                    "sismo: unwind snapshot #{} regs_ip=0x{:x} regs_sp=0x{:x} stack_len={} stack_trunc={}",
+                    self.unwind_snapshots, rec.regs_ip, rec.regs_sp, rec.stack_len, rec.stack_trunc
+                );
+            }
+            self.process_sample(&rec.sample);
+            return;
+        }
         if hdr.r#type != SISMO_EVT_SAMPLE {
             return;
         }
-        self.samples += 1;
         let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoSampleRec) };
-        self.acc.insert(hdr.tid, rec.counters[0]);
-
-        if !self.active.load(Ordering::Acquire) {
-            return;
-        }
-        if self.need_defaults.swap(false, Ordering::AcqRel) {
-            self.interner.reset();
-            self.emit_defaults();
-        }
-        self.emit_sample(rec);
+        self.process_sample(rec);
     }
 
     fn handle_ksym(&mut self, rec: &SismoKsymRec) {
@@ -1232,6 +1278,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         data_frames: 0,
         offcpu_samples: 0,
         offcpu_ns: 0,
+        unwind_snapshots: 0,
         sampler_precise_ip: 0,
         ds_slot: u32::MAX,
         active: AtomicBool::new(false),
@@ -1335,6 +1382,26 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
             cfg_fd,
             &zero as *const u32 as *const c_void,
             &pid as *const u32 as *const c_void,
+            0,
+        )
+    };
+
+    // NAT-1: cfg[1] gates the BPF unwind-capture path (regs + raw user-stack
+    // snapshot alongside the FP-walked sample). Nothing consumes the payload
+    // yet, so it stays off by default — an 8 KiB/sample cost with no benefit
+    // until the host-side unwinder lands. Opt in with SISMO_UNWIND_CAPTURE to
+    // exercise it; x86-64 only. The next step (host unwind) makes it the
+    // default via auto-detect.
+    #[cfg(target_arch = "x86_64")]
+    let unwind_flag: u32 = u32::from(std::env::var_os("SISMO_UNWIND_CAPTURE").is_some());
+    #[cfg(not(target_arch = "x86_64"))]
+    let unwind_flag: u32 = 0;
+    let one: u32 = 1;
+    unsafe {
+        bpf_map_update_elem(
+            cfg_fd,
+            &one as *const u32 as *const c_void,
+            &unwind_flag as *const u32 as *const c_void,
             0,
         )
     };

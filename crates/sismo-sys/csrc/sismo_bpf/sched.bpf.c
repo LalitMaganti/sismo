@@ -80,10 +80,10 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
+  __uint(max_entries, 2);
   __type(key, __u32);
   __type(value, __u32);
-} cfg SEC(".maps");  // cfg[0] = target tgid (0 = all)
+} cfg SEC(".maps");  // cfg[0] = target tgid (0 = all), cfg[1] = unwind-capture flag (NAT-1)
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -276,6 +276,12 @@ static __always_inline __u32 target_tgid(void) {
   __u32 zero = 0;
   __u32 *t = bpf_map_lookup_elem(&cfg, &zero);
   return t ? *t : 0;
+}
+
+static __always_inline __u32 unwind_enabled(void) {
+  __u32 one = 1;
+  __u32 *v = bpf_map_lookup_elem(&cfg, &one);
+  return v ? *v : 0;
 }
 
 // Read every counter slot on the current CPU, diff against last_pe, advance
@@ -570,6 +576,63 @@ int on_tick(struct bpf_perf_event_data *ctx) {
     // reserve + bpf_snprintf, so 64 unrolled copies blow the 512-byte BPF stack.
     for (int i = 0; i < SISMO_MAX_KERNEL_STACK && i < nr_kernel; i++)
       ks->id[i] = resolve_ksym(ks->addr[i]);
+  }
+
+  // NAT-1: when unwind capture is on, ship a sismo_unwind_rec instead of the
+  // plain sample — same sample fields (only hdr.type differs), plus the regs
+  // + a raw user-stack snapshot for host-side DWARF unwinding. Filled
+  // directly into the ringbuf reservation (never on the 512-byte BPF stack).
+  // Nothing consumes regs/stack_bytes yet: the FP stack[] above is still what
+  // gets processed, so today's facts don't move.
+  if (unwind_enabled()) {
+    struct sismo_unwind_rec *ue = bpf_ringbuf_reserve(&events, sizeof(*ue), 0);
+    if (!ue)
+      return 0;
+    ue->sample.hdr.type = SISMO_EVT_SAMPLE_UNWIND;
+    ue->sample.hdr.tid = BPF_CORE_READ(cur, pid);
+    ue->sample.hdr.pid = tgid;
+    ue->sample.hdr.cpu = bpf_get_smp_processor_id();
+    ue->sample.hdr.timebase = (unsigned int)bpf_get_attach_cookie(ctx);
+    ue->sample.hdr.nr_kernel_frames = nr_kernel;
+    ue->sample.hdr.ts = bpf_ktime_get_ns();
+    ue->sample.data_addr = ctx->addr;
+#pragma unroll
+    for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
+      ue->sample.counters[s] = tc->v[s];
+    long un = bpf_get_stack(ctx, ue->sample.stack, sizeof(ue->sample.stack), BPF_F_USER_STACK);
+    ue->sample.hdr.nr_frames = (un > 0) ? (__u32)(un / 8) : 0;
+    for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
+      ue->sample.kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
+
+    // bpf_perf_event_data.regs is an opaque u64[21] blob (see kernel_defs.h)
+    // laid out exactly like x86_64 struct pt_regs, so the CO-RE-safe
+    // PT_REGS_* accessors work once cast to that type.
+    struct pt_regs *uregs = (struct pt_regs *)&ctx->regs;
+    ue->regs_ip = PT_REGS_IP(uregs);
+    ue->regs_sp = PT_REGS_SP(uregs);
+    ue->regs_bp = PT_REGS_FP(uregs);
+
+    // bpf_probe_read_user is all-or-nothing: it copies the whole requested
+    // size or nothing. A shallow stack sits close to its mapping top, so a
+    // full SISMO_STACK_SNAP_MAX read from sp overruns the top page and fails
+    // outright — which is the common case for the simple, FP-less workloads
+    // NAT-1 targets. Try decreasing power-of-two sizes and keep the largest
+    // that maps; each unrolled size is a compile-time constant the verifier
+    // can bound against the 8 KiB buffer.
+    __u32 snap = 0;
+#pragma unroll
+    for (int shift = 0; shift < 5; shift++) {
+      if (snap == 0) {
+        __u32 sz = SISMO_STACK_SNAP_MAX >> shift;
+        if (bpf_probe_read_user(ue->stack_bytes, sz, (void *)ue->regs_sp) == 0)
+          snap = sz;
+      }
+    }
+    ue->stack_len = snap;
+    ue->stack_trunc = (snap < SISMO_STACK_SNAP_MAX) ? 1 : 0;
+
+    bpf_ringbuf_submit(ue, 0);
+    return 0;
   }
 
   struct sismo_sample_rec *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
