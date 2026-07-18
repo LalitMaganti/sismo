@@ -795,6 +795,11 @@ pub struct Capture {
     // the module isn't Go / didn't parse). Go carries no .eh_frame, so framehop
     // can't unwind it; this walks Go frames from the pcsp frame-size tables.
     go_unwinders: HashMap<u64, Option<GoPclntab>>,
+    // JIT-1: the target's JIT symbol map (`/tmp/perf-<pid>.map`, e.g. node
+    // --perf-basic-prof), sorted by start address, mapping an anon-exec JIT PC
+    // to its runtime method name. None until first loaded; empty when absent.
+    jit_syms: Option<Vec<(u64, u64, String)>>,
+    jit_map_size: u64,
     // PY-1: `_PyRuntime`'s runtime address + parsed `_Py_DebugOffsets`,
     // located and parsed once per run (the layout never changes for a live
     // interpreter). `python_tried` gates the one-time locate/parse attempt;
@@ -920,13 +925,20 @@ impl Capture {
                     // an anon exec page, etc.) instead of dropping it; a native
                     // process has no runtime, so this is a no-op and its capture
                     // is unchanged.
-                    if let Some(label) =
-                        self.residual_map.as_ref().and_then(|r| r.residual_label(pc))
-                    {
+                    let label = self.residual_map.as_ref().and_then(|r| r.residual_label(pc));
+                    if let Some(label) = label {
+                        // JIT-1: if the runtime published a symbol map (node
+                        // --perf-basic-prof et al.), name the method instead of
+                        // recording a bare [jit:*] placeholder.
+                        let name = self.jit_name(pc);
                         let mapping_iid =
                             self.interner.intern_residual_mapping(label.as_bytes(), idw);
+                        let name_iid = match &name {
+                            Some(n) => self.interner.intern_func_name(n.as_bytes(), idw),
+                            None => 0,
+                        };
                         let frame_iid = self.interner.intern_frame(
-                            FrameKey { mapping_iid, rel_pc: pc, name_iid: 0 },
+                            FrameKey { mapping_iid, rel_pc: pc, name_iid },
                             idw,
                         );
                         fids.push(frame_iid);
@@ -1219,6 +1231,27 @@ impl Capture {
         Some(go.unwind(base, pc, sp, read_stack, SISMO_MAX_STACK))
     }
 
+    /// JIT-1: the runtime method name for an anon-exec PC from the target's
+    /// `/tmp/perf-<pid>.map`, or None. The runtime appends to the map as it
+    /// compiles (V8 writes builtins at startup, then each JS method when it
+    /// tiers up), so reload whenever the file has grown — a load-once would
+    /// cache a map taken before the hot methods existed.
+    fn jit_name(&mut self, pc: u64) -> Option<String> {
+        let size = std::fs::metadata(format!("/tmp/perf-{}.map", self.target_pid))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if self.jit_syms.is_none() || size != self.jit_map_size {
+            self.jit_syms = Some(load_perf_map(self.target_pid));
+            self.jit_map_size = size;
+        }
+        let syms = self.jit_syms.as_ref()?;
+        // The last entry whose start is <= pc, if that entry still covers pc.
+        let i = syms.partition_point(|&(start, _, _)| start <= pc);
+        syms.get(i.checked_sub(1)?)
+            .filter(|(start, size, _)| pc < start.wrapping_add(*size))
+            .map(|(_, _, name)| name.clone())
+    }
+
     /// Build the host-side unwinder on first use and register every target
     /// module not yet registered (new ones appear as the target dlopen's).
     fn ensure_unwinder(&mut self) {
@@ -1466,6 +1499,30 @@ fn map_fd(obj: *mut BpfObject, name: &std::ffi::CStr) -> Option<c_int> {
     Some(unsafe { bpf_map__fd(m) })
 }
 
+/// Parse a Linux perf JIT symbol map (`/tmp/perf-<pid>.map`): one
+/// `<hex start> <hex size> <name>` line per JIT method, the name running to end
+/// of line. Returns `(start, size, name)` sorted by start; empty when the file
+/// is absent (no JIT map published) or unreadable.
+fn load_perf_map(pid: u32) -> Vec<(u64, u64, String)> {
+    let Ok(text) = std::fs::read_to_string(format!("/tmp/perf-{pid}.map")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.splitn(3, ' ');
+        let (Some(a), Some(sz), Some(name)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        if let (Ok(start), Ok(size)) =
+            (u64::from_str_radix(a, 16), u64::from_str_radix(sz, 16))
+        {
+            out.push((start, size, name.to_string()));
+        }
+    }
+    out.sort_by_key(|&(start, _, _)| start);
+    out
+}
+
 fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *mut Capture {
     let cap = Box::into_raw(Box::new(Capture {
         obj: ptr::null_mut(),
@@ -1497,6 +1554,8 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         unwinder: None,
         unwind_registered: HashSet::new(),
         go_unwinders: HashMap::new(),
+        jit_syms: None,
+        jit_map_size: 0,
         python_tried: false,
         python_runtime: None,
         python_debug_count: 0,

@@ -375,6 +375,18 @@ def build_variants() -> list[Variant]:
                        "diagnostic explains missing JS frames (no perf-map/"
                        "jitdump support)"),
         map_substr="node"))
+    v.append(Variant(
+        "js-node-perfmap", "js",
+        "Node --perf-basic-prof: V8 JIT methods named from the perf-map (JIT-1)",
+        # --no-turbo-inlining keeps sismo_wl_leaf a distinct method; V8 otherwise
+        # inlines it into its caller, collapsing the leaf frame the chain check
+        # anchors on. The point here is that sismo names the JIT frames, not V8's
+        # inlining policy. --logfile=/dev/null suppresses the per-isolate v8.log
+        # --perf-basic-prof would otherwise drop in the cwd (the repo root).
+        [node, "--perf-basic-prof", "--no-turbo-inlining", "--logfile=/dev/null",
+         wl_js, "{DUR}"],
+        Expect(leaf="full", chain="full", module_status=None),
+        map_substr="node"))
     javac = _mise_tool("javac")
     java = _mise_tool("java")
     jar = _mise_tool("jar")

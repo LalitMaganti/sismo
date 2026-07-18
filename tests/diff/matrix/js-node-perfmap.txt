@@ -1,0 +1,9 @@
+record_exit: 0
+samples: present
+offcpu: present
+mapping: present
+leaf: symbolized
+chain: full
+module_status: partial
+diagnostics: interpreted-runtime
+residual: [jit:node]
