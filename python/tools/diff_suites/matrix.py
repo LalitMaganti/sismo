@@ -121,6 +121,8 @@ def build_variants() -> list[Variant]:
     wl_zig = os.path.join(TARGETS, "workload.zig")
     wl_py = os.path.join(TARGETS, "workload.py")
     wl_js = os.path.join(TARGETS, "workload.js")
+    wl_inline = os.path.join(TARGETS, "workload_inline.c")
+    mk_mdi = os.path.join(TARGETS, "make_minidebug.sh")
 
     fp = "-fno-omit-frame-pointer"
     v: list[Variant] = []
@@ -199,6 +201,51 @@ def build_variants() -> list[Variant]:
     c_variant("c-zigcc-musl-static", ZIG + ["cc"],
               ["-target", "x86_64-linux-musl", "-O2", fp], Expect(),
               "static musl binary via zig cc")
+
+    # --- inline-frame fidelity -------------------------------------------
+    # The hot leaf is always-inlined into mid, built with -g. Its name
+    # survives only if the symbolizer emits DWARF inline frames; today it
+    # keeps only the outermost frame, so leaf is absent at baseline.
+    b = _bin("c-clang-inline")
+    v.append(Variant(
+        "c-clang-inline", "c",
+        "inlined hot leaf (-g): inline-frame fidelity",
+        [b, "{DUR}"],
+        Expect(leaf="none", chain="na",
+               gremlin="inlined callee names are dropped — the symbolizer "
+                       "keeps only the outermost DWARF frame, so an inlined "
+                       "hot function is invisible in the profile"),
+        [["clang", "-O2", fp, "-g", "-o", b, wl_inline]],
+        leaf="sismo_wl_inline_leaf", mid="sismo_wl_mid", outer="sismo_wl_outer"))
+
+    # --- weird binary layouts / out-of-line symbols ----------------------
+    # Real distro shapes that defeat name-based section/table lookup.
+    c_variant("c-sectionless", ["clang"], ["-O2", fp, "-rdynamic"],
+              Expect(leaf="none", chain="na",
+                     gremlin="section header table removed (objcopy "
+                             "--strip-section-headers); names must be read "
+                             "from PT_DYNAMIC/.dynsym, not section headers"),
+              "no section header table; symbols only via .dynsym",
+              post=[["objcopy", "--strip-section-headers", "{BIN}", "{BIN}"]])
+    c_variant("c-gnu-debugdata", ["clang"], ["-O2", fp],
+              Expect(leaf="none", chain="na",
+                     gremlin="function names live only in an xz-compressed "
+                             ".gnu_debugdata (MiniDebugInfo, the Fedora/Arch "
+                             "stripped-lib format); the real .symtab is gone"),
+              "MiniDebugInfo: symbols in a compressed .gnu_debugdata section",
+              post=[["bash", mk_mdi, "{BIN}"]])
+    b = _bin("go-sectionless-pclntab")
+    v.append(Variant(
+        "go-sectionless-pclntab", "go",
+        "stripped Go with .gopclntab renamed away (distro external-PIE "
+        "shape, systing #158)",
+        [b, "{DUR}"],
+        Expect(leaf="none", chain="na", module_status="partial",
+               gremlin="no .gopclntab by name — the table is merged into a "
+                       "data section, so a resolver must scan data sections "
+                       "to find it (sismo has no gopclntab resolver yet)"),
+        [["go", "build", "-ldflags=-s -w", "-o", b, wl_go],
+         ["objcopy", "--rename-section", ".gopclntab=.data.rel.ro.pcln", b]]))
 
     # --- C++ --------------------------------------------------------------
     b = _bin("cpp-gxx-O2-fp")
