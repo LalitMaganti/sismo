@@ -395,7 +395,34 @@ class BuildSkip(Exception):
     pass
 
 
+@functools.lru_cache(maxsize=1)
+def _sources_mtime() -> float:
+    """Newest mtime among the workload sources and this config. A variant's
+    binary older than this must be rebuilt; newer can be reused."""
+    newest = os.path.getmtime(__file__)
+    for name in os.listdir(TARGETS):
+        p = os.path.join(TARGETS, name)
+        if os.path.isfile(p):
+            newest = max(newest, os.path.getmtime(p))
+    return newest
+
+
+def build_is_current(variant: Variant) -> bool:
+    """True when the variant's binary already exists and is newer than every
+    workload source and the matrix config. The workloads are independent of
+    sismo, so iterating on sismo alone need not recompile them — this is what
+    makes a re-run fast."""
+    try:
+        return os.path.getmtime(_bin(variant.name)) >= _sources_mtime()
+    except OSError:
+        return False
+
+
 def run_build(variant: Variant) -> None:
+    # Reuse an up-to-date binary from a previous run — the common case when
+    # only sismo changed between matrix runs.
+    if build_is_current(variant):
+        return
     env = dict(os.environ, GOCACHE=GOCACHE)
     for cmd in variant.build:
         p = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=ROOT_DIR)
@@ -569,7 +596,22 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
     return "\n".join(lines) + "\n"
 
 
+def reserve_cpu_headroom() -> None:
+    """Pin this run and its build/record children off one CPU so the machine
+    stays usable — parallel toolchain builds and the hot-loop workloads
+    otherwise saturate every core. Children inherit the affinity."""
+    if not hasattr(os, "sched_setaffinity"):
+        return
+    try:
+        avail = sorted(os.sched_getaffinity(0))
+        if len(avail) > 1:
+            os.sched_setaffinity(0, set(avail[:-1]))  # drop the top core
+    except OSError:
+        pass
+
+
 def run(ctx: SuiteContext) -> int:
+    reserve_cpu_headroom()
     needs = [SISMO_RUN, TP_SHELL, SISMO]
     cases = [
         (v.name, functools.partial(variant_facts, v), needs)
