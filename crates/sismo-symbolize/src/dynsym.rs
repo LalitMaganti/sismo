@@ -235,6 +235,45 @@ fn parse_syms(symtab: &[u8], strtab: &[u8], image_base: u64) -> Vec<Sym> {
     out
 }
 
+// Section header type for a local symbol table.
+const SHT_SYMTAB: u32 = 2;
+
+/// Whether the ELF at `path` still carries a local symbol table (`.symtab`).
+/// `Some(false)` means it was stripped — only `.dynsym`/exports remain, or the
+/// section header table is gone entirely. `None` if the file isn't a readable
+/// 64-bit LE ELF. This is the reliable "is this binary stripped" signal: a
+/// stripped binary keeps its dynamic symbols but drops `.symtab`.
+pub fn has_symtab(path: &str) -> Option<bool> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut ehdr = [0u8; 64];
+    f.read_exact_at(&mut ehdr, 0).ok()?;
+    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 {
+        return None; // not ELFCLASS64
+    }
+    let e_shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
+    let e_shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap());
+    let e_shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap());
+    // No section header table (0 offset/count, or `--strip-section-headers`) →
+    // no `.symtab` reachable, so treat as stripped.
+    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 {
+        return Some(false);
+    }
+    for i in 0..e_shnum {
+        // sh_name (u32) + sh_type (u32) are the first 8 bytes of Elf64_Shdr.
+        let mut shdr = [0u8; 8];
+        if f
+            .read_exact_at(&mut shdr, e_shoff + i as u64 * e_shentsize as u64)
+            .is_err()
+        {
+            return Some(false);
+        }
+        if u32::from_le_bytes(shdr[4..8].try_into().unwrap()) == SHT_SYMTAB {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// A NUL-terminated string at `off` in the string table, as UTF-8 (dynamic
 /// symbol names are ASCII in practice; non-UTF-8 bytes yield None).
 fn cstr_at(strtab: &[u8], off: usize) -> Option<&str> {
@@ -310,6 +349,17 @@ mod tests {
         assert_eq!(cstr_at(strtab, 5), Some("bar"));
         assert_eq!(cstr_at(strtab, 0), Some("")); // empty string at index 0
         assert_eq!(cstr_at(strtab, 99), None); // out of range
+    }
+
+    // The test binary is compiled with debug info, so it keeps a `.symtab`;
+    // a non-ELF path yields None.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn has_symtab_detects_local_symbols() {
+        let exe = std::fs::read_link("/proc/self/exe").expect("readlink");
+        assert_eq!(has_symtab(exe.to_str().unwrap()), Some(true));
+        assert_eq!(has_symtab("/etc/hostname"), None);
+        assert_eq!(has_symtab("/no/such/path"), None);
     }
 
     // End to end against the running test binary itself: it's a normally-linked

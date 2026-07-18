@@ -5,4 +5,4 @@ mapping: present
 leaf: absent
 chain: truncated
 module_status: partial
-diagnostics: none
+diagnostics: stripped

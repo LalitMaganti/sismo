@@ -624,7 +624,12 @@ fn report(stats: &[ModuleStat], n_addrs: usize, n_funcs: usize) {
             Status::Unresolved => "unresolved",
             Status::NoSymbols => "no symbols",
         };
-        if matches!(st.status(), Status::NoSymbols | Status::Unresolved) {
+        // NoSymbols/Unresolved always need help; a Partial module needs it only
+        // when the shortfall is stripping (local names gone), not the odd
+        // unresolvable stub in an otherwise-symbolized binary.
+        if matches!(st.status(), Status::NoSymbols | Status::Unresolved)
+            || (st.status() == Status::Partial && module_is_stripped(&st.name))
+        {
             needs_help = true;
         }
         eprintln!("  [{tag}] {:>5}/{:<5} {}", st.n_resolved, st.n_addrs, s(&st.name));
@@ -634,12 +639,62 @@ fn report(stats: &[ModuleStat], n_addrs: usize, n_funcs: usize) {
     }
 }
 
+/// A module is stripped when its file is present but carries no local symbol
+/// table — its local function names are gone, only exports/`.dynsym` remain.
+fn module_is_stripped(name: &[u8]) -> bool {
+    match std::str::from_utf8(name) {
+        Ok(p) => file_exists(name) && crate::dynsym::has_symtab(p) == Some(false),
+        Err(_) => false,
+    }
+}
+
+/// Whether `path` is a distro-shipped library (under a system library dir) as
+/// opposed to a binary the user built. Decides whether the remedy is "install
+/// the debug package" or "stop stripping your own build".
+fn is_system_library(path: &[u8]) -> bool {
+    let p = match std::str::from_utf8(path) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    const SYS_DIRS: &[&str] = &[
+        "/usr/lib/", "/usr/lib64/", "/lib/", "/lib64/", "/usr/local/lib/", "/usr/local/lib64/",
+    ];
+    SYS_DIRS.iter().any(|d| p.starts_with(d))
+}
+
+/// Print the origin-appropriate remedy for a stripped module. A distro library
+/// wants its debug package or debuginfod; a user's own binary wants its symbols
+/// kept — telling them to `debuginfo-install` a package they built is wrong.
+fn print_stripped_remedy(name: &[u8]) {
+    if is_system_library(name) {
+        eprintln!("      - install its debug package: {}", install_hint());
+        eprintln!("      - or let sismo fetch it: export DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/");
+        eprintln!("        then re-run `sismo record` (sismo honors DEBUGINFOD_URLS and caches downloads).");
+    } else {
+        eprintln!("      - this is your own binary: keep its local symbols — don't run `strip`");
+        eprintln!("        (Go: drop `-ldflags=-s -w`; Rust: drop `-Cstrip=symbols`).");
+        eprintln!("      - or keep an unstripped copy and point DEBUGINFOD_URLS at your symbol server.");
+    }
+}
+
 fn print_guidance(stats: &[ModuleStat]) {
-    let hint = install_hint();
     eprintln!("\nsismo record: some modules did not fully symbolize:");
     for st in stats {
         match st.status() {
-            Status::Ok | Status::Partial => continue,
+            Status::Ok => continue,
+            Status::Partial => {
+                if !module_is_stripped(&st.name) {
+                    continue;
+                }
+                eprintln!(
+                    "\n  {}\n    {}/{} sampled addresses resolved — the rest are local functions\n    \
+                     whose names were stripped from this binary (only exported/.dynsym\n    \
+                     names remain, so the hot code shows up unnamed).",
+                    s(&st.name), st.n_resolved, st.n_addrs
+                );
+                eprintln!("    recover the local names:");
+                print_stripped_remedy(&st.name);
+            }
             Status::NoSymbols => {
                 eprint!("\n  {}\n    no symbols could be loaded", s(&st.name));
                 if !st.err.is_empty() {
@@ -651,9 +706,7 @@ fn print_guidance(stats: &[ModuleStat]) {
                 } else {
                     eprintln!("    the binary on disk is stripped and has no separate debug info installed.");
                     eprintln!("    fix it one of these ways:");
-                    eprintln!("      - install its debug package: {hint}");
-                    eprintln!("      - or let sismo fetch it: export DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/");
-                    eprintln!("        then re-run `sismo record` (sismo honors DEBUGINFOD_URLS and caches downloads).");
+                    print_stripped_remedy(&st.name);
                 }
             }
             Status::Unresolved => {
@@ -963,6 +1016,17 @@ mod tests {
         assert_eq!(strip_offset(b"matmul +12"), b"matmul");
         assert_eq!(strip_offset(b"operator+ +0"), b"operator+");
         assert_eq!(strip_offset(b"nooffset"), b"nooffset");
+    }
+
+    #[test]
+    fn is_system_library_classifies_paths() {
+        assert!(is_system_library(b"/usr/lib64/libc.so.6"));
+        assert!(is_system_library(b"/lib/x86_64-linux-gnu/libc.so.6"));
+        assert!(is_system_library(b"/usr/local/lib/libfoo.so"));
+        // A user's own binary is not a system library, even if stripped.
+        assert!(!is_system_library(b"/home/me/proj/target/release/app"));
+        assert!(!is_system_library(b"/tmp/build/server"));
+        assert!(!is_system_library(b"./relative"));
     }
 
     #[test]
