@@ -51,9 +51,25 @@ type RowCb = extern "C" fn(
     load_bias: u64,
 );
 
+type StackQualityCb = extern "C" fn(
+    ctx: *mut c_void,
+    name: *const u8,
+    name_len: usize,
+    build_id: *const u8,
+    build_id_len: usize,
+    load_bias: u64,
+    total: u64,
+    single_frame: u64,
+);
+
 #[cfg(not(test))]
 extern "C" {
     fn sismo_trace_query_unsymbolized(trace_path: *const u8, cb: RowCb, ctx: *mut c_void) -> c_int;
+    fn sismo_trace_query_stack_quality(
+        trace_path: *const u8,
+        cb: StackQualityCb,
+        ctx: *mut c_void,
+    ) -> c_int;
 }
 
 // cargo test links the rlib standalone with no C++ shim — stub it (the pure
@@ -62,6 +78,15 @@ extern "C" {
 unsafe extern "C" fn sismo_trace_query_unsymbolized(
     _trace_path: *const u8,
     _cb: RowCb,
+    _ctx: *mut c_void,
+) -> c_int {
+    0
+}
+
+#[cfg(test)]
+unsafe extern "C" fn sismo_trace_query_stack_quality(
+    _trace_path: *const u8,
+    _cb: StackQualityCb,
     _ctx: *mut c_void,
 ) -> c_int {
     0
@@ -196,6 +221,106 @@ pub fn symbolize_trace(trace_path: &str) {
 
     append_source_asm_sidecar(trace_path, &src_set, &asm_records);
     report(&stats, n_addrs, n_funcs);
+    report_truncation(trace_path);
+}
+
+// ---- DIA-1: frame-pointer-omission diagnostic --------------------------------
+
+struct StackRow {
+    name: Vec<u8>,
+    total: u64,
+    single_frame: u64,
+}
+
+#[derive(Default)]
+struct StackQualityCollector {
+    rows: Vec<StackRow>,
+}
+
+extern "C" fn on_stack_row(
+    ctx: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    _build_id_ptr: *const u8,
+    _build_id_len: usize,
+    _load_bias: u64,
+    total: u64,
+    single_frame: u64,
+) {
+    let self_ = unsafe { &mut *(ctx as *mut StackQualityCollector) };
+    let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+    self_.rows.push(StackRow {
+        name: name.to_vec(),
+        total,
+        single_frame,
+    });
+}
+
+/// Query the per-module stack shape and, for any file-backed module whose
+/// stacks DIA-0 judges truncated by frame-pointer omission, print the cause and
+/// the toolchain remedy. Best-effort: a query failure just skips the diagnostic.
+fn report_truncation(trace_path: &str) {
+    let mut path_z: Vec<u8> = trace_path.as_bytes().to_vec();
+    path_z.push(0);
+
+    let mut coll = StackQualityCollector::default();
+    let rc = unsafe {
+        sismo_trace_query_stack_quality(
+            path_z.as_ptr(),
+            on_stack_row,
+            &mut coll as *mut StackQualityCollector as *mut c_void,
+        )
+    };
+    if rc != 0 {
+        return;
+    }
+
+    for row in &coll.rows {
+        // Only file-backed user modules. Bracketed pseudo-modules
+        // ([kernel.kallsyms], [vdso], anon) aren't a user toolchain choice.
+        if row.name.first() != Some(&b'/') {
+            continue;
+        }
+        let shape = crate::stack_quality::StackShape {
+            total: row.total,
+            single_frame: row.single_frame,
+        };
+        if shape.classify() != crate::stack_quality::StackQuality::LikelyTruncated {
+            continue;
+        }
+        print_fp_diagnostic(&row.name, &shape);
+    }
+}
+
+fn print_fp_diagnostic(name: &[u8], shape: &crate::stack_quality::StackShape) {
+    let pct = if shape.total > 0 {
+        shape.single_frame * 100 / shape.total
+    } else {
+        0
+    };
+    eprintln!("\nsismo record: {}", s(name));
+    eprintln!(
+        "    stacks are truncated to the sampled function — {pct}% of its samples\n    \
+         have a single frame with no recoverable caller. This binary omits frame\n    \
+         pointers, so the kernel stack walker cannot climb past the sampled PC."
+    );
+    eprintln!("    rebuild it with frame pointers so callers are recorded:");
+    eprintln!("      rustc:     -Cforce-frame-pointers=yes  (or RUSTFLAGS)");
+    eprintln!("      gcc/clang: -fno-omit-frame-pointer  (gcc still omits leaf-function");
+    eprintln!("                 frame pointers — use clang for full fidelity)");
+    // If the binary already ships .eh_frame, offline DWARF unwinding will
+    // recover these without a rebuild once that lands — say so rather than
+    // implying a rebuild is the only path.
+    if let Ok(p) = std::str::from_utf8(name) {
+        if crate::stack_quality::probe_unwind_capability(p)
+            .is_some_and(|c| c.has_eh_frame)
+        {
+            eprintln!(
+                "    (this binary carries .eh_frame, so sismo will recover these stacks\n    \
+                 automatically once offline unwinding lands — no rebuild needed then.)"
+            );
+        }
+    }
 }
 
 /// Append `bytes` at the end of the file at `path`.

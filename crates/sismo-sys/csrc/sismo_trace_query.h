@@ -37,6 +37,26 @@ int sismo_trace_query_unsymbolized(const char* trace_path,
                                    sismo_unsym_row_cb cb,
                                    void* ctx);
 
+// Invoked once per module with its observed stack shape (DIA-0/DIA-1):
+// `total` samples whose innermost frame is in the module, of which
+// `single_frame` had a single user frame — the frame-pointer-omission
+// truncation marker. `name`/`build_id` are NOT NUL-terminated; use the paired
+// length. Pointers are valid only for the call.
+typedef void (*sismo_stack_quality_cb)(void* ctx,
+                                       const char* name,
+                                       size_t name_len,
+                                       const char* build_id,
+                                       size_t build_id_len,
+                                       uint64_t load_bias,
+                                       uint64_t total,
+                                       uint64_t single_frame);
+
+// Loads `trace_path` and runs the per-module stack-shape query, invoking
+// `cb(ctx, ...)` once per module. Returns 0 on success, non-zero on error.
+int sismo_trace_query_stack_quality(const char* trace_path,
+                                    sismo_stack_quality_cb cb,
+                                    void* ctx);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -5,4 +5,4 @@ mapping: present
 leaf: symbolized
 chain: truncated
 module_status: ok
-diagnostics: none
+diagnostics: frame-pointer
