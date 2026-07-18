@@ -54,6 +54,20 @@ impl ProcMaps {
     pub fn find(&self, addr: u64) -> Option<&Mapping> {
         crate::maps_common::find_range(&self.mappings, addr, |m| (m.start, m.end))
     }
+
+    /// Distinct loaded modules as `(image base avma, file path)`, one entry per
+    /// unique base — the inputs a per-module unwinder or symbolizer wants to
+    /// register once. Order follows ascending mapping start.
+    pub fn modules(&self) -> Vec<(u64, &str)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for m in &self.mappings {
+            if seen.insert(m.base_avma) {
+                out.push((m.base_avma, m.path.as_str()));
+            }
+        }
+        out
+    }
 }
 
 // ---- DIA-6: residual (unresolvable) frame classification --------------------

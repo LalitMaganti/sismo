@@ -3,7 +3,7 @@ samples: present
 offcpu: present
 mapping: present
 leaf: symbolized
-chain: truncated
+chain: full
 module_status: ok
 diagnostics: none
 residual: none

@@ -737,7 +737,9 @@ impl Interner {
 
 use crate::symbolize::data_regions::DataRegions;
 use crate::symbolize::proc_maps::{ProcMaps, ResidualMap};
+use crate::symbolize::unwinder::{StackRegs, Unwinder};
 use crate::ffi::{sismo_ds_emit, sismo_ds_emit_offcpu};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // TracePacket / defaults field tags + constants.
@@ -782,6 +784,11 @@ pub struct Capture {
     // NAT-1: count of SISMO_EVT_SAMPLE_UNWIND records seen, for the
     // SISMO_DEBUG_UNWIND verification hook.
     unwind_snapshots: u64,
+    // NAT-1 host-side DWARF unwinder (framehop, x86-64/ELF) fed the captured
+    // regs + stack snapshot, plus the set of module base avmas already
+    // registered into it. Built lazily on the first unwind sample.
+    unwinder: Option<Unwinder>,
+    unwind_registered: HashSet<u64>,
     sampler_precise_ip: u8,
     ds_slot: u32,
     active: AtomicBool,
@@ -845,16 +852,23 @@ impl Capture {
 
     /// Intern the sample's full callstack (user leaf-first reversed to root-
     /// first, then kernel above), returning the callstack iid (0 if empty).
-    fn intern_callstack(&mut self, rec: &SismoSampleRec, idw: &mut ProtoWriter) -> u64 {
+    /// Intern a sample's callstack. `user_pcs` are the leaf-first user PCs —
+    /// either the BPF frame-pointer walk (`rec.stack`) or, for a NAT-1 unwind
+    /// sample, framehop's DWARF-recovered return addresses. Kernel frames come
+    /// from `rec.kernel_ids` regardless.
+    fn intern_callstack(
+        &mut self,
+        user_pcs: &[u64],
+        rec: &SismoSampleRec,
+        idw: &mut ProtoWriter,
+    ) -> u64 {
         let mut combined: Vec<u64> = Vec::new();
 
         self.ensure_maps(rec.hdr.ts);
         if self.maps.is_some() {
-            let nr = (rec.hdr.nr_frames as usize).min(SISMO_MAX_STACK);
             let mut fids: Vec<u64> = Vec::new();
             let mut reparsed = false;
-            for i in 0..nr {
-                let pc = rec.stack[i];
+            for &pc in user_pcs {
                 if pc == 0 {
                     continue;
                 }
@@ -957,9 +971,9 @@ impl Capture {
         unsafe { sismo_ds_emit(self.ds_slot, w.bytes().as_ptr(), w.bytes().len()) };
     }
 
-    fn emit_sample(&mut self, rec: &SismoSampleRec) {
+    fn emit_sample(&mut self, rec: &SismoSampleRec, user_pcs: &[u64]) {
         let mut idw = ProtoWriter::new();
-        let cs_iid = self.intern_callstack(rec, &mut idw);
+        let cs_iid = self.intern_callstack(user_pcs, rec, &mut idw);
 
         // Project the cumulative counters onto the active set.
         let mut follower_buf = [0u64; SISMO_MAX_COUNTERS];
@@ -1030,7 +1044,9 @@ impl Capture {
 
         std::mem::swap(&mut self.interner, &mut self.offcpu_interner);
         let mut idw = ProtoWriter::new();
-        let cs_iid = self.intern_callstack(rec, &mut idw);
+        let nr = (rec.hdr.nr_frames as usize).min(SISMO_MAX_STACK);
+        let user_pcs: Vec<u64> = rec.stack[..nr].to_vec();
+        let cs_iid = self.intern_callstack(&user_pcs, rec, &mut idw);
         std::mem::swap(&mut self.interner, &mut self.offcpu_interner);
 
         let mut tp = ProtoWriter::new();
@@ -1063,24 +1079,100 @@ impl Capture {
         unsafe { sismo_ds_emit_offcpu(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
     }
 
-    /// Process a plain SISMO_EVT_SAMPLE payload: run/counter bookkeeping, then
-    /// (if a session is active) emit it as a PerfSample. Also the body of a
-    /// SISMO_EVT_SAMPLE_UNWIND record's embedded `.sample` — that record's
-    /// regs/stack snapshot rides along unused for now, so its FP frames must
-    /// be processed identically to a plain sample (NAT-1: no host-side
-    /// unwinding wired up yet).
-    fn process_sample(&mut self, rec: &SismoSampleRec) {
+    /// Counter/run bookkeeping every sample needs, then whether a session is
+    /// active (and defaults emitted) so the caller should emit the sample.
+    fn begin_sample(&mut self, rec: &SismoSampleRec) -> bool {
         self.samples += 1;
         self.acc.insert(rec.hdr.tid, rec.counters[0]);
-
         if !self.active.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         if self.need_defaults.swap(false, Ordering::AcqRel) {
             self.interner.reset();
             self.emit_defaults();
         }
-        self.emit_sample(rec);
+        true
+    }
+
+    /// A plain SISMO_EVT_SAMPLE: emit its frame-pointer-walked stack.
+    fn process_sample(&mut self, rec: &SismoSampleRec) {
+        if !self.begin_sample(rec) {
+            return;
+        }
+        let nr = (rec.hdr.nr_frames as usize).min(SISMO_MAX_STACK);
+        let user_pcs: Vec<u64> = rec.stack[..nr].to_vec();
+        self.emit_sample(rec, &user_pcs);
+    }
+
+    /// A SISMO_EVT_SAMPLE_UNWIND: DWARF-unwind the captured snapshot host-side
+    /// and emit that chain instead of the FP walk (falling back to the FP walk
+    /// when the snapshot is empty or the unwind doesn't beat it).
+    fn process_unwind_sample(&mut self, urec: &SismoUnwindRec) {
+        if !self.begin_sample(&urec.sample) {
+            return;
+        }
+        let user_pcs = self.unwind_user_stack(urec);
+        self.emit_sample(&urec.sample, &user_pcs);
+    }
+
+    /// Framehop-recovered user PCs for an unwind sample, or the FP walk as a
+    /// fallback. Empty `stack_len` (a kernel-context sample, or a failed copy)
+    /// has no user snapshot to walk; a walk that recovers no more than the FP
+    /// walk isn't worth preferring.
+    fn unwind_user_stack(&mut self, urec: &SismoUnwindRec) -> Vec<u64> {
+        let nr = (urec.sample.hdr.nr_frames as usize).min(SISMO_MAX_STACK);
+        let fp: Vec<u64> = urec.sample.stack[..nr].to_vec();
+        if urec.stack_len == 0 {
+            return fp;
+        }
+        self.ensure_maps(urec.sample.hdr.ts);
+        self.ensure_unwinder();
+        let Some(unw) = self.unwinder.as_mut() else {
+            return fp;
+        };
+        let regs = StackRegs {
+            pc: urec.regs_ip,
+            fp: urec.regs_bp,
+            lr: 0,
+            sp: urec.regs_sp,
+        };
+        let len = (urec.stack_len as usize).min(SISMO_STACK_SNAP_MAX);
+        let pcs = unw.walk_snapshot(regs, &urec.stack_bytes[..len], urec.regs_sp, SISMO_MAX_STACK);
+        // The frame-pointer walk truncates on FP-less code (often to the leaf
+        // PC alone); prefer the DWARF chain only when it recovered more.
+        if pcs.len() > fp.len() {
+            pcs
+        } else {
+            fp
+        }
+    }
+
+    /// Build the host-side unwinder on first use and register every target
+    /// module not yet registered (new ones appear as the target dlopen's).
+    fn ensure_unwinder(&mut self) {
+        if self.unwinder.is_none() {
+            self.unwinder = Some(Unwinder::new_x86_64());
+        }
+        let Some(maps) = self.maps.as_ref() else {
+            return;
+        };
+        let to_add: Vec<(u64, String)> = maps
+            .modules()
+            .into_iter()
+            .filter(|(base, path)| {
+                // Anonymous regions ([vdso]/[stack]/…) have no ELF to parse.
+                !self.unwind_registered.contains(base) && !path.starts_with('[')
+            })
+            .map(|(base, path)| (base, path.to_string()))
+            .collect();
+        for (base, path) in to_add {
+            self.unwind_registered.insert(base);
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Some(unw) = self.unwinder.as_mut() {
+                    unw.add_module(base, &bytes);
+                }
+            }
+        }
     }
 
     fn handle(&mut self, hdr: &SismoHdr) {
@@ -1114,7 +1206,7 @@ impl Capture {
                     self.unwind_snapshots, rec.regs_ip, rec.regs_sp, rec.stack_len, rec.stack_trunc
                 );
             }
-            self.process_sample(&rec.sample);
+            self.process_unwind_sample(rec);
             return;
         }
         if hdr.r#type != SISMO_EVT_SAMPLE {
@@ -1279,6 +1371,8 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         offcpu_samples: 0,
         offcpu_ns: 0,
         unwind_snapshots: 0,
+        unwinder: None,
+        unwind_registered: HashSet::new(),
         sampler_precise_ip: 0,
         ds_slot: u32::MAX,
         active: AtomicBool::new(false),
@@ -1387,13 +1481,16 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
     };
 
     // NAT-1: cfg[1] gates the BPF unwind-capture path (regs + raw user-stack
-    // snapshot alongside the FP-walked sample). Nothing consumes the payload
-    // yet, so it stays off by default — an 8 KiB/sample cost with no benefit
-    // until the host-side unwinder lands. Opt in with SISMO_UNWIND_CAPTURE to
-    // exercise it; x86-64 only. The next step (host unwind) makes it the
-    // default via auto-detect.
+    // snapshot alongside the FP-walked sample), which the host-side unwinder
+    // turns into a DWARF-recovered chain. On by default on x86-64 — it is what
+    // recovers stacks for frame-pointer-less binaries. The 8 KiB/sample cost is
+    // the framehop-offline baseline (NAT-2's in-kernel tables shrink it later);
+    // SISMO_UNWIND_CAPTURE=0 forces it off to fall back to the pure FP walk.
     #[cfg(target_arch = "x86_64")]
-    let unwind_flag: u32 = u32::from(std::env::var_os("SISMO_UNWIND_CAPTURE").is_some());
+    let unwind_flag: u32 = match std::env::var("SISMO_UNWIND_CAPTURE").as_deref() {
+        Ok("0") => 0,
+        _ => 1,
+    };
     #[cfg(not(target_arch = "x86_64"))]
     let unwind_flag: u32 = 0;
     let one: u32 = 1;
