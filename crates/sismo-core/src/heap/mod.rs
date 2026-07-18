@@ -145,7 +145,7 @@ struct TraceData {
 /// heap frames.
 fn resolve_name(symbolizer: Option<&Symbolizer>, pc: u64) -> Vec<u8> {
     match symbolizer.and_then(|s| s.resolve(pc)) {
-        Some(r) => r.name.into_bytes(),
+        Some(r) => r.outer_display().into_bytes(),
         None => b"?".to_vec(),
     }
 }

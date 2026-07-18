@@ -37,12 +37,37 @@ pub struct ModuleLoad {
     pub error: Option<String>,
 }
 
-/// A resolved address: the demangled `<name> +<offset>`, plus source location
-/// when debug info is available (`line` 0 = unknown).
-pub struct Resolved {
+/// One frame at a resolved address: a demangled function name plus source
+/// location when debug info is available (`line` 0 = unknown, `file` None =
+/// unknown).
+pub struct Frame {
     pub name: String,
     pub file: Option<String>,
     pub line: u32,
+}
+
+/// A resolved address. `frames` is the inline chain at the address, ordered
+/// innermost inlinee first and the physical (outermost) function last — the
+/// order Perfetto's `AddressSymbols.lines` expects. It always has at least one
+/// entry. `offset` is the byte offset of the address from the start of the
+/// physical function.
+pub struct Resolved {
+    pub frames: Vec<Frame>,
+    pub offset: u64,
+}
+
+impl Resolved {
+    /// The physical (outermost) function's frame — the one a caller that does
+    /// not expand inline frames wants (heap display, disassembly labels).
+    pub fn outer(&self) -> &Frame {
+        self.frames.last().expect("resolve never returns empty frames")
+    }
+
+    /// The outer function's name with the byte offset suffix, e.g. `foo +12`.
+    /// The single-line view for callers that don't expand inline frames.
+    pub fn outer_display(&self) -> String {
+        format!("{} +{}", self.outer().name, self.offset)
+    }
 }
 
 struct SymModule {
@@ -143,7 +168,8 @@ impl Symbolizer {
         result
     }
 
-    /// Resolve `avma` to `<demangled_name> +<byte_offset>` plus source location,
+    /// Resolve `avma` to its inline chain (innermost inlinee first, physical
+    /// function last) plus the byte offset from the physical function's start,
     /// or `None` if no registered module contains it (or its map didn't load).
     pub fn resolve(&self, avma: u64) -> Option<Resolved> {
         let module = self
@@ -162,25 +188,43 @@ impl Symbolizer {
         // vsprintf's end. The async path validates containment first.
         let info = self.rt.block_on(map.lookup(LookupAddress::Relative(rel)))?;
 
-        // Source line info lives in `info.frames` (DWARF / inline records), not
-        // `info.symbol`. The vec runs innermost inlinee first, so the last entry
-        // is the outermost real function — the one `info.symbol.name` reports.
-        let (mut file, mut line) = (None, 0u32);
-        if let Some(frame) = info.frames.as_ref().and_then(|f| f.last()) {
-            if let Some(l) = frame.line_number {
-                line = l;
+        // `info.frames` carries the DWARF inline records — innermost inlinee
+        // first, the physical function last. Emit every frame so an inlined
+        // callee is its own frame instead of being folded into its caller;
+        // keeping only the last one (the old behavior) made inlined hot
+        // functions invisible. The physical function's name comes from the
+        // symtab (`info.symbol.name`) when its DWARF frame has no function.
+        let frames: Vec<Frame> = match info.frames.as_ref().filter(|f| !f.is_empty()) {
+            Some(dwarf) => {
+                let last = dwarf.len() - 1;
+                dwarf
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let name = f.function.clone().unwrap_or_else(|| {
+                            if i == last { info.symbol.name.clone() } else { String::new() }
+                        });
+                        let file = f
+                            .file_path
+                            .as_ref()
+                            .map(|p| String::from_utf8_lossy(p.raw_path().as_bytes()).into_owned());
+                        Frame { name, file, line: f.line_number.unwrap_or(0) }
+                    })
+                    .filter(|f| !f.name.is_empty())
+                    .collect()
             }
-            if let Some(path) = frame.file_path.as_ref() {
-                file = Some(String::from_utf8_lossy(path.raw_path().as_bytes()).into_owned());
-            }
-        }
+            None => Vec::new(),
+        };
+        // Symtab-only modules (no DWARF) and the all-anonymous-frame edge fall
+        // back to the single symbol name with no source location.
+        let frames = if frames.is_empty() {
+            vec![Frame { name: info.symbol.name.clone(), file: None, line: 0 }]
+        } else {
+            frames
+        };
 
-        let offset = rel.saturating_sub(info.symbol.address);
-        Some(Resolved {
-            name: format!("{} +{}", info.symbol.name, offset),
-            file,
-            line,
-        })
+        let offset = rel.saturating_sub(info.symbol.address) as u64;
+        Some(Resolved { frames, offset })
     }
 }
 

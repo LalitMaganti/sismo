@@ -216,20 +216,20 @@ fn current_arch() -> Option<Arch> {
 
 // ---- Symbolizer resolve helper ---------------------------------------------
 
+/// Outer-frame view of a resolved address, used where inline frames are not
+/// expanded (disassembly labels/lines). `name` carries the `+<offset>` suffix.
 struct Resolved {
     name: Vec<u8>,
-    file: Vec<u8>,
     line: u32,
 }
 
 fn resolve(sym: &Symbolizer, avma: u64) -> Resolved {
     match sym.resolve(avma) {
         Some(r) => Resolved {
-            name: r.name.into_bytes(),
-            file: r.file.map(String::into_bytes).unwrap_or_default(),
-            line: r.line,
+            name: r.outer_display().into_bytes(),
+            line: r.outer().line,
         },
-        None => Resolved { name: Vec::new(), file: Vec::new(), line: 0 },
+        None => Resolved { name: Vec::new(), line: 0 },
     }
 }
 
@@ -267,29 +267,42 @@ fn build_module_symbols(
     let mut address_symbols: Vec<Vec<u8>> = Vec::new();
     for &rel_pc in &m.rel_pcs {
         stat.n_addrs += 1;
-        let r = resolve(sym, rel_pc);
-        let func = strip_offset(&r.name);
-        if func.is_empty() {
+        let resolved = match sym.resolve(rel_pc) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // One Line per inline frame. `resolved.frames` is innermost inlinee
+        // first, physical function last — the order Perfetto expands into the
+        // callstack — so an inlined callee shows as its own frame rather than
+        // being attributed to its caller.
+        let mut as_ = ProtoWriter::new();
+        as_.write_uint64(AS_FIELD_ADDRESS, rel_pc);
+        let mut emitted = false;
+        for frame in &resolved.frames {
+            if frame.name.is_empty() {
+                continue;
+            }
+            let mut line = ProtoWriter::new();
+            line.write_string(LINE_FIELD_FUNCTION_NAME, frame.name.as_bytes());
+            // Source file + line come from DWARF; absent for symtab-only modules.
+            if let Some(file) = frame.file.as_ref().filter(|f| !f.is_empty()) {
+                line.write_string(LINE_FIELD_SOURCE_FILE_NAME, file.as_bytes());
+                let file_bytes = file.clone().into_bytes();
+                if src_seen.insert(file_bytes.clone()) {
+                    src_set.push(file_bytes);
+                }
+            }
+            if frame.line > 0 {
+                line.write_uint32(LINE_FIELD_LINE_NUMBER, frame.line);
+            }
+            as_.write_message(AS_FIELD_LINES, line.bytes());
+            emitted = true;
+        }
+        if !emitted {
             continue;
         }
         stat.n_resolved += 1;
-
-        let mut line = ProtoWriter::new();
-        line.write_string(LINE_FIELD_FUNCTION_NAME, func);
-        // Source file + line come from DWARF; absent for symtab-only modules.
-        if !r.file.is_empty() {
-            line.write_string(LINE_FIELD_SOURCE_FILE_NAME, &r.file);
-            if src_seen.insert(r.file.clone()) {
-                src_set.push(r.file.clone());
-            }
-        }
-        if r.line > 0 {
-            line.write_uint32(LINE_FIELD_LINE_NUMBER, r.line);
-        }
-
-        let mut as_ = ProtoWriter::new();
-        as_.write_uint64(AS_FIELD_ADDRESS, rel_pc);
-        as_.write_message(AS_FIELD_LINES, line.bytes());
         address_symbols.push(as_.bytes().to_vec());
     }
     if address_symbols.is_empty() {
