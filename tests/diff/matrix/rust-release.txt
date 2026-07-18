@@ -6,3 +6,4 @@ leaf: symbolized
 chain: truncated
 module_status: ok
 diagnostics: frame-pointer
+residual: none

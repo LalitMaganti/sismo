@@ -5,26 +5,32 @@
 // shape). JIT frames are a known sismo gap; this target pins down what a
 // Node user sees today. sismo_wl_block uses Atomics.wait for a real
 // futex-style block (off-CPU), not a timer yield.
+//
+// The hot path uses 32-bit Number arithmetic (Math.imul + |0), not BigInt.
+// BigInt operators run inside node's own C++ (no anonymous JIT code), so the
+// hot leaf never showed up as a residual JIT frame. With Number arithmetic
+// V8 tiers sismo_wl_leaf/mid/outer up into anonymous executable pages, which
+// sismo's residual classifier surfaces as [jit:node].
 
 "use strict";
 
 function sismo_wl_leaf(x) {
-  for (let i = 0n; i < 4096n; i++) {
-    x = (x * 2654435761n + i) & 0xffffffffffffffffn;
+  for (let i = 0; i < 4096; i++) {
+    x = (Math.imul(x, 2654435761) + i) | 0;
   }
   return x;
 }
 
 function sismo_wl_mid(x) {
-  for (let i = 0n; i < 8n; i++) {
+  for (let i = 0; i < 8; i++) {
     x = sismo_wl_leaf(x ^ i);
   }
   return x;
 }
 
 function sismo_wl_outer(x) {
-  for (let i = 0n; i < 4n; i++) {
-    x = sismo_wl_mid(x + i);
+  for (let i = 0; i < 4; i++) {
+    x = sismo_wl_mid((x + i) | 0);
   }
   return x;
 }
@@ -37,7 +43,7 @@ function sismo_wl_block() {
 function main() {
   const durationMs = process.argv.length > 2 ? parseInt(process.argv[2], 10) : 3000;
   const end = Date.now() + durationMs;
-  let x = 1n;
+  let x = 1;
   let iters = 0;
   while (Date.now() < end) {
     x = sismo_wl_outer(x);

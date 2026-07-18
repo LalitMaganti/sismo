@@ -6,3 +6,4 @@ leaf: absent
 chain: truncated
 module_status: ok
 diagnostics: interpreted-runtime
+residual: none

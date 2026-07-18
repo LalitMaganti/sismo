@@ -6,3 +6,4 @@ leaf: symbolized
 chain: partial
 module_status: ok
 diagnostics: build-id
+residual: none

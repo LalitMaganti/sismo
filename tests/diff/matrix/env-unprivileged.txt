@@ -6,3 +6,4 @@ leaf: absent
 chain: none
 module_status: absent
 diagnostics: bpf-init-failed
+residual: none

@@ -6,3 +6,4 @@ leaf: symbolized
 chain: full
 module_status: ok
 diagnostics: none
+residual: none

@@ -6,3 +6,4 @@ leaf: absent
 chain: truncated
 module_status: partial
 diagnostics: interpreted-runtime
+residual: [jit:node]

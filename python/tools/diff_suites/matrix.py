@@ -508,6 +508,40 @@ UNION ALL SELECT 'chain',
     return facts
 
 
+def query_residual(trace: str) -> list[str]:
+    """The distinct residual-frame labels present in the trace, sorted.
+
+    DIA-6 records an unresolvable PC as a synthetic mapping whose name is the
+    residual class — `[jit:<runtime>]` for anonymous executable (JIT) pages,
+    `[anon]` / `[unmapped]` otherwise. A native, fully-symbolized capture emits
+    none. js-node's hot leaf JITs into anonymous exec pages, so it surfaces
+    `[jit:node]` here.
+    """
+    # trace_processor renders the synthetic mapping's path with a leading '/'
+    # (it is stored as a normal mapping name), so match the label anywhere and
+    # extract the bracketed class. LIKE treats '[' literally.
+    #
+    # A stray garbage FP-walk PC lands in [anon]/[unmapped] as one-off noise
+    # that flaps run to run; the meaningful signal (js-node's JITed hot loop)
+    # covers dozens of distinct PCs. Require a class to carry >= 5 distinct
+    # frames so the golden reports only residuals that actually recur.
+    sql = (
+        "SELECT m.name FROM stack_profile_frame f "
+        "JOIN stack_profile_mapping m ON f.mapping = m.id "
+        "WHERE m.name LIKE '%[jit:%' OR m.name LIKE '%[anon]' "
+        "OR m.name LIKE '%[anon-exec]' OR m.name LIKE '%[unmapped]' "
+        "GROUP BY m.name HAVING count(*) >= 5;"
+    )
+    p = subprocess.run([TP_SHELL, "-q", "/dev/stdin", trace],
+                       input=sql, capture_output=True, text=True)
+    labels = set()
+    for line in p.stdout.splitlines():
+        mo = re.search(r'(\[[a-z0-9:_-]+\])', line)
+        if mo:
+            labels.add(mo.group(1))
+    return sorted(labels)
+
+
 MODULE_RE = re.compile(
     r"^\s*\[(ok|partial|unresolved|no symbols|no names)\s*\]\s+(\d+)/(\d+)\s+(.+)$")
 
@@ -583,6 +617,8 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
     diagnostics = sorted(
         label for label, rx in DIAG_CATALOG if re.search(rx, rec.stderr))
 
+    residual = query_residual(rec.trace) if os.path.exists(rec.trace) else []
+
     lines = [
         f"record_exit: {rec.exit}",
         f"samples: {'present' if samples_present else 'absent'}",
@@ -592,6 +628,7 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
         f"chain: {chain}",
         f"module_status: {module_status}",
         f"diagnostics: {', '.join(diagnostics) if diagnostics else 'none'}",
+        f"residual: {', '.join(residual) if residual else 'none'}",
     ]
     return "\n".join(lines) + "\n"
 

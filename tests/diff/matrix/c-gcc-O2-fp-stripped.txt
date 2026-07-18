@@ -6,3 +6,4 @@ leaf: absent
 chain: truncated
 module_status: no names
 diagnostics: stripped
+residual: none

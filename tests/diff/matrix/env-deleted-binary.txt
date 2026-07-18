@@ -6,3 +6,4 @@ leaf: absent
 chain: truncated
 module_status: no symbols
 diagnostics: deleted-file
+residual: none
