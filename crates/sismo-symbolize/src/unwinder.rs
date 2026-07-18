@@ -455,16 +455,20 @@ mod x86_64_self_unwind {
                 rbp = out(reg) rbp,
             );
         }
-        // Snapshot 64 KiB of our own stack upward from rsp. The stack grows
-        // down, so the caller frames we want live at higher addresses; the
-        // nested allocations below push new frames lower than rsp and leave
-        // the snapshot region untouched. 64 KiB is safely within the 8 MiB
-        // main-thread stack.
+        // Snapshot our own stack upward from rsp via /proc/self/mem rather than
+        // a raw copy. The stack grows down, so the caller frames we want live at
+        // higher addresses. This runs on a spawned test thread whose stack is
+        // far smaller than main's, and the call chain here is shallow, so rsp
+        // sits close to the top — a blind 64 KiB copy runs off the end into the
+        // guard page and SIGSEGVs. A pread stops cleanly at the first unmapped
+        // page (short read, no fault), giving exactly the mapped stack, which is
+        // all the walk needs.
+        use std::os::unix::fs::FileExt;
         const SNAP: usize = 64 * 1024;
+        let mem = std::fs::File::open("/proc/self/mem").unwrap();
         let mut buf = vec![0u8; SNAP];
-        unsafe {
-            core::ptr::copy_nonoverlapping(rsp as *const u8, buf.as_mut_ptr(), SNAP);
-        }
+        let n = mem.read_at(&mut buf, rsp).unwrap_or(0);
+        buf.truncate(n);
 
         let exe = std::fs::read("/proc/self/exe").unwrap();
         let mut unw = Unwinder::new_x86_64();
