@@ -736,6 +736,7 @@ impl Interner {
 // ---- Capture: the collector object (output half) ---------------------------
 
 use crate::symbolize::data_regions::DataRegions;
+use crate::symbolize::gopclntab::GoPclntab;
 use crate::symbolize::proc_maps::{ProcMaps, ResidualMap};
 use crate::symbolize::python_offsets::PyDebugOffsets;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
@@ -790,6 +791,10 @@ pub struct Capture {
     // registered into it. Built lazily on the first unwind sample.
     unwinder: Option<Unwinder>,
     unwind_registered: HashSet<u64>,
+    // NAT-1b: per-module Go unwinders (base avma -> parsed .gopclntab, None when
+    // the module isn't Go / didn't parse). Go carries no .eh_frame, so framehop
+    // can't unwind it; this walks Go frames from the pcsp frame-size tables.
+    go_unwinders: HashMap<u64, Option<GoPclntab>>,
     // PY-1: `_PyRuntime`'s runtime address + parsed `_Py_DebugOffsets`,
     // located and parsed once per run (the layout never changes for a live
     // interpreter). `python_tried` gates the one-time locate/parse attempt;
@@ -1156,6 +1161,25 @@ impl Capture {
             return fp;
         }
         self.ensure_maps(urec.sample.hdr.ts);
+        let sp0 = urec.regs_sp;
+        let len = (urec.stack_len as usize).min(SISMO_STACK_SNAP_MAX);
+        let bytes = &urec.stack_bytes[..len];
+        let read_stack = |addr: u64| -> Option<u64> {
+            let off = addr.checked_sub(sp0)? as usize;
+            let end = off.checked_add(8)?;
+            bytes.get(off..end).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        };
+
+        // Go carries no .eh_frame, so framehop can't unwind it; when the leaf is
+        // in a Go module walk it from the pcsp frame-size tables instead. Prefer
+        // whichever recovered more than the frame-pointer walk (which truncates
+        // on FP-less code), so a module neither can unwind keeps the FP frames.
+        if let Some(pcs) = self.go_unwind(urec.regs_ip, sp0, read_stack) {
+            if pcs.len() > fp.len() {
+                return pcs;
+            }
+        }
+
         self.ensure_unwinder();
         let Some(unw) = self.unwinder.as_mut() else {
             return fp;
@@ -1164,17 +1188,35 @@ impl Capture {
             pc: urec.regs_ip,
             fp: urec.regs_bp,
             lr: 0,
-            sp: urec.regs_sp,
+            sp: sp0,
         };
-        let len = (urec.stack_len as usize).min(SISMO_STACK_SNAP_MAX);
-        let pcs = unw.walk_snapshot(regs, &urec.stack_bytes[..len], urec.regs_sp, SISMO_MAX_STACK);
-        // The frame-pointer walk truncates on FP-less code (often to the leaf
-        // PC alone); prefer the DWARF chain only when it recovered more.
+        let pcs = unw.walk_snapshot(regs, bytes, sp0, SISMO_MAX_STACK);
         if pcs.len() > fp.len() {
             pcs
         } else {
             fp
         }
+    }
+
+    /// Go-unwind from the snapshot when `pc` is in a Go module (has a parseable
+    /// `.gopclntab`), else `None`. The per-module `GoPclntab` is parsed once and
+    /// cached (including the negative result for non-Go modules).
+    fn go_unwind(
+        &mut self,
+        pc: u64,
+        sp: u64,
+        read_stack: impl FnMut(u64) -> Option<u64>,
+    ) -> Option<Vec<u64>> {
+        let (base, path) = {
+            let m = self.maps.as_ref()?.find(pc)?;
+            (m.base_avma, m.path.clone())
+        };
+        if !self.go_unwinders.contains_key(&base) {
+            let parsed = GoPclntab::from_path(&path);
+            self.go_unwinders.insert(base, parsed);
+        }
+        let go = self.go_unwinders.get(&base)?.as_ref()?;
+        Some(go.unwind(base, pc, sp, read_stack, SISMO_MAX_STACK))
     }
 
     /// Build the host-side unwinder on first use and register every target
@@ -1454,6 +1496,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         unwind_snapshots: 0,
         unwinder: None,
         unwind_registered: HashSet::new(),
+        go_unwinders: HashMap::new(),
         python_tried: false,
         python_runtime: None,
         python_debug_count: 0,

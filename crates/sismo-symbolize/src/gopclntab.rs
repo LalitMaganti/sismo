@@ -150,6 +150,45 @@ impl GoPclntab {
         pcvalue(&self.data, self.pctab_off.checked_add(pcsp as usize)?, entryoff, q)
     }
 
+    /// Unwind a Go stack from a captured snapshot, returning the PC chain
+    /// (leaf first, AVMAs). Go carries no `.eh_frame`, but its `pcsp` frame
+    /// sizes are enough to step frames without a frame pointer: on amd64 the
+    /// call pushes the return address, so the caller's SP is `sp + framesize +
+    /// 8` and the return PC sits one word below it, at `sp + framesize`.
+    /// Stops when a PC leaves this Go module (no `pcsp` entry), a stack read
+    /// misses the snapshot, or the return address is 0 (the goroutine's
+    /// `goexit` sentinel). `read_stack` reads 8 bytes at an AVMA or `None`.
+    pub fn unwind(
+        &self,
+        module_base_avma: u64,
+        pc0: u64,
+        sp0: u64,
+        mut read_stack: impl FnMut(u64) -> Option<u64>,
+        max_pcs: usize,
+    ) -> Vec<u64> {
+        let mut out = Vec::new();
+        let (mut pc, mut sp) = (pc0, sp0);
+        while out.len() < max_pcs {
+            out.push(pc);
+            let Some(fs) = self.frame_size(pc.wrapping_sub(module_base_avma)) else {
+                break; // left this Go module (or the goexit sentinel)
+            };
+            if fs < 0 {
+                break; // uncovered PC — don't step backwards on bad data
+            }
+            let caller_sp = sp.wrapping_add(fs as u64);
+            let Some(ret) = read_stack(caller_sp) else {
+                break;
+            };
+            if ret == 0 {
+                break;
+            }
+            pc = ret;
+            sp = caller_sp.wrapping_add(8);
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.nfunc
     }
