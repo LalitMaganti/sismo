@@ -11,6 +11,9 @@ pub mod disasm;
 #[cfg(not(target_os = "windows"))]
 pub mod dynsym;
 mod maps_common;
+// DIA-0: per-module stack-quality primitive (truncation signal + eh_frame probe).
+#[cfg(not(target_os = "windows"))]
+pub mod stack_quality;
 // macOS Mach-based module enumeration + mach-o reading.
 #[cfg(target_os = "macos")]
 pub mod dyld_images;
