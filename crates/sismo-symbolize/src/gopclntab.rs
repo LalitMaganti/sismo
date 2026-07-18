@@ -159,28 +159,43 @@ fn find_sections(f: &std::fs::File) -> Option<((u64, u64), u64)> {
     let mut names = vec![0u8; shstr_size as usize];
     f.read_exact_at(&mut names, shstr_off).ok()?;
 
-    let mut gopcln = None;
+    const SHT_PROGBITS: u32 = 1;
+    let mut gopcln_named = None;
+    let mut gopcln_magic = None;
     let mut text_vaddr = None;
     for i in 0..e_shnum {
         let sh = read_shdr(i)?;
-        if u32::from_le_bytes(sh[4..8].try_into().unwrap()) == SHT_NULL {
+        let sh_type = u32::from_le_bytes(sh[4..8].try_into().unwrap());
+        if sh_type == SHT_NULL {
             continue;
         }
         let name_off = u32::from_le_bytes(sh[0..4].try_into().unwrap()) as usize;
         let name = cstr_at(&names, name_off)?;
-        match name {
-            ".gopclntab" => {
-                let off = u64::from_le_bytes(sh[24..32].try_into().unwrap());
-                let size = u64::from_le_bytes(sh[32..40].try_into().unwrap());
-                gopcln = Some((off, size));
+        let off = u64::from_le_bytes(sh[24..32].try_into().unwrap());
+        let size = u64::from_le_bytes(sh[32..40].try_into().unwrap());
+        if name == ".text" {
+            text_vaddr = Some(u64::from_le_bytes(sh[16..24].try_into().unwrap()));
+            continue;
+        }
+        if name == ".gopclntab" {
+            gopcln_named = Some((off, size));
+            continue;
+        }
+        // systing #158: some Go binaries rename the section (objcopy
+        // --rename-section .gopclntab=.data.rel.ro.pcln), so match a PROGBITS
+        // section whose content starts with the pcHeader magic + a 64-bit
+        // ptrSize instead of relying on the name.
+        if gopcln_magic.is_none() && sh_type == SHT_PROGBITS && size >= 64 {
+            let mut head = [0u8; 8];
+            if f.read_exact_at(&mut head, off).is_ok() {
+                let magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
+                if (magic == MAGIC_118 || magic == MAGIC_120) && head[7] == 8 {
+                    gopcln_magic = Some((off, size));
+                }
             }
-            ".text" => {
-                text_vaddr = Some(u64::from_le_bytes(sh[16..24].try_into().unwrap()));
-            }
-            _ => {}
         }
     }
-    Some((gopcln?, text_vaddr?))
+    Some((gopcln_named.or(gopcln_magic)?, text_vaddr?))
 }
 
 /// The image base — the lowest PT_LOAD vaddr — which `avma - base_avma` relative
