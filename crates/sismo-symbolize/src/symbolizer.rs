@@ -83,6 +83,10 @@ struct SymModule {
     /// zero symbols (a section-header-stripped ELF). Names only, no line info.
     #[cfg(not(target_os = "windows"))]
     dynsym: Option<crate::dynsym::DynSyms>,
+    /// `.gopclntab` fallback for a stripped Go binary — recovers the Go function
+    /// names wholesym can't see once `-s` drops the symbol table. Names only.
+    #[cfg(not(target_os = "windows"))]
+    gopclntab: Option<crate::gopclntab::GoPclntab>,
 }
 
 /// Build the wholesym config. Debuginfod is opt-in (it does network I/O),
@@ -185,12 +189,26 @@ impl Symbolizer {
             None
         };
 
+        // A stripped Go binary keeps `.gopclntab`; load it so `resolve` can
+        // recover Go names wholesym can't (it only saw synthetic placeholders).
+        // Cheap to skip: non-Go ELFs have no `.gopclntab` and `from_path` bails.
+        #[cfg(not(target_os = "windows"))]
+        let gopclntab = path.to_str().and_then(crate::gopclntab::GoPclntab::from_path);
+        #[cfg(not(target_os = "windows"))]
+        if let Some(g) = gopclntab.as_ref() {
+            if result.symbol_count == 0 {
+                result = ModuleLoad { symbol_count: g.len() as u64, error: None };
+            }
+        }
+
         self.modules.push(SymModule {
             base_avma,
             end_avma,
             map,
             #[cfg(not(target_os = "windows"))]
             dynsym,
+            #[cfg(not(target_os = "windows"))]
+            gopclntab,
         });
         result
     }
@@ -209,23 +227,44 @@ impl Symbolizer {
         let rel_u64 = avma - module.base_avma;
 
         // Primary: wholesym, which carries DWARF inline frames and line info.
+        // Use the async `lookup` (block_on'd through our runtime), not
+        // `lookup_sync`. The sync variant returns the nearest preceding symbol
+        // regardless of whether the address falls within its body — fine for
+        // full symbol tables, but for stripped dyld_shared_cache members it
+        // produces bogus matches like "vsprintf +41" hundreds of bytes past
+        // vsprintf's end. The async path validates containment first.
+        //
+        // A wholesym result whose outer name is a synthesized placeholder
+        // (fun_<hex> / EntryPoint) is not a real name — hold it as a last
+        // resort and prefer a real name from `.gopclntab`/`.dynsym` if one
+        // exists, so a stripped Go binary reports `main.foo`, not `fun_1234`.
+        let mut placeholder: Option<Resolved> = None;
         if let Some(map) = module.map.as_ref() {
             if let Ok(rel) = u32::try_from(rel_u64) {
-                // Use the async `lookup` (block_on'd through our runtime), not
-                // `lookup_sync`. The sync variant returns the nearest preceding
-                // symbol regardless of whether the address falls within its body
-                // — fine for full symbol tables, but for stripped
-                // dyld_shared_cache members it produces bogus matches like
-                // "vsprintf +41" hundreds of bytes past vsprintf's end. The
-                // async path validates containment first.
                 if let Some(info) = self.rt.block_on(map.lookup(LookupAddress::Relative(rel))) {
-                    return Some(frames_from_lookup(&info, rel));
+                    let resolved = frames_from_lookup(&info, rel);
+                    if is_synthetic_name(&resolved.outer().name) {
+                        placeholder = Some(resolved);
+                    } else {
+                        return Some(resolved);
+                    }
                 }
             }
         }
 
-        // Fallback: `.dynsym` via PT_DYNAMIC for a section-header-stripped ELF,
-        // where wholesym found no symbols. Names only — no source location.
+        // `.gopclntab` for a stripped Go binary — real Go names, no line info.
+        #[cfg(not(target_os = "windows"))]
+        if let Some(gopclntab) = module.gopclntab.as_ref() {
+            if let Some((name, offset)) = gopclntab.resolve(rel_u64) {
+                return Some(Resolved {
+                    frames: vec![Frame { name: name.to_owned(), file: None, line: 0 }],
+                    offset,
+                });
+            }
+        }
+
+        // `.dynsym` via PT_DYNAMIC for a section-header-stripped ELF, where
+        // wholesym found no symbols. Names only — no source location.
         #[cfg(not(target_os = "windows"))]
         if let Some(dynsym) = module.dynsym.as_ref() {
             if let Some((name, offset)) = dynsym.resolve(rel_u64) {
@@ -236,7 +275,27 @@ impl Symbolizer {
             }
         }
 
-        None
+        // Nothing better than wholesym's placeholder (if any) — a distinct
+        // `fun_<hex>` per function still beats a bare hex address.
+        placeholder
+    }
+}
+
+/// Whether `name` is one of wholesym's synthesized placeholder names — `fun_<hex>`
+/// (a function start found from unwind info with no name) or `EntryPoint` (the
+/// ELF entry). These are not real symbol names; preferring a real name from
+/// another source over one of these is the point of the `.gopclntab`/`.dynsym`
+/// fallbacks.
+pub fn is_synthetic_name(name: &str) -> bool {
+    if name == "EntryPoint" {
+        return true;
+    }
+    match name.strip_prefix("fun_") {
+        Some(rest) => {
+            !rest.is_empty()
+                && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
     }
 }
 

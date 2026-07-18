@@ -10,6 +10,9 @@ pub mod disasm;
 // `.dynsym`-via-PT_DYNAMIC fallback for section-header-stripped ELF (Linux/ELF).
 #[cfg(not(target_os = "windows"))]
 pub mod dynsym;
+// `.gopclntab` function-name resolver for stripped Go binaries (Linux/ELF).
+#[cfg(not(target_os = "windows"))]
+pub mod gopclntab;
 mod maps_common;
 // DIA-0: per-module stack-quality primitive (truncation signal + eh_frame probe).
 #[cfg(not(target_os = "windows"))]

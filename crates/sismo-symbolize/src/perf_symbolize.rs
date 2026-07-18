@@ -918,24 +918,7 @@ fn os_release_id(text: &str) -> Option<&str> {
 
 // ---- Pure helpers ----------------------------------------------------------
 
-/// Whether `name` is one of wholesym's synthesized placeholder names rather than
-/// a real symbol: `fun_<hex>` (a function start found from unwind info with no
-/// name) or `EntryPoint` (the ELF entry). samply marks both as
-/// not-a-proper-symbol; a module that resolves only to these has had its local
-/// names stripped, even though every address "resolved" to something.
-fn is_synthetic_name(name: &str) -> bool {
-    if name == "EntryPoint" {
-        return true;
-    }
-    match name.strip_prefix("fun_") {
-        // samply formats the address with `{:x}` — lowercase hex, non-empty.
-        Some(rest) => {
-            !rest.is_empty()
-                && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        }
-        None => false,
-    }
-}
+use crate::symbolizer::is_synthetic_name;
 
 /// Strip wholesym's trailing " +<offset>" so only the function name is emitted
 /// (trace_processor recomputes the per-frame offset itself).
