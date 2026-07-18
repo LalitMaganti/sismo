@@ -112,6 +112,23 @@ def _bin(name: str) -> str:
     return os.path.join(BIN_DIR, name)
 
 
+@functools.lru_cache(maxsize=None)
+def _mise_tool(name: str) -> str:
+    """Absolute path to a tool, resolving mise-managed toolchains (java) that
+    are not on the harness PATH. Falls back to the bare name so the variant's
+    availability check can Skip it cleanly when nothing provides it."""
+    found = shutil.which(name)
+    if found:
+        return found
+    try:
+        p = subprocess.run(["mise", "which", name], capture_output=True, text=True)
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.strip()
+    except OSError:
+        pass
+    return name
+
+
 def build_variants() -> list[Variant]:
     wl_c = os.path.join(TARGETS, "workload.c")
     wl_dlopen = os.path.join(TARGETS, "workload_dlopen.c")
@@ -121,6 +138,7 @@ def build_variants() -> list[Variant]:
     wl_zig = os.path.join(TARGETS, "workload.zig")
     wl_py = os.path.join(TARGETS, "workload.py")
     wl_js = os.path.join(TARGETS, "workload.js")
+    wl_java = os.path.join(TARGETS, "workload.java")
     wl_inline = os.path.join(TARGETS, "workload_inline.c")
     mk_mdi = os.path.join(TARGETS, "make_minidebug.sh")
 
@@ -357,6 +375,21 @@ def build_variants() -> list[Variant]:
                        "diagnostic explains missing JS frames (no perf-map/"
                        "jitdump support)"),
         map_substr="node"))
+    javac = _mise_tool("javac")
+    java = _mise_tool("java")
+    jar = _mise_tool("jar")
+    classdir = _bin("jvm-java.d")
+    v.append(Variant(
+        "jvm-java", "jit", "JVM/HotSpot: Java methods are unnamed native frames",
+        [java, "-jar", _bin("jvm-java"), "{DUR}"],
+        Expect(leaf="none", chain="na", module_status=None,
+               gremlin="HotSpot samples show only native libjvm/JIT frames; "
+                       "naming the sismo_wl_* methods needs a perf-map "
+                       "(-XX:+PreserveFramePointer + producer), JIT-1"),
+        [[javac, "-d", classdir, wl_java],
+         [jar, "--create", "--file", _bin("jvm-java"),
+          "--main-class", "Workload", "-C", classdir, "."]],
+        map_substr="libjvm"))
 
     # --- environments -----------------------------------------------------
     b = _bin("env-unprivileged")
