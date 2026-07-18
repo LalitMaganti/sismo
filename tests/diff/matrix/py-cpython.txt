@@ -2,8 +2,8 @@ record_exit: 0
 samples: present
 offcpu: present
 mapping: present
-leaf: absent
-chain: truncated
+leaf: symbolized
+chain: full
 module_status: ok
 diagnostics: interpreted-runtime
 residual: none

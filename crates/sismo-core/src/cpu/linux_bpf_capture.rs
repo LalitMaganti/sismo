@@ -737,6 +737,7 @@ impl Interner {
 
 use crate::symbolize::data_regions::DataRegions;
 use crate::symbolize::proc_maps::{ProcMaps, ResidualMap};
+use crate::symbolize::python_offsets::PyDebugOffsets;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
 use crate::ffi::{sismo_ds_emit, sismo_ds_emit_offcpu};
 use std::collections::HashSet;
@@ -789,6 +790,14 @@ pub struct Capture {
     // registered into it. Built lazily on the first unwind sample.
     unwinder: Option<Unwinder>,
     unwind_registered: HashSet<u64>,
+    // PY-1: `_PyRuntime`'s runtime address + parsed `_Py_DebugOffsets`,
+    // located and parsed once per run (the layout never changes for a live
+    // interpreter). `python_tried` gates the one-time locate/parse attempt;
+    // `python_runtime` stays None when the target isn't Python 3.14, or the
+    // locate/parse failed.
+    python_tried: bool,
+    python_runtime: Option<(u64, PyDebugOffsets)>,
+    python_debug_count: u64,
     sampler_precise_ip: u8,
     ds_slot: u32,
     active: AtomicBool,
@@ -867,6 +876,27 @@ impl Capture {
         self.ensure_maps(rec.hdr.ts);
         if self.maps.is_some() {
             let mut fids: Vec<u64> = Vec::new();
+
+            // PY-1: splice in the live-recovered Python call chain, leaf
+            // first, ahead of the native frames below — reversed together
+            // with them, this lands Python as the leaf-most frames (CPython
+            // 3.11+ runs the bytecode loop without one native frame per
+            // Python call, so the FP walk alone never sees these).
+            if self.residual_map.as_ref().and_then(|r| r.runtime()) == Some("python") {
+                let py_frames = self.python_frames();
+                if !py_frames.is_empty() {
+                    let mapping_iid = self.interner.intern_residual_mapping(b"[python]", idw);
+                    for name in &py_frames {
+                        let name_iid = self.interner.intern_func_name(name.as_bytes(), idw);
+                        let frame_iid = self.interner.intern_frame(
+                            FrameKey { mapping_iid, rel_pc: 0, name_iid },
+                            idw,
+                        );
+                        fids.push(frame_iid);
+                    }
+                }
+            }
+
             let mut reparsed = false;
             for &pc in user_pcs {
                 if pc == 0 {
@@ -1175,6 +1205,57 @@ impl Capture {
         }
     }
 
+    /// Locate + parse `_PyRuntime`'s `_Py_DebugOffsets` once per run, when the
+    /// target is running a recognized Python interpreter. A no-op on every
+    /// call after the first (whether it succeeded or not) — the layout is
+    /// fixed for the life of the interpreter, so there's nothing to refresh.
+    fn ensure_python_runtime(&mut self) {
+        if self.python_tried {
+            return;
+        }
+        self.python_tried = true;
+        if self.residual_map.as_ref().and_then(|r| r.runtime()) != Some("python") {
+            return;
+        }
+        let Some(maps) = self.maps.as_ref() else { return };
+        let Some(avma) = crate::symbolize::python_stack::locate_py_runtime(self.target_pid, maps)
+        else {
+            return;
+        };
+        let Some(blob) =
+            crate::symbolize::python_stack::read_debug_offsets_blob(self.target_pid, avma)
+        else {
+            return;
+        };
+        let Some(offs) = crate::symbolize::python_offsets::parse(&blob) else {
+            return;
+        };
+        self.python_runtime = Some((avma, offs));
+    }
+
+    /// Live-walk the target's Python interpreter frame chain (leaf-first
+    /// qualnames), or an empty vec when no Python runtime was located.
+    /// Behind `SISMO_DEBUG_PYTHON`, dumps the first few walks' recovered
+    /// names to stderr — the debugging hook for a walk that isn't recovering
+    /// frames.
+    fn python_frames(&mut self) -> Vec<String> {
+        self.ensure_python_runtime();
+        let Some((avma, offs)) = self.python_runtime else {
+            return Vec::new();
+        };
+        let frames = crate::symbolize::python_stack::walk_python_stack(self.target_pid, avma, &offs);
+        if self.python_debug_count < 5 && std::env::var_os("SISMO_DEBUG_PYTHON").is_some() {
+            self.python_debug_count += 1;
+            eprintln!(
+                "sismo: python walk #{} recovered {} frame(s): {:?}",
+                self.python_debug_count,
+                frames.len(),
+                frames
+            );
+        }
+        frames
+    }
+
     fn handle(&mut self, hdr: &SismoHdr) {
         if hdr.r#type == SISMO_EVT_KSYM {
             let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoKsymRec) };
@@ -1373,6 +1454,9 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         unwind_snapshots: 0,
         unwinder: None,
         unwind_registered: HashSet::new(),
+        python_tried: false,
+        python_runtime: None,
+        python_debug_count: 0,
         sampler_precise_ip: 0,
         ds_slot: u32::MAX,
         active: AtomicBool::new(false),

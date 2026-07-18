@@ -14,6 +14,13 @@ pub mod dynsym;
 #[cfg(not(target_os = "windows"))]
 pub mod gopclntab;
 mod maps_common;
+// PY-1: `_Py_DebugOffsets` table parser (pure, no OS dependency; Linux-only
+// because its sole consumer, python_stack, reads /proc/<pid>/mem).
+#[cfg(target_os = "linux")]
+pub mod python_offsets;
+// PY-1: live CPython 3.14+ frame recovery via /proc/<pid>/mem (Linux-only).
+#[cfg(target_os = "linux")]
+pub mod python_stack;
 // DIA-0: per-module stack-quality primitive (truncation signal + eh_frame probe).
 #[cfg(not(target_os = "windows"))]
 pub mod stack_quality;

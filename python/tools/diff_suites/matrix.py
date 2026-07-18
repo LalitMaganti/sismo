@@ -505,12 +505,21 @@ def query_trace(variant: Variant, trace: str) -> dict[str, int]:
     # every fact is one UNION ALL arm of one SELECT.
     like = lambda s: f"'%{s}%'"  # noqa: E731
     m = like(variant.mapping_pattern())
+    # A frame counts as "named X" if either its symbolized name (from
+    # stack_profile_symbol, the native/DWARF path) or its own frame.name (set
+    # directly via function_name_id — how synthetic frames like the PY-1
+    # recovered Python qualnames are named) matches. LEFT JOIN the symbol so
+    # frames with no symbol_set_id (every synthetic frame) still match on
+    # frame.name.
+    leaf = like(variant.leaf)
+    mid = like(variant.mid)
+    outer = like(variant.outer)
     sql = f"""
 WITH RECURSIVE anc(id, parent_id, frame_id) AS (
   SELECT c.id, c.parent_id, c.frame_id FROM stack_profile_callsite c
   JOIN stack_profile_frame f ON c.frame_id = f.id
-  JOIN stack_profile_symbol s USING(symbol_set_id)
-  WHERE s.name LIKE {like(variant.leaf)}
+  LEFT JOIN stack_profile_symbol s USING(symbol_set_id)
+  WHERE s.name LIKE {leaf} OR f.name LIKE {leaf}
   UNION ALL
   SELECT p.id, p.parent_id, p.frame_id
   FROM stack_profile_callsite p JOIN anc a ON p.id = a.parent_id
@@ -518,18 +527,20 @@ WITH RECURSIVE anc(id, parent_id, frame_id) AS (
 SELECT 'samples' AS k, count(*) AS v FROM perf_sample
 UNION ALL SELECT 'sessions', count(DISTINCT perf_session_id) FROM perf_sample
 UNION ALL SELECT 'mapping', count(*) FROM stack_profile_mapping WHERE name LIKE {m}
-UNION ALL SELECT 'leaf_syms', count(*) FROM stack_profile_symbol
-  WHERE name LIKE {like(variant.leaf)}
+UNION ALL SELECT 'leaf_syms', count(*)
+  FROM stack_profile_frame f LEFT JOIN stack_profile_symbol s USING(symbol_set_id)
+  WHERE s.name LIKE {leaf} OR f.name LIKE {leaf}
 UNION ALL SELECT 'target_frames', count(*)
   FROM stack_profile_frame f JOIN stack_profile_mapping mp ON f.mapping = mp.id
   WHERE mp.name LIKE {m}
 UNION ALL SELECT 'max_depth', coalesce(max(depth), 0) FROM stack_profile_callsite
 UNION ALL SELECT 'chain',
-  (SELECT count(DISTINCT CASE WHEN s.name LIKE {like(variant.mid)} THEN 1
-                              WHEN s.name LIKE {like(variant.outer)} THEN 2 END)
+  (SELECT count(DISTINCT CASE WHEN s.name LIKE {mid} OR f.name LIKE {mid} THEN 1
+                              WHEN s.name LIKE {outer} OR f.name LIKE {outer} THEN 2 END)
    FROM anc JOIN stack_profile_frame f ON anc.frame_id = f.id
-   JOIN stack_profile_symbol s USING(symbol_set_id)
-   WHERE s.name LIKE {like(variant.mid)} OR s.name LIKE {like(variant.outer)});
+   LEFT JOIN stack_profile_symbol s USING(symbol_set_id)
+   WHERE s.name LIKE {mid} OR f.name LIKE {mid}
+      OR s.name LIKE {outer} OR f.name LIKE {outer});
 """
     p = subprocess.run([TP_SHELL, "-q", "/dev/stdin", trace],
                        input=sql, capture_output=True, text=True)
