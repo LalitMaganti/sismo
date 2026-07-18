@@ -2,7 +2,7 @@ record_exit: 0
 samples: present
 offcpu: present
 mapping: present
-leaf: absent
-chain: truncated
-module_status: unresolved
-diagnostics: build-id, deleted-file
+leaf: symbolized
+chain: full
+module_status: ok
+diagnostics: none

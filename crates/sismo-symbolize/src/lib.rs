@@ -7,6 +7,9 @@
 
 pub mod data_regions;
 pub mod disasm;
+// `.dynsym`-via-PT_DYNAMIC fallback for section-header-stripped ELF (Linux/ELF).
+#[cfg(not(target_os = "windows"))]
+pub mod dynsym;
 mod maps_common;
 // macOS Mach-based module enumeration + mach-o reading.
 #[cfg(target_os = "macos")]

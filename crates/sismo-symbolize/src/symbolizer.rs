@@ -79,6 +79,10 @@ struct SymModule {
     /// returns 0 (= no match) instead of falling through to a wrong
     /// neighbor module's range.
     map: Option<SymbolMap>,
+    /// `.dynsym`-via-PT_DYNAMIC fallback, populated only when wholesym found
+    /// zero symbols (a section-header-stripped ELF). Names only, no line info.
+    #[cfg(not(target_os = "windows"))]
+    dynsym: Option<crate::dynsym::DynSyms>,
 }
 
 /// Build the wholesym config. Debuginfod is opt-in (it does network I/O),
@@ -157,75 +161,122 @@ impl Symbolizer {
             self.manager
                 .load_symbol_map_for_binary_at_path(path, disambiguator),
         );
-        let (map, result) = match load {
+        let (map, mut result) = match load {
             Ok(m) => {
                 let symbol_count = m.symbol_count() as u64;
                 (Some(m), ModuleLoad { symbol_count, error: None })
             }
             Err(e) => (None, ModuleLoad { symbol_count: 0, error: Some(format!("{e}")) }),
         };
-        self.modules.push(SymModule { base_avma, end_avma, map });
+
+        // When wholesym found no symbols, the ELF may have had its section
+        // header table stripped — its names are still reachable through the
+        // dynamic segment. Try that fallback and, if it works, report the
+        // recovered count so the module status is honest rather than the
+        // misleading "0 symbols / binary changed" it produced before.
+        #[cfg(not(target_os = "windows"))]
+        let dynsym = if result.symbol_count == 0 {
+            let d = path.to_str().and_then(crate::dynsym::DynSyms::from_path);
+            if let Some(d) = d.as_ref() {
+                result = ModuleLoad { symbol_count: d.len() as u64, error: None };
+            }
+            d
+        } else {
+            None
+        };
+
+        self.modules.push(SymModule {
+            base_avma,
+            end_avma,
+            map,
+            #[cfg(not(target_os = "windows"))]
+            dynsym,
+        });
         result
     }
 
     /// Resolve `avma` to its inline chain (innermost inlinee first, physical
     /// function last) plus the byte offset from the physical function's start,
-    /// or `None` if no registered module contains it (or its map didn't load).
+    /// or `None` if no registered module contains it (or nothing resolved).
     pub fn resolve(&self, avma: u64) -> Option<Resolved> {
         let module = self
             .modules
             .iter()
             .find(|m| avma >= m.base_avma && avma < m.end_avma)?;
-        let map = module.map.as_ref()?;
         // wholesym's `Relative` form on macOS is "offset from __TEXT base"
-        // — exactly `avma - base_avma` for a normally-loaded mach-o image.
-        let rel: u32 = (avma - module.base_avma).try_into().ok()?;
-        // Use the async `lookup` (block_on'd through our runtime), not
-        // `lookup_sync`. The sync variant returns the nearest preceding symbol
-        // regardless of whether the address falls within its body — fine for
-        // full symbol tables, but for stripped dyld_shared_cache members it
-        // produces bogus matches like "vsprintf +41" hundreds of bytes past
-        // vsprintf's end. The async path validates containment first.
-        let info = self.rt.block_on(map.lookup(LookupAddress::Relative(rel)))?;
+        // — exactly `avma - base_avma` for a normally-loaded mach-o image; for
+        // ELF the relative-address base is 0, so this is the link-time vaddr.
+        let rel_u64 = avma - module.base_avma;
 
-        // `info.frames` carries the DWARF inline records — innermost inlinee
-        // first, the physical function last. Emit every frame so an inlined
-        // callee is its own frame instead of being folded into its caller;
-        // keeping only the last one (the old behavior) made inlined hot
-        // functions invisible. The physical function's name comes from the
-        // symtab (`info.symbol.name`) when its DWARF frame has no function.
-        let frames: Vec<Frame> = match info.frames.as_ref().filter(|f| !f.is_empty()) {
-            Some(dwarf) => {
-                let last = dwarf.len() - 1;
-                dwarf
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| {
-                        let name = f.function.clone().unwrap_or_else(|| {
-                            if i == last { info.symbol.name.clone() } else { String::new() }
-                        });
-                        let file = f
-                            .file_path
-                            .as_ref()
-                            .map(|p| String::from_utf8_lossy(p.raw_path().as_bytes()).into_owned());
-                        Frame { name, file, line: f.line_number.unwrap_or(0) }
-                    })
-                    .filter(|f| !f.name.is_empty())
-                    .collect()
+        // Primary: wholesym, which carries DWARF inline frames and line info.
+        if let Some(map) = module.map.as_ref() {
+            if let Ok(rel) = u32::try_from(rel_u64) {
+                // Use the async `lookup` (block_on'd through our runtime), not
+                // `lookup_sync`. The sync variant returns the nearest preceding
+                // symbol regardless of whether the address falls within its body
+                // — fine for full symbol tables, but for stripped
+                // dyld_shared_cache members it produces bogus matches like
+                // "vsprintf +41" hundreds of bytes past vsprintf's end. The
+                // async path validates containment first.
+                if let Some(info) = self.rt.block_on(map.lookup(LookupAddress::Relative(rel))) {
+                    return Some(frames_from_lookup(&info, rel));
+                }
             }
-            None => Vec::new(),
-        };
-        // Symtab-only modules (no DWARF) and the all-anonymous-frame edge fall
-        // back to the single symbol name with no source location.
-        let frames = if frames.is_empty() {
-            vec![Frame { name: info.symbol.name.clone(), file: None, line: 0 }]
-        } else {
-            frames
-        };
+        }
 
-        let offset = rel.saturating_sub(info.symbol.address) as u64;
-        Some(Resolved { frames, offset })
+        // Fallback: `.dynsym` via PT_DYNAMIC for a section-header-stripped ELF,
+        // where wholesym found no symbols. Names only — no source location.
+        #[cfg(not(target_os = "windows"))]
+        if let Some(dynsym) = module.dynsym.as_ref() {
+            if let Some((name, offset)) = dynsym.resolve(rel_u64) {
+                return Some(Resolved {
+                    frames: vec![Frame { name: name.to_owned(), file: None, line: 0 }],
+                    offset,
+                });
+            }
+        }
+
+        None
     }
+}
+
+/// Turn a wholesym lookup into the resolved inline chain. `info.frames` carries
+/// the DWARF inline records — innermost inlinee first, the physical function
+/// last. Emit every frame so an inlined callee is its own frame instead of
+/// being folded into its caller; keeping only the last one made inlined hot
+/// functions invisible. The physical function's name comes from the symtab
+/// (`info.symbol.name`) when its DWARF frame has no function.
+fn frames_from_lookup(info: &wholesym::AddressInfo, rel: u32) -> Resolved {
+    let frames: Vec<Frame> = match info.frames.as_ref().filter(|f| !f.is_empty()) {
+        Some(dwarf) => {
+            let last = dwarf.len() - 1;
+            dwarf
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let name = f.function.clone().unwrap_or_else(|| {
+                        if i == last { info.symbol.name.clone() } else { String::new() }
+                    });
+                    let file = f
+                        .file_path
+                        .as_ref()
+                        .map(|p| String::from_utf8_lossy(p.raw_path().as_bytes()).into_owned());
+                    Frame { name, file, line: f.line_number.unwrap_or(0) }
+                })
+                .filter(|f| !f.name.is_empty())
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    // Symtab-only modules (no DWARF) and the all-anonymous-frame edge fall back
+    // to the single symbol name with no source location.
+    let frames = if frames.is_empty() {
+        vec![Frame { name: info.symbol.name.clone(), file: None, line: 0 }]
+    } else {
+        frames
+    };
+    let offset = rel.saturating_sub(info.symbol.address) as u64;
+    Resolved { frames, offset }
 }
 
 #[cfg(test)]
