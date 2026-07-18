@@ -676,6 +676,90 @@ fn report(stats: &[ModuleStat], n_addrs: usize, n_funcs: usize) {
         print_guidance(stats);
     }
     report_missing_build_ids(stats);
+    report_interpreter_runtimes(stats);
+}
+
+// ---- DIA-5: interpreted / JIT "native frames only" diagnostic ---------------
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Runtime {
+    Python,
+    NodeV8,
+    Jvm,
+}
+
+/// Recognize an interpreter / VM from a sampled module's path. These runtimes
+/// run user code the native unwinder can't see (bytecode in the interpreter
+/// loop, JIT methods with no ELF symbol), so their presence explains a profile
+/// that shows only VM internals.
+fn classify_runtime(name: &[u8]) -> Option<Runtime> {
+    let s = std::str::from_utf8(name).ok()?;
+    let base = s.rsplit('/').next().unwrap_or(s);
+    if s.contains("libpython") || base == "python" || base.starts_with("python2")
+        || base.starts_with("python3")
+    {
+        return Some(Runtime::Python);
+    }
+    if s.contains("libnode") || base == "node" {
+        return Some(Runtime::NodeV8);
+    }
+    if s.contains("libjvm") {
+        return Some(Runtime::Jvm);
+    }
+    None
+}
+
+/// Emit a runtime-specific "why is my user code invisible" diagnostic once per
+/// interpreter/VM found in the sampled modules. Orthogonal to symbolization: the
+/// native frames resolve fine, but the language-level frames need a different
+/// mechanism entirely.
+fn report_interpreter_runtimes(stats: &[ModuleStat]) {
+    let (mut py, mut node, mut jvm) = (false, false, false);
+    for st in stats {
+        let rt = match classify_runtime(&st.name) {
+            Some(Runtime::Python) if !py => {
+                py = true;
+                Runtime::Python
+            }
+            Some(Runtime::NodeV8) if !node => {
+                node = true;
+                Runtime::NodeV8
+            }
+            Some(Runtime::Jvm) if !jvm => {
+                jvm = true;
+                Runtime::Jvm
+            }
+            _ => continue,
+        };
+        print_runtime_diagnostic(&st.name, rt);
+    }
+}
+
+fn print_runtime_diagnostic(name: &[u8], rt: Runtime) {
+    match rt {
+        Runtime::Python => {
+            eprintln!("\nsismo record: {} — CPython interpreter detected.", s(name));
+            eprintln!("    the profile shows only the native interpreter frames; your Python");
+            eprintln!("    functions are invisible. Recovering them needs sismo to read the");
+            eprintln!("    interpreter's frame state directly (planned, PY-1). Until then the");
+            eprintln!("    Python call stack is not available.");
+        }
+        Runtime::NodeV8 => {
+            eprintln!("\nsismo record: {} — Node/V8 JIT runtime detected.", s(name));
+            eprintln!("    the profile shows only native V8 frames; your JavaScript functions");
+            eprintln!("    are unnamed. Run node with --perf-basic-prof (a perf-map) or");
+            eprintln!("    --perf-prof (jitdump) so sismo can name the JIT frames (JIT-1).");
+            eprintln!("    Interpreter and inlined frames stay out of scope by design.");
+        }
+        Runtime::Jvm => {
+            eprintln!("\nsismo record: {} — JVM detected.", s(name));
+            eprintln!("    the profile shows only native VM frames; your Java/Kotlin methods");
+            eprintln!("    are unnamed. Launch the JVM with -XX:+PreserveFramePointer and a");
+            eprintln!("    perf-map producer (perf-map-agent, -XX:+DumpPerfMapAtExit, or");
+            eprintln!("    async-profiler) so sismo can name the JIT frames (JIT-1). Interpreter");
+            eprintln!("    and inlined frames are out of scope; with no map this is permanent.");
+        }
+    }
 }
 
 /// Warn once per sampled module whose on-disk file has no real GNU build-id.
@@ -1146,6 +1230,20 @@ mod tests {
         assert!(mk(true, 10, 10, 10).status() == Status::NamesStripped);
         // A few real names among placeholders is still partial.
         assert!(mk(true, 10, 8, 6).status() == Status::Partial);
+    }
+
+    #[test]
+    fn classify_runtime_detects_interpreters() {
+        assert!(classify_runtime(b"/usr/lib64/libpython3.14.so.1.0") == Some(Runtime::Python));
+        assert!(classify_runtime(b"/usr/bin/python3.14") == Some(Runtime::Python));
+        assert!(classify_runtime(b"/usr/bin/python") == Some(Runtime::Python));
+        assert!(classify_runtime(b"/opt/node/bin/node") == Some(Runtime::NodeV8));
+        assert!(classify_runtime(b"/usr/lib/jvm/.../libjvm.so") == Some(Runtime::Jvm));
+        // Not runtimes.
+        assert!(classify_runtime(b"/usr/lib64/libc.so.6").is_none());
+        assert!(classify_runtime(b"/home/me/mytool").is_none());
+        // A path with "node" as a directory but a different binary must not match.
+        assert!(classify_runtime(b"/opt/node/bin/npm").is_none());
     }
 
     #[test]
