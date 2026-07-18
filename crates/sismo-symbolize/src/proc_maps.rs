@@ -89,9 +89,18 @@ pub enum Residual {
 
 /// The target's full address-space map for residual classification: every
 /// region with its executable bit, plus which JIT runtime (if any) is loaded.
+struct Region {
+    start: u64,
+    end: u64,
+    exec: bool,
+    /// A named region (a file path, or `[vdso]`/`[heap]`/`[stack]`). Truly
+    /// anonymous regions — the ones JIT engines mmap for code — have no name.
+    named: bool,
+}
+
 pub struct ResidualMap {
-    /// (start, end, exec) for every region, sorted by start for binary search.
-    regions: Vec<(u64, u64, bool)>,
+    /// Every region, sorted by start for binary search.
+    regions: Vec<Region>,
     /// The recognized JIT/interpreter runtime present in the process, if any.
     runtime: Option<&'static str>,
 }
@@ -107,7 +116,10 @@ impl ResidualMap {
         let mut runtime = None;
         for line in raw.split('\n') {
             let mut it = line.split([' ', '\t']).filter(|t| !t.is_empty());
-            let (Some(range), Some(perms)) = (it.next(), it.next()) else {
+            // start-end perms offset dev inode [pathname]
+            let (Some(range), Some(perms), Some(_off), Some(_dev), Some(_ino)) =
+                (it.next(), it.next(), it.next(), it.next(), it.next())
+            else {
                 continue;
             };
             let Some((s, e)) = range.split_once('-') else { continue };
@@ -117,52 +129,53 @@ impl ResidualMap {
             ) else {
                 continue;
             };
+            let path = it.next(); // present iff the region is named
             let exec = perms.as_bytes().get(2) == Some(&b'x');
-            regions.push((start, end, exec));
-            // The path is the last token (offset/dev/inode then pathname); absent
-            // for pure-anon regions. Detect the runtime from any loaded image.
+            regions.push(Region { start, end, exec, named: path.is_some() });
             if runtime.is_none() {
-                if let Some(path) = line.rsplit([' ', '\t']).find(|t| !t.is_empty()) {
-                    runtime = runtime_from_path(path);
+                if let Some(p) = path {
+                    runtime = runtime_from_path(p);
                 }
             }
         }
-        regions.sort_by_key(|r| r.0);
+        regions.sort_by_key(|r| r.start);
         ResidualMap { regions, runtime }
     }
 
     /// The region containing `addr`, if any (binary search).
-    fn region(&self, addr: u64) -> Option<(u64, u64, bool)> {
-        let i = self.regions.partition_point(|r| r.0 <= addr);
-        if i == 0 {
-            return None;
-        }
-        let r = self.regions[i - 1];
-        (addr >= r.0 && addr < r.1).then_some(r)
+    fn region(&self, addr: u64) -> Option<&Region> {
+        let i = self.regions.partition_point(|r| r.start <= addr);
+        (i > 0 && addr < self.regions[i - 1].end).then(|| &self.regions[i - 1])
     }
 
-    /// Classify a residual address (one that resolved to no file-backed symbol).
+    /// Classify a residual address into one of the four residual kinds. Assumes
+    /// the address is a genuine residual (no file-backed symbol); a named region
+    /// is treated as anonymous-of-that-permission for classification purposes —
+    /// callers that must not surface named regions check [`Self::residual_label`].
     pub fn classify(&self, addr: u64) -> Residual {
         match self.region(addr) {
             None => Residual::Unmapped,
-            Some((_, _, false)) => Residual::Anon,
-            Some((_, _, true)) => {
-                if self.runtime.is_some() {
-                    Residual::Jit
-                } else {
-                    Residual::AnonExec
-                }
-            }
+            Some(r) if !r.exec => Residual::Anon,
+            Some(_) if self.runtime.is_some() => Residual::Jit,
+            Some(_) => Residual::AnonExec,
         }
     }
 
-    /// The display label for a residual address, e.g. `[jit:node]`, `[anon-exec]`.
-    pub fn label(&self, addr: u64) -> String {
-        match self.classify(addr) {
-            Residual::Jit => format!("[jit:{}]", self.runtime.unwrap_or("?")),
-            Residual::AnonExec => "[anon-exec]".to_string(),
-            Residual::Anon => "[anon]".to_string(),
-            Residual::Unmapped => "[unmapped]".to_string(),
+    /// The label to record for a residual PC, or None to leave it dropped.
+    ///
+    /// None when no JIT runtime is present — so a native capture is byte-for-byte
+    /// unchanged — or when the PC falls in a *named* region ([vdso], [heap], a
+    /// mapped file's non-exec page): those aren't anonymous JIT/residual code and
+    /// mislabeling them as `[jit:…]` would be wrong. Otherwise an anonymous
+    /// executable page is the runtime's JIT code, an anonymous non-exec page is
+    /// `[anon]`, and an address in no mapping is `[unmapped]`.
+    pub fn residual_label(&self, addr: u64) -> Option<String> {
+        let rt = self.runtime?;
+        match self.region(addr) {
+            None => Some("[unmapped]".to_string()),
+            Some(r) if r.named => None,
+            Some(r) if r.exec => Some(format!("[jit:{rt}]")),
+            Some(_) => Some("[anon]".to_string()),
         }
     }
 
@@ -514,37 +527,41 @@ mod tests {
         assert_eq!(build_id_from_notes(&notes), None);
     }
 
-    // A synthetic maps text with a JIT runtime, an anon-exec (JIT) page, a
-    // non-exec anon page, and a gap — exercises every residual class.
+    // A JIT process: node image, an anon-exec (JIT) page, a non-exec anon page,
+    // and a named [vdso] exec region — exercises every residual case.
     const JIT_MAPS: &str = "\
 400000-401000 r-xp 00000000 fd:01 1  /usr/bin/node\n\
 7f0000000000-7f0000010000 rwxp 00000000 00:00 0 \n\
-7f0000020000-7f0000030000 rw-p 00000000 00:00 0 \n";
+7f0000020000-7f0000030000 rw-p 00000000 00:00 0 \n\
+7ffff7ffd000-7ffff7fff000 r-xp 00000000 00:00 0  [vdso]\n";
 
     #[test]
-    fn residual_map_classifies_by_region() {
+    fn residual_label_in_jit_process() {
         let m = ResidualMap::from_text(JIT_MAPS);
         assert_eq!(m.runtime(), Some("node"));
-        // Anon exec page in a JIT process → jit.
+        // Anon exec page in a JIT process → jit method.
+        assert_eq!(m.residual_label(0x7f0000000100).as_deref(), Some("[jit:node]"));
         assert_eq!(m.classify(0x7f0000000100), Residual::Jit);
-        assert_eq!(m.label(0x7f0000000100), "[jit:node]");
-        // Non-exec anon page → anon.
-        assert_eq!(m.classify(0x7f0000020100), Residual::Anon);
+        // Anon non-exec page → anon.
+        assert_eq!(m.residual_label(0x7f0000020100).as_deref(), Some("[anon]"));
         // A gap between regions → unmapped.
-        assert_eq!(m.classify(0x7f0000015000), Residual::Unmapped);
-        assert_eq!(m.label(0x7f0000015000), "[unmapped]");
+        assert_eq!(m.residual_label(0x7f0000015000).as_deref(), Some("[unmapped]"));
+        // A named [vdso] exec region must NOT be mislabeled as jit — left dropped.
+        assert_eq!(m.residual_label(0x7ffff7ffd100), None);
     }
 
     #[test]
-    fn residual_anon_exec_without_runtime() {
-        // Same shape but no recognized runtime image → anon-exec, not jit.
+    fn residual_label_none_without_runtime() {
+        // No recognized runtime → never surface a residual, so a native capture
+        // is byte-identical to before. classify still reports the raw kind.
         let maps = "\
 400000-401000 r-xp 00000000 fd:01 1  /home/me/mytool\n\
 7f0000000000-7f0000010000 rwxp 00000000 00:00 0 \n";
         let m = ResidualMap::from_text(maps);
         assert_eq!(m.runtime(), None);
+        assert_eq!(m.residual_label(0x7f0000000100), None);
+        assert_eq!(m.residual_label(0xdeadbeef0000), None); // unmapped, still None
         assert_eq!(m.classify(0x7f0000000100), Residual::AnonExec);
-        assert_eq!(m.label(0x7f0000000100), "[anon-exec]");
     }
 
     #[test]

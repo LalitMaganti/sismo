@@ -647,6 +647,31 @@ impl Interner {
         iid
     }
 
+    /// A synthetic mapping for a residual-frame label (`[jit:node]`,
+    /// `[anon-exec]`, `[anon]`, `[unmapped]`), keyed by the label so each is
+    /// interned once. Like the kernel mapping it carries only a path, so the
+    /// frame renders as the label.
+    fn intern_residual_mapping(&mut self, label: &[u8], idw: &mut ProtoWriter) -> u64 {
+        // Path strings are interned by bytes, so an already-seen label returns
+        // the same path iid; guard the mapping itself on that iid.
+        let path_iid = self.intern_path(label, idw);
+        // Reuse the mappings map keyed by a sentinel derived from the path iid
+        // (path iids are >=1 and never collide with real mapping starts, which
+        // are page-aligned user addresses, nor with the kernel sentinel 0).
+        let key = u64::MAX - path_iid;
+        if let Some(&iid) = self.mappings.get(&key) {
+            return iid;
+        }
+        let iid = self.next_mapping;
+        self.next_mapping += 1;
+        self.mappings.insert(key, iid);
+        idw.message(19, |mp| {
+            mp.write_uint64(1, iid);
+            mp.write_uint64(7, path_iid);
+        });
+        iid
+    }
+
     /// InternedData.frames (6): Frame{iid=1, function_name_id=2, mapping_id=3,
     /// rel_pc=4}. function_name_id set only for inline-named (kernel) frames.
     fn intern_frame(&mut self, key: FrameKey, idw: &mut ProtoWriter) -> u64 {
@@ -690,7 +715,7 @@ impl Interner {
 // ---- Capture: the collector object (output half) ---------------------------
 
 use crate::symbolize::data_regions::DataRegions;
-use crate::symbolize::proc_maps::ProcMaps;
+use crate::symbolize::proc_maps::{ProcMaps, ResidualMap};
 use crate::ffi::{sismo_ds_emit, sismo_ds_emit_offcpu};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -714,6 +739,9 @@ pub struct Capture {
     samples: u64,
     target_pid: u32,
     maps: Option<ProcMaps>, // None = not parsed
+    // Full-address-space view (incl. anon/[vdso]) for labeling residual PCs that
+    // fall outside any file-backed mapping (DIA-6). Built alongside `maps`.
+    residual_map: Option<ResidualMap>,
     maps_tried: bool,
     last_maps_ns: u64,
     interner: Interner,
@@ -746,6 +774,7 @@ impl Capture {
         }
         self.maps_tried = true;
         self.maps = ProcMaps::parse(self.target_pid);
+        self.residual_map = ResidualMap::parse(self.target_pid);
         self.last_maps_ns = now_ns;
     }
 
@@ -756,6 +785,10 @@ impl Capture {
         self.last_maps_ns = now_ns;
         if let Some(fresh) = ProcMaps::parse(self.target_pid) {
             self.maps = Some(fresh);
+        }
+        // JIT code is mmap'd late and churns, so refresh the residual view too.
+        if let Some(fresh) = ResidualMap::parse(self.target_pid) {
+            self.residual_map = Some(fresh);
         }
     }
 
@@ -809,6 +842,22 @@ impl Capture {
                     self.reparse_maps(rec.hdr.ts);
                 }
                 let Some(m) = self.maps.as_ref().and_then(|mp| mp.find(pc)) else {
+                    // Residual PC: no file-backed mapping. In a process running a
+                    // recognized JIT runtime, label and record it (a JIT method in
+                    // an anon exec page, etc.) instead of dropping it; a native
+                    // process has no runtime, so this is a no-op and its capture
+                    // is unchanged.
+                    if let Some(label) =
+                        self.residual_map.as_ref().and_then(|r| r.residual_label(pc))
+                    {
+                        let mapping_iid =
+                            self.interner.intern_residual_mapping(label.as_bytes(), idw);
+                        let frame_iid = self.interner.intern_frame(
+                            FrameKey { mapping_iid, rel_pc: pc, name_iid: 0 },
+                            idw,
+                        );
+                        fids.push(frame_iid);
+                    }
                     continue;
                 };
                 let mapping_iid = self.interner.intern_mapping(
@@ -1168,6 +1217,7 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         samples: 0,
         target_pid: pid,
         maps: None,
+        residual_map: None,
         maps_tried: false,
         last_maps_ns: 0,
         interner: Interner::new(),
