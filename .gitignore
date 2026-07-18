@@ -5,6 +5,9 @@ plans/
 target/
 Cargo.lock
 
+# Matrix/bench harness build products (tools/matrixtest, tools/bench).
+out/
+
 # Dev heap-preload dylib install prefix (crates/sismo/build.rs).
 dev-install/
 
