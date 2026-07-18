@@ -482,7 +482,7 @@ UNION ALL SELECT 'chain',
 
 
 MODULE_RE = re.compile(
-    r"^\s*\[(ok|partial|unresolved|no symbols)\s*\]\s+(\d+)/(\d+)\s+(.+)$")
+    r"^\s*\[(ok|partial|unresolved|no symbols|no names)\s*\]\s+(\d+)/(\d+)\s+(.+)$")
 
 
 def parse_module_report(stderr: str) -> list[tuple[str, int, int, str]]:

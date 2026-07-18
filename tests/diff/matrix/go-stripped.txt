@@ -4,5 +4,5 @@ offcpu: present
 mapping: present
 leaf: absent
 chain: truncated
-module_status: partial
+module_status: no names
 diagnostics: stripped

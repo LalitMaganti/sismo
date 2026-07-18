@@ -197,7 +197,7 @@ pub fn symbolize_trace(trace_path: &str) {
         let mut stat = ModuleStat::new(m.name.clone(), m.build_id_hex.clone());
         let ms = build_module_symbols(&mut sym, m, &mut stat, &mut src_set, &mut src_seen);
         n_addrs += stat.n_addrs;
-        n_funcs += stat.n_resolved;
+        n_funcs += stat.n_real();
         stats.push(stat);
         // Disassemble this module's hot functions while `sym` is scoped exactly
         // as build_module_symbols saw it (line resolution reuses the lookups).
@@ -396,6 +396,11 @@ fn build_module_symbols(
             Some(r) => r,
             None => continue,
         };
+        // A resolution whose outermost frame is a synthesized placeholder
+        // (fun_<hex>/EntryPoint) has no real name behind it — track it so a
+        // module that resolves only to placeholders reports its names as
+        // stripped rather than a misleading "ok".
+        let synthetic = is_synthetic_name(&resolved.outer().name);
 
         // One Line per inline frame. `resolved.frames` is innermost inlinee
         // first, physical function last — the order Perfetto expands into the
@@ -428,6 +433,9 @@ fn build_module_symbols(
             continue;
         }
         stat.n_resolved += 1;
+        if synthetic {
+            stat.n_synthetic += 1;
+        }
         address_symbols.push(as_.bytes().to_vec());
     }
     if address_symbols.is_empty() {
@@ -563,6 +571,10 @@ enum Status {
     Partial,
     Unresolved,
     NoSymbols,
+    /// Addresses resolved, but only to synthesized placeholders (fun_<hex> /
+    /// EntryPoint) — the binary's local names were stripped. Distinct from
+    /// `Ok`/`Partial` so a stripped binary doesn't report a misleading green.
+    NamesStripped,
 }
 
 /// What happened when we tried to symbolize one module.
@@ -573,6 +585,8 @@ struct ModuleStat {
     symbol_count: u64,
     n_addrs: usize,
     n_resolved: usize,
+    /// Of `n_resolved`, how many landed on a synthesized placeholder name.
+    n_synthetic: usize,
     err: Vec<u8>,
 }
 
@@ -585,8 +599,14 @@ impl ModuleStat {
             symbol_count: 0,
             n_addrs: 0,
             n_resolved: 0,
+            n_synthetic: 0,
             err: Vec::new(),
         }
+    }
+
+    /// Resolutions that carry a real name (not a synthesized placeholder).
+    fn n_real(&self) -> usize {
+        self.n_resolved - self.n_synthetic
     }
 
     fn status(&self) -> Status {
@@ -596,6 +616,15 @@ impl ModuleStat {
         if self.n_resolved == 0 {
             return Status::Unresolved;
         }
+        // Not one address carries a real name — every resolution is a
+        // placeholder, so the local names are gone. This is strict (zero real
+        // names) so a healthy binary with the odd placeholder (EntryPoint, a
+        // PLT thunk) or MiniDebugInfo that resolves most names stays out of it.
+        if self.n_real() == 0 {
+            return Status::NamesStripped;
+        }
+        // Partial keys on addresses that resolved to nothing at all, not on the
+        // placeholder count, so a mostly-named module isn't downgraded.
         if self.n_resolved < self.n_addrs {
             return Status::Partial;
         }
@@ -618,21 +647,30 @@ fn report(stats: &[ModuleStat], n_addrs: usize, n_funcs: usize) {
     );
     let mut needs_help = false;
     for st in stats {
-        let tag = match st.status() {
+        let status = st.status();
+        let tag = match status {
             Status::Ok => "ok        ",
             Status::Partial => "partial   ",
             Status::Unresolved => "unresolved",
             Status::NoSymbols => "no symbols",
+            Status::NamesStripped => "no names  ",
         };
-        // NoSymbols/Unresolved always need help; a Partial module needs it only
-        // when the shortfall is stripping (local names gone), not the odd
-        // unresolvable stub in an otherwise-symbolized binary.
-        if matches!(st.status(), Status::NoSymbols | Status::Unresolved)
-            || (st.status() == Status::Partial && module_is_stripped(&st.name))
+        // NoSymbols/Unresolved/NamesStripped always need help; a Partial module
+        // needs it only when its resolutions are placeholder-dominated (stripped
+        // names), not for the odd unresolvable stub in a well-named binary — and
+        // not for sectionless/MiniDebugInfo binaries, which lack .symtab yet
+        // resolve real names from .dynsym/.gnu_debugdata.
+        if matches!(
+            status,
+            Status::NoSymbols | Status::Unresolved | Status::NamesStripped
+        ) || (status == Status::Partial && st.n_synthetic > st.n_real())
         {
             needs_help = true;
         }
-        eprintln!("  [{tag}] {:>5}/{:<5} {}", st.n_resolved, st.n_addrs, s(&st.name));
+        // For "no names" show the real count (0) — a placeholder isn't a name;
+        // otherwise show how many addresses resolved to a symbol at all.
+        let shown = if status == Status::NamesStripped { st.n_real() } else { st.n_resolved };
+        eprintln!("  [{tag}] {:>5}/{:<5} {}", shown, st.n_addrs, s(&st.name));
     }
     if needs_help {
         print_guidance(stats);
@@ -661,15 +699,6 @@ fn report_missing_build_ids(stats: &[ModuleStat]) {
         eprintln!("    without one, sismo can't match this binary across runs or against a");
         eprintln!("    symbol server, so offline symbolization is unavailable.");
         eprintln!("    link with a build-id to enable it: -Wl,--build-id=sha1");
-    }
-}
-
-/// A module is stripped when its file is present but carries no local symbol
-/// table — its local function names are gone, only exports/`.dynsym` remain.
-fn module_is_stripped(name: &[u8]) -> bool {
-    match std::str::from_utf8(name) {
-        Ok(p) => file_exists(name) && crate::dynsym::has_symtab(p) == Some(false),
-        Err(_) => false,
     }
 }
 
@@ -708,14 +737,27 @@ fn print_guidance(stats: &[ModuleStat]) {
         match st.status() {
             Status::Ok => continue,
             Status::Partial => {
-                if !module_is_stripped(&st.name) {
+                // Only when placeholders dominate — a well-named binary missing
+                // the odd stub isn't "stripped".
+                if st.n_synthetic <= st.n_real() {
                     continue;
                 }
                 eprintln!(
-                    "\n  {}\n    {}/{} sampled addresses resolved — the rest are local functions\n    \
-                     whose names were stripped from this binary (only exported/.dynsym\n    \
-                     names remain, so the hot code shows up unnamed).",
-                    s(&st.name), st.n_resolved, st.n_addrs
+                    "\n  {}\n    {}/{} sampled addresses have real names — the rest are local\n    \
+                     functions whose names were stripped from this binary (only\n    \
+                     exported/.dynsym names remain, so the hot code shows up unnamed).",
+                    s(&st.name), st.n_real(), st.n_addrs
+                );
+                eprintln!("    recover the local names:");
+                print_stripped_remedy(&st.name);
+            }
+            Status::NamesStripped => {
+                eprintln!(
+                    "\n  {}\n    every sampled address resolved only to a placeholder name\n    \
+                     (fun_… / EntryPoint), so the report looks resolved but the real\n    \
+                     function names were stripped from this binary — the hot code is\n    \
+                     effectively anonymous.",
+                    s(&st.name)
                 );
                 eprintln!("    recover the local names:");
                 print_stripped_remedy(&st.name);
@@ -791,6 +833,25 @@ fn os_release_id(text: &str) -> Option<&str> {
 }
 
 // ---- Pure helpers ----------------------------------------------------------
+
+/// Whether `name` is one of wholesym's synthesized placeholder names rather than
+/// a real symbol: `fun_<hex>` (a function start found from unwind info with no
+/// name) or `EntryPoint` (the ELF entry). samply marks both as
+/// not-a-proper-symbol; a module that resolves only to these has had its local
+/// names stripped, even though every address "resolved" to something.
+fn is_synthetic_name(name: &str) -> bool {
+    if name == "EntryPoint" {
+        return true;
+    }
+    match name.strip_prefix("fun_") {
+        // samply formats the address with `{:x}` — lowercase hex, non-empty.
+        Some(rest) => {
+            !rest.is_empty()
+                && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
+}
 
 /// Strip wholesym's trailing " +<offset>" so only the function name is emitted
 /// (trace_processor recomputes the per-frame offset itself).
@@ -1069,17 +1130,35 @@ mod tests {
 
     #[test]
     fn module_stat_status_classification() {
-        let mk = |loaded, n_addrs, n_resolved| {
+        let mk = |loaded, n_addrs, n_resolved, n_synthetic| {
             let mut st = ModuleStat::new(b"x".to_vec(), Vec::new());
             st.symbols_loaded = loaded;
             st.n_addrs = n_addrs;
             st.n_resolved = n_resolved;
+            st.n_synthetic = n_synthetic;
             st
         };
-        assert!(mk(true, 10, 10).status() == Status::Ok);
-        assert!(mk(true, 10, 3).status() == Status::Partial);
-        assert!(mk(true, 10, 0).status() == Status::Unresolved);
-        assert!(mk(false, 10, 0).status() == Status::NoSymbols);
+        assert!(mk(true, 10, 10, 0).status() == Status::Ok);
+        assert!(mk(true, 10, 3, 0).status() == Status::Partial);
+        assert!(mk(true, 10, 0, 0).status() == Status::Unresolved);
+        assert!(mk(false, 10, 0, 0).status() == Status::NoSymbols);
+        // All resolutions are placeholders → names stripped, not "ok".
+        assert!(mk(true, 10, 10, 10).status() == Status::NamesStripped);
+        // A few real names among placeholders is still partial.
+        assert!(mk(true, 10, 8, 6).status() == Status::Partial);
+    }
+
+    #[test]
+    fn is_synthetic_name_matches_wholesym_placeholders() {
+        assert!(is_synthetic_name("EntryPoint"));
+        assert!(is_synthetic_name("fun_14e30"));
+        assert!(is_synthetic_name("fun_0"));
+        // Real names are not placeholders, including near-misses.
+        assert!(!is_synthetic_name("sismo_wl_leaf"));
+        assert!(!is_synthetic_name("fun_")); // no hex
+        assert!(!is_synthetic_name("fun_14z30")); // z isn't hex
+        assert!(!is_synthetic_name("function_main"));
+        assert!(!is_synthetic_name("EntryPointer"));
     }
 
     #[test]
