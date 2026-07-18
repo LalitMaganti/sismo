@@ -151,7 +151,15 @@ fn from_pid(pid: u32) -> Option<ProcMaps> {
     Some(ProcMaps { mappings })
 }
 
+/// Whether the ELF at `path` carries a real GNU build-id note. `false` means
+/// sismo had to synthesize a per-run id, so cross-run correlation and
+/// symbol-server / offline symbolization can't match this binary.
+pub fn has_gnu_build_id(path: &str) -> bool {
+    read_build_id(path).is_some()
+}
+
 const PT_NOTE: u32 = 4;
+const SHT_NOTE: u32 = 7;
 const NT_GNU_BUILD_ID: u32 = 3;
 
 fn align4(n: usize) -> usize {
@@ -198,6 +206,47 @@ fn read_build_id(path: &str) -> Option<Vec<u8>> {
         }
         let mut notes = vec![0u8; p_filesz as usize];
         if f.read_exact_at(&mut notes, p_offset).is_err() {
+            continue;
+        }
+        if let Some(id) = build_id_from_notes(&notes) {
+            return Some(id.to_vec());
+        }
+    }
+
+    // Go puts `.note.gnu.build-id` in a section that no PT_NOTE segment covers,
+    // so the program-header scan above misses it and sismo would synthesize a
+    // per-run id — silently breaking cross-run matching for every Go binary.
+    // Fall back to scanning SHT_NOTE sections.
+    read_build_id_from_sections(&f, &ehdr)
+}
+
+/// Fallback build-id lookup that scans `SHT_NOTE` sections via the section
+/// header table, for GNU build-id notes not reachable through a PT_NOTE segment.
+fn read_build_id_from_sections(f: &std::fs::File, ehdr: &[u8; 64]) -> Option<Vec<u8>> {
+    let e_shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
+    let e_shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap());
+    let e_shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap());
+    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 {
+        return None; // no (usable) section header table
+    }
+    for i in 0..e_shnum {
+        let mut shdr = [0u8; 64];
+        if f
+            .read_exact_at(&mut shdr, e_shoff + i as u64 * e_shentsize as u64)
+            .is_err()
+        {
+            return None;
+        }
+        if u32::from_le_bytes(shdr[4..8].try_into().unwrap()) != SHT_NOTE {
+            continue;
+        }
+        let sh_offset = u64::from_le_bytes(shdr[24..32].try_into().unwrap());
+        let sh_size = u64::from_le_bytes(shdr[32..40].try_into().unwrap());
+        if sh_size == 0 || sh_size > 64 * 1024 {
+            continue;
+        }
+        let mut notes = vec![0u8; sh_size as usize];
+        if f.read_exact_at(&mut notes, sh_offset).is_err() {
             continue;
         }
         if let Some(id) = build_id_from_notes(&notes) {
@@ -333,6 +382,12 @@ mod tests {
         notes.extend_from_slice(b"GNU\0");
         notes.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(build_id_from_notes(&notes), None);
+    }
+
+    #[test]
+    fn has_gnu_build_id_false_for_non_elf_and_missing() {
+        assert!(!has_gnu_build_id("/no/such/binary"));
+        assert!(!has_gnu_build_id("/etc/hostname")); // present but not an ELF
     }
 
     #[test]

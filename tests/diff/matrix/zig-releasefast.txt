@@ -5,4 +5,4 @@ mapping: present
 leaf: symbolized
 chain: full
 module_status: partial
-diagnostics: none
+diagnostics: build-id

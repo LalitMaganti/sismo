@@ -637,6 +637,31 @@ fn report(stats: &[ModuleStat], n_addrs: usize, n_funcs: usize) {
     if needs_help {
         print_guidance(stats);
     }
+    report_missing_build_ids(stats);
+}
+
+/// Warn once per sampled module whose on-disk file has no real GNU build-id.
+/// The recording still symbolized locally, but a synthetic per-run id means the
+/// binary can't be matched across runs or against a symbol server — a silent
+/// loss until now. Orthogonal to symbolization status: a fully-resolved module
+/// can still lack a build-id.
+fn report_missing_build_ids(stats: &[ModuleStat]) {
+    for st in stats {
+        if !file_exists(&st.name) {
+            continue;
+        }
+        let p = match std::str::from_utf8(&st.name) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if crate::proc_maps::has_gnu_build_id(p) {
+            continue;
+        }
+        eprintln!("\nsismo record: {} has no build-id", s(&st.name));
+        eprintln!("    without one, sismo can't match this binary across runs or against a");
+        eprintln!("    symbol server, so offline symbolization is unavailable.");
+        eprintln!("    link with a build-id to enable it: -Wl,--build-id=sha1");
+    }
 }
 
 /// A module is stripped when its file is present but carries no local symbol
