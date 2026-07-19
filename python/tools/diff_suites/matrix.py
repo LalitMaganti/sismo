@@ -169,6 +169,31 @@ def build_variants() -> list[Variant]:
                    "no diagnostic")
     c_variant("c-gcc-O0", ["gcc"], ["-O0"], Expect(),
               "gcc -O0: FP everywhere, symtab present")
+
+    # --- flags that strip or reshape the data sismo needs -----------------
+    # No unwind tables: the workload's own functions get no .eh_frame FDEs
+    # (crt/libc still ship theirs), so framehop has nothing to DWARF-unwind and
+    # -O2's omitted frame pointers leave the FP walk truncated too.
+    c_variant("c-gcc-O2-noeh", ["gcc"],
+              ["-O2", "-fno-asynchronous-unwind-tables", "-fno-unwind-tables"],
+              Expect(chain="partial",
+                     gremlin="no .eh_frame FDEs for the workload's functions and "
+                             "no frame pointers → the chain is partial and sismo "
+                             "emits no diagnostic naming the missing unwind tables"),
+              "gcc -O2, no unwind tables: neither DWARF CFI nor frame pointers")
+    # Cross-TU optimization: LTO can rename/merge and inline across units.
+    c_variant("c-gcc-O2-lto", ["gcc"], ["-O2", fp, "-flto"],
+              Expect(),
+              "gcc -O2 -flto: link-time optimization reshapes symbols/inlining")
+    # Compressed debug info (SHF_COMPRESSED .debug_*): the symbolizer must
+    # decompress to read line/inline info.
+    c_variant("c-gcc-O2-gz", ["gcc"], ["-O2", fp, "-g", "-gz"],
+              Expect(),
+              "gcc -O2 -g -gz: zlib-compressed DWARF sections")
+    # DWARF 5 forms (.debug_rnglists/.debug_addr, new abbrev forms).
+    c_variant("c-gcc-O2-dwarf5", ["gcc"], ["-O2", fp, "-g", "-gdwarf-5"],
+              Expect(),
+              "gcc -O2 -g -gdwarf-5: DWARF version 5 encoding")
     c_variant("c-gcc-O2", ["gcc"], ["-O2"],
               Expect(chain="truncated",
                      gremlin="plain -O2 omits frame pointers → stacks are "
