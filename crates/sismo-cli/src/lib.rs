@@ -22,6 +22,7 @@ pub mod cmd_prepare;
 // `sismo snapshot` subcommand (clone the recorder's rolling buffer). POSIX-only.
 #[cfg(not(target_os = "windows"))]
 pub mod cmd_snapshot;
+pub mod cmd_symbolize;
 // Shared trace-output plumbing: clone-a-session-to-file + default output path.
 // Used by snapshot and by record's dump-on-exit. POSIX-only.
 #[cfg(not(target_os = "windows"))]

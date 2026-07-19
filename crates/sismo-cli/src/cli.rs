@@ -38,6 +38,11 @@ enum Commands {
 
     /// Diagnose local setup problems and optionally apply safe fixes.
     Doctor(crate::cmd_doctor::DoctorArgs),
+
+    /// Symbolize a trace offline: resolve the native frames of a trace recorded
+    /// with `--no-symbolize` (or any unsymbolized trace) and append the symbols
+    /// in place. The deferred half of the record/symbolize split.
+    Symbolize(crate::cmd_symbolize::SymbolizeArgs),
 }
 
 /// Parse the process argv (`args[0]` is the exe) and run the chosen subcommand,
@@ -60,5 +65,6 @@ pub fn run(args: &[String]) -> i32 {
         Some(Commands::Snapshot(a)) => crate::cmd_snapshot::run(a),
         Some(Commands::Datasource(a)) => crate::cmd_datasource::run(a),
         Some(Commands::Doctor(a)) => crate::cmd_doctor::run(a),
+        Some(Commands::Symbolize(a)) => crate::cmd_symbolize::run(a),
     }
 }
