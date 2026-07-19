@@ -704,6 +704,11 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
     except BuildSkip as s:
         raise Skip(str(s))
 
+    # Capture cmd[0]'s real build-id now — a deleted-binary variant removes the
+    # file during the record, so this is the only chance to read it. Used as the
+    # reference id only when the target module's own file is gone by symbolize time.
+    prebuilt_bid = real_build_id(variant.cmd[0])
+
     rec = run_record(variant, duration_ms)
     facts = query_trace(variant, rec.trace) if os.path.exists(rec.trace) else {}
 
@@ -729,6 +734,27 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
 
     residual = query_residual(rec.trace) if os.path.exists(rec.trace) else []
 
+    # build_id: does the trace carry the target module's real GNU build-id? `gnu`
+    # means it matches the module's own file (CAP-2 captures it in-band, so even a
+    # binary deleted mid-record keeps it); `synthetic` means sismo fell back to a
+    # per-run id (no build-id, or it was lost); `absent` means none at all. The
+    # reference id is read from the module's actual file (the trace path — e.g. the
+    # real libjvm.so, not the java launcher in cmd[0]); only when that file is gone
+    # (deleted binary) do we fall back to the build-time cmd[0] capture.
+    trace_exists = os.path.exists(rec.trace)
+    trace_bid = query_build_id(variant, rec.trace) if trace_exists else ""
+    target_path = query_target_path(variant, rec.trace) if trace_exists else ""
+    if target_path and "(deleted)" not in target_path and os.path.exists(target_path):
+        real_bid = real_build_id(target_path) or prebuilt_bid
+    else:
+        real_bid = prebuilt_bid
+    if not trace_bid:
+        build_id = "absent"
+    elif real_bid and trace_bid == real_bid:
+        build_id = "gnu"
+    else:
+        build_id = "synthetic"
+
     lines = [
         f"record_exit: {rec.exit}",
         f"samples: {'present' if samples_present else 'absent'}",
@@ -737,10 +763,54 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
         f"leaf: {'symbolized' if facts.get('leaf_syms', 0) >= 1 else 'absent'}",
         f"chain: {chain}",
         f"module_status: {module_status}",
+        f"build_id: {build_id}",
         f"diagnostics: {', '.join(diagnostics) if diagnostics else 'none'}",
         f"residual: {', '.join(residual) if residual else 'none'}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def real_build_id(path: str) -> str:
+    """The file's GNU build-id as lowercase hex, or '' if it has none. Captured
+    before the record, since a deleted-binary variant removes the file mid-run."""
+    try:
+        p = subprocess.run(["readelf", "-n", path], capture_output=True, text=True)
+    except OSError:
+        return ""
+    mo = re.search(r"Build ID:\s*([0-9a-f]+)", p.stdout)
+    return mo.group(1).lower() if mo else ""
+
+
+def query_build_id(variant: Variant, trace: str) -> str:
+    """The build-id (lowercase hex) the trace carries for the target module, or
+    '' if none. trace_processor stores build_id already as a hex string, so read
+    it directly (hex()-ing it would double-encode)."""
+    pat = f"'%{variant.mapping_pattern()}%'"
+    sql = ("SELECT lower(build_id) FROM __intrinsic_stack_profile_mapping "
+           f"WHERE name LIKE {pat} AND build_id IS NOT NULL AND build_id != '' LIMIT 1;")
+    p = subprocess.run([TP_SHELL, "-q", "/dev/stdin", trace],
+                       input=sql, capture_output=True, text=True)
+    for line in p.stdout.splitlines():
+        mo = re.match(r'^"([0-9a-f]+)"$', line)
+        if mo:
+            return mo.group(1)
+    return ""
+
+
+def query_target_path(variant: Variant, trace: str) -> str:
+    """The on-disk path the trace records for the target module (e.g. the actual
+    libjvm.so, not the java launcher). '' if none."""
+    pat = f"'%{variant.mapping_pattern()}%'"
+    sql = ("SELECT name FROM __intrinsic_stack_profile_mapping "
+           f"WHERE name LIKE {pat} AND build_id IS NOT NULL AND build_id != '' LIMIT 1;")
+    p = subprocess.run([TP_SHELL, "-q", "/dev/stdin", trace],
+                       input=sql, capture_output=True, text=True)
+    for line in p.stdout.splitlines():
+        # Skip the CSV header row ("name"); mappings are absolute paths.
+        mo = re.match(r'^"(/.+)"$', line)
+        if mo:
+            return mo.group(1)
+    return ""
 
 
 def reserve_cpu_headroom() -> None:

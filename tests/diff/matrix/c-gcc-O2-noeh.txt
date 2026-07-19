@@ -5,5 +5,6 @@ mapping: present
 leaf: symbolized
 chain: partial
 module_status: ok
+build_id: gnu
 diagnostics: frame-pointer, unwind-tables
 residual: none

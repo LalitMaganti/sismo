@@ -5,5 +5,6 @@ mapping: present
 leaf: symbolized
 chain: full
 module_status: partial
+build_id: gnu
 diagnostics: interpreted-runtime
 residual: [jit:node]
