@@ -222,6 +222,16 @@ def build_variants() -> list[Variant]:
     c_variant("c-clang-splitdwarf", ["clang"],
               ["-O2", fp, "-g", "-gsplit-dwarf"], Expect(),
               "split DWARF (.dwo): names from symtab must still work")
+    # Lock-in regression guards: build shapes sismo already handles, pinned so a
+    # future symbolizer/unwinder change that breaks one fails the golden.
+    c_variant("c-clang-dwarf4", ["clang"], ["-O2", fp, "-g", "-gdwarf-4"],
+              Expect(), "clang -gdwarf-4: the older DWARF version still resolves")
+    c_variant("c-clang-thinlto", ["clang"], ["-O2", fp, "-flto=thin"],
+              Expect(), "clang -flto=thin: ThinLTO cross-module optimization")
+    c_variant("c-gcc-splitdwarf", ["gcc"], ["-O2", fp, "-g", "-gsplit-dwarf"],
+              Expect(), "gcc split DWARF (.dwo): names from symtab must still work")
+    c_variant("c-clang-gz-zstd", ["clang"], ["-O2", fp, "-g", "-gz=zstd"],
+              Expect(), "clang -gz=zstd: zstd-compressed DWARF (object ruzstd path)")
     c_variant("c-gcc-O2-fp-stripped", ["gcc"], ["-O2", fp],
               Expect(leaf="none", chain="na", module_status="partial",
                      gremlin="stripped binary reports [partial] with no "
