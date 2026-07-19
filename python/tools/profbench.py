@@ -1,7 +1,7 @@
 # Copyright 2026 The Sismo Authors. All rights reserved.
 # Licensed under the MIT License.
 
-"""Comparative profiler overhead benchmark: sismo vs perf, honestly.
+"""Comparative profiler overhead benchmark: sismo vs perf vs systing, honestly.
 
 Overhead is not one number. This measures a resource *vector* for each profiler,
 attributed to the collector alone (not the workload), normalized by the data it
@@ -27,19 +27,26 @@ Fairness rules baked in:
     separate adapters, paired against sismo by what stacks each recovers.
   * Interleave trials across profilers so thermal / frequency drift cancels;
     report median and IQR, discard a warmup.
+  * systing is a sidecar (attaches to a running pid, not a child), so it runs on
+    a separate path: launch the workload, attach, sample both trees. It samples
+    cpu-cycles at a target Hz, so its --sample-freq is set to the CPU MHz to land
+    on the same ~1e6-cycle period. It carries a ~0.2 s attach latency the wrapper
+    profilers don't, so its sample count runs slightly low — read cost per
+    delivered sample, not per wall-second.
 
   tools/profbench
   tools/profbench --trials 9 --duration-ms 2000
-  tools/profbench --profilers none,perf-dwarf,sismo --json out/profbench.json
+  tools/profbench --profilers none,perf-dwarf,sismo,systing --json out/pb.json
 
-Linux only. Needs a setcap'd sismo-run; perf adapters are skipped if perf is
-absent. Not part of the fast CI gate.
+Linux only. Needs a setcap'd sismo-run; a setcap'd systing at ~/systing-bench and
+perf are auto-skipped if absent. Not part of the fast CI gate.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import resource
 import shutil
@@ -51,6 +58,7 @@ import time
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SISMO_RUN: str = os.path.join(ROOT_DIR, "crates", "sismo-run", "target", "debug", "sismo-run")
+SYSTING_BIN: str = os.path.expanduser("~/systing-bench/target/release/systing")
 TP_SHELL: str = os.path.join(
     ROOT_DIR, "third_party", "src", "perfetto", "out", "sismo", "trace_processor_shell")
 WL_SRC: str = os.path.join(ROOT_DIR, "tests", "matrix", "targets", "workload.c")
@@ -59,6 +67,20 @@ OUT_DIR: str = os.path.join(ROOT_DIR, "out", "profbench")
 # sismo's default sampler: PERF_TYPE_HARDWARE cpu-cycles, this overflow period
 # (linux_bpf_capture.rs resolve_sampler). perf must match the trigger exactly.
 SISMO_CYCLE_PERIOD: int = 1_000_003
+
+# systing samples cpu-cycles at a target Hz; period ~= cpu_max_freq / freq.
+# Setting freq to the CPU MHz yields a ~1e6-cycle period, matching sismo/perf.
+def _cpu_mhz() -> int:
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("cpu MHz"):
+                    return max(1, int(float(line.split(":")[1])))
+    except (OSError, ValueError):
+        pass
+    return 1000
+
+SYSTING_SAMPLE_FREQ: int = _cpu_mhz()
 
 CLK_TCK: int = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE: int = os.sysconf("SC_PAGE_SIZE")
@@ -137,8 +159,10 @@ class TreeSampler:
     RSS/fds and last-seen cumulative CPU per class. Records a phase boundary the
     instant the workload leaf disappears, so record vs finalize costs separate."""
 
-    def __init__(self, root_pid: int, workload_exe: str):
-        self.root = root_pid
+    def __init__(self, roots: list[int], workload_exe: str):
+        # One root for a wrapper profiler (workload is its child); two for a
+        # sidecar like systing (workload and profiler are separate trees).
+        self.roots = list(roots)
         self.wl_exe = os.path.realpath(workload_exe)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -164,7 +188,9 @@ class TreeSampler:
     def _loop(self) -> None:
         while not self._stop.is_set():
             ppids = _all_ppids()
-            pids = _subtree(self.root, ppids)
+            pids = set()
+            for r in self.roots:
+                pids.update(_subtree(r, ppids))
             col_rss = col_fds = col_cpu = wl_cpu = 0
             wl_present = False
             for pid in pids:
@@ -228,6 +254,8 @@ class Measures:
 
 class Adapter:
     name = "?"
+    sidecar = False
+    out_ext = ".data"
 
     def available(self) -> bool:
         return True
@@ -334,6 +362,48 @@ class SismoAdapter(Adapter):
                         "ON p.callsite_id = c.id;")
 
 
+class SystingAdapter(Adapter):
+    name = "systing"
+    sidecar = True  # attaches to a running pid; workload is a separate tree
+    out_ext = ".pb"  # systing auto-detects format from extension
+
+    def available(self):
+        if not os.path.exists(SYSTING_BIN):
+            return False
+        caps = subprocess.run(["getcap", SYSTING_BIN], capture_output=True, text=True)
+        return "cap_bpf" in caps.stdout
+
+    def attach_cmd(self, wl_pid, out_path, duration_ms):
+        secs = max(1, math.ceil(duration_ms / 1000))
+        # --only-recorder cpu-stacks: on-CPU stacks only, equal fidelity with the
+        # perf/sismo cpu configs. --pid attaches to the running workload.
+        # --output-dir keeps systing's streaming parquet out of the repo root.
+        return [SYSTING_BIN, "--pid", str(wl_pid), "--only-recorder", "cpu-stacks",
+                "--sample-freq", str(SYSTING_SAMPLE_FREQ),
+                "--duration", str(secs), "--output", out_path,
+                "--output-dir", os.path.join(OUT_DIR, "systing-traces")]
+
+    def _tp(self, out_path, sql):
+        if not (os.path.exists(TP_SHELL) and os.path.exists(out_path)):
+            return None
+        p = subprocess.run([TP_SHELL, "-q", "/dev/stdin", out_path],
+                           input=sql, capture_output=True, text=True)
+        try:
+            return float(p.stdout.strip().splitlines()[-1].strip('"'))
+        except (ValueError, IndexError):
+            return None
+
+    def samples(self, out_path):
+        n = self._tp(out_path, "SELECT count(*) FROM perf_sample;")
+        return int(n) if n is not None else None
+
+    def mean_depth(self, out_path):
+        return self._tp(out_path,
+                        "SELECT avg(depth+1) FROM perf_sample p "
+                        "JOIN __intrinsic_stack_profile_callsite c "
+                        "ON p.callsite_id = c.id;")
+
+
 # ----- trial runner -------------------------------------------------------
 
 
@@ -350,7 +420,7 @@ def run_trial(adapter: Adapter, wl_argv: list[str], out_path: str,
     tree_cpu0 = children_cpu_s()
     t0 = time.monotonic()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    sampler = TreeSampler(proc.pid, wl_argv[0])
+    sampler = TreeSampler([proc.pid], wl_argv[0])
     sampler.start()
     out, err = proc.communicate(timeout=300)
     wall = time.monotonic() - t0
@@ -372,6 +442,46 @@ def run_trial(adapter: Adapter, wl_argv: list[str], out_path: str,
         "iters_per_s": iters / (duration_ms / 1000.0),
         "wall_s": wall,
         "tree_cpu_s": tree_cpu,
+        "collector_cpu_s": m.collector_cpu_s,
+        "record_cpu_s": m.record_cpu_s,
+        "finalize_cpu_s": m.finalize_cpu_s,
+        "workload_cpu_s": m.workload_cpu_s,
+        "peak_rss_mb": m.peak_rss_mb,
+        "peak_rss_record_mb": m.peak_rss_record_mb,
+        "peak_fds": m.peak_fds,
+    }
+
+
+def run_sidecar_trial(adapter: "SystingAdapter", wl_argv: list[str], out_path: str,
+                      duration_ms: int) -> dict:
+    """Sidecar profilers (systing) attach to an already-running pid rather than
+    launching the workload, so the workload and the collector are separate trees.
+    Launch the workload, attach the profiler to it, sample both."""
+    if os.path.exists(out_path):
+        os.unlink(out_path)
+    t0 = time.monotonic()
+    wl = subprocess.Popen(wl_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    prof_cmd = adapter.attach_cmd(wl.pid, out_path, duration_ms)
+    prof = subprocess.Popen(prof_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    sampler = TreeSampler([prof.pid, wl.pid], wl_argv[0])
+    sampler.start()
+    out, err = wl.communicate(timeout=300)
+    perr = prof.communicate(timeout=300)[1]
+    wall = time.monotonic() - t0
+    m = sampler.stop()
+    if prof.returncode not in (0, None):
+        raise RuntimeError(f"{adapter.name} failed ({prof.returncode}): "
+                           f"{' '.join(prof_cmd)}\n{perr[-1500:]}")
+    iters = None
+    for line in out.splitlines():
+        if ITERS_MARKER in line:
+            iters = int(line.split(ITERS_MARKER)[1].split()[0])
+    if iters is None:
+        raise RuntimeError(f"no '{ITERS_MARKER}' in workload output under {adapter.name}")
+    return {
+        "iters_per_s": iters / (duration_ms / 1000.0),
+        "wall_s": wall,
+        "tree_cpu_s": 0.0,
         "collector_cpu_s": m.collector_cpu_s,
         "record_cpu_s": m.record_cpu_s,
         "finalize_cpu_s": m.finalize_cpu_s,
@@ -424,6 +534,7 @@ def main() -> int:
         "perf-dwarf": PerfAdapter("dwarf"),
         "sismo": SismoAdapter(),
         "sismo-nosym": SismoAdapter(no_symbolize=True),
+        "systing": SystingAdapter(),
     }
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--trials", type=int, default=7)
@@ -467,14 +578,18 @@ def main() -> int:
 
     trials: dict[str, list[dict]] = {a.name: [] for a in chosen}
     fidelity: dict[str, dict] = {a.name: {} for a in chosen}
-    out_paths = {a.name: os.path.join(OUT_DIR, f"{a.name}.data") for a in chosen}
+    out_paths = {a.name: os.path.join(OUT_DIR, a.name + a.out_ext) for a in chosen}
+
+    def do_trial(a):
+        fn = run_sidecar_trial if a.sidecar else run_trial
+        return fn(a, wl_argv, out_paths[a.name], args.duration_ms)
 
     for a in chosen:  # warmup (also primes build caches / page cache)
-        run_trial(a, wl_argv, out_paths[a.name], args.duration_ms)
+        do_trial(a)
 
     for t in range(args.trials):
         for a in chosen:  # interleaved: cancels thermal/frequency drift
-            r = run_trial(a, wl_argv, out_paths[a.name], args.duration_ms)
+            r = do_trial(a)
             trials[a.name].append(r)
         print(f"  trial {t + 1}/{args.trials} done")
 
@@ -509,9 +624,13 @@ def main() -> int:
         depth = fi["mean_depth"] or 0.0
         ob = fi["out_bytes"]
         ob_str = f"{ob / 1024:.0f}K" if ob < 1024 * 1024 else f"{ob / 1024 / 1024:.1f}M"
+        # A live process always has >=3 fds; 0 with real RSS means /proc/pid/fd
+        # was unreadable — a setcap single-binary (systing) clears the dumpable
+        # flag, so its fd dir is root-only. Report unmeasured rather than "0".
+        fds_str = "n/a" if (fds == 0 and rss > 0) else f"{fds:.0f}"
         tag = "" if a.name != "none" else "  (baseline)"
         print(f"{a.name:<12} {overhead:>6.1f}% {col_cpu:>7.2f}s "
-              f"{rec_cpu:>4.2f}/{sym_cpu:<4.2f} {rss:>7.0f}MB {fds:>5.0f} "
+              f"{rec_cpu:>4.2f}/{sym_cpu:<4.2f} {rss:>7.0f}MB {fds_str:>5} "
               f"{ob_str:>9} {samp_s:>8.0f} {depth:>6.1f}{tag}")
         report["profilers"][a.name] = {
             "target_overhead_pct": round(overhead, 2),
