@@ -109,6 +109,11 @@ pub struct RecordArgs {
     buffer: Option<u32>,
     #[arg(long)]
     no_instrumentation: bool,
+    /// Skip the post-record symbolization pass, leaving the trace's native
+    /// frames as `{build-id, file-offset}` for a later offline pass. Cuts the
+    /// recorder's stop-time CPU/memory; the profile is symbolized elsewhere.
+    #[arg(long)]
+    no_symbolize: bool,
     #[arg(long, conflicts_with = "command")]
     pid: Option<i32>,
     #[arg(long, conflicts_with = "external_sched")]
@@ -151,6 +156,8 @@ pub struct RecordConfig {
     pub cpu_mode: SourceMode,
     pub heap_mode: SourceMode,
     pub no_instrumentation: bool,
+    /// Skip the post-record symbolization pass (leave native frames unresolved).
+    pub no_symbolize: bool,
     pub focus: Option<String>,
     pub sample_density: Option<f64>,
 }
@@ -217,6 +224,7 @@ impl RecordArgs {
             cpu_mode: cpu,
             heap_mode: heap,
             no_instrumentation: self.no_instrumentation,
+            no_symbolize: self.no_symbolize,
             focus: self.focus,
             sample_density: self.sample_density,
         })
@@ -250,6 +258,12 @@ mod tests {
         assert_eq!(a.sched_mode, SourceMode::InProcess);
         assert_eq!(a.output, None);
         assert!(!a.long_trace);
+        assert!(!a.no_symbolize);
+    }
+
+    #[test]
+    fn no_symbolize_flag() {
+        assert!(parse(&["--no-symbolize", "./app"]).unwrap().no_symbolize);
     }
 
     #[test]

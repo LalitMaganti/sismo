@@ -697,6 +697,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
     let no_sched = config.sched_mode == SourceMode::Off;
     let no_cpu = config.cpu_mode == SourceMode::Off;
     let no_instrumentation = config.no_instrumentation;
+    let no_symbolize = config.no_symbolize;
     let sample_density = config.sample_density;
 
     // Resolve --focus (only "cache" today); unknown = hard error.
@@ -903,7 +904,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
         if !append_privileged_marker(output_path_str, &[target_pid], focus_preset, precise >= 2) {
             eprintln!("sismo record: failed to write privileged marker");
         }
-        if had_bpf {
+        if had_bpf && !no_symbolize {
             sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str);
         }
     } else {
@@ -918,7 +919,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
                 if !append_privileged_marker(output_path_str, &[target_pid], focus_preset, precise >= 2) {
                     eprintln!("sismo record: failed to write privileged marker");
                 }
-                if had_bpf {
+                if had_bpf && !no_symbolize {
                     sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str);
                 }
             }
