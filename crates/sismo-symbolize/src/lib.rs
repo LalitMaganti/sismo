@@ -7,6 +7,10 @@
 
 pub mod data_regions;
 pub mod disasm;
+// Shared 64-bit ELF view (program headers, PT_DYNAMIC, sections) over object's
+// typed reader — the common substrate for the phdr/shdr parsers below.
+#[cfg(not(target_os = "windows"))]
+pub mod elf;
 // `.dynsym`-via-PT_DYNAMIC fallback for section-header-stripped ELF (Linux/ELF).
 #[cfg(not(target_os = "windows"))]
 pub mod dynsym;

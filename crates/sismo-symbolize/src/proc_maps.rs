@@ -14,7 +14,6 @@
 //! [`Mapping`] out of it.
 
 use std::collections::HashMap;
-use std::os::unix::fs::FileExt;
 
 /// One parsed maps line. Non-exec lines are retained (flagged) because a
 /// file's base avma must consider every mapping, not just executable ones.
@@ -315,8 +314,6 @@ pub fn has_gnu_build_id(path: &str) -> bool {
     read_build_id(path).is_some()
 }
 
-const PT_NOTE: u32 = 4;
-const SHT_NOTE: u32 = 7;
 const NT_GNU_BUILD_ID: u32 = 3;
 
 fn align4(n: usize) -> usize {
@@ -324,89 +321,34 @@ fn align4(n: usize) -> usize {
 }
 
 /// Read the GNU build-id (raw bytes) from the ELF at `path`. Best effort:
-/// returns None on any read/parse problem. Assumes a 64-bit LE ELF
-/// (x86-64 / aarch64); other classes yield None.
+/// returns None on any read/parse problem. 64-bit ELF only (x86-64 / aarch64);
+/// other classes yield None. Reads only the note ranges off disk.
 fn read_build_id(path: &str) -> Option<Vec<u8>> {
-    let f = std::fs::File::open(path).ok()?;
+    // The closure is load-bearing: passing `build_id_from_elf` directly fails
+    // higher-ranked lifetime inference ("FnOnce is not general enough").
+    #[allow(clippy::redundant_closure)]
+    crate::elf::with_elf_at_path(path, |elf| build_id_from_elf(elf)).flatten()
+}
 
-    let mut ehdr = [0u8; 64];
-    f.read_exact_at(&mut ehdr, 0).ok()?;
-    if &ehdr[0..4] != b"\x7fELF" {
-        return None;
-    }
-    if ehdr[4] != 2 {
-        return None; // ELFCLASS64
-    }
-    let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
-    let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap());
-    let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
-    if e_phentsize < 56 {
-        return None;
-    }
-
-    for i in 0..e_phnum {
-        let mut phdr = [0u8; 56];
-        if f
-            .read_exact_at(&mut phdr, e_phoff + i as u64 * e_phentsize as u64)
-            .is_err()
-        {
-            return None;
-        }
-        let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
-        if p_type != PT_NOTE {
+/// The GNU build-id from an ELF's notes: `PT_NOTE` segments first, then a
+/// fallback scan of `SHT_NOTE` sections. Go puts `.note.gnu.build-id` in a
+/// section no `PT_NOTE` segment covers, so without the fallback sismo would
+/// synthesize a per-run id and silently break cross-run matching for every Go
+/// binary. A note blob over 64 KiB is skipped as implausible.
+fn build_id_from_elf<'d, R: object::ReadRef<'d>>(elf: &crate::elf::Elf<'d, R>) -> Option<Vec<u8>> {
+    for seg in elf.segments().filter(|s| s.p_type == crate::elf::PT_NOTE) {
+        if seg.filesz == 0 || seg.filesz > 64 * 1024 {
             continue;
         }
-        let p_offset = u64::from_le_bytes(phdr[8..16].try_into().unwrap());
-        let p_filesz = u64::from_le_bytes(phdr[32..40].try_into().unwrap());
-        if p_filesz == 0 || p_filesz > 64 * 1024 {
-            continue;
-        }
-        let mut notes = vec![0u8; p_filesz as usize];
-        if f.read_exact_at(&mut notes, p_offset).is_err() {
-            continue;
-        }
-        if let Some(id) = build_id_from_notes(&notes) {
+        if let Some(id) = elf.read(seg.offset, seg.filesz).and_then(build_id_from_notes) {
             return Some(id.to_vec());
         }
     }
-
-    // Go puts `.note.gnu.build-id` in a section that no PT_NOTE segment covers,
-    // so the program-header scan above misses it and sismo would synthesize a
-    // per-run id — silently breaking cross-run matching for every Go binary.
-    // Fall back to scanning SHT_NOTE sections.
-    read_build_id_from_sections(&f, &ehdr)
-}
-
-/// Fallback build-id lookup that scans `SHT_NOTE` sections via the section
-/// header table, for GNU build-id notes not reachable through a PT_NOTE segment.
-fn read_build_id_from_sections(f: &std::fs::File, ehdr: &[u8; 64]) -> Option<Vec<u8>> {
-    let e_shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
-    let e_shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap());
-    let e_shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap());
-    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 {
-        return None; // no (usable) section header table
-    }
-    for i in 0..e_shnum {
-        let mut shdr = [0u8; 64];
-        if f
-            .read_exact_at(&mut shdr, e_shoff + i as u64 * e_shentsize as u64)
-            .is_err()
-        {
-            return None;
-        }
-        if u32::from_le_bytes(shdr[4..8].try_into().unwrap()) != SHT_NOTE {
+    for sec in elf.sections().into_iter().filter(|s| s.sh_type == crate::elf::SHT_NOTE) {
+        if sec.size == 0 || sec.size > 64 * 1024 {
             continue;
         }
-        let sh_offset = u64::from_le_bytes(shdr[24..32].try_into().unwrap());
-        let sh_size = u64::from_le_bytes(shdr[32..40].try_into().unwrap());
-        if sh_size == 0 || sh_size > 64 * 1024 {
-            continue;
-        }
-        let mut notes = vec![0u8; sh_size as usize];
-        if f.read_exact_at(&mut notes, sh_offset).is_err() {
-            continue;
-        }
-        if let Some(id) = build_id_from_notes(&notes) {
+        if let Some(id) = elf.read(sec.offset, sec.size).and_then(build_id_from_notes) {
             return Some(id.to_vec());
         }
     }

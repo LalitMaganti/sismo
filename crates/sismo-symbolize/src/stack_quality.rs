@@ -26,14 +26,6 @@
 //! These are internal APIs; the DIA-1+ diagnostics consume them. Nothing
 //! user-visible changes yet.
 
-use std::os::unix::fs::FileExt;
-
-// Program header type for the `.eh_frame_hdr` lookup table.
-const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
-
-// Section header type for PROGBITS (holds `.eh_frame`).
-const SHT_PROGBITS: u32 = 1;
-
 /// Below this many samples a module hasn't been observed enough to judge —
 /// keeps a couple of stray single-frame samples from flagging a cold module.
 const MIN_SAMPLES: u64 = 16;
@@ -100,84 +92,17 @@ pub struct UnwindCapability {
 }
 
 /// Probe the ELF at `path` for unwind metadata. `None` if it isn't a readable
-/// 64-bit LE ELF. `has_eh_frame` reflects what the offline unwinder can actually
+/// 64-bit ELF. `has_eh_frame` reflects what the offline unwinder can actually
 /// find: the `PT_GNU_EH_FRAME` program header (present even when the section
 /// table was stripped) *or* a `.eh_frame` section. Checking only the phdr
 /// under-reports for a binary linked with `--no-eh-frame-hdr` (the `.eh_frame`
 /// section is still there and framehop indexes it directly).
 pub fn probe_unwind_capability(path: &str) -> Option<UnwindCapability> {
-    let f = std::fs::File::open(path).ok()?;
-    let mut ehdr = [0u8; 64];
-    f.read_exact_at(&mut ehdr, 0).ok()?;
-    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 {
-        return None; // not ELFCLASS64
-    }
-    let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
-    let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap());
-    let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
-    if e_phentsize < 56 || e_phnum > 4096 {
-        return None;
-    }
-    let mut has_eh_frame = false;
-    for i in 0..e_phnum {
-        // p_type is the first 4 bytes of the program header; that's all we need.
-        let mut p_type = [0u8; 4];
-        if f
-            .read_exact_at(&mut p_type, e_phoff + i as u64 * e_phentsize as u64)
-            .is_err()
-        {
-            return None;
-        }
-        if u32::from_le_bytes(p_type) == PT_GNU_EH_FRAME {
-            has_eh_frame = true;
-            break;
-        }
-    }
-    // No PT_GNU_EH_FRAME (e.g. --no-eh-frame-hdr): look for a `.eh_frame`
-    // section directly. Absent section headers just leave `has_eh_frame` as-is.
-    if !has_eh_frame {
-        has_eh_frame = has_eh_frame_section(&f, &ehdr).unwrap_or(false);
-    }
-    Some(UnwindCapability { has_eh_frame })
-}
-
-/// Whether the ELF carries a section literally named `.eh_frame`. Reads the
-/// section header table and its name strings; `None` on any malformed field or a
-/// stripped section table. `ehdr` is the already-read 64-byte ELF header.
-fn has_eh_frame_section(f: &std::fs::File, ehdr: &[u8; 64]) -> Option<bool> {
-    let e_shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
-    let e_shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap()) as u64;
-    let e_shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap());
-    let e_shstrndx = u16::from_le_bytes(ehdr[62..64].try_into().unwrap());
-    if e_shoff == 0 || e_shentsize < 64 || e_shnum == 0 || e_shstrndx >= e_shnum {
-        return None;
-    }
-    // The shstrtab section header gives the offset/size of the name string pool.
-    let mut sh = [0u8; 64];
-    f.read_exact_at(&mut sh, e_shoff + e_shstrndx as u64 * e_shentsize)
-        .ok()?;
-    let str_off = u64::from_le_bytes(sh[24..32].try_into().unwrap());
-    let str_sz = u64::from_le_bytes(sh[32..40].try_into().unwrap());
-    if str_sz == 0 || str_sz > 16 * 1024 * 1024 {
-        return None;
-    }
-    let mut strtab = vec![0u8; str_sz as usize];
-    f.read_exact_at(&mut strtab, str_off).ok()?;
-    for i in 0..e_shnum {
-        f.read_exact_at(&mut sh, e_shoff + i as u64 * e_shentsize)
-            .ok()?;
-        let sh_name = u32::from_le_bytes(sh[0..4].try_into().unwrap()) as usize;
-        let sh_type = u32::from_le_bytes(sh[4..8].try_into().unwrap());
-        if sh_type != SHT_PROGBITS {
-            continue;
-        }
-        let name = strtab.get(sh_name..)?;
-        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-        if &name[..end] == b".eh_frame" {
-            return Some(true);
-        }
-    }
-    Some(false)
+    crate::elf::with_elf_at_path(path, |elf| {
+        let has_eh_frame = elf.segment(crate::elf::PT_GNU_EH_FRAME).is_some()
+            || elf.has_section(b".eh_frame");
+        UnwindCapability { has_eh_frame }
+    })
 }
 
 #[cfg(test)]
@@ -261,7 +186,9 @@ mod tests {
         let mut neutralized = false;
         for i in 0..e_phnum {
             let off = e_phoff + i * e_phentsize;
-            if u32::from_le_bytes(elf[off..off + 4].try_into().unwrap()) == PT_GNU_EH_FRAME {
+            if u32::from_le_bytes(elf[off..off + 4].try_into().unwrap())
+                == crate::elf::PT_GNU_EH_FRAME
+            {
                 elf[off..off + 4].fill(0); // PT_NULL
                 neutralized = true;
             }

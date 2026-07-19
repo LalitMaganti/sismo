@@ -18,12 +18,6 @@
 //! lacks. This is a symtab-quality fallback, tried only when wholesym loaded
 //! zero symbols.
 
-use std::os::unix::fs::FileExt;
-
-// Program header types.
-const PT_LOAD: u32 = 1;
-const PT_DYNAMIC: u32 = 2;
-
 // Dynamic array tags (Elf64_Dyn.d_tag).
 const DT_NULL: i64 = 0;
 const DT_STRTAB: i64 = 5;
@@ -37,9 +31,8 @@ const STT_GNU_IFUNC: u8 = 10;
 const SHN_UNDEF: u16 = 0;
 
 const ELF64_SYM_SIZE: u64 = 24;
-// Guards so a malformed or hostile ELF can't make us allocate unboundedly.
+// Guard so a malformed or hostile ELF can't make us allocate unboundedly.
 const MAX_TABLE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_PHNUM: u16 = 4096;
 
 /// One defined function symbol: its link-time value/size and its name.
 struct Sym {
@@ -53,81 +46,32 @@ pub struct DynSyms {
     syms: Vec<Sym>,
 }
 
-/// A PT_LOAD segment, used to translate a vaddr (as `DT_SYMTAB`/`DT_STRTAB`
-/// store it) into a file offset for reading.
-struct Load {
-    vaddr: u64,
-    offset: u64,
-    filesz: u64,
-}
-
-fn vaddr_to_offset(loads: &[Load], vaddr: u64, len: u64) -> Option<u64> {
-    for l in loads {
-        if vaddr >= l.vaddr && vaddr.checked_add(len)? <= l.vaddr.checked_add(l.filesz)? {
-            return Some(vaddr - l.vaddr + l.offset);
-        }
-    }
-    None
-}
-
 impl DynSyms {
     /// Parse the dynamic symbol table of the ELF at `path`. Returns `None` when
-    /// the file isn't a 64-bit LE ELF, has no dynamic segment, or yields no
-    /// usable function symbols. Best effort: any malformed field bails to None.
+    /// the file isn't a 64-bit ELF, has no dynamic segment, or yields no usable
+    /// function symbols. Best effort: any malformed field bails to None. Reads
+    /// only the header/dynamic/symtab ranges off disk.
     pub fn from_path(path: &str) -> Option<DynSyms> {
-        let f = std::fs::File::open(path).ok()?;
+        // The closure is load-bearing: passing `Self::from_elf` directly fails
+        // higher-ranked lifetime inference ("FnOnce is not general enough").
+        #[allow(clippy::redundant_closure)]
+        crate::elf::with_elf_at_path(path, |elf| Self::from_elf(elf)).flatten()
+    }
 
-        let mut ehdr = [0u8; 64];
-        f.read_exact_at(&mut ehdr, 0).ok()?;
-        if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 {
-            return None; // not ELFCLASS64
-        }
-        let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
-        let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap());
-        let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
-        if e_phentsize < 56 || e_phnum == 0 || e_phnum > MAX_PHNUM {
-            return None;
-        }
-
-        let mut loads: Vec<Load> = Vec::new();
-        let mut dyn_range: Option<(u64, u64)> = None; // (offset, filesz)
-        for i in 0..e_phnum {
-            let mut phdr = [0u8; 56];
-            f.read_exact_at(&mut phdr, e_phoff + i as u64 * e_phentsize as u64)
-                .ok()?;
-            let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
-            let p_offset = u64::from_le_bytes(phdr[8..16].try_into().unwrap());
-            let p_vaddr = u64::from_le_bytes(phdr[16..24].try_into().unwrap());
-            let p_filesz = u64::from_le_bytes(phdr[32..40].try_into().unwrap());
-            match p_type {
-                PT_LOAD => loads.push(Load { vaddr: p_vaddr, offset: p_offset, filesz: p_filesz }),
-                PT_DYNAMIC => dyn_range = Some((p_offset, p_filesz)),
-                _ => {}
-            }
-        }
-        let (dyn_off, dyn_sz) = dyn_range?;
-
+    fn from_elf<'d, R: object::ReadRef<'d>>(elf: &crate::elf::Elf<'d, R>) -> Option<DynSyms> {
         // The caller compares against `avma - base_avma`, where base_avma is the
         // image's lowest mapping — the first PT_LOAD. samply/wholesym likewise
         // normalize ELF symbol addresses to that base, so a non-PIE symbol at
         // vaddr 0x401060 in an image based at 0x400000 must become 0x1060.
         // Subtract the image base (min PT_LOAD vaddr) from every st_value.
-        let image_base = loads.iter().map(|l| l.vaddr).min()?;
+        let image_base = elf.image_base()?;
 
         // Walk the dynamic array (Elf64_Dyn: i64 tag, u64 val) to DT_NULL.
         let mut symtab_va = None;
         let mut strtab_va = None;
         let mut strsz = None;
         let mut syment = ELF64_SYM_SIZE;
-        if dyn_sz == 0 || dyn_sz > MAX_TABLE_BYTES {
-            return None;
-        }
-        let mut dynbuf = vec![0u8; dyn_sz as usize];
-        f.read_exact_at(&mut dynbuf, dyn_off).ok()?;
-        let mut off = 0usize;
-        while off + 16 <= dynbuf.len() {
-            let tag = i64::from_le_bytes(dynbuf[off..off + 8].try_into().unwrap());
-            let val = u64::from_le_bytes(dynbuf[off + 8..off + 16].try_into().unwrap());
+        for (tag, val) in elf.dynamic()? {
             match tag {
                 DT_NULL => break,
                 DT_SYMTAB => symtab_va = Some(val),
@@ -136,7 +80,6 @@ impl DynSyms {
                 DT_SYMENT => syment = val,
                 _ => {}
             }
-            off += 16;
         }
         let symtab_va = symtab_va?;
         let strtab_va = strtab_va?;
@@ -158,15 +101,12 @@ impl DynSyms {
             return None;
         }
 
-        let symtab_off = vaddr_to_offset(&loads, symtab_va, symtab_bytes)?;
-        let strtab_off = vaddr_to_offset(&loads, strtab_va, strsz)?;
+        let symtab_off = elf.vaddr_to_offset(symtab_va, symtab_bytes)?;
+        let strtab_off = elf.vaddr_to_offset(strtab_va, strsz)?;
+        let symtab = elf.read(symtab_off, symtab_bytes)?;
+        let strtab = elf.read(strtab_off, strsz)?;
 
-        let mut symtab = vec![0u8; symtab_bytes as usize];
-        f.read_exact_at(&mut symtab, symtab_off).ok()?;
-        let mut strtab = vec![0u8; strsz as usize];
-        f.read_exact_at(&mut strtab, strtab_off).ok()?;
-
-        let syms = parse_syms(&symtab, &strtab, image_base);
+        let syms = parse_syms(symtab, strtab, image_base);
         if syms.is_empty() {
             return None;
         }
@@ -235,43 +175,15 @@ fn parse_syms(symtab: &[u8], strtab: &[u8], image_base: u64) -> Vec<Sym> {
     out
 }
 
-// Section header type for a local symbol table.
-const SHT_SYMTAB: u32 = 2;
-
 /// Whether the ELF at `path` still carries a local symbol table (`.symtab`).
 /// `Some(false)` means it was stripped — only `.dynsym`/exports remain, or the
 /// section header table is gone entirely. `None` if the file isn't a readable
-/// 64-bit LE ELF. This is the reliable "is this binary stripped" signal: a
-/// stripped binary keeps its dynamic symbols but drops `.symtab`.
+/// 64-bit ELF. This is the reliable "is this binary stripped" signal: a stripped
+/// binary keeps its dynamic symbols but drops `.symtab`.
 pub fn has_symtab(path: &str) -> Option<bool> {
-    let f = std::fs::File::open(path).ok()?;
-    let mut ehdr = [0u8; 64];
-    f.read_exact_at(&mut ehdr, 0).ok()?;
-    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 {
-        return None; // not ELFCLASS64
-    }
-    let e_shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
-    let e_shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap());
-    let e_shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap());
-    // No section header table (0 offset/count, or `--strip-section-headers`) →
-    // no `.symtab` reachable, so treat as stripped.
-    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 {
-        return Some(false);
-    }
-    for i in 0..e_shnum {
-        // sh_name (u32) + sh_type (u32) are the first 8 bytes of Elf64_Shdr.
-        let mut shdr = [0u8; 8];
-        if f
-            .read_exact_at(&mut shdr, e_shoff + i as u64 * e_shentsize as u64)
-            .is_err()
-        {
-            return Some(false);
-        }
-        if u32::from_le_bytes(shdr[4..8].try_into().unwrap()) == SHT_SYMTAB {
-            return Some(true);
-        }
-    }
-    Some(false)
+    crate::elf::with_elf_at_path(path, |elf| {
+        elf.sections().iter().any(|s| s.sh_type == crate::elf::SHT_SYMTAB)
+    })
 }
 
 /// A NUL-terminated string at `off` in the string table, as UTF-8 (dynamic

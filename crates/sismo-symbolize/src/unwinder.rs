@@ -407,10 +407,6 @@ fn register_elf(
     AddModule::Added
 }
 
-// Program header types for the section-header-stripped `.eh_frame` fallback.
-const PT_LOAD: u32 = 1;
-const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
-
 /// Recover `.eh_frame`/`.eh_frame_hdr` from the program headers when the section
 /// table can't reach them. `PT_GNU_EH_FRAME` covers `.eh_frame_hdr`, whose header
 /// points at `.eh_frame`; the containing `PT_LOAD` bounds the bytes. Returns
@@ -420,55 +416,27 @@ fn fill_eh_frame_from_phdrs(
     bytes: &[u8],
     info: &mut ExplicitModuleSectionInfo<Vec<u8>>,
 ) -> Option<()> {
-    let ehdr = bytes.get(..64)?;
-    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 {
-        return None; // not ELFCLASS64
-    }
-    let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
-    let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as u64;
-    let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
-    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 4096 {
-        return None;
-    }
+    use crate::elf::{Elf, PT_GNU_EH_FRAME};
 
-    // Every PT_LOAD as (vaddr, offset, filesz) — used to map the .eh_frame vaddr
-    // to a file offset — plus the PT_GNU_EH_FRAME (.eh_frame_hdr) location.
-    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
-    let mut hdr_seg: Option<(u64, u64, u64)> = None;
-    for i in 0..e_phnum as u64 {
-        let off = (e_phoff + i * e_phentsize) as usize;
-        let ph = bytes.get(off..off.checked_add(56)?)?;
-        let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
-        let p_offset = u64::from_le_bytes(ph[8..16].try_into().unwrap());
-        let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
-        let p_filesz = u64::from_le_bytes(ph[32..40].try_into().unwrap());
-        match p_type {
-            PT_LOAD => loads.push((p_vaddr, p_offset, p_filesz)),
-            PT_GNU_EH_FRAME => hdr_seg = Some((p_vaddr, p_offset, p_filesz)),
-            _ => {}
-        }
-    }
-    let (hdr_vaddr, hdr_off, hdr_filesz) = hdr_seg?;
-    let hdr_bytes = bytes.get(hdr_off as usize..hdr_off.checked_add(hdr_filesz)? as usize)?;
+    let elf = Elf::parse(bytes)?;
+    let hdr = elf.segment(PT_GNU_EH_FRAME)?;
+    let hdr_bytes = elf.read(hdr.offset, hdr.filesz)?;
 
     // Decode just the `eh_frame_ptr` field of `.eh_frame_hdr` to find where
     // `.eh_frame` begins; framehop re-parses the header for the FDE index.
-    let eh_frame_vaddr = decode_eh_frame_ptr(hdr_bytes, hdr_vaddr)?;
+    let eh_frame_vaddr = decode_eh_frame_ptr(hdr_bytes, hdr.vaddr)?;
 
     // `.eh_frame` runs from that vaddr to the end of its PT_LOAD. Handing
     // framehop the `.eh_frame_hdr` too means it binary-searches to the exact
     // FDE, so the trailing bytes past the real section are never scanned.
-    let (lv, lo, lf) = loads
-        .iter()
-        .copied()
-        .find(|&(v, _, f)| eh_frame_vaddr >= v && eh_frame_vaddr < v.checked_add(f).unwrap_or(v))?;
-    let start_off = (eh_frame_vaddr - lv).checked_add(lo)? as usize;
-    let end_off = lo.checked_add(lf)? as usize;
-    let eh_frame = bytes.get(start_off..end_off)?;
-    let eh_frame_end_vaddr = eh_frame_vaddr + (end_off - start_off) as u64;
+    let load = elf.load_containing(eh_frame_vaddr)?;
+    let start_off = (eh_frame_vaddr - load.vaddr).checked_add(load.offset)?;
+    let end_off = load.offset.checked_add(load.filesz)?;
+    let eh_frame = elf.read(start_off, end_off.checked_sub(start_off)?)?;
+    let eh_frame_end_vaddr = eh_frame_vaddr + eh_frame.len() as u64;
 
     info.eh_frame_hdr = Some(hdr_bytes.to_vec());
-    info.eh_frame_hdr_svma = Some(hdr_vaddr..hdr_vaddr + hdr_filesz);
+    info.eh_frame_hdr_svma = Some(hdr.vaddr..hdr.vaddr + hdr.filesz);
     info.eh_frame = Some(eh_frame.to_vec());
     info.eh_frame_svma = Some(eh_frame_vaddr..eh_frame_end_vaddr);
     Some(())
