@@ -22,6 +22,10 @@ pub const SISMO_EVT_OFFCPU: u32 = 2;
 pub const SISMO_EVT_FILE: u32 = 3;
 pub const SISMO_EVT_SAMPLE_UNWIND: u32 = 4;
 pub const SISMO_EVT_PYFRAME: u32 = 5;
+pub const SISMO_EVT_MODULE: u32 = 6;
+
+/// Bytes of a module's mapped-image prefix in `SismoModuleRec` (one page).
+pub const SISMO_MODULE_PREFIX: usize = 4096;
 
 /// Bytes of the raw user-stack snapshot in `SismoUnwindRec` (perf's default
 /// PERF_SAMPLE_STACK_USER size).
@@ -88,6 +92,17 @@ pub struct SismoPyframeRec {
     pub r#type: u32,
     pub id: u32,
     pub name: [c_char; SISMO_PY_NAME_MAX],
+}
+
+/// SISMO_EVT_MODULE. A module's image base + the first mapped page of its image,
+/// read from the target in-band at sample time (CAP-2); the host parses the
+/// build-id from `prefix`.
+#[repr(C)]
+pub struct SismoModuleRec {
+    pub r#type: u32,
+    pub prefix_len: u32,
+    pub base: u64,
+    pub prefix: [u8; SISMO_MODULE_PREFIX],
 }
 
 /// CAP-1 config pushed into the BPF `py_cfg` map: `_PyRuntime` avma + the
@@ -808,6 +823,7 @@ pub struct Capture {
     py_names: HashMap<u32, Vec<u8>>,   // CAP-1: id -> Python qualname
     py_cfg_fd: c_int,                  // CAP-1: fd of the py_cfg BPF map (-1 if absent)
     python_bpf: bool,                  // CAP-1: in-BPF walk armed (py_cfg pushed)
+    bpf_build_ids: HashMap<u64, Vec<u8>>, // CAP-2: base avma -> in-band build-id
     counters: Vec<Counter>,
     active_slots: Vec<u8>, // indices into `counters`; [0] is the timebase
     focus: Option<FocusPreset>,
@@ -994,13 +1010,20 @@ impl Capture {
                     }
                     continue;
                 };
+                // CAP-2: prefer the build-id the BPF captured in-band from mapped
+                // memory (it matches the file read for a live binary, and is the
+                // only real id for one deleted before symbolization).
+                let build_id: &[u8] = match self.bpf_build_ids.get(&m.base_avma) {
+                    Some(id) => id,
+                    None => &m.build_id,
+                };
                 let mapping_iid = self.interner.intern_mapping(
                     m.start,
                     m.end,
                     m.offset,
                     m.base_avma,
                     m.path.as_bytes(),
-                    &m.build_id,
+                    build_id,
                     idw,
                 );
                 let frame_iid = self.interner.intern_frame(
@@ -1426,6 +1449,11 @@ impl Capture {
             self.handle_pyframe(rec);
             return;
         }
+        if hdr.r#type == SISMO_EVT_MODULE {
+            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoModuleRec) };
+            self.handle_module(rec);
+            return;
+        }
         if hdr.r#type == SISMO_EVT_OFFCPU {
             // The blocking stack + off-CPU duration (in data_addr). Emitted onto
             // the off-CPU sequence — same data source, own timebase.
@@ -1480,6 +1508,19 @@ impl Capture {
             unsafe { std::slice::from_raw_parts(rec.name.as_ptr() as *const u8, SISMO_KSYM_NAME_MAX) };
         let name = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
         self.file_names.insert(rec.id, name.to_vec());
+    }
+
+    // CAP-2: a module identity page the BPF captured in-band. Parse the build-id
+    // from its mapped prefix (the same parser used for a file) and key it by base
+    // avma, so a mapping whose file is gone can still be named. Once per base.
+    fn handle_module(&mut self, rec: &SismoModuleRec) {
+        if rec.prefix_len == 0 || self.bpf_build_ids.contains_key(&rec.base) {
+            return;
+        }
+        let n = (rec.prefix_len as usize).min(SISMO_MODULE_PREFIX);
+        if let Some(id) = crate::symbolize::proc_maps::build_id_from_image_prefix(&rec.prefix[..n]) {
+            self.bpf_build_ids.insert(rec.base, id);
+        }
     }
 
     // CAP-1: a CPython qualname definition (id -> name) the BPF walk emitted the
@@ -1646,6 +1687,7 @@ fn capture_init(
         py_names: HashMap::new(),
         py_cfg_fd: -1,
         python_bpf: false,
+        bpf_build_ids: HashMap::new(),
         counters: Vec::new(),
         active_slots: Vec::new(),
         focus,

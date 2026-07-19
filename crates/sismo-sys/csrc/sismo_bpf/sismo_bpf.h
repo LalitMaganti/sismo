@@ -68,7 +68,18 @@ enum sismo_event_type {
   // sample whose py_ids[] reference it, so userspace names Python frames
   // without the host walking the interpreter's memory.
   SISMO_EVT_PYFRAME = 5,
+  // A module identity page: a loaded module's image base + the first page of its
+  // mapped image (ELF header + build-id note), copied from the target's memory
+  // in-band at sample time (CAP-2). Emitted once per module base; the host
+  // parses the build-id from it, so a binary deleted before symbolization keeps
+  // a real id instead of a synthetic one. See sismo_module_rec.
+  SISMO_EVT_MODULE = 6,
 };
+
+// Bytes of a module's mapped-image prefix carried by SISMO_EVT_MODULE — one page,
+// which holds the ELF header, program headers, and (essentially always) the
+// .note.gnu.build-id.
+#define SISMO_MODULE_PREFIX 4096
 
 // Max bytes of the raw user-stack snapshot carried by SISMO_EVT_SAMPLE_UNWIND;
 // perf's default PERF_SAMPLE_STACK_USER size.
@@ -145,6 +156,17 @@ struct sismo_pyframe_rec {
   unsigned int type;  // = SISMO_EVT_PYFRAME (aliases sismo_hdr.type)
   unsigned int id;
   char name[SISMO_PY_NAME_MAX];
+};
+
+// SISMO_EVT_MODULE. A module's image base + the first mapped page of its image,
+// read from the target's memory in-band at sample time (CAP-2). `prefix_len` is
+// the valid byte count (0 if the copy failed). The host parses the build-id from
+// `prefix` via the same code that reads it from a file.
+struct sismo_module_rec {
+  unsigned int type;        // = SISMO_EVT_MODULE (aliases sismo_hdr.type)
+  unsigned int prefix_len;  // valid bytes in prefix[]
+  unsigned long long base;  // module image base avma (== host base_avma)
+  unsigned char prefix[SISMO_MODULE_PREFIX];
 };
 
 // CAP-1 config: the `_PyRuntime` runtime address + the `_Py_DebugOffsets` field

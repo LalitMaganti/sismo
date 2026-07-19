@@ -376,6 +376,59 @@ fn build_id_from_notes(notes: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// Parse the GNU build-id from the *mapped image prefix* of an ELF — the leading
+/// bytes of the module as they sit in the target's address space, which is what
+/// BPF copies from mapped memory at sample time (CAP-2). Unlike
+/// `build_id_from_elf` it needs no section table and no complete file: it reads
+/// the ELF header, walks the program headers, and reads each `PT_NOTE` at its
+/// vaddr offset within the prefix. `prefix` starts at the image base (the first
+/// `PT_LOAD`'s mapping). `None` if the note isn't within the prefix.
+pub fn build_id_from_image_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
+    let ehdr = prefix.get(..64)?;
+    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 {
+        return None; // not ELFCLASS64
+    }
+    let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
+    let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as u64;
+    let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
+    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 4096 {
+        return None;
+    }
+    // The prefix is indexed by vaddr from the image base (min PT_LOAD vaddr, 0
+    // for a PIE), matching how it sits mapped in the target. Read each PT_NOTE
+    // at `p_vaddr - image_base` — which equals p_offset for a note in the first
+    // load segment, so this also works on a whole-file prefix.
+    let phdr = |i: u64| -> Option<(u32, u64, u64)> {
+        let off = (e_phoff + i * e_phentsize) as usize;
+        let ph = prefix.get(off..off.checked_add(56)?)?;
+        Some((
+            u32::from_le_bytes(ph[0..4].try_into().unwrap()),   // p_type
+            u64::from_le_bytes(ph[16..24].try_into().unwrap()), // p_vaddr
+            u64::from_le_bytes(ph[32..40].try_into().unwrap()), // p_filesz
+        ))
+    };
+    let mut image_base = u64::MAX;
+    for i in 0..e_phnum as u64 {
+        let (p_type, p_vaddr, _) = phdr(i)?;
+        if p_type == crate::elf::PT_LOAD {
+            image_base = image_base.min(p_vaddr);
+        }
+    }
+    let image_base = if image_base == u64::MAX { 0 } else { image_base };
+    for i in 0..e_phnum as u64 {
+        let (p_type, p_vaddr, p_filesz) = phdr(i)?;
+        if p_type != crate::elf::PT_NOTE {
+            continue;
+        }
+        let start = p_vaddr.checked_sub(image_base)? as usize;
+        let end = start.checked_add(p_filesz as usize)?;
+        if let Some(id) = prefix.get(start..end).and_then(build_id_from_notes) {
+            return Some(id.to_vec());
+        }
+    }
+    None
+}
+
 /// A 16-byte synthetic build-id for binaries without a GNU build-id note.
 /// Only needs to be stable within a recording and distinct in length from a
 /// real (20-byte sha1) id — the bytes themselves are never compared across
@@ -543,6 +596,27 @@ mod tests {
         assert_eq!(a.len(), 16);
         assert_eq!(a, b); // stable
         assert_ne!(a, c); // path-distinct
+    }
+
+    // CAP-2: the build-id parsed from a *mapped image prefix* (what BPF copies
+    // from the target's memory) must equal the build-id read from the whole
+    // file. For a PIE the first PT_LOAD maps at file offset 0, so the file's
+    // leading bytes equal the mapped prefix — read the running test binary and
+    // compare the two paths.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_id_from_image_prefix_matches_whole_file() {
+        let exe = std::fs::read_link("/proc/self/exe").expect("readlink");
+        let path = exe.to_str().unwrap();
+        let whole = read_build_id(path);
+        assert!(whole.is_some(), "test binary should carry a GNU build-id");
+        let bytes = std::fs::read(path).unwrap();
+        let prefix = &bytes[..bytes.len().min(64 * 1024)];
+        assert_eq!(
+            build_id_from_image_prefix(prefix),
+            whole,
+            "prefix build-id must match the whole-file build-id"
+        );
     }
 
     // Exercises the real path end to end (live /proc read + ELF build-id

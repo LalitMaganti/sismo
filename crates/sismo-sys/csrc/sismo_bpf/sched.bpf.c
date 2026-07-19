@@ -133,6 +133,14 @@ struct {
   __type(value, __u64);
 } pyframe_next SEC(".maps");
 
+// CAP-2: emit a module's identity page (SISMO_EVT_MODULE) once per image base.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u64);  // module image base avma
+  __type(value, __u8);
+} module_seen SEC(".maps");
+
 // Per-CPU scratch for the kernel stack: bpf_get_stack writes the addresses here
 // (kept off the 512-byte BPF stack and out of the shipped record); the resolve
 // loop then fills `id` in place.
@@ -387,6 +395,49 @@ static __noinline __u32 walk_python(__u32 *py_ids) {
   return n;
 }
 
+// CAP-2: bpf_find_vma callback — stash the containing vma's start + file page
+// offset so the caller derives the module image base.
+struct find_vma_ctx {
+  __u64 start;
+  __u64 pgoff;
+};
+static long vma_info_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx) {
+  struct find_vma_ctx *c = ctx;
+  c->start = BPF_CORE_READ(vma, vm_start);
+  c->pgoff = BPF_CORE_READ(vma, vm_pgoff);
+  return 0;
+}
+
+// CAP-2: on first sight of the module containing `pc`, copy its first mapped
+// page (ELF header + build-id note) from the target's memory and ship it, so the
+// host can name the module by build-id even if its file is later deleted. The
+// image base is `vm_start - (vm_pgoff << PAGE_SHIFT)` — the address file-offset-0
+// maps to, constant across the file's segments and equal to the host base_avma.
+// bpf_find_vma trylocks mmap_lock, so it is best-effort in interrupt context; a
+// miss just retries next sample (module_seen is set only on success).
+static __noinline void capture_module(struct task_struct *cur, __u64 pc) {
+  if (!pc)
+    return;
+  struct find_vma_ctx vc = {};
+  if (bpf_find_vma(cur, pc, vma_info_cb, &vc, 0) || !vc.start)
+    return;
+  __u64 base = vc.start - (vc.pgoff << 12);  // PAGE_SHIFT = 12
+  if (bpf_map_lookup_elem(&module_seen, &base))
+    return;
+  __u8 one = 1;
+  bpf_map_update_elem(&module_seen, &base, &one, BPF_ANY);
+
+  struct sismo_module_rec *r = bpf_ringbuf_reserve(&events, sizeof(*r), 0);
+  if (!r)
+    return;
+  r->type = SISMO_EVT_MODULE;
+  r->base = base;
+  r->prefix_len = 0;
+  if (bpf_probe_read_user(r->prefix, sizeof(r->prefix), (void *)base) == 0)
+    r->prefix_len = sizeof(r->prefix);
+  bpf_ringbuf_submit(r, 0);
+}
+
 static __always_inline __u32 target_tgid(void) {
   __u32 zero = 0;
   __u32 *t = bpf_map_lookup_elem(&cfg, &zero);
@@ -416,7 +467,7 @@ static __always_inline void read_advance(struct sismo_counters *dc) {
   struct sismo_last *last = bpf_map_lookup_elem(&last_pe, &zero);
   if (!last)
     return;
-#pragma unroll
+#pragma clang loop unroll(disable)
   for (int s = 0; s < SISMO_MAX_COUNTERS; s++) {
     struct bpf_perf_event_value val = {};
     __u64 idx = (__u64)s * SISMO_MAX_CPUS + cpu;
@@ -453,7 +504,7 @@ static __always_inline struct sismo_counters *credit(struct task_struct *t,
       bpf_task_storage_get(&thread_ctrs, t, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
   if (!tc)
     return 0;
-#pragma unroll
+#pragma clang loop unroll(disable)
   for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
     tc->v[s] += dc->v[s];
   return tc;
@@ -525,14 +576,16 @@ static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
       e->hdr.nr_kernel_frames = st->nr_kernel;
       e->hdr.ts = now;
       e->data_addr = delta; // off-CPU duration (ns) = the sample's weight
-#pragma unroll
+#pragma clang loop unroll(disable)
       for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
         e->counters[s] = 0;
       // counters[] are meaningless for an off-CPU sample; slot 0 carries the
       // block identity (futex uaddr or packed TCP peer), 0 when unnamed.
       e->counters[0] = st->block_id;
+      #pragma clang loop unroll(disable)
       for (int i = 0; i < SISMO_MAX_STACK; i++)
         e->stack[i] = (i < st->nr_frames) ? st->ustack[i] : 0;
+      #pragma clang loop unroll(disable)
       for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
         e->kernel_ids[i] = (i < st->nr_kernel) ? st->kids[i] : 0;
       bpf_ringbuf_submit(e, 0);
@@ -693,6 +746,11 @@ int on_tick(struct bpf_perf_event_data *ctx) {
       ks->id[i] = resolve_ksym(ks->addr[i]);
   }
 
+  // CAP-2: ship the sampled module's identity page (image base + build-id note)
+  // in-band, once per module, so a binary deleted before symbolization still
+  // resolves to a real build-id.
+  capture_module(cur, PT_REGS_IP((struct pt_regs *)&ctx->regs));
+
   // NAT-1: when unwind capture is on, ship a sismo_unwind_rec instead of the
   // plain sample — same sample fields (only hdr.type differs), plus the regs
   // + a raw user-stack snapshot for host-side DWARF unwinding. Filled
@@ -711,11 +769,12 @@ int on_tick(struct bpf_perf_event_data *ctx) {
     ue->sample.hdr.nr_kernel_frames = nr_kernel;
     ue->sample.hdr.ts = bpf_ktime_get_ns();
     ue->sample.data_addr = ctx->addr;
-#pragma unroll
+#pragma clang loop unroll(disable)
     for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
       ue->sample.counters[s] = tc->v[s];
     long un = bpf_get_stack(ctx, ue->sample.stack, sizeof(ue->sample.stack), BPF_F_USER_STACK);
     ue->sample.hdr.nr_frames = (un > 0) ? (__u32)(un / 8) : 0;
+    #pragma clang loop unroll(disable)
     for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
       ue->sample.kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
     // CAP-1: recover CPython frames from the interpreter's memory at sample time.
@@ -767,11 +826,12 @@ int on_tick(struct bpf_perf_event_data *ctx) {
   // Data linear address of the sampled access (the kernel fills ctx->addr only
   // when the leader event sampled PERF_SAMPLE_ADDR — the cache focus; 0 else).
   e->data_addr = ctx->addr;
-#pragma unroll
+#pragma clang loop unroll(disable)
   for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
     e->counters[s] = tc->v[s];
   long n = bpf_get_stack(ctx, e->stack, sizeof(e->stack), BPF_F_USER_STACK);
   e->hdr.nr_frames = (n > 0) ? (__u32)(n / 8) : 0;
+  #pragma clang loop unroll(disable)
   for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
     e->kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
   e->hdr.nr_py_frames = walk_python(e->py_ids);  // CAP-1
