@@ -670,6 +670,7 @@ DIAG_CATALOG: list[tuple[str, str]] = [
     ("build-id", r"build[- ]id|readelf -n"),
     ("deleted-file", r"no longer at this path|deleted|binary changed since"),
     ("frame-pointer", r"frame pointer|omit-frame|force-frame-pointers"),
+    ("unwind-tables", r"unwind tables|asynchronous-unwind|\.eh_frame FDE"),
     ("interpreted-runtime", r"interpreter frame|interpreted runtime|"
                             r"JIT frame|perf-?map|jitdump"),
 ]

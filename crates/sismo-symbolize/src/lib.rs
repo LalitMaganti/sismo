@@ -24,6 +24,10 @@ pub mod python_stack;
 // DIA-0: per-module stack-quality primitive (truncation signal + eh_frame probe).
 #[cfg(not(target_os = "windows"))]
 pub mod stack_quality;
+// FLAG-noeh: detect a module with no .eh_frame FDE coverage for its own code and
+// no frame pointers — the one build shape sismo cannot unwind by any path.
+#[cfg(not(target_os = "windows"))]
+pub mod unwind_tables;
 // macOS Mach-based module enumeration + mach-o reading.
 #[cfg(target_os = "macos")]
 pub mod dyld_images;

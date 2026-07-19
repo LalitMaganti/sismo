@@ -204,6 +204,9 @@ pub fn symbolize_trace(trace_path: &str) {
         if let Some(arch) = host_arch {
             collect_module_disasm(&sym, m, arch, &mut asm_records);
         }
+        // FLAG-noeh: warn when this module's own code has neither unwind tables
+        // nor frame pointers (sym now has it registered, so fn starts resolve).
+        report_missing_unwind_tables(&sym, m);
         if ms.is_empty() {
             continue;
         }
@@ -324,6 +327,63 @@ fn print_fp_diagnostic(name: &[u8], shape: &crate::stack_quality::StackShape) {
             );
         }
     }
+}
+
+/// FLAG-noeh: a module whose own sampled code has no `.eh_frame` FDEs *and* no
+/// frame pointers can't be unwound by any path sismo has — the chain comes back
+/// silently short. Name the missing unwind tables so the user knows recompiling
+/// with either restores stacks. Distinct from the frame-pointer diagnostic
+/// (DIA-1), whose "rebuild with frame pointers" is not the only remedy here.
+/// Static reads of the on-disk ELF; best-effort, silent on any read failure.
+fn report_missing_unwind_tables(sym: &Symbolizer, m: &Module) {
+    // Only file-backed user modules, matching the frame-pointer diagnostic.
+    if m.name.first() != Some(&b'/') {
+        return;
+    }
+    let Ok(path) = std::str::from_utf8(&m.name) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+
+    // Image-relative sampled addresses (wholesym's ELF relative space).
+    let sampled_rel: Vec<u64> =
+        m.rel_pcs.iter().map(|&pc| pc.wrapping_sub(m.load_bias)).collect();
+    // Cheap gate: a module whose code carries FDEs exits here — this clears
+    // every normally-built module (libc, ld.so, ...) before the costlier checks.
+    if !crate::unwind_tables::sampled_code_lacks_fde_coverage(&bytes, &sampled_rel) {
+        return;
+    }
+    // A Go binary also lacks `.eh_frame` for its code and its FP prologue sits
+    // behind a stack-check preamble, so both checks would misread it — but sismo
+    // unwinds Go from `.gopclntab` pcsp tables (NAT-1b), so the "no unwind path"
+    // premise is false. Skip it (only reached for the few uncovered modules).
+    if crate::gopclntab::GoPclntab::from_path(path).is_some() {
+        return;
+    }
+
+    // Resolve each sampled address to its function start (image-relative) for
+    // the frame-pointer prologue check.
+    let mut fn_starts: Vec<u64> = Vec::new();
+    for &pc in &m.rel_pcs {
+        if let Some(r) = sym.resolve(pc) {
+            fn_starts.push(pc.wrapping_sub(m.load_bias).wrapping_sub(r.offset));
+        }
+    }
+    if !crate::unwind_tables::functions_omit_frame_pointer(&bytes, &fn_starts) {
+        return;
+    }
+
+    eprintln!("\nsismo record: {}", s(&m.name));
+    eprintln!(
+        "    stacks stop short in this module — its own functions carry no unwind\n    \
+         tables (.eh_frame FDEs) and no frame pointers, so neither sismo's DWARF\n    \
+         unwinder nor the frame-pointer walk can recover their callers."
+    );
+    eprintln!("    rebuild with either to record full stacks:");
+    eprintln!("      gcc/clang: -fasynchronous-unwind-tables  (unwind tables), or");
+    eprintln!("                 -fno-omit-frame-pointer        (frame pointers)");
 }
 
 /// Append `bytes` at the end of the file at `path`.
