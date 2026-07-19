@@ -1060,21 +1060,23 @@ impl Capture {
                 // CAP-2: prefer the build-id the BPF captured in-band from mapped
                 // memory (it matches the file read for a live binary, and is the
                 // only real id for one deleted before symbolization).
-                let build_id: &[u8] = match self.bpf_build_ids.get(&m.base_avma) {
+                let real_id: &[u8] = match self.bpf_build_ids.get(&m.base_avma) {
                     Some(id) => id,
                     None => &m.build_id,
                 };
                 // CAP-3(b): register this module the first time we see it so its
-                // bytes stay reachable (per --keep-module-files policy) if the
-                // file is deleted or rebuilt before symbolization.
-                self.modules.observe(&m.path, build_id);
+                // bytes stay reachable (per --keep-module-files policy) if the file
+                // is deleted before symbolization. The registry also supplies the
+                // effective build-id — a synthetic magic+random one when the module
+                // has no GNU note — memoized per (dev,inode) so it is stable.
+                let build_id = self.modules.observe(&m.path, real_id);
                 let mapping_iid = self.interner.intern_mapping(
                     m.start,
                     m.end,
                     m.offset,
                     m.base_avma,
                     m.path.as_bytes(),
-                    build_id,
+                    &build_id,
                     idw,
                 );
                 let frame_iid = self.interner.intern_frame(

@@ -26,6 +26,8 @@ use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 
+use crate::symbolize::proc_maps::synthetic_build_id;
+
 /// Which sampled module files to hold an fd open for, from `--keep-module-files`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeepPolicy {
@@ -59,7 +61,21 @@ fn is_unstable(path: &str) -> bool {
     !STABLE_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
+/// FNV-1a of a path, the dedup key for a file we could not stat (already gone).
+fn path_key(path: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in path.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 struct Entry {
+    // The build-id the trace carries for this module: the real GNU note when it
+    // has one, else a synthetic magic+random id minted here and memoized so every
+    // frame of the module groups under it and a rebuild (new inode) gets a fresh
+    // one.
     build_id: Vec<u8>,
     // Held only when the policy decided this file was worth pinning; a None here
     // is a module we saw but chose to reopen by path at the end.
@@ -70,34 +86,62 @@ struct Entry {
 pub struct ModuleRegistry {
     policy: KeepPolicy,
     by_inode: HashMap<(u64, u64), Entry>,
+    // splitmix64 state for minting synthetic ids: a bijection over the sequence,
+    // so distinct draws never collide within a recording. Seeded per registry so
+    // ids differ across runs without needing a system RNG.
+    rng: u64,
 }
 
 impl ModuleRegistry {
     pub fn new(policy: KeepPolicy) -> ModuleRegistry {
-        ModuleRegistry { policy, by_inode: HashMap::new() }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        ModuleRegistry { policy, by_inode: HashMap::new(), rng: seed }
     }
 
-    /// Note that `path` (carrying `build_id`) was sampled. On first sight of its
-    /// `(dev, inode)`, hold an fd per the policy. Best effort: a path already
-    /// gone (short-lived deletion) or an open failure just leaves no held fd.
-    pub fn observe(&mut self, path: &str, build_id: &[u8]) {
-        if self.policy == KeepPolicy::None || path.is_empty() {
-            return;
-        }
-        let Ok(meta) = std::fs::metadata(path) else {
-            return; // already gone, or not a real path (e.g. "[vdso]")
+    fn next_rand(&mut self) -> u64 {
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Note that `path` was sampled, carrying `real_id` (its real GNU build-id, or
+    /// empty). Returns the build-id the trace should use: `real_id` when present,
+    /// else a synthetic id minted once per `(dev, inode)`. Holds an fd per the
+    /// policy so a since-deleted file still symbolizes. Idempotent per module —
+    /// re-observing the same inode returns the same id, so map re-parses don't
+    /// split a module across ids.
+    pub fn observe(&mut self, path: &str, real_id: &[u8]) -> Vec<u8> {
+        // Key by (dev, inode) when the file is on disk; fall back to a path key
+        // when it is already gone (its real id then comes from CAP-2 in-band, and
+        // no fd can be held anyway).
+        let meta = std::fs::metadata(path).ok();
+        let key = match &meta {
+            Some(m) => (m.dev(), m.ino()),
+            None => (0, path_key(path)),
         };
-        let key = (meta.dev(), meta.ino());
-        if self.by_inode.contains_key(&key) {
-            return;
+        if let Some(e) = self.by_inode.get(&key) {
+            return e.build_id.clone();
         }
-        let hold = match self.policy {
-            KeepPolicy::All => true,
-            KeepPolicy::Auto => is_unstable(path),
-            KeepPolicy::None => false,
+        let build_id = if real_id.is_empty() {
+            let r = self.next_rand();
+            synthetic_build_id(r).to_vec()
+        } else {
+            real_id.to_vec()
         };
+        let hold = meta.is_some()
+            && match self.policy {
+                KeepPolicy::All => true,
+                KeepPolicy::Auto => is_unstable(path),
+                KeepPolicy::None => false,
+            };
         let fd = if hold { File::open(path).ok() } else { None };
-        self.by_inode.insert(key, Entry { build_id: build_id.to_vec(), fd });
+        self.by_inode.insert(key, Entry { build_id: build_id.clone(), fd });
+        build_id
     }
 
     /// Map each held module's build-id to a `/proc/self/fd/<n>` path a symbolizer
@@ -139,26 +183,47 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("prog"); // not under a stable prefix → auto holds it
         std::fs::write(&p, b"\x7fELF...").unwrap();
-        let bid = [1u8, 2, 3, 4];
+        let real = [1u8, 2, 3, 4]; // pretend a real GNU note
 
         let mut reg = ModuleRegistry::new(KeepPolicy::Auto);
-        reg.observe(p.to_str().unwrap(), &bid);
+        let id = reg.observe(p.to_str().unwrap(), &real);
+        assert_eq!(id, real); // a real id passes through unchanged
         assert_eq!(reg.held_count(), 1);
+        // Re-observing the same inode returns the same id and adds no second fd.
+        assert_eq!(reg.observe(p.to_str().unwrap(), &real), real);
+        assert_eq!(reg.held_count(), 1);
+
         std::fs::remove_file(&p).unwrap(); // deleted, but the held fd keeps it readable
-
         let paths = reg.held_fd_paths();
-        let fd_path = paths.get(&bid[..].to_vec()).expect("held by build-id");
+        let fd_path = paths.get(&real[..].to_vec()).expect("held by build-id");
         assert_eq!(std::fs::read(fd_path).unwrap(), b"\x7fELF...");
-
-        // Dedup: observing the same inode again does not add a second fd.
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn none_policy_holds_nothing() {
+    fn mints_a_synthetic_id_when_the_note_is_missing() {
+        use crate::symbolize::proc_maps::is_synthetic;
+        let dir = std::env::temp_dir().join(format!("sismo-reg-syn-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+
         let mut reg = ModuleRegistry::new(KeepPolicy::None);
-        reg.observe("/tmp/whatever", &[9, 9]);
-        assert_eq!(reg.held_count(), 0);
+        let ida = reg.observe(a.to_str().unwrap(), &[]); // no real note
+        let idb = reg.observe(b.to_str().unwrap(), &[]);
+        assert!(is_synthetic(&ida) && is_synthetic(&idb));
+        assert_ne!(ida, idb); // distinct files → distinct ids (no path collision)
+        assert_eq!(reg.observe(a.to_str().unwrap(), &[]), ida); // stable per inode
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn none_policy_ids_but_holds_nothing() {
+        let mut reg = ModuleRegistry::new(KeepPolicy::None);
+        let id = reg.observe("/tmp/whatever-nonexistent", &[9, 9]);
+        assert_eq!(id, vec![9, 9]); // still assigns the id
+        assert_eq!(reg.held_count(), 0); // but holds no fd
         assert!(reg.held_fd_paths().is_empty());
     }
 }

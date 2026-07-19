@@ -298,13 +298,34 @@ fn parse_text(raw: &str, mut build_id_for: impl FnMut(&str) -> Vec<u8>) -> Vec<M
     out
 }
 
-/// Live parse of `/proc/<pid>/maps`.
+/// Live parse of `/proc/<pid>/maps`. `build_id` is the real GNU note or empty —
+/// a module with no note is given a synthetic id later, by the module registry,
+/// where it can be memoized per `(dev, inode)` and marked with [`SYNTH_MAGIC`].
 fn from_pid(pid: u32) -> Option<ProcMaps> {
     let raw = crate::maps_common::read_maps_text(pid)?;
-    let mappings = parse_text(&raw, |path| {
-        read_build_id(path).unwrap_or_else(|| synth_build_id(path).to_vec())
-    });
+    let mappings = parse_text(&raw, |path| read_build_id(path).unwrap_or_default());
     Some(ProcMaps { mappings })
+}
+
+/// The 8-byte prefix that marks a build-id as sismo-synthesized rather than a
+/// real GNU note: readable in a hexdump, and vanishingly unlikely (2⁻⁶⁴) to
+/// prefix a real build-id. The trailing 8 bytes are a random per-module value.
+/// Any consumer can recognize a fabricated id — and skip debuginfod, staleness
+/// checks, or cross-machine correlation for it — with a cheap prefix check.
+pub const SYNTH_MAGIC: [u8; 8] = *b"SISMOSYN";
+
+/// Whether `build_id` is a sismo-synthesized id (carries [`SYNTH_MAGIC`]).
+pub fn is_synthetic(build_id: &[u8]) -> bool {
+    build_id.len() >= SYNTH_MAGIC.len() && build_id[..SYNTH_MAGIC.len()] == SYNTH_MAGIC
+}
+
+/// Build a synthetic build-id: the magic prefix plus `rand` (a per-module random
+/// value). 16 bytes, matching a GNU md5 note's width.
+pub fn synthetic_build_id(rand: u64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&SYNTH_MAGIC);
+    out[8..].copy_from_slice(&rand.to_le_bytes());
+    out
 }
 
 /// Whether the ELF at `path` carries a real GNU build-id note. `false` means
@@ -429,25 +450,6 @@ pub fn build_id_from_image_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// A 16-byte synthetic build-id for binaries without a GNU build-id note.
-/// Only needs to be stable within a recording and distinct in length from a
-/// real (20-byte sha1) id — the bytes themselves are never compared across
-/// runs, so this need not match any external value.
-fn synth_build_id(path: &str) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    out[0..8].copy_from_slice(&fnv1a64(path.as_bytes(), 0xcbf2_9ce4_8422_2325).to_le_bytes());
-    out[8..16].copy_from_slice(&fnv1a64(path.as_bytes(), 0x9e37_79b9_7f4a_7c15).to_le_bytes());
-    out
-}
-
-fn fnv1a64(bytes: &[u8], basis: u64) -> u64 {
-    let mut h = basis;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
 
 #[cfg(test)]
 mod tests {
@@ -589,13 +591,16 @@ mod tests {
     }
 
     #[test]
-    fn synth_build_id_is_stable_16_bytes() {
-        let a = synth_build_id("/bin/app");
-        let b = synth_build_id("/bin/app");
-        let c = synth_build_id("/bin/other");
+    fn synthetic_id_is_magic_tagged_and_recognized() {
+        let a = synthetic_build_id(0x1122_3344_5566_7788);
         assert_eq!(a.len(), 16);
-        assert_eq!(a, b); // stable
-        assert_ne!(a, c); // path-distinct
+        assert_eq!(&a[..8], &SYNTH_MAGIC); // self-identifying prefix
+        assert!(is_synthetic(&a));
+        // Distinct random tails give distinct ids; the prefix stays constant.
+        assert_ne!(synthetic_build_id(1), synthetic_build_id(2));
+        // A real (non-magic) id is not mistaken for synthetic.
+        assert!(!is_synthetic(&[0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0]));
+        assert!(!is_synthetic(b"SISMO")); // too short to carry the magic
     }
 
     // CAP-2: the build-id parsed from a *mapped image prefix* (what BPF copies
@@ -632,7 +637,11 @@ mod tests {
             assert!(w[0].start <= w[1].start);
         }
         for m in &maps.mappings {
-            assert!(!m.build_id.is_empty()); // real id or synth fallback
+            // build_id is the real GNU note or empty now (the registry supplies a
+            // synthetic id for note-less modules); a real one must be a real note.
+            if !m.build_id.is_empty() {
+                assert!(!is_synthetic(&m.build_id)); // proc_maps never fabricates
+            }
             assert!(m.base_avma <= m.start);
             // The mapping must be findable at its own start address.
             assert_eq!(maps.find(m.start).map(|f| f.start), Some(m.start));

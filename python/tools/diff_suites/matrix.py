@@ -52,6 +52,9 @@ ZIG: list[str] = [os.path.join(ROOT_DIR, "tools", "zig")]
 RUSTC: list[str] = [os.path.join(ROOT_DIR, "tools", "rustc")]
 
 MIN_SAMPLES: int = 50
+# The 8-byte prefix sismo stamps on a fabricated build-id (proc_maps::SYNTH_MAGIC
+# = b"SISMOSYN"), as lowercase hex, so a synthetic id is recognized by its prefix.
+SYNTH_MAGIC_HEX: str = "5349534d4f53594e"
 
 
 # ----- variant model ------------------------------------------------------
@@ -752,13 +755,14 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
 
     residual = query_residual(rec.trace) if os.path.exists(rec.trace) else []
 
-    # build_id: does the trace carry the target module's real GNU build-id? `gnu`
-    # means it matches the module's own file (CAP-2 captures it in-band, so even a
-    # binary deleted mid-record keeps it); `synthetic` means sismo fell back to a
-    # per-run id (no build-id, or it was lost); `absent` means none at all. The
-    # reference id is read from the module's actual file (the trace path — e.g. the
-    # real libjvm.so, not the java launcher in cmd[0]); only when that file is gone
-    # (deleted binary) do we fall back to the build-time cmd[0] capture.
+    # build_id: what identity does the trace carry for the target module? `gnu`
+    # means a real GNU note matching the module's own file (CAP-2 captures it in-
+    # band, so even a binary deleted mid-record keeps it); `synthetic` means sismo
+    # fabricated an id, recognized precisely by its magic prefix; `absent` means
+    # none at all; `mismatch` (should never appear) is a real-looking id that does
+    # not match the file — a capture bug. The reference id is read from the
+    # module's actual file (the trace path — e.g. the real libjvm.so, not the java
+    # launcher in cmd[0]); only when that file is gone do we fall back to cmd[0].
     trace_exists = os.path.exists(rec.trace)
     trace_bid = query_build_id(variant, rec.trace) if trace_exists else ""
     target_path = query_target_path(variant, rec.trace) if trace_exists else ""
@@ -768,10 +772,12 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
         real_bid = prebuilt_bid
     if not trace_bid:
         build_id = "absent"
+    elif trace_bid.startswith(SYNTH_MAGIC_HEX):
+        build_id = "synthetic"
     elif real_bid and trace_bid == real_bid:
         build_id = "gnu"
     else:
-        build_id = "synthetic"
+        build_id = "mismatch"
 
     lines = [
         f"record_exit: {rec.exit}",
