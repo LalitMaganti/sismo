@@ -784,7 +784,8 @@ fn run_linux(config: &RecordConfig) -> c_int {
         None
     } else {
         let focus = if focus_int == 0 { Some(FocusPreset::Cache) } else { None };
-        let c = linux_bpf_capture::init(target_pid as u32, focus, sample_density);
+        let c = linux_bpf_capture::init(
+            target_pid as u32, focus, sample_density, config.capture_offcpu);
         if c.is_none() {
             eprintln!("sismo record: bpf capture init failed — CPU samples disabled");
         }

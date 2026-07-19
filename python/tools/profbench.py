@@ -307,8 +307,11 @@ class SismoAdapter(Adapter):
         return "cap_bpf" in caps.stdout
 
     def record_cmd(self, wl_argv, out_path):
+        # --only cpu: CPU sampling alone, no off-CPU/heap/instrumentation, so the
+        # capture is equal-fidelity with perf's cycles-only record.
         extra = ["--no-symbolize"] if self.no_symbolize else []
-        return [SISMO_RUN, "record", *extra, "--output", out_path, *wl_argv]
+        return [SISMO_RUN, "record", "--only", "cpu", *extra,
+                "--output", out_path, *wl_argv]
 
     def _tp(self, out_path, sql):
         if not (os.path.exists(TP_SHELL) and os.path.exists(out_path)):

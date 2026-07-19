@@ -128,8 +128,17 @@ pub struct RecordArgs {
     no_heap: bool,
     #[arg(long)]
     external_heap: bool,
+    /// Skip off-CPU (blocking-stack) capture, sampling on-CPU only.
+    #[arg(long)]
+    no_offcpu: bool,
     #[arg(long)]
     all_external: bool,
+    /// Capture only these sources (comma list of cpu,sched,heap,instrumentation),
+    /// turning every other source off. `--only cpu` is the CPU-sampling-only
+    /// recording — the apples-to-apples config to compare against `perf record`.
+    /// Overrides the per-source --no-*/--external-* flags.
+    #[arg(long)]
+    only: Option<String>,
     #[arg(long)]
     focus: Option<String>,
     #[arg(long, value_parser = clap_density)]
@@ -156,6 +165,8 @@ pub struct RecordConfig {
     pub cpu_mode: SourceMode,
     pub heap_mode: SourceMode,
     pub no_instrumentation: bool,
+    /// Capture off-CPU (blocking-stack) samples alongside on-CPU sampling.
+    pub capture_offcpu: bool,
     /// Skip the post-record symbolization pass (leave native frames unresolved).
     pub no_symbolize: bool,
     pub focus: Option<String>,
@@ -184,6 +195,32 @@ impl RecordArgs {
                     *m = SourceMode::External;
                 }
             }
+        }
+
+        // --only <sources>: keep exactly the listed sources, everything else off
+        // — the CPU-only config that matches `perf record`. Takes precedence over
+        // the granular flags above.
+        let mut no_instr = self.no_instrumentation;
+        let mut capture_offcpu = !self.no_offcpu;
+        if let Some(only) = self.only.as_deref() {
+            let mut keep: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for s in only.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !matches!(s, "cpu" | "offcpu" | "sched" | "heap" | "instrumentation") {
+                    eprintln!("sismo record: --only: unknown source {s:?} (want cpu, offcpu, sched, heap, instrumentation)");
+                    return Err(0);
+                }
+                keep.insert(s);
+            }
+            if keep.is_empty() {
+                eprintln!("sismo record: --only needs at least one source");
+                return Err(0);
+            }
+            let on = |name| if keep.contains(name) { SourceMode::InProcess } else { SourceMode::Off };
+            sched = on("sched");
+            cpu = on("cpu");
+            heap = on("heap");
+            no_instr = !keep.contains("instrumentation");
+            capture_offcpu = keep.contains("offcpu");
         }
 
         // --pid is a macOS-only capability (Linux would need a pidfd exit watcher).
@@ -223,7 +260,8 @@ impl RecordArgs {
             sched_mode: sched,
             cpu_mode: cpu,
             heap_mode: heap,
-            no_instrumentation: self.no_instrumentation,
+            no_instrumentation: no_instr,
+            capture_offcpu,
             no_symbolize: self.no_symbolize,
             focus: self.focus,
             sample_density: self.sample_density,
@@ -264,6 +302,29 @@ mod tests {
     #[test]
     fn no_symbolize_flag() {
         assert!(parse(&["--no-symbolize", "./app"]).unwrap().no_symbolize);
+    }
+
+    #[test]
+    fn only_cpu_turns_the_rest_off() {
+        let a = parse(&["--only", "cpu", "./app"]).unwrap();
+        assert_eq!(a.cpu_mode, SourceMode::InProcess);
+        assert_eq!(a.sched_mode, SourceMode::Off);
+        assert_eq!(a.heap_mode, SourceMode::Off);
+        assert!(a.no_instrumentation);
+        assert!(!a.capture_offcpu); // on-CPU only, no blocking stacks
+        // off-CPU is on by default, and opt-in-able alongside cpu.
+        assert!(parse(&["./app"]).unwrap().capture_offcpu);
+        assert!(parse(&["--only", "cpu,offcpu", "./app"]).unwrap().capture_offcpu);
+        assert!(!parse(&["--no-offcpu", "./app"]).unwrap().capture_offcpu);
+    }
+
+    #[test]
+    fn only_multi_source_and_bad_source() {
+        let a = parse(&["--only", "cpu,sched", "./app"]).unwrap();
+        assert_eq!(a.cpu_mode, SourceMode::InProcess);
+        assert_eq!(a.sched_mode, SourceMode::InProcess);
+        assert_eq!(a.heap_mode, SourceMode::Off);
+        assert!(parse(&["--only", "bogus", "./app"]).is_none());
     }
 
     #[test]

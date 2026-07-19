@@ -1523,7 +1523,12 @@ fn load_perf_map(pid: u32) -> Vec<(u64, u64, String)> {
     out
 }
 
-fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *mut Capture {
+fn capture_init(
+    pid: u32,
+    focus: Option<FocusPreset>,
+    density: Option<f64>,
+    offcpu: bool,
+) -> *mut Capture {
     let cap = Box::into_raw(Box::new(Capture {
         obj: ptr::null_mut(),
         rb: ptr::null_mut(),
@@ -1689,31 +1694,34 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
         )
     };
 
-    let ss = unsafe { bpf_object__find_program_by_name(obj, c"on_sched_switch".as_ptr()) };
-    if !ss.is_null() {
-        let link = unsafe { bpf_program__attach(ss) };
-        if !link.is_null() {
-            c.links.push(link);
-        }
-    }
-
-    // Futex enter/exit + tcp_recvmsg entry/return: tag off-CPU blocks with what
-    // they wait on (the lock's futex uaddr, or the TCP peer). Best effort — a
-    // kernel that refuses any of these just loses that identity, not the
-    // off-CPU stacks.
-    for name in [
-        c"on_futex_enter".as_ptr(),
-        c"on_futex_exit".as_ptr(),
-        c"on_tcp_recvmsg".as_ptr(),
-        c"on_tcp_recvmsg_ret".as_ptr(),
-        c"on_vfs_read".as_ptr(),
-        c"on_vfs_read_ret".as_ptr(),
-    ] {
-        let prog = unsafe { bpf_object__find_program_by_name(obj, name) };
-        if !prog.is_null() {
-            let link = unsafe { bpf_program__attach(prog) };
+    // Off-CPU capture: the sched_switch blocking-stack program plus the
+    // futex/tcp/vfs probes that tag each block with what it waits on. Gated so a
+    // CPU-only recording (`--only cpu`) does no scheduler work at all.
+    if offcpu {
+        let ss = unsafe { bpf_object__find_program_by_name(obj, c"on_sched_switch".as_ptr()) };
+        if !ss.is_null() {
+            let link = unsafe { bpf_program__attach(ss) };
             if !link.is_null() {
                 c.links.push(link);
+            }
+        }
+
+        // Best effort — a kernel that refuses any of these just loses that
+        // identity, not the off-CPU stacks.
+        for name in [
+            c"on_futex_enter".as_ptr(),
+            c"on_futex_exit".as_ptr(),
+            c"on_tcp_recvmsg".as_ptr(),
+            c"on_tcp_recvmsg_ret".as_ptr(),
+            c"on_vfs_read".as_ptr(),
+            c"on_vfs_read_ret".as_ptr(),
+        ] {
+            let prog = unsafe { bpf_object__find_program_by_name(obj, name) };
+            if !prog.is_null() {
+                let link = unsafe { bpf_program__attach(prog) };
+                if !link.is_null() {
+                    c.links.push(link);
+                }
             }
         }
     }
@@ -1775,8 +1783,13 @@ fn capture_init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> *
 /// Start the Linux CPU collector for `pid`, or None if init failed. The worker
 /// thread keeps a raw pointer into the returned box for its lifetime, so the box
 /// must live until [`Capture::shutdown`] (which joins the worker first).
-pub fn init(pid: u32, focus: Option<FocusPreset>, density: Option<f64>) -> Option<Box<Capture>> {
-    let p = capture_init(pid, focus, density);
+pub fn init(
+    pid: u32,
+    focus: Option<FocusPreset>,
+    density: Option<f64>,
+    offcpu: bool,
+) -> Option<Box<Capture>> {
+    let p = capture_init(pid, focus, density, offcpu);
     if p.is_null() {
         None
     } else {
