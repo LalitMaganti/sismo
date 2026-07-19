@@ -181,6 +181,15 @@ def build_variants() -> list[Variant]:
                              "no frame pointers → the chain is partial and sismo "
                              "emits no diagnostic naming the missing unwind tables"),
               "gcc -O2, no unwind tables: neither DWARF CFI nor frame pointers")
+    # No .eh_frame_hdr (and no PT_GNU_EH_FRAME): the `.eh_frame` section is still
+    # present, so framehop indexes it directly and the FP-less stacks unwind to
+    # full chains — a regression guard for the no-hdr path. The point of the
+    # variant is Finding B: the phdr-only probe used to under-report this binary
+    # as having no CFI; it now also checks the `.eh_frame` section.
+    c_variant("c-gcc-O2-noehframehdr", ["gcc"],
+              ["-O2", "-Wl,--no-eh-frame-hdr"],
+              Expect(),
+              "gcc -O2, --no-eh-frame-hdr: .eh_frame kept but no lookup header")
     # Cross-TU optimization: LTO can rename/merge and inline across units.
     c_variant("c-gcc-O2-lto", ["gcc"], ["-O2", fp, "-flto"],
               Expect(),
@@ -269,6 +278,15 @@ def build_variants() -> list[Variant]:
                              "--strip-section-headers); names must be read "
                              "from PT_DYNAMIC/.dynsym, not section headers"),
               "no section header table; symbols only via .dynsym",
+              post=[["objcopy", "--strip-section-headers", "{BIN}", "{BIN}"]])
+    # FLAG-sectionless-eh (Finding A): a section-header-stripped binary that is
+    # ALSO frame-pointer-less. c-sectionless kept frame pointers, so its FP walk
+    # hid the bug; here there is no FP walk to fall back on, so unwinding must
+    # come from `.eh_frame` reached via PT_GNU_EH_FRAME/PT_LOAD. -rdynamic keeps
+    # the names in .dynsym (SYM-2) so the recovered chain is symbolized.
+    c_variant("c-clang-sectionless-nofp", ["clang"], ["-O2", "-rdynamic"],
+              Expect(),
+              "FP-less + no section headers: unwind from .eh_frame via phdrs",
               post=[["objcopy", "--strip-section-headers", "{BIN}", "{BIN}"]])
     c_variant("c-gnu-debugdata", ["clang"], ["-O2", fp],
               Expect(leaf="none", chain="na",

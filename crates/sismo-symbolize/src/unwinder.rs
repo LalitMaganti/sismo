@@ -381,6 +381,17 @@ fn register_elf(
     }
 
     if info.eh_frame.is_none() {
+        // No `.eh_frame` reachable through the section table — either the
+        // headers were stripped (`objcopy --strip-section-headers`) or there is
+        // no section named `.eh_frame`. Reach the unwind sections through the
+        // program headers the way the loader does, mirroring dynsym.rs's
+        // PT_DYNAMIC symbol fallback. A binary with genuinely no CFI (Go) has no
+        // PT_GNU_EH_FRAME either, so this leaves `info` untouched and we still
+        // report NoUnwindInfo.
+        let _ = fill_eh_frame_from_phdrs(bytes, &mut info);
+    }
+
+    if info.eh_frame.is_none() {
         return AddModule::NoUnwindInfo;
     }
 
@@ -396,6 +407,102 @@ fn register_elf(
     AddModule::Added
 }
 
+// Program header types for the section-header-stripped `.eh_frame` fallback.
+const PT_LOAD: u32 = 1;
+const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
+
+/// Recover `.eh_frame`/`.eh_frame_hdr` from the program headers when the section
+/// table can't reach them. `PT_GNU_EH_FRAME` covers `.eh_frame_hdr`, whose header
+/// points at `.eh_frame`; the containing `PT_LOAD` bounds the bytes. Returns
+/// `None` (leaving `info` untouched) on any malformed field or a binary with no
+/// CFI, so a hostile ELF can't panic us. `bytes` is the whole on-disk ELF.
+fn fill_eh_frame_from_phdrs(
+    bytes: &[u8],
+    info: &mut ExplicitModuleSectionInfo<Vec<u8>>,
+) -> Option<()> {
+    let ehdr = bytes.get(..64)?;
+    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 {
+        return None; // not ELFCLASS64
+    }
+    let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
+    let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as u64;
+    let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
+    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 4096 {
+        return None;
+    }
+
+    // Every PT_LOAD as (vaddr, offset, filesz) — used to map the .eh_frame vaddr
+    // to a file offset — plus the PT_GNU_EH_FRAME (.eh_frame_hdr) location.
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+    let mut hdr_seg: Option<(u64, u64, u64)> = None;
+    for i in 0..e_phnum as u64 {
+        let off = (e_phoff + i * e_phentsize) as usize;
+        let ph = bytes.get(off..off.checked_add(56)?)?;
+        let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
+        let p_offset = u64::from_le_bytes(ph[8..16].try_into().unwrap());
+        let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
+        let p_filesz = u64::from_le_bytes(ph[32..40].try_into().unwrap());
+        match p_type {
+            PT_LOAD => loads.push((p_vaddr, p_offset, p_filesz)),
+            PT_GNU_EH_FRAME => hdr_seg = Some((p_vaddr, p_offset, p_filesz)),
+            _ => {}
+        }
+    }
+    let (hdr_vaddr, hdr_off, hdr_filesz) = hdr_seg?;
+    let hdr_bytes = bytes.get(hdr_off as usize..hdr_off.checked_add(hdr_filesz)? as usize)?;
+
+    // Decode just the `eh_frame_ptr` field of `.eh_frame_hdr` to find where
+    // `.eh_frame` begins; framehop re-parses the header for the FDE index.
+    let eh_frame_vaddr = decode_eh_frame_ptr(hdr_bytes, hdr_vaddr)?;
+
+    // `.eh_frame` runs from that vaddr to the end of its PT_LOAD. Handing
+    // framehop the `.eh_frame_hdr` too means it binary-searches to the exact
+    // FDE, so the trailing bytes past the real section are never scanned.
+    let (lv, lo, lf) = loads
+        .iter()
+        .copied()
+        .find(|&(v, _, f)| eh_frame_vaddr >= v && eh_frame_vaddr < v.checked_add(f).unwrap_or(v))?;
+    let start_off = (eh_frame_vaddr - lv).checked_add(lo)? as usize;
+    let end_off = lo.checked_add(lf)? as usize;
+    let eh_frame = bytes.get(start_off..end_off)?;
+    let eh_frame_end_vaddr = eh_frame_vaddr + (end_off - start_off) as u64;
+
+    info.eh_frame_hdr = Some(hdr_bytes.to_vec());
+    info.eh_frame_hdr_svma = Some(hdr_vaddr..hdr_vaddr + hdr_filesz);
+    info.eh_frame = Some(eh_frame.to_vec());
+    info.eh_frame_svma = Some(eh_frame_vaddr..eh_frame_end_vaddr);
+    Some(())
+}
+
+/// Decode the `eh_frame_ptr` at offset 4 of a `.eh_frame_hdr` to an svma.
+/// The header's first four bytes are `version`, `eh_frame_ptr_enc`,
+/// `fde_count_enc`, `table_enc`; `eh_frame_ptr` follows, encoded per the second
+/// byte (a DW_EH_PE code). gcc/clang emit `pcrel|sdata4` (0x1b); the other
+/// fixed-width forms are handled too. `None` on an unsupported encoding.
+fn decode_eh_frame_ptr(hdr: &[u8], hdr_vaddr: u64) -> Option<u64> {
+    if hdr.len() < 4 || hdr[0] != 1 {
+        return None; // unsupported .eh_frame_hdr version
+    }
+    let enc = hdr[1];
+    const FIELD_OFF: usize = 4;
+    let data = hdr.get(FIELD_OFF..)?;
+    let field_vaddr = hdr_vaddr + FIELD_OFF as u64;
+    let raw: i128 = match enc & 0x0f {
+        0x00 | 0x04 => u64::from_le_bytes(data.get(..8)?.try_into().ok()?) as i128, // absptr/udata8
+        0x03 => u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as i128,        // udata4
+        0x0b => i32::from_le_bytes(data.get(..4)?.try_into().ok()?) as i128,        // sdata4
+        0x0c => i64::from_le_bytes(data.get(..8)?.try_into().ok()?) as i128,        // sdata8
+        _ => return None,
+    };
+    let base: i128 = match enc & 0x70 {
+        0x00 => 0,                    // absolute
+        0x10 => field_vaddr as i128,  // pcrel — relative to the field itself
+        0x30 => hdr_vaddr as i128,    // datarel — relative to .eh_frame_hdr start
+        _ => return None,
+    };
+    u64::try_from(base.checked_add(raw)?).ok()
+}
+
 // A self-unwind test: capture this thread's own regs + stack, register the
 // running executable's ELF, walk, and confirm framehop recovers the actual
 // call chain through frame-pointer-independent DWARF CFI. This is the NAT-1
@@ -405,18 +512,18 @@ mod x86_64_self_unwind {
     use super::*;
 
     #[inline(never)]
-    fn level1(out: &mut Vec<u64>) {
-        level2(out);
+    fn level1(out: &mut Vec<u64>, module: &[u8]) {
+        level2(out, module);
         std::hint::black_box(out);
     }
     #[inline(never)]
-    fn level2(out: &mut Vec<u64>) {
-        level3(out);
+    fn level2(out: &mut Vec<u64>, module: &[u8]) {
+        level3(out, module);
         std::hint::black_box(out);
     }
     #[inline(never)]
-    fn level3(out: &mut Vec<u64>) {
-        capture_and_walk(out);
+    fn level3(out: &mut Vec<u64>, module: &[u8]) {
+        capture_and_walk(out, module);
         std::hint::black_box(out);
     }
 
@@ -443,7 +550,7 @@ mod x86_64_self_unwind {
         panic!("no file-offset-0 mapping for {exe}");
     }
 
-    fn capture_and_walk(out: &mut Vec<u64>) {
+    fn capture_and_walk(out: &mut Vec<u64>, module: &[u8]) {
         let (rip, rsp, rbp): (u64, u64, u64);
         unsafe {
             core::arch::asm!(
@@ -470,10 +577,9 @@ mod x86_64_self_unwind {
         let n = mem.read_at(&mut buf, rsp).unwrap_or(0);
         buf.truncate(n);
 
-        let exe = std::fs::read("/proc/self/exe").unwrap();
         let mut unw = Unwinder::new_x86_64();
         assert!(matches!(
-            unw.add_module(exe_load_address(), &exe),
+            unw.add_module(exe_load_address(), module),
             AddModule::Added
         ));
 
@@ -485,21 +591,16 @@ mod x86_64_self_unwind {
         );
     }
 
-    #[test]
-    fn recovers_the_call_chain() {
-        let mut pcs = Vec::new();
-        level1(&mut pcs);
-
+    /// Assert the walk recovered the level1→2→3 chain. Each caller's return
+    /// address lands within a small window after its entry; these functions are
+    /// tiny, so 4 KiB bounds each. Finding all three proves framehop stepped the
+    /// real chain, not just that it produced some frames.
+    fn assert_recovered_chain(pcs: &[u64]) {
         assert!(
             pcs.len() >= 4,
             "expected a deep chain from CFI unwinding, got {} frames: {pcs:x?}",
             pcs.len()
         );
-
-        // Each caller's return address lands inside that caller's body, i.e.
-        // within a small window after its entry. These functions are tiny, so
-        // 4 KiB comfortably bounds each. Finding all three proves framehop
-        // stepped the real chain, not just that it produced some frames.
         let want = [
             ("level1", level1 as *const () as u64),
             ("level2", level2 as *const () as u64),
@@ -511,5 +612,43 @@ mod x86_64_self_unwind {
                 "{name} (@{entry:#x}) not found in recovered pcs {pcs:x?}"
             );
         }
+    }
+
+    /// Zero the section-header fields of an ELF header, simulating `objcopy
+    /// --strip-section-headers`: `object` then finds no sections and unwinding
+    /// must fall back to the program headers.
+    fn strip_section_headers(elf: &[u8]) -> Vec<u8> {
+        let mut b = elf.to_vec();
+        b[40..48].fill(0); // e_shoff
+        b[58..60].fill(0); // e_shentsize
+        b[60..62].fill(0); // e_shnum
+        b[62..64].fill(0); // e_shstrndx
+        b
+    }
+
+    #[test]
+    fn recovers_the_call_chain() {
+        let exe = std::fs::read("/proc/self/exe").unwrap();
+        let mut pcs = Vec::new();
+        level1(&mut pcs, &exe);
+        assert_recovered_chain(&pcs);
+    }
+
+    // The core FLAG-sectionless-eh guarantee: with the section header table
+    // gone, `register_elf` must still reach `.eh_frame`/`.eh_frame_hdr` through
+    // PT_GNU_EH_FRAME + PT_LOAD and unwind exactly as it does with sections.
+    #[test]
+    fn recovers_the_call_chain_without_section_headers() {
+        let exe = std::fs::read("/proc/self/exe").unwrap();
+        let stripped = strip_section_headers(&exe);
+        // Sanity: the strip really removed section-based access.
+        {
+            use object::Object;
+            let f = object::File::parse(&stripped[..]).unwrap();
+            assert!(f.section_by_name(".eh_frame").is_none());
+        }
+        let mut pcs = Vec::new();
+        level1(&mut pcs, &stripped);
+        assert_recovered_chain(&pcs);
     }
 }

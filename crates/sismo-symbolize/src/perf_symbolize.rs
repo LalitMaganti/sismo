@@ -308,16 +308,19 @@ fn print_fp_diagnostic(name: &[u8], shape: &crate::stack_quality::StackShape) {
     eprintln!("      rustc:     -Cforce-frame-pointers=yes  (or RUSTFLAGS)");
     eprintln!("      gcc/clang: -fno-omit-frame-pointer  (gcc still omits leaf-function");
     eprintln!("                 frame pointers — use clang for full fidelity)");
-    // If the binary already ships .eh_frame, offline DWARF unwinding will
-    // recover these without a rebuild once that lands — say so rather than
-    // implying a rebuild is the only path.
+    // sismo's offline DWARF unwinder is always on, so a stack that is still
+    // truncated here was *not* recovered from CFI — even if the binary ships an
+    // `.eh_frame` section, it doesn't cover this module's own functions (its
+    // FDEs are the crt/libc ones). Say that rather than promising a recovery
+    // that already ran and didn't help.
     if let Ok(p) = std::str::from_utf8(name) {
         if crate::stack_quality::probe_unwind_capability(p)
             .is_some_and(|c| c.has_eh_frame)
         {
             eprintln!(
-                "    (this binary carries .eh_frame, so sismo will recover these stacks\n    \
-                 automatically once offline unwinding lands — no rebuild needed then.)"
+                "    (this binary has an .eh_frame section, but sismo's DWARF unwinder\n    \
+                 could not extend these stacks from it — the sampled code isn't covered\n    \
+                 by unwind tables, so rebuilding with frame pointers is the fix.)"
             );
         }
     }
