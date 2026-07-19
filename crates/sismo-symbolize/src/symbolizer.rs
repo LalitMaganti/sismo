@@ -305,6 +305,32 @@ pub fn is_synthetic_name(name: &str) -> bool {
 /// being folded into its caller; keeping only the last one made inlined hot
 /// functions invisible. The physical function's name comes from the symtab
 /// (`info.symbol.name`) when its DWARF frame has no function.
+/// Strip GCC/LLVM clone and hot/cold-split suffixes so a sample in a specialized
+/// clone or a function's cold half attributes to the base function instead of
+/// showing as a separate symbol that splits its cost. gcc emits `foo.isra.0`,
+/// `foo.constprop.1`, `foo.part.0` at plain `-O2`; hot/cold splitting emits
+/// `foo.cold`; ThinLTO/LTO emit `foo.llvm.<hash>` / `foo.lto_priv.0`. Suffixes
+/// chain (`foo.constprop.0.isra.1`), so cut at the first clone-tag segment. Only
+/// exact `.`-delimited tag segments are stripped, so a real name like
+/// `foo.israble` is untouched. These suffixes live on the symtab symbol, not the
+/// DWARF `DW_AT_name`, but stripping is a no-op on an already-clean name.
+fn strip_clone_suffix(name: &str) -> &str {
+    const TAGS: [&str; 7] =
+        ["isra", "constprop", "part", "cold", "llvm", "lto_priv", "clone"];
+    let mut idx = 0;
+    while let Some(dot) = name[idx..].find('.') {
+        let seg_start = idx + dot + 1;
+        let seg_end = name[seg_start..]
+            .find('.')
+            .map_or(name.len(), |p| seg_start + p);
+        if TAGS.contains(&&name[seg_start..seg_end]) {
+            return &name[..idx + dot];
+        }
+        idx = seg_start;
+    }
+    name
+}
+
 fn frames_from_lookup(info: &wholesym::AddressInfo, rel: u32) -> Resolved {
     let frames: Vec<Frame> = match info.frames.as_ref().filter(|f| !f.is_empty()) {
         Some(dwarf) => {
@@ -313,9 +339,10 @@ fn frames_from_lookup(info: &wholesym::AddressInfo, rel: u32) -> Resolved {
                 .iter()
                 .enumerate()
                 .map(|(i, f)| {
-                    let name = f.function.clone().unwrap_or_else(|| {
+                    let raw = f.function.clone().unwrap_or_else(|| {
                         if i == last { info.symbol.name.clone() } else { String::new() }
                     });
+                    let name = strip_clone_suffix(&raw).to_string();
                     let file = f
                         .file_path
                         .as_ref()
@@ -330,7 +357,11 @@ fn frames_from_lookup(info: &wholesym::AddressInfo, rel: u32) -> Resolved {
     // Symtab-only modules (no DWARF) and the all-anonymous-frame edge fall back
     // to the single symbol name with no source location.
     let frames = if frames.is_empty() {
-        vec![Frame { name: info.symbol.name.clone(), file: None, line: 0 }]
+        vec![Frame {
+            name: strip_clone_suffix(&info.symbol.name).to_string(),
+            file: None,
+            line: 0,
+        }]
     } else {
         frames
     };
@@ -341,6 +372,25 @@ fn frames_from_lookup(info: &wholesym::AddressInfo, rel: u32) -> Resolved {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_clone_suffix_merges_clones_and_splits() {
+        // GCC IPA clones and hot/cold split, including chained suffixes.
+        assert_eq!(strip_clone_suffix("sismo_wl_leaf.isra.0"), "sismo_wl_leaf");
+        assert_eq!(strip_clone_suffix("foo.constprop.1"), "foo");
+        assert_eq!(strip_clone_suffix("foo.part.0"), "foo");
+        assert_eq!(strip_clone_suffix("foo.cold"), "foo");
+        assert_eq!(strip_clone_suffix("foo.constprop.0.isra.1"), "foo");
+        // LLVM ThinLTO / LTO promotion.
+        assert_eq!(strip_clone_suffix("foo.llvm.12345678"), "foo");
+        assert_eq!(strip_clone_suffix("foo.lto_priv.0"), "foo");
+        // Plain names and names that merely contain a tag as a substring of a
+        // larger segment are left untouched.
+        assert_eq!(strip_clone_suffix("sismo_wl_leaf"), "sismo_wl_leaf");
+        assert_eq!(strip_clone_suffix("israble"), "israble");
+        assert_eq!(strip_clone_suffix("foo.israble"), "foo.israble");
+        assert_eq!(strip_clone_suffix("coldstart"), "coldstart");
+    }
 
     fn add(s: &mut Symbolizer, path: &str) -> ModuleLoad {
         s.add_module(0, 0x300000, Path::new(path), None, None)
