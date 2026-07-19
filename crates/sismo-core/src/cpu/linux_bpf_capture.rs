@@ -11,7 +11,9 @@ use std::os::raw::{c_char, c_int, c_void};
 pub const SISMO_MAX_CPUS: usize = 256;
 pub const SISMO_MAX_STACK: usize = 64;
 pub const SISMO_MAX_KERNEL_STACK: usize = 64;
+pub const SISMO_MAX_PY_FRAMES: usize = 16;
 pub const SISMO_KSYM_NAME_MAX: usize = 96;
+pub const SISMO_PY_NAME_MAX: usize = 128;
 pub const SISMO_MAX_COUNTERS: usize = 12;
 
 pub const SISMO_EVT_SAMPLE: u32 = 0;
@@ -19,6 +21,7 @@ pub const SISMO_EVT_KSYM: u32 = 1;
 pub const SISMO_EVT_OFFCPU: u32 = 2;
 pub const SISMO_EVT_FILE: u32 = 3;
 pub const SISMO_EVT_SAMPLE_UNWIND: u32 = 4;
+pub const SISMO_EVT_PYFRAME: u32 = 5;
 
 /// Bytes of the raw user-stack snapshot in `SismoUnwindRec` (perf's default
 /// PERF_SAMPLE_STACK_USER size).
@@ -39,6 +42,7 @@ pub struct SismoHdr {
     pub timebase: u32,
     pub nr_frames: u32,
     pub nr_kernel_frames: u32,
+    pub nr_py_frames: u32, // CAP-1; fills the former pad before `ts`
     pub ts: u64,
 }
 
@@ -51,6 +55,7 @@ pub struct SismoSampleRec {
     pub counters: [u64; SISMO_MAX_COUNTERS],
     pub stack: [u64; SISMO_MAX_STACK],
     pub kernel_ids: [u32; SISMO_MAX_KERNEL_STACK],
+    pub py_ids: [u32; SISMO_MAX_PY_FRAMES], // CAP-1: Python frame-name ids, leaf-first
 }
 
 /// SISMO_EVT_SAMPLE_UNWIND. Composes `SismoSampleRec` verbatim (byte-identical
@@ -75,6 +80,31 @@ pub struct SismoKsymRec {
     pub r#type: u32,
     pub id: u32,
     pub name: [c_char; SISMO_KSYM_NAME_MAX],
+}
+
+/// SISMO_EVT_PYFRAME. One-time (id -> CPython qualname) mapping (CAP-1).
+#[repr(C)]
+pub struct SismoPyframeRec {
+    pub r#type: u32,
+    pub id: u32,
+    pub name: [c_char; SISMO_PY_NAME_MAX],
+}
+
+/// CAP-1 config pushed into the BPF `py_cfg` map: `_PyRuntime` avma + the
+/// `_Py_DebugOffsets` field offsets the in-BPF interpreter walk reads. Mirrors
+/// `struct sismo_py_cfg`. `runtime == 0` disables the walk.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SismoPyCfg {
+    pub runtime: u64,
+    pub interpreters_head: u64,
+    pub threads_head: u64,
+    pub current_frame: u64,
+    pub frame_previous: u64,
+    pub frame_executable: u64,
+    pub code_qualname: u64,
+    pub unicode_length: u64,
+    pub unicode_data: u64,
 }
 
 // ---- libbpf (system -lbpf, from bpf/libbpf.h) -----------------------------
@@ -775,6 +805,9 @@ pub struct Capture {
     offcpu_interner: Interner,
     ksym_names: HashMap<u32, Vec<u8>>, // id -> bare function name
     file_names: HashMap<u32, Vec<u8>>, // interned file id -> base name
+    py_names: HashMap<u32, Vec<u8>>,   // CAP-1: id -> Python qualname
+    py_cfg_fd: c_int,                  // CAP-1: fd of the py_cfg BPF map (-1 if absent)
+    python_bpf: bool,                  // CAP-1: in-BPF walk armed (py_cfg pushed)
     counters: Vec<Counter>,
     active_slots: Vec<u8>, // indices into `counters`; [0] is the timebase
     focus: Option<FocusPreset>,
@@ -893,11 +926,27 @@ impl Capture {
             // 3.11+ runs the bytecode loop without one native frame per
             // Python call, so the FP walk alone never sees these).
             if self.residual_map.as_ref().and_then(|r| r.runtime()) == Some("python") {
-                let py_frames = self.python_frames();
+                // Arm the in-BPF walk on first sight (idempotent); pushes py_cfg.
+                self.ensure_python_runtime();
+                // CAP-1: in BPF mode use the frame ids the in-BPF walk attached
+                // to this exact sample — no host `/proc/<pid>/mem` walk at all,
+                // so nothing is stale and no per-sample memory read happens. A
+                // handful of samples captured before py_cfg was armed carry no
+                // ids and simply show no Python frames. Only SISMO_PYSTACK_BPF=0
+                // takes the legacy host walk.
+                let py_frames: Vec<Vec<u8>> = if self.python_bpf {
+                    let n = (rec.hdr.nr_py_frames as usize).min(SISMO_MAX_PY_FRAMES);
+                    rec.py_ids[..n]
+                        .iter()
+                        .filter_map(|id| self.py_names.get(id).cloned())
+                        .collect()
+                } else {
+                    self.python_frames().into_iter().map(String::into_bytes).collect()
+                };
                 if !py_frames.is_empty() {
                     let mapping_iid = self.interner.intern_residual_mapping(b"[python]", idw);
                     for name in &py_frames {
-                        let name_iid = self.interner.intern_func_name(name.as_bytes(), idw);
+                        let name_iid = self.interner.intern_func_name(name, idw);
                         let frame_iid = self.interner.intern_frame(
                             FrameKey { mapping_iid, rel_pc: 0, name_iid },
                             idw,
@@ -1305,6 +1354,36 @@ impl Capture {
         let Some(offs) = crate::symbolize::python_offsets::parse(&blob) else {
             return;
         };
+
+        // CAP-1: push the offsets + _PyRuntime avma into the BPF `py_cfg` map so
+        // the in-BPF walk (on_tick) recovers Python frames at sample time, exact
+        // and race-free, instead of the host `/proc/<pid>/mem` walk. Gated by
+        // SISMO_PYSTACK_BPF (default on); off falls back to the host walk.
+        let bpf_walk = std::env::var("SISMO_PYSTACK_BPF").as_deref() != Ok("0");
+        if bpf_walk && self.py_cfg_fd >= 0 {
+            let cfg = SismoPyCfg {
+                runtime: avma,
+                interpreters_head: offs.interpreters_head,
+                threads_head: offs.threads_head,
+                current_frame: offs.current_frame,
+                frame_previous: offs.frame_previous,
+                frame_executable: offs.frame_executable,
+                code_qualname: offs.code_qualname,
+                unicode_length: offs.unicode_length,
+                unicode_data: offs.unicode_asciiobject_size,
+            };
+            let zero: u32 = 0;
+            let rc = unsafe {
+                bpf_map_update_elem(
+                    self.py_cfg_fd,
+                    &zero as *const u32 as *const c_void,
+                    &cfg as *const SismoPyCfg as *const c_void,
+                    0,
+                )
+            };
+            self.python_bpf = rc == 0;
+        }
+
         self.python_runtime = Some((avma, offs));
     }
 
@@ -1340,6 +1419,11 @@ impl Capture {
         if hdr.r#type == SISMO_EVT_FILE {
             let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoKsymRec) };
             self.handle_file(rec);
+            return;
+        }
+        if hdr.r#type == SISMO_EVT_PYFRAME {
+            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoPyframeRec) };
+            self.handle_pyframe(rec);
             return;
         }
         if hdr.r#type == SISMO_EVT_OFFCPU {
@@ -1396,6 +1480,18 @@ impl Capture {
             unsafe { std::slice::from_raw_parts(rec.name.as_ptr() as *const u8, SISMO_KSYM_NAME_MAX) };
         let name = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
         self.file_names.insert(rec.id, name.to_vec());
+    }
+
+    // CAP-1: a CPython qualname definition (id -> name) the BPF walk emitted the
+    // first time it saw a code object. Same intern-by-id pattern as ksym.
+    fn handle_pyframe(&mut self, rec: &SismoPyframeRec) {
+        if self.py_names.contains_key(&rec.id) {
+            return;
+        }
+        let raw: &[u8] =
+            unsafe { std::slice::from_raw_parts(rec.name.as_ptr() as *const u8, SISMO_PY_NAME_MAX) };
+        let name = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
+        self.py_names.insert(rec.id, name.to_vec());
     }
 }
 
@@ -1547,6 +1643,9 @@ fn capture_init(
         offcpu_interner: Interner::new(),
         ksym_names: HashMap::new(),
         file_names: HashMap::new(),
+        py_names: HashMap::new(),
+        py_cfg_fd: -1,
+        python_bpf: false,
         counters: Vec::new(),
         active_slots: Vec::new(),
         focus,
@@ -1617,6 +1716,9 @@ fn capture_init(
             return ptr::null_mut();
         }
     };
+    // CAP-1: the Python-offsets config map (populated later, once the target's
+    // interpreter is located). Best-effort — absent on a pre-CAP-1 object.
+    c.py_cfg_fd = map_fd(obj, c"py_cfg").unwrap_or(-1);
 
     let max_cpus = SISMO_MAX_CPUS as u32;
     let ncpu = (unsafe { libbpf_num_possible_cpus() } as u32).min(max_cpus);

@@ -16,7 +16,9 @@
 #define SISMO_MAX_CPUS 256
 #define SISMO_MAX_STACK 64      // max user frames per sample
 #define SISMO_MAX_KERNEL_STACK 64  // max kernel frames per sample
+#define SISMO_MAX_PY_FRAMES 16  // max CPython interpreter frames per sample (CAP-1)
 #define SISMO_KSYM_NAME_MAX 96  // max bytes of a resolved kernel symbol name
+#define SISMO_PY_NAME_MAX 128   // max bytes of a Python qualname (power of two)
 // Max PMU counters tracked per thread, across all multiplexed groups. Userspace
 // (linux_bpf_capture.zig) parks up to this many events; the active candidate
 // list may be shorter (unused slots read back as errors → 0). Bump when adding
@@ -60,6 +62,12 @@ enum sismo_event_type {
   // user-stack snapshot for host-side DWARF unwinding (NAT-1). The embedded
   // `sample` is byte-identical to a SISMO_EVT_SAMPLE record.
   SISMO_EVT_SAMPLE_UNWIND = 4,
+  // A CPython qualname definition: the (id, name) for an interpreter frame's
+  // code-object qualname the BPF program recovered for the first time (CAP-1).
+  // Same (id, name) shape/role as SISMO_EVT_KSYM, emitted once ahead of the
+  // sample whose py_ids[] reference it, so userspace names Python frames
+  // without the host walking the interpreter's memory.
+  SISMO_EVT_PYFRAME = 5,
 };
 
 // Max bytes of the raw user-stack snapshot carried by SISMO_EVT_SAMPLE_UNWIND;
@@ -74,6 +82,9 @@ struct sismo_hdr {
   unsigned int timebase;      // SAMPLE: which sampler/timebase fired (attach cookie index)
   unsigned int nr_frames;     // SAMPLE: number of valid entries in stack[]
   unsigned int nr_kernel_frames;  // SAMPLE: number of valid entries in kernel_stack[]
+  unsigned int nr_py_frames;  // SAMPLE: valid entries in py_ids[] (CAP-1; fills
+                              // the former padding before `ts`, so layout is
+                              // unchanged for readers that ignore it)
   unsigned long long ts;      // CLOCK_MONOTONIC ns
 };
 
@@ -94,6 +105,10 @@ struct sismo_sample_rec {
   unsigned long long counters[SISMO_MAX_COUNTERS];
   unsigned long long stack[SISMO_MAX_STACK];
   unsigned int kernel_ids[SISMO_MAX_KERNEL_STACK];
+  // CAP-1: CPython frame-name ids, leaf-first (see SISMO_EVT_PYFRAME). 0 unless
+  // the target is a recognized interpreter and the in-BPF walk recovered
+  // frames; count in hdr.nr_py_frames.
+  unsigned int py_ids[SISMO_MAX_PY_FRAMES];
 };
 
 // SISMO_EVT_SAMPLE_UNWIND. Composes sismo_sample_rec verbatim (hdr.type =
@@ -121,6 +136,32 @@ struct sismo_ksym_rec {
   unsigned int type;  // = SISMO_EVT_KSYM (aliases sismo_hdr.type)
   unsigned int id;
   char name[SISMO_KSYM_NAME_MAX];
+};
+
+// SISMO_EVT_PYFRAME. A one-time (id -> CPython qualname) mapping, the interpreter
+// analogue of sismo_ksym_rec: the BPF walk read the qualname from the target's
+// interpreter memory and ships the interned id, so the sample carries only ids.
+struct sismo_pyframe_rec {
+  unsigned int type;  // = SISMO_EVT_PYFRAME (aliases sismo_hdr.type)
+  unsigned int id;
+  char name[SISMO_PY_NAME_MAX];
+};
+
+// CAP-1 config: the `_PyRuntime` runtime address + the `_Py_DebugOffsets` field
+// offsets the in-BPF interpreter walk needs, pushed once by the host when the
+// target is a recognized CPython 3.14. `runtime == 0` disables the walk. Each
+// offset is a byte offset into the corresponding live CPython struct (mirrors
+// the host PyDebugOffsets the /proc/<pid>/mem walk used).
+struct sismo_py_cfg {
+  unsigned long long runtime;             // _PyRuntime avma (0 = disabled)
+  unsigned long long interpreters_head;   // _PyRuntime.interpreters.head
+  unsigned long long threads_head;        // PyInterpreterState.threads.head
+  unsigned long long current_frame;       // PyThreadState.current_frame
+  unsigned long long frame_previous;      // _PyInterpreterFrame.previous
+  unsigned long long frame_executable;    // _PyInterpreterFrame.f_executable (code obj)
+  unsigned long long code_qualname;       // PyCodeObject.co_qualname
+  unsigned long long unicode_length;      // PyASCIIObject.length
+  unsigned long long unicode_data;        // ASCII header size (char data start)
 };
 
 #endif  // SISMO_SRC_C_SISMO_BPF_SISMO_BPF_H_

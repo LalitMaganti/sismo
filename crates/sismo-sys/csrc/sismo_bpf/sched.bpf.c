@@ -108,6 +108,31 @@ struct {
   __type(value, __u64);
 } ksym_next SEC(".maps");
 
+// CAP-1 CPython interpreter unwind. py_cfg holds the _PyRuntime avma + the
+// _Py_DebugOffsets the in-BPF walk reads (runtime 0 = disabled, the default for
+// non-Python targets). pyframe_ids/pyframe_next intern a qualname object pointer
+// to an id, the same LRU + monotonic-allocator pattern as ksym.
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct sismo_py_cfg);
+} py_cfg SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, __u64);  // co_qualname PyUnicode pointer
+  __type(value, __u32);
+} pyframe_ids SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u64);
+} pyframe_next SEC(".maps");
+
 // Per-CPU scratch for the kernel stack: bpf_get_stack writes the addresses here
 // (kept off the 512-byte BPF stack and out of the shipped record); the resolve
 // loop then fills `id` in place.
@@ -270,6 +295,96 @@ static __always_inline __u32 resolve_file(struct file *file) {
     bpf_ringbuf_submit(k, 0);
   }
   return id;
+}
+
+// CAP-1: intern a CPython code-object qualname (keyed by the PyUnicode pointer)
+// to an id, emitting a SISMO_EVT_PYFRAME (id -> name) on first sight — the
+// resolve_ksym pattern for interpreter frames. `qual` is the co_qualname pointer
+// in the target; `pc` supplies the unicode offsets. Returns 0 if none minted.
+static __noinline __u32 resolve_pyframe(struct sismo_py_cfg *pc, __u64 qual) {
+  __u32 *idp = bpf_map_lookup_elem(&pyframe_ids, &qual);
+  if (idp)
+    return *idp;
+
+  __u32 zero = 0;
+  __u64 *next = bpf_map_lookup_elem(&pyframe_next, &zero);
+  if (!next)
+    return 0;
+  __u32 id = (__u32)__sync_fetch_and_add(next, 1) + 1;
+  bpf_map_update_elem(&pyframe_ids, &qual, &id, BPF_ANY);
+
+  struct sismo_pyframe_rec *r = bpf_ringbuf_reserve(&events, sizeof(*r), 0);
+  if (r) {
+    r->type = SISMO_EVT_PYFRAME;
+    r->id = id;
+    r->name[0] = 0;
+    // co_qualname is a compact-ASCII PyUnicode: `length` then that many chars at
+    // the ASCII-header size. Mask the length to the buffer (power of two) so the
+    // verifier accepts the variable-size read.
+    __u64 len = 0;
+    bpf_probe_read_user(&len, sizeof(len), (void *)(qual + pc->unicode_length));
+    len &= (SISMO_PY_NAME_MAX - 1);
+    if (len)
+      bpf_probe_read_user(r->name, len, (void *)(qual + pc->unicode_data));
+    r->name[len] = 0;
+    bpf_ringbuf_submit(r, 0);
+  }
+  return id;
+}
+
+// CAP-1: walk the sampled thread's CPython frame chain directly in the target's
+// memory (bpf_probe_read_user, exact at sample time) and fill py_ids[] leaf-first,
+// returning the count. Mirrors the host PY-1 walk: _PyRuntime -> first
+// interpreter -> first thread state -> current_frame -> `previous` chain, naming
+// each frame's code-object qualname. A frameless C-shim frame (executable == 0)
+// is skipped, not named. No-op when py_cfg is unset (every non-Python target).
+static __noinline __u32 walk_python(__u32 *py_ids) {
+  __u32 zero = 0;
+  struct sismo_py_cfg *pc = bpf_map_lookup_elem(&py_cfg, &zero);
+  if (!pc || !pc->runtime)
+    return 0;
+
+  __u64 interp = 0, tstate = 0, frame = 0;
+  if (bpf_probe_read_user(&interp, sizeof(interp),
+                          (void *)(pc->runtime + pc->interpreters_head)) ||
+      !interp)
+    return 0;
+  if (bpf_probe_read_user(&tstate, sizeof(tstate),
+                          (void *)(interp + pc->threads_head)) ||
+      !tstate)
+    return 0;
+  if (bpf_probe_read_user(&frame, sizeof(frame),
+                          (void *)(tstate + pc->current_frame)))
+    return 0;
+
+  // Real bounded loop (not unrolled): the verifier walks the body once with a
+  // bounded trip count, which keeps on_tick's complexity under the limit — the
+  // 32x-unrolled form blew -E2BIG.
+  __u32 n = 0;
+  for (int i = 0; i < SISMO_MAX_PY_FRAMES; i++) {
+    if (!frame || n >= SISMO_MAX_PY_FRAMES)
+      break;
+    __u64 code = 0;
+    if (bpf_probe_read_user(&code, sizeof(code),
+                            (void *)(frame + pc->frame_executable)))
+      break;
+    if (code) {
+      __u64 qual = 0;
+      if (!bpf_probe_read_user(&qual, sizeof(qual),
+                               (void *)(code + pc->code_qualname)) &&
+          qual) {
+        __u32 id = resolve_pyframe(pc, qual);
+        if (id)
+          py_ids[n++ & (SISMO_MAX_PY_FRAMES - 1)] = id;
+      }
+    }
+    __u64 nextf = 0;
+    if (bpf_probe_read_user(&nextf, sizeof(nextf),
+                            (void *)(frame + pc->frame_previous)))
+      break;
+    frame = nextf;
+  }
+  return n;
 }
 
 static __always_inline __u32 target_tgid(void) {
@@ -603,6 +718,8 @@ int on_tick(struct bpf_perf_event_data *ctx) {
     ue->sample.hdr.nr_frames = (un > 0) ? (__u32)(un / 8) : 0;
     for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
       ue->sample.kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
+    // CAP-1: recover CPython frames from the interpreter's memory at sample time.
+    ue->sample.hdr.nr_py_frames = walk_python(ue->sample.py_ids);
 
     // bpf_perf_event_data.regs is an opaque u64[21] blob (see kernel_defs.h)
     // laid out exactly like x86_64 struct pt_regs, so the CO-RE-safe
@@ -657,6 +774,7 @@ int on_tick(struct bpf_perf_event_data *ctx) {
   e->hdr.nr_frames = (n > 0) ? (__u32)(n / 8) : 0;
   for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
     e->kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
+  e->hdr.nr_py_frames = walk_python(e->py_ids);  // CAP-1
   bpf_ringbuf_submit(e, 0);
   return 0;
 }
