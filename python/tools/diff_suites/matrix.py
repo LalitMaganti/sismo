@@ -477,7 +477,11 @@ def build_variants() -> list[Variant]:
         Expect(leaf="none", chain="na", module_status="no symbols",
                diags=[r"no longer|deleted|not found|missing"]),
         [["gcc", "-O2", fp, "-o", b, wl_c]],
-        mid_run=(0.6, "delete")))
+        # Delete before the host's first /proc/<pid>/maps read (~0.2s in), so the
+        # only path to a real build-id is CAP-2's in-band copy from mapped memory
+        # at sample time. A later deletion lets the host file read win and the
+        # test would pass even with CAP-2 off.
+        mid_run=(0.1, "delete")))
 
     return v
 

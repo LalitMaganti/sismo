@@ -598,6 +598,15 @@ struct Interner {
     build_ids: HashMap<Vec<u8>, u64>,
     func_names: HashMap<Vec<u8>, u64>,
     mappings: HashMap<u64, u64>, // map.start -> iid
+    // CAP-2: enough of each interned mapping to re-emit its definition, keyed by
+    // image base. When the in-band module record lands after the mapping was
+    // already interned with a synthetic build-id, we re-emit the same iid with
+    // the real one — the build-id lives on the mapping, so every sample that
+    // references it resolves to the corrected id. (iid, start, end, offset, path_iid)
+    mapping_reemit: HashMap<u64, Vec<(u64, u64, u64, u64, u64)>>,
+    // The build-id each base was interned with, so re-emit is skipped when the
+    // in-band id matches what the host read already supplied (the live-binary case).
+    mapping_reemit_bid: HashMap<u64, Vec<u8>>,
     frames: HashMap<FrameKey, u64>,
     callstacks: HashMap<Vec<u8>, u64>, // frame-id bytes -> iid
     next_path: u64,
@@ -693,7 +702,39 @@ impl Interner {
             mp.write_uint64(8, offset);
             mp.write_uint64(7, path_iid);
         });
+        self.mapping_reemit
+            .entry(base_avma)
+            .or_default()
+            .push((iid, start, end, offset, path_iid));
+        self.mapping_reemit_bid.insert(base_avma, build_id.to_vec());
         iid
+    }
+
+    /// CAP-2: re-emit every mapping sharing `base` with `build_id`, reusing the
+    /// original iid so trace_processor rebinds the build-id on the existing
+    /// mapping. Called when the in-band module record arrives after the mapping
+    /// was interned with a synthetic id. Returns whether anything was emitted.
+    fn reemit_build_id(&mut self, base: u64, build_id: &[u8], idw: &mut ProtoWriter) -> bool {
+        if self.mapping_reemit_bid.get(&base).map(|b| b.as_slice()) == Some(build_id) {
+            return false; // host read already interned this id — nothing to correct
+        }
+        let params = match self.mapping_reemit.get(&base) {
+            Some(p) if !p.is_empty() => p.clone(),
+            _ => return false,
+        };
+        let build_id_iid = self.intern_build_id(build_id, idw);
+        for (iid, start, end, offset, path_iid) in params {
+            idw.message(19, |mp| {
+                mp.write_uint64(1, iid);
+                mp.write_uint64(2, build_id_iid);
+                mp.write_uint64(4, start);
+                mp.write_uint64(5, end);
+                mp.write_uint64(6, base);
+                mp.write_uint64(8, offset);
+                mp.write_uint64(7, path_iid);
+            });
+        }
+        true
     }
 
     /// The synthetic "[kernel.kallsyms]" mapping every kernel frame shares
@@ -1518,9 +1559,22 @@ impl Capture {
             return;
         }
         let n = (rec.prefix_len as usize).min(SISMO_MODULE_PREFIX);
-        if let Some(id) = crate::symbolize::proc_maps::build_id_from_image_prefix(&rec.prefix[..n]) {
-            self.bpf_build_ids.insert(rec.base, id);
+        let Some(id) = crate::symbolize::proc_maps::build_id_from_image_prefix(&rec.prefix[..n])
+        else {
+            return;
+        };
+        // Correct any mapping already interned with a synthetic id: re-emit its
+        // definition with the real build-id on the same iid. If the mapping is
+        // not yet interned, the pending bpf_build_ids entry supplies the real id
+        // at intern time, so nothing to re-emit here.
+        let mut idw = ProtoWriter::new();
+        if self.interner.reemit_build_id(rec.base, &id, &mut idw) {
+            let mut tp = ProtoWriter::new();
+            tp.write_uint32(13, SEQ_NEEDS_INCREMENTAL_STATE);
+            tp.write_message(12, idw.bytes());
+            unsafe { sismo_ds_emit(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
         }
+        self.bpf_build_ids.insert(rec.base, id);
     }
 
     // CAP-1: a CPython qualname definition (id -> name) the BPF walk emitted the
