@@ -482,6 +482,20 @@ def build_variants() -> list[Variant]:
         # at sample time. A later deletion lets the host file read win and the
         # test would pass even with CAP-2 off.
         mid_run=(0.1, "delete")))
+    b = _bin("env-deleted-binary-kept")
+    v.append(Variant(
+        "env-deleted-binary-kept", "env",
+        "binary deleted after sismo held its fd: symbolizes via /proc/self/fd",
+        [b, "{DUR}"],
+        Expect(leaf="full", chain="full", module_status="ok"),
+        [["gcc", "-O2", fp, "-o", b, wl_c]],
+        # Delete at 0.6s — after the first sample (~0.2s) made sismo hold an fd
+        # open to the executable (it lives under out/, an unstable path, so the
+        # default --keep-module-files=auto holds it), but before the post-record
+        # symbolize pass. The file is gone at symbolize time, so `leaf: symbolized`
+        # here is due entirely to CAP-3(b) reading the bytes back through the held
+        # fd; with --keep-module-files=none it reverts to `leaf: absent`.
+        mid_run=(0.6, "delete")))
 
     return v
 

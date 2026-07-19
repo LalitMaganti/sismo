@@ -10,6 +10,7 @@
 //! produces the native [`RecordConfig`] both runners consume.
 
 use clap::Args;
+use sismo_core::cpu::module_registry::KeepPolicy;
 
 // ---- Scalar value parsers --------------------------------------------------
 
@@ -62,6 +63,10 @@ fn clap_buffer(s: &str) -> Result<u32, String> {
 }
 fn clap_duration(s: &str) -> Result<u32, String> {
     parse_duration_seconds(s.as_bytes()).ok_or_else(|| format!("invalid --duration '{s}' (use 30s / 5m / 1h)"))
+}
+fn clap_keep_policy(s: &str) -> Result<KeepPolicy, String> {
+    KeepPolicy::parse(s)
+        .ok_or_else(|| format!("--keep-module-files must be all, auto, or none, got '{s}'"))
 }
 fn clap_density(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| format!("--sample-density must be a positive number, got '{s}'"))?;
@@ -143,6 +148,12 @@ pub struct RecordArgs {
     focus: Option<String>,
     #[arg(long, value_parser = clap_density)]
     sample_density: Option<f64>,
+    /// Which sampled module files to hold open so a binary deleted or rebuilt
+    /// mid-recording still symbolizes: `auto` (default) holds fds only for files
+    /// on unstable paths (home/tmp/build dirs) and reopens system files by path;
+    /// `all` holds every module; `none` holds nothing (open by path at the end).
+    #[arg(long, value_parser = clap_keep_policy, default_value = "auto")]
+    keep_module_files: KeepPolicy,
     // The workload + its own flags: everything after the first positional token.
     // Not allow_hyphen_values, so a *leading* unknown `--flag` still errors.
     #[arg(trailing_var_arg = true)]
@@ -171,6 +182,8 @@ pub struct RecordConfig {
     pub no_symbolize: bool,
     pub focus: Option<String>,
     pub sample_density: Option<f64>,
+    /// CAP-3(b): which sampled module files to hold open for symbolization.
+    pub keep_module_files: KeepPolicy,
 }
 
 impl RecordArgs {
@@ -265,6 +278,7 @@ impl RecordArgs {
             no_symbolize: self.no_symbolize,
             focus: self.focus,
             sample_density: self.sample_density,
+            keep_module_files: self.keep_module_files,
         })
     }
 }

@@ -27,7 +27,11 @@ pub fn run(args: SymbolizeArgs) -> i32 {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        sismo_core::symbolize::perf_symbolize::symbolize_trace(&args.trace);
+        // Offline pass: no held fds (the recorder's are long gone), so a binary
+        // deleted before this runs is a fundamental limitation — record with
+        // --keep-module-files to preserve it in-process instead.
+        let held = std::collections::HashMap::new();
+        sismo_core::symbolize::perf_symbolize::symbolize_trace(&args.trace, &held);
         0
     }
     #[cfg(target_os = "windows")]

@@ -20,6 +20,7 @@
 use crate::disasm::{disasm_module, Arch};
 use sismo_proto::ProtoWriter;
 use crate::symbolizer::Symbolizer;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write;
@@ -148,7 +149,11 @@ extern "C" fn on_row(
 /// `ModuleSymbols` packets + the source/asm sidecar to the same file.
 /// Best-effort: any failure is logged and swallowed so a symbolization problem
 /// never loses a recording.
-pub fn symbolize_trace(trace_path: &str) {
+///
+/// `held_fds` maps a module build-id to a `/proc/self/fd/<n>` path the recorder
+/// kept open for it (CAP-3(b)); it is the byte source for a module whose file was
+/// deleted since recording. Empty for an offline pass with no held fds.
+pub fn symbolize_trace(trace_path: &str, held_fds: &HashMap<Vec<u8>, String>) {
     let mut path_z: Vec<u8> = trace_path.as_bytes().to_vec();
     path_z.push(0);
 
@@ -195,7 +200,7 @@ pub fn symbolize_trace(trace_path: &str) {
             continue;
         }
         let mut stat = ModuleStat::new(m.name.clone(), m.build_id_hex.clone());
-        let ms = build_module_symbols(&mut sym, m, &mut stat, &mut src_set, &mut src_seen);
+        let ms = build_module_symbols(&mut sym, m, &mut stat, &mut src_set, &mut src_seen, held_fds);
         n_addrs += stat.n_addrs;
         n_funcs += stat.n_real();
         stats.push(stat);
@@ -431,6 +436,7 @@ fn build_module_symbols(
     stat: &mut ModuleStat,
     src_set: &mut Vec<Vec<u8>>,
     src_seen: &mut HashSet<Vec<u8>>,
+    held_fds: &HashMap<Vec<u8>, String>,
 ) -> Vec<u8> {
     // base_avma = load_bias so the bridge's `rel = avma - base_avma` equals
     // `rel_pc - load_bias`. end_avma just has to be past every rel_pc.
@@ -440,13 +446,17 @@ fn build_module_symbols(
     }
     let end_avma = max_pc + 1;
 
-    let load = sym.add_module(
-        m.load_bias,
-        end_avma,
-        Path::new(OsStr::from_bytes(&m.name)),
-        None,
-        None,
-    );
+    // CAP-3(b): the recorded path is normally the byte source, but a binary
+    // deleted since recording is gone from it. If the recorder held an fd open
+    // for this module (--keep-module-files), read its bytes via /proc/self/fd,
+    // keyed by the same build-id the trace carries, so a deleted module still
+    // symbolizes.
+    let recorded = Path::new(OsStr::from_bytes(&m.name));
+    let mut build_id_raw = [0u8; 64];
+    let bid = hex_to_bytes(&m.build_id_hex, &mut build_id_raw);
+    let held = (!recorded.exists()).then(|| held_fds.get(bid)).flatten();
+    let byte_source = held.map(|p| Path::new(p.as_str())).unwrap_or(recorded);
+    let load = sym.add_module(m.load_bias, end_avma, byte_source, None, None);
     stat.symbols_loaded = load.error.is_none();
     stat.symbol_count = load.symbol_count;
     stat.err = load.error.unwrap_or_default().into_bytes();

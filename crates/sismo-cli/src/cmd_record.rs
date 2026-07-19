@@ -684,6 +684,7 @@ use sismo_core::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, s
 
 #[cfg(target_os = "linux")]
 use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
+use sismo_core::cpu::module_registry::{KeepPolicy, ModuleRegistry};
 
 
 #[cfg(target_os = "linux")]
@@ -785,19 +786,19 @@ fn run_linux(config: &RecordConfig) -> c_int {
     } else {
         let focus = if focus_int == 0 { Some(FocusPreset::Cache) } else { None };
         let c = linux_bpf_capture::init(
-            target_pid as u32, focus, sample_density, config.capture_offcpu);
+            target_pid as u32, focus, sample_density, config.capture_offcpu, config.keep_module_files);
         if c.is_none() {
             eprintln!("sismo record: bpf capture init failed — CPU samples disabled");
         }
         c
     };
     let had_bpf = bpf.is_some();
-    let shutdown_bpf = |bpf: Option<Box<Capture>>| -> u8 {
+    let shutdown_bpf = |bpf: Option<Box<Capture>>| -> (u8, ModuleRegistry) {
         let Some(c) = bpf else {
-            return 0;
+            return (0, ModuleRegistry::new(KeepPolicy::None));
         };
         let precise = c.precise_ip();
-        let s = c.shutdown();
+        let (s, modules) = c.shutdown();
         eprintln!(
             "sismo record: bpf — {} samples across {} threads (busiest {} cycles)",
             s.samples, s.threads, s.busiest_cycles
@@ -815,7 +816,13 @@ fn run_linux(config: &RecordConfig) -> c_int {
                 s.offcpu_ns / 1_000_000
             );
         }
-        precise
+        if modules.held_count() > 0 {
+            eprintln!(
+                "sismo record: keeping {} module file(s) open for symbolization",
+                modules.held_count()
+            );
+        }
+        (precise, modules)
     };
 
     // Data source entries.
@@ -900,19 +907,22 @@ fn run_linux(config: &RecordConfig) -> c_int {
     if long_trace {
         // Streaming mode: traced already wrote the file; stop finalizes it.
         unsafe { sismo_consumer_session_stop_blocking(session) };
-        let precise = shutdown_bpf(bpf.take());
+        let (precise, modules) = shutdown_bpf(bpf.take());
         eprintln!("sismo record: saved {output_path_str}");
         if !append_privileged_marker(output_path_str, &[target_pid], focus_preset, precise >= 2) {
             eprintln!("sismo record: failed to write privileged marker");
         }
         if had_bpf && !no_symbolize {
-            sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str);
+            // `modules` stays alive across this call: it owns the fds the held-open
+            // paths point at (CAP-3(b)).
+            sismo_core::symbolize::perf_symbolize::symbolize_trace(
+                output_path_str, &modules.held_fd_paths());
         }
     } else {
         // Rolling-buffer mode: drain the BPF worker into the still-active session
         // (it self-drains on shutdown, so this must precede the clone), clone the
         // session to the file, then stop.
-        let precise = shutdown_bpf(bpf.take());
+        let (precise, modules) = shutdown_bpf(bpf.take());
         eprintln!("sismo record: stopping — writing trace to {output_path_str}");
         match crate::trace_sink::clone_session_to_file("sismo_record", output_path_str) {
             Ok(bytes) => {
@@ -921,7 +931,8 @@ fn run_linux(config: &RecordConfig) -> c_int {
                     eprintln!("sismo record: failed to write privileged marker");
                 }
                 if had_bpf && !no_symbolize {
-                    sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str);
+                    sismo_core::symbolize::perf_symbolize::symbolize_trace(
+                        output_path_str, &modules.held_fd_paths());
                 }
             }
             Err(e) => eprintln!("sismo record: failed to write trace: {e}"),

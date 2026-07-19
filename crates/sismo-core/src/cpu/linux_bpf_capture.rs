@@ -821,6 +821,7 @@ impl Interner {
 
 // ---- Capture: the collector object (output half) ---------------------------
 
+use crate::cpu::module_registry::{KeepPolicy, ModuleRegistry};
 use crate::symbolize::data_regions::DataRegions;
 use crate::symbolize::gopclntab::GoPclntab;
 use crate::symbolize::proc_maps::{ProcMaps, ResidualMap};
@@ -865,6 +866,11 @@ pub struct Capture {
     py_cfg_fd: c_int,                  // CAP-1: fd of the py_cfg BPF map (-1 if absent)
     python_bpf: bool,                  // CAP-1: in-BPF walk armed (py_cfg pushed)
     bpf_build_ids: HashMap<u64, Vec<u8>>, // CAP-2: base avma -> in-band build-id
+    // CAP-3(b): the module files this recording sampled. Per policy it holds an
+    // fd open to each (from first sight to the post-record symbolize pass) so a
+    // binary deleted or rebuilt mid-run still resolves via /proc/self/fd. Handed
+    // out by `shutdown` so its fds outlive the capture until symbolization runs.
+    modules: ModuleRegistry,
     counters: Vec<Counter>,
     active_slots: Vec<u8>, // indices into `counters`; [0] is the timebase
     focus: Option<FocusPreset>,
@@ -1058,6 +1064,10 @@ impl Capture {
                     Some(id) => id,
                     None => &m.build_id,
                 };
+                // CAP-3(b): register this module the first time we see it so its
+                // bytes stay reachable (per --keep-module-files policy) if the
+                // file is deleted or rebuilt before symbolization.
+                self.modules.observe(&m.path, build_id);
                 let mapping_iid = self.interner.intern_mapping(
                     m.start,
                     m.end,
@@ -1719,6 +1729,7 @@ fn capture_init(
     focus: Option<FocusPreset>,
     density: Option<f64>,
     offcpu: bool,
+    keep_policy: KeepPolicy,
 ) -> *mut Capture {
     let cap = Box::into_raw(Box::new(Capture {
         obj: ptr::null_mut(),
@@ -1742,6 +1753,7 @@ fn capture_init(
         py_cfg_fd: -1,
         python_bpf: false,
         bpf_build_ids: HashMap::new(),
+        modules: ModuleRegistry::new(keep_policy),
         counters: Vec::new(),
         active_slots: Vec::new(),
         focus,
@@ -1986,8 +1998,9 @@ pub fn init(
     focus: Option<FocusPreset>,
     density: Option<f64>,
     offcpu: bool,
+    keep_policy: KeepPolicy,
 ) -> Option<Box<Capture>> {
-    let p = capture_init(pid, focus, density, offcpu);
+    let p = capture_init(pid, focus, density, offcpu, keep_policy);
     if p.is_null() {
         None
     } else {
@@ -2002,12 +2015,16 @@ impl Capture {
         self.sampler_precise_ip
     }
 
-    /// Stop the worker, tear down BPF, and return the run stats. Consumes self.
-    pub fn shutdown(mut self: Box<Self>) -> LinuxBpfStats {
+    /// Stop the worker, tear down BPF, and return the run stats plus the module
+    /// registry (whose held fds must outlive the capture until symbolization).
+    /// Consumes self.
+    pub fn shutdown(mut self: Box<Self>) -> (LinuxBpfStats, ModuleRegistry) {
         self.exit_requested.store(true, Ordering::Release);
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+        // The worker has joined, so no one else touches the registry; move it out.
+        let modules = std::mem::replace(&mut self.modules, ModuleRegistry::new(KeepPolicy::None));
         let stats = LinuxBpfStats {
             samples: self.samples,
             threads: self.acc.len() as u64,
@@ -2031,7 +2048,7 @@ impl Capture {
                 bpf_object__close(self.obj);
             }
         }
-        stats
+        (stats, modules)
         // maps / data_regions dropped with self.
     }
 }
