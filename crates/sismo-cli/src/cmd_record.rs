@@ -685,6 +685,7 @@ use sismo_core::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, s
 #[cfg(target_os = "linux")]
 use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
 use sismo_core::cpu::module_registry::{KeepPolicy, ModuleRegistry};
+use std::sync::{Arc, Mutex};
 
 
 #[cfg(target_os = "linux")]
@@ -793,9 +794,9 @@ fn run_linux(config: &RecordConfig) -> c_int {
         c
     };
     let had_bpf = bpf.is_some();
-    let shutdown_bpf = |bpf: Option<Box<Capture>>| -> (u8, ModuleRegistry) {
+    let shutdown_bpf = |bpf: Option<Box<Capture>>| -> (u8, Arc<Mutex<ModuleRegistry>>) {
         let Some(c) = bpf else {
-            return (0, ModuleRegistry::new(KeepPolicy::None));
+            return (0, Arc::new(Mutex::new(ModuleRegistry::new(KeepPolicy::None))));
         };
         let precise = c.precise_ip();
         let (s, modules) = c.shutdown();
@@ -816,11 +817,9 @@ fn run_linux(config: &RecordConfig) -> c_int {
                 s.offcpu_ns / 1_000_000
             );
         }
-        if modules.held_count() > 0 {
-            eprintln!(
-                "sismo record: keeping {} module file(s) open for symbolization",
-                modules.held_count()
-            );
+        let held = modules.lock().unwrap().held_count();
+        if held > 0 {
+            eprintln!("sismo record: keeping {held} module file(s) open for symbolization");
         }
         (precise, modules)
     };
@@ -916,7 +915,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
             // `modules` stays alive across this call: it owns the fds the held-open
             // paths point at (CAP-3(b)).
             sismo_core::symbolize::perf_symbolize::symbolize_trace(
-                output_path_str, &modules.held_fd_paths());
+                output_path_str, &modules.lock().unwrap().held_fd_paths());
         }
     } else {
         // Rolling-buffer mode: drain the BPF worker into the still-active session
@@ -932,7 +931,7 @@ fn run_linux(config: &RecordConfig) -> c_int {
                 }
                 if had_bpf && !no_symbolize {
                     sismo_core::symbolize::perf_symbolize::symbolize_trace(
-                        output_path_str, &modules.held_fd_paths());
+                        output_path_str, &modules.lock().unwrap().held_fd_paths());
                 }
             }
             Err(e) => eprintln!("sismo record: failed to write trace: {e}"),

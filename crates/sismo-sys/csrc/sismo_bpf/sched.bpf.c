@@ -90,6 +90,17 @@ struct {
   __uint(max_entries, 1 << 22);  // 4 MiB
 } events SEC(".maps");
 
+// CAP-3(b): module-identity records (SISMO_EVT_MODULE) ride their own ringbuf,
+// drained by a dedicated host thread. This keeps build-id capture and the fd pin
+// it drives off the sample backlog, so a binary deleted or replaced mid-run is
+// pinned/identified promptly instead of after the main queue catches up. Sized
+// for the page-carrying records; module discovery is deduped in-BPF (module_seen)
+// so the volume is one record per distinct module.
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 1 << 22);  // 4 MiB
+} module_hints SEC(".maps");
+
 // Kernel-symbol interning. ksym_ids maps a kernel address to the id we assigned
 // it; LRU so a long session self-bounds — an evicted address is just re-resolved
 // and gets a fresh id, harmless because userspace dedups by name. ksym_next is
@@ -427,11 +438,15 @@ static __noinline void capture_module(struct task_struct *cur, __u64 pc) {
   __u8 one = 1;
   bpf_map_update_elem(&module_seen, &base, &one, BPF_ANY);
 
-  struct sismo_module_rec *r = bpf_ringbuf_reserve(&events, sizeof(*r), 0);
+  // Emit on the dedicated module_hints ringbuf so the capture thread pins this
+  // module's fd and reads its build-id promptly, not behind the sample backlog.
+  struct sismo_module_rec *r = bpf_ringbuf_reserve(&module_hints, sizeof(*r), 0);
   if (!r)
     return;
   r->type = SISMO_EVT_MODULE;
   r->base = base;
+  r->tgid = bpf_get_current_pid_tgid() >> 32;
+  r->_pad = 0;
   r->prefix_len = 0;
   if (bpf_probe_read_user(r->prefix, sizeof(r->prefix), (void *)base) == 0)
     r->prefix_len = sizeof(r->prefix);

@@ -161,10 +161,15 @@ struct sismo_pyframe_rec {
 // SISMO_EVT_MODULE. A module's image base + the first mapped page of its image,
 // read from the target's memory in-band at sample time (CAP-2). `prefix_len` is
 // the valid byte count (0 if the copy failed). The host parses the build-id from
-// `prefix` via the same code that reads it from a file.
+// `prefix` via the same code that reads it from a file. Carried on the dedicated
+// `module_hints` ringbuf and drained by its own thread, so this capture (and the
+// fd pin it drives) is not stuck behind the sample backlog. `tgid` lets that
+// thread read the owning process's /proc/<tgid>/maps to pin the file.
 struct sismo_module_rec {
   unsigned int type;        // = SISMO_EVT_MODULE (aliases sismo_hdr.type)
   unsigned int prefix_len;  // valid bytes in prefix[]
+  unsigned int tgid;        // owning process (for /proc/<tgid>/maps)
+  unsigned int _pad;        // keep `base` 8-byte aligned
   unsigned long long base;  // module image base avma (== host base_avma)
   unsigned char prefix[SISMO_MODULE_PREFIX];
 };

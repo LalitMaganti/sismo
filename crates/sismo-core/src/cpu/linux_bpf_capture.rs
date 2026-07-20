@@ -101,6 +101,8 @@ pub struct SismoPyframeRec {
 pub struct SismoModuleRec {
     pub r#type: u32,
     pub prefix_len: u32,
+    pub tgid: u32,
+    pub _pad: u32,
     pub base: u64,
     pub prefix: [u8; SISMO_MODULE_PREFIX],
 }
@@ -598,15 +600,6 @@ struct Interner {
     build_ids: HashMap<Vec<u8>, u64>,
     func_names: HashMap<Vec<u8>, u64>,
     mappings: HashMap<u64, u64>, // map.start -> iid
-    // CAP-2: enough of each interned mapping to re-emit its definition, keyed by
-    // image base. When the in-band module record lands after the mapping was
-    // already interned with a synthetic build-id, we re-emit the same iid with
-    // the real one — the build-id lives on the mapping, so every sample that
-    // references it resolves to the corrected id. (iid, start, end, offset, path_iid)
-    mapping_reemit: HashMap<u64, Vec<(u64, u64, u64, u64, u64)>>,
-    // The build-id each base was interned with, so re-emit is skipped when the
-    // in-band id matches what the host read already supplied (the live-binary case).
-    mapping_reemit_bid: HashMap<u64, Vec<u8>>,
     frames: HashMap<FrameKey, u64>,
     callstacks: HashMap<Vec<u8>, u64>, // frame-id bytes -> iid
     next_path: u64,
@@ -702,39 +695,7 @@ impl Interner {
             mp.write_uint64(8, offset);
             mp.write_uint64(7, path_iid);
         });
-        self.mapping_reemit
-            .entry(base_avma)
-            .or_default()
-            .push((iid, start, end, offset, path_iid));
-        self.mapping_reemit_bid.insert(base_avma, build_id.to_vec());
         iid
-    }
-
-    /// CAP-2: re-emit every mapping sharing `base` with `build_id`, reusing the
-    /// original iid so trace_processor rebinds the build-id on the existing
-    /// mapping. Called when the in-band module record arrives after the mapping
-    /// was interned with a synthetic id. Returns whether anything was emitted.
-    fn reemit_build_id(&mut self, base: u64, build_id: &[u8], idw: &mut ProtoWriter) -> bool {
-        if self.mapping_reemit_bid.get(&base).map(|b| b.as_slice()) == Some(build_id) {
-            return false; // host read already interned this id — nothing to correct
-        }
-        let params = match self.mapping_reemit.get(&base) {
-            Some(p) if !p.is_empty() => p.clone(),
-            _ => return false,
-        };
-        let build_id_iid = self.intern_build_id(build_id, idw);
-        for (iid, start, end, offset, path_iid) in params {
-            idw.message(19, |mp| {
-                mp.write_uint64(1, iid);
-                mp.write_uint64(2, build_id_iid);
-                mp.write_uint64(4, start);
-                mp.write_uint64(5, end);
-                mp.write_uint64(6, base);
-                mp.write_uint64(8, offset);
-                mp.write_uint64(7, path_iid);
-            });
-        }
-        true
     }
 
     /// The synthetic "[kernel.kallsyms]" mapping every kernel frame shares
@@ -830,6 +791,7 @@ use crate::symbolize::unwinder::{StackRegs, Unwinder};
 use crate::ffi::{sismo_ds_emit, sismo_ds_emit_offcpu};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 // TracePacket / defaults field tags + constants.
 const TP_FIELD_PERF_SAMPLE: u32 = 66;
@@ -843,6 +805,15 @@ const USER_ADDR_MAX: u64 = 0x0000_7fff_ffff_ffff;
 pub struct Capture {
     obj: *mut BpfObject,
     rb: *mut RingBuffer,
+    // CAP-3(b): the module_hints ringbuf + its dedicated drain thread, so module
+    // build-id capture and fd pinning run promptly, off the sample backlog. The
+    // thread touches ONLY Arc-shared state (`modules`, `module_exit`) — never this
+    // Capture — so it never aliases the main drain's `&mut Capture`. `module_ctx`
+    // owns the boxed Arc the ringbuf callback receives.
+    module_rb: *mut RingBuffer,
+    module_worker: Option<std::thread::JoinHandle<()>>,
+    module_exit: Arc<AtomicBool>,
+    module_ctx: Option<Box<Arc<Mutex<ModuleRegistry>>>>,
     links: Vec<*mut BpfLink>,
     perf_fds: Vec<i32>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -865,12 +836,12 @@ pub struct Capture {
     py_names: HashMap<u32, Vec<u8>>,   // CAP-1: id -> Python qualname
     py_cfg_fd: c_int,                  // CAP-1: fd of the py_cfg BPF map (-1 if absent)
     python_bpf: bool,                  // CAP-1: in-BPF walk armed (py_cfg pushed)
-    bpf_build_ids: HashMap<u64, Vec<u8>>, // CAP-2: base avma -> in-band build-id
-    // CAP-3(b): the module files this recording sampled. Per policy it holds an
-    // fd open to each (from first sight to the post-record symbolize pass) so a
-    // binary deleted or rebuilt mid-run still resolves via /proc/self/fd. Handed
+    // CAP-3(b): the module files this recording sampled — build-ids + held fds.
+    // Shared between the capture thread (fills it from module_hints) and the main
+    // drain (reads a module's build-id when interning its mapping). Arc<Mutex>, so
+    // the capture thread holds its own handle without touching this Capture. Handed
     // out by `shutdown` so its fds outlive the capture until symbolization runs.
-    modules: ModuleRegistry,
+    modules: Arc<Mutex<ModuleRegistry>>,
     counters: Vec<Counter>,
     active_slots: Vec<u8>, // indices into `counters`; [0] is the timebase
     focus: Option<FocusPreset>,
@@ -1057,19 +1028,18 @@ impl Capture {
                     }
                     continue;
                 };
-                // CAP-2: prefer the build-id the BPF captured in-band from mapped
-                // memory (it matches the file read for a live binary, and is the
-                // only real id for one deleted before symbolization).
-                let real_id: &[u8] = match self.bpf_build_ids.get(&m.base_avma) {
-                    Some(id) => id,
-                    None => &m.build_id,
-                };
-                // CAP-3(b): register this module the first time we see it so its
-                // bytes stay reachable (per --keep-module-files policy) if the file
-                // is deleted before symbolization. The registry also supplies the
-                // effective build-id — a synthetic magic+random one when the module
-                // has no GNU note — memoized per (dev,inode) so it is stable.
-                let build_id = self.modules.observe(&m.path, real_id);
+                // CAP-3(b): the module's trace build-id comes from the shared
+                // registry. Under load the capture thread has already settled it
+                // in-band (replace-immune); if not, our /proc read (`m.build_id`,
+                // or empty → a synthetic id) settles it, and both threads then
+                // agree. `m.build_id` here is correct because a light-enough load
+                // to beat the capture thread also means we intern early, before any
+                // mid-run change.
+                let build_id = self
+                    .modules
+                    .lock()
+                    .unwrap()
+                    .id_for(rec.hdr.pid, m.base_avma, &m.build_id);
                 let mapping_iid = self.interner.intern_mapping(
                     m.start,
                     m.end,
@@ -1502,11 +1472,7 @@ impl Capture {
             self.handle_pyframe(rec);
             return;
         }
-        if hdr.r#type == SISMO_EVT_MODULE {
-            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoModuleRec) };
-            self.handle_module(rec);
-            return;
-        }
+        // SISMO_EVT_MODULE rides the module_hints ringbuf, not this one.
         if hdr.r#type == SISMO_EVT_OFFCPU {
             // The blocking stack + off-CPU duration (in data_addr). Emitted onto
             // the off-CPU sequence — same data source, own timebase.
@@ -1563,31 +1529,6 @@ impl Capture {
         self.file_names.insert(rec.id, name.to_vec());
     }
 
-    // CAP-2: a module identity page the BPF captured in-band. Parse the build-id
-    // from its mapped prefix (the same parser used for a file) and key it by base
-    // avma, so a mapping whose file is gone can still be named. Once per base.
-    fn handle_module(&mut self, rec: &SismoModuleRec) {
-        if rec.prefix_len == 0 || self.bpf_build_ids.contains_key(&rec.base) {
-            return;
-        }
-        let n = (rec.prefix_len as usize).min(SISMO_MODULE_PREFIX);
-        let Some(id) = crate::symbolize::proc_maps::build_id_from_image_prefix(&rec.prefix[..n])
-        else {
-            return;
-        };
-        // Correct any mapping already interned with a synthetic id: re-emit its
-        // definition with the real build-id on the same iid. If the mapping is
-        // not yet interned, the pending bpf_build_ids entry supplies the real id
-        // at intern time, so nothing to re-emit here.
-        let mut idw = ProtoWriter::new();
-        if self.interner.reemit_build_id(rec.base, &id, &mut idw) {
-            let mut tp = ProtoWriter::new();
-            tp.write_uint32(13, SEQ_NEEDS_INCREMENTAL_STATE);
-            tp.write_message(12, idw.bytes());
-            unsafe { sismo_ds_emit(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
-        }
-        self.bpf_build_ids.insert(rec.base, id);
-    }
 
     // CAP-1: a CPython qualname definition (id -> name) the BPF walk emitted the
     // first time it saw a code object. Same intern-by-id pattern as ksym.
@@ -1629,6 +1570,11 @@ pub struct LinuxBpfStats {
 struct SendPtr(*mut Capture);
 unsafe impl Send for SendPtr {}
 
+// A module-hints ringbuf pointer smuggled into the capture thread. The ringbuf is
+// alive for the thread's lifetime (freed in shutdown after the join).
+struct SendRb(*mut RingBuffer);
+unsafe impl Send for SendRb {}
+
 extern "C" fn on_setup(_user: *mut c_void, _cfg: *const c_void, _cfg_len: usize) {}
 
 extern "C" fn on_start(user: *mut c_void) {
@@ -1652,6 +1598,37 @@ extern "C" fn on_flush(user: *mut c_void, flusher: *mut c_void) {
     if !flusher.is_null() {
         c.flush_req.store(flusher as usize, Ordering::Release);
     }
+}
+
+// CAP-3(b): resolve a module-hint record's file and hand it to the shared
+// registry (build-id from the in-band page; fd pinned per policy). `registry` is
+// the capture thread's own Arc handle — this touches no `Capture`.
+fn capture_module_record(registry: &Mutex<ModuleRegistry>, rec: &SismoModuleRec) {
+    let n = (rec.prefix_len as usize).min(SISMO_MODULE_PREFIX);
+    let page = &rec.prefix[..n];
+    // The path the module's base is mapped from (empty if the file is already
+    // gone; the in-band page still yields the build-id).
+    let path = ProcMaps::parse(rec.tgid)
+        .and_then(|m| {
+            m.modules()
+                .iter()
+                .find(|(b, _)| *b == rec.base)
+                .map(|(_, p)| p.to_string())
+        })
+        .unwrap_or_default();
+    registry.lock().unwrap().record_module(rec.tgid, rec.base, page, &path);
+}
+
+// The ctx is a boxed `Arc<Mutex<ModuleRegistry>>` (see capture_init); the capture
+// thread reaches nothing else, so it never aliases the main drain's `&mut Capture`.
+unsafe extern "C" fn on_module_event(ctx: *mut c_void, data: *mut c_void, _size: usize) -> c_int {
+    let registry = &*(ctx as *const Arc<Mutex<ModuleRegistry>>);
+    let hdr = &*(data as *const SismoHdr);
+    if hdr.r#type == SISMO_EVT_MODULE {
+        let rec = &*(data as *const SismoModuleRec);
+        capture_module_record(registry, rec);
+    }
+    0
 }
 
 unsafe extern "C" fn on_event(ctx: *mut c_void, data: *mut c_void, _size: usize) -> c_int {
@@ -1693,6 +1670,7 @@ fn worker_entry(cap: *mut Capture) {
     unsafe { ring_buffer__consume(rb) };
     service_acks(cap);
 }
+
 
 fn map_fd(obj: *mut BpfObject, name: &std::ffi::CStr) -> Option<c_int> {
     let m = unsafe { bpf_object__find_map_by_name(obj, name.as_ptr()) };
@@ -1736,6 +1714,10 @@ fn capture_init(
     let cap = Box::into_raw(Box::new(Capture {
         obj: ptr::null_mut(),
         rb: ptr::null_mut(),
+        module_rb: ptr::null_mut(),
+        module_worker: None,
+        module_exit: Arc::new(AtomicBool::new(false)),
+        module_ctx: None,
         links: Vec::new(),
         perf_fds: Vec::new(),
         worker: None,
@@ -1754,8 +1736,7 @@ fn capture_init(
         py_names: HashMap::new(),
         py_cfg_fd: -1,
         python_bpf: false,
-        bpf_build_ids: HashMap::new(),
-        modules: ModuleRegistry::new(keep_policy),
+        modules: Arc::new(Mutex::new(ModuleRegistry::new(keep_policy))),
         counters: Vec::new(),
         active_slots: Vec::new(),
         focus,
@@ -1989,6 +1970,30 @@ fn capture_init(
         let send = send;
         worker_entry(send.0)
     }));
+
+    // CAP-3(b): the module_hints ringbuf + its dedicated drain thread. The thread
+    // and the ringbuf callback share only `c.modules` (via an Arc handle) and
+    // `c.module_exit` — never the Capture — so nothing aliases the main worker's
+    // `&mut Capture`. Best-effort: if the map/ringbuf is unavailable, module
+    // capture degrades to the main drain's /proc read (no prompt fd pin).
+    c.module_ctx = Some(Box::new(Arc::clone(&c.modules)));
+    let mctx = c.module_ctx.as_ref().unwrap().as_ref() as *const Arc<Mutex<ModuleRegistry>>;
+    c.module_rb = map_fd(obj, c"module_hints")
+        .map(|fd| unsafe { ring_buffer__new(fd, on_module_event, mctx as *mut c_void, ptr::null()) })
+        .unwrap_or(ptr::null_mut());
+    if !c.module_rb.is_null() {
+        let rb = SendRb(c.module_rb);
+        let exit = Arc::clone(&c.module_exit);
+        c.module_worker = Some(std::thread::spawn(move || {
+            let rb = rb;
+            while !exit.load(Ordering::Acquire) {
+                unsafe { ring_buffer__poll(rb.0, 20) };
+            }
+            unsafe { ring_buffer__consume(rb.0) };
+        }));
+    } else {
+        eprintln!("sismo record: module_hints ringbuf unavailable — deleted-binary capture degraded");
+    }
     cap
 }
 
@@ -2020,13 +2025,23 @@ impl Capture {
     /// Stop the worker, tear down BPF, and return the run stats plus the module
     /// registry (whose held fds must outlive the capture until symbolization).
     /// Consumes self.
-    pub fn shutdown(mut self: Box<Self>) -> (LinuxBpfStats, ModuleRegistry) {
+    pub fn shutdown(mut self: Box<Self>) -> (LinuxBpfStats, Arc<Mutex<ModuleRegistry>>) {
         self.exit_requested.store(true, Ordering::Release);
+        self.module_exit.store(true, Ordering::Release);
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
-        // The worker has joined, so no one else touches the registry; move it out.
-        let modules = std::mem::replace(&mut self.modules, ModuleRegistry::new(KeepPolicy::None));
+        if let Some(w) = self.module_worker.take() {
+            let _ = w.join();
+        }
+        // Both workers have joined; hand out the registry Arc (its held fds must
+        // outlive the capture until symbolization). Drop the callback's Arc handle
+        // first so the returned one is the sole owner.
+        self.module_ctx = None;
+        let modules = std::mem::replace(
+            &mut self.modules,
+            Arc::new(Mutex::new(ModuleRegistry::new(KeepPolicy::None))),
+        );
         let stats = LinuxBpfStats {
             samples: self.samples,
             threads: self.acc.len() as u64,
@@ -2039,6 +2054,9 @@ impl Capture {
         unsafe {
             if !self.rb.is_null() {
                 ring_buffer__free(self.rb);
+            }
+            if !self.module_rb.is_null() {
+                ring_buffer__free(self.module_rb);
             }
             for &l in &self.links {
                 bpf_link__destroy(l);
