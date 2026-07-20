@@ -1,0 +1,10 @@
+record_exit: 0
+samples: present
+offcpu: present
+mapping: present
+leaf: absent
+chain: truncated
+module_status: no symbols
+build_id: mismatch
+diagnostics: build-id, changed-file, deleted-file, stripped
+residual: none

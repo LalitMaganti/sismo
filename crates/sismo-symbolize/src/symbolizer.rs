@@ -213,6 +213,22 @@ impl Symbolizer {
         result
     }
 
+    /// Register `[base_avma, end_avma)` with no symbol source, so addresses inside
+    /// resolve to `None` rather than matching a neighboring module. Used when the
+    /// on-disk file was replaced since recording and must not be trusted for
+    /// symbols.
+    pub fn add_range_no_symbols(&mut self, base_avma: u64, end_avma: u64) {
+        self.modules.push(SymModule {
+            base_avma,
+            end_avma,
+            map: None,
+            #[cfg(not(target_os = "windows"))]
+            dynsym: None,
+            #[cfg(not(target_os = "windows"))]
+            gopclntab: None,
+        });
+    }
+
     /// Resolve `avma` to its inline chain (innermost inlinee first, physical
     /// function last) plus the byte offset from the physical function's start,
     /// or `None` if no registered module contains it (or nothing resolved).

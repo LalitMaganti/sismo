@@ -446,16 +446,39 @@ fn build_module_symbols(
     }
     let end_avma = max_pc + 1;
 
-    // CAP-3(b): the recorded path is normally the byte source, but a binary
-    // deleted since recording is gone from it. If the recorder held an fd open
-    // for this module (--keep-module-files), read its bytes via /proc/self/fd,
-    // keyed by the same build-id the trace carries, so a deleted module still
-    // symbolizes.
+    // CAP-3(b): choose the byte source for this module's symbols, in order:
+    //  1. The recorded path when it still holds the same file (build-id matches).
+    //     Preferred over a held fd so wholesym can resolve sidecar debug info —
+    //     .gnu_debuglink / split-dwarf .dwo are found relative to the real path,
+    //     which a /proc/self/fd/<n> path defeats.
+    //  2. A held fd (--keep-module-files) — the exact inode we sampled — when the
+    //     path is gone (deleted) or now holds a different file (rebuilt).
+    //  3. Neither: if the path holds a *changed* file we did not keep, refuse it
+    //     (register the range empty) rather than emit the wrong build's symbols.
     let recorded = Path::new(OsStr::from_bytes(&m.name));
+    let recorded_str = std::str::from_utf8(&m.name).ok();
     let mut build_id_raw = [0u8; 64];
     let bid = hex_to_bytes(&m.build_id_hex, &mut build_id_raw);
-    let held = (!recorded.exists()).then(|| held_fds.get(bid)).flatten();
-    let byte_source = held.map(|p| Path::new(p.as_str())).unwrap_or(recorded);
+    let path_matches = recorded.exists()
+        && recorded_str.is_some_and(|p| crate::proc_maps::byte_source_matches(p, bid));
+    let held = held_fds.get(bid);
+    let byte_source = if path_matches {
+        recorded
+    } else if let Some(p) = held {
+        Path::new(p.as_str())
+    } else if recorded.exists() {
+        // Present but the build-id changed, and we kept no fd → don't trust it.
+        sym.add_range_no_symbols(m.load_bias, end_avma);
+        stat.symbols_loaded = false;
+        stat.err = b"on-disk file changed since recording (build-id mismatch)".to_vec();
+        eprintln!(
+            "sismo record: {} changed since recording (build-id mismatch) — not symbolized",
+            String::from_utf8_lossy(&m.name)
+        );
+        return Vec::new();
+    } else {
+        recorded // gone and not held: let add_module fail gracefully
+    };
     let load = sym.add_module(m.load_bias, end_avma, byte_source, None, None);
     stat.symbols_loaded = load.error.is_none();
     stat.symbol_count = load.symbol_count;

@@ -103,7 +103,11 @@ class Variant:
                                          # basename of cmd[0]
     runner: str = "caps"                 # caps (sismo-run) | plain (sismo)
     chain_need: int = 2                  # distinct chain symbols for "full"
-    mid_run: tuple[float, str] | None = None   # (delay_s, "delete") action
+    mid_run: tuple[float, str] | None = None   # (delay_s, "delete"|"replace")
+    # Build command run at the mid_run point for action "replace" — rebuilds the
+    # binary at cmd[0] so the on-disk file's build-id no longer matches the trace.
+    mid_run_build: list[list[str]] = dataclasses.field(default_factory=list)
+    keep_module_files: str = "auto"      # --keep-module-files=<all|auto|none>
     build_may_skip: str | None = None    # regex on build stderr → skip
     skip_reason: str | None = None
 
@@ -499,6 +503,23 @@ def build_variants() -> list[Variant]:
         # here is due entirely to CAP-3(b) reading the bytes back through the held
         # fd; with --keep-module-files=none it reverts to `leaf: absent`.
         mid_run=(0.6, "delete")))
+    b = _bin("env-replaced-binary")
+    v.append(Variant(
+        "env-replaced-binary", "env",
+        "binary rebuilt mid-run, not held: symbolizer refuses the changed file",
+        [b, "{DUR}"],
+        Expect(leaf="none", chain="na", module_status=None,
+               diags=[r"changed since recording"]),
+        [["gcc", "-O2", fp, "-o", b, wl_c]],
+        # Record with the file NOT held, then rebuild it (at -O0, a different
+        # build-id) at the same path at 0.5s. At symbolize the path holds the new
+        # file, whose id no longer matches the trace, so the safety net refuses it
+        # rather than emit the wrong build's symbols: `leaf: absent`, `build_id:
+        # mismatch`, and a changed-file diagnostic. Held (`auto`) would instead
+        # symbolize correctly from the retained original inode.
+        keep_module_files="none",
+        mid_run=(0.5, "replace"),
+        mid_run_build=[["gcc", "-O0", fp, "-o", b, wl_c]]))
 
     return v
 
@@ -561,12 +582,15 @@ class RecordResult:
     wall_s: float
 
 
-def run_record(variant: Variant, duration_ms: int) -> RecordResult:
+def run_record(variant: Variant, duration_ms: int, no_symbolize: bool = False) -> RecordResult:
     trace = os.path.join(TRACE_DIR, variant.name + ".pftrace")
     if os.path.exists(trace):
         os.unlink(trace)
     runner = SISMO_RUN if variant.runner == "caps" else SISMO
-    cmd = [runner, "record", "--output", trace]
+    cmd = [runner, "record", "--keep-module-files", variant.keep_module_files,
+           "--output", trace]
+    if no_symbolize:
+        cmd.append("--no-symbolize")
     cmd += [a.replace("{DUR}", str(duration_ms)) for a in variant.cmd]
     t0 = time.monotonic()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -576,6 +600,12 @@ def run_record(variant: Variant, duration_ms: int) -> RecordResult:
         time.sleep(delay)
         if action == "delete" and os.path.exists(variant.cmd[0]):
             os.unlink(variant.cmd[0])
+        elif action == "replace":
+            # Rebuild the binary at the same path so its build-id changes under
+            # the running process — the running inode is untouched, the path now
+            # holds a different file.
+            for step in variant.mid_run_build:
+                subprocess.run(step, capture_output=True, cwd=ROOT_DIR)
     try:
         out, err = proc.communicate(timeout=120)
     except subprocess.TimeoutExpired:
@@ -700,6 +730,7 @@ DIAG_CATALOG: list[tuple[str, str]] = [
     ("stripped", r"stripped|no debug info|debuginfo"),
     ("build-id", r"build[- ]id|readelf -n"),
     ("deleted-file", r"no longer at this path|deleted|binary changed since"),
+    ("changed-file", r"changed since recording|build-id mismatch"),
     ("frame-pointer", r"frame pointer|omit-frame|force-frame-pointers"),
     ("unwind-tables", r"unwind tables|asynchronous-unwind|\.eh_frame FDE"),
     ("interpreted-runtime", r"interpreter frame|interpreted runtime|"
@@ -759,8 +790,9 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS) -> s
     # means a real GNU note matching the module's own file (CAP-2 captures it in-
     # band, so even a binary deleted mid-record keeps it); `synthetic` means sismo
     # fabricated an id, recognized precisely by its magic prefix; `absent` means
-    # none at all; `mismatch` (should never appear) is a real-looking id that does
-    # not match the file — a capture bug. The reference id is read from the
+    # none at all; `mismatch` is a real-looking id that does not match the file —
+    # expected for a replaced binary (env-replaced-binary), a capture bug on any
+    # normal recording. The reference id is read from the
     # module's actual file (the trace path — e.g. the real libjvm.so, not the java
     # launcher in cmd[0]); only when that file is gone do we fall back to cmd[0].
     trace_exists = os.path.exists(rec.trace)
