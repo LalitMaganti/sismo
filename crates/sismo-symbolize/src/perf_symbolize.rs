@@ -874,6 +874,12 @@ fn print_runtime_diagnostic(name: &[u8], rt: Runtime) {
 /// or a dyld-shared-cache dylib with no file at all — as id-less). Orthogonal
 /// to symbolization status: a fully-resolved module can still lack an id.
 fn report_missing_build_ids(stats: &[ModuleStat]) {
+    // How to restore the binary's identity, in this platform's linker terms.
+    #[cfg(target_os = "macos")]
+    const ADVICE: &str = "    ld emits an LC_UUID by default — this binary was linked with\n    \
+                          -no_uuid; drop that flag to restore its identity.";
+    #[cfg(not(target_os = "macos"))]
+    const ADVICE: &str = "    link with a build-id to enable it: -Wl,--build-id=sha1";
     for st in stats {
         let mut raw = [0u8; 64];
         let bid = hex_to_bytes(&st.build_id_hex, &mut raw);
@@ -886,12 +892,7 @@ fn report_missing_build_ids(stats: &[ModuleStat]) {
         eprintln!("\nsismo record: {} has no build-id", s(&st.name));
         eprintln!("    without one, sismo can't match this binary across runs or against a");
         eprintln!("    symbol server, so offline symbolization is unavailable.");
-        if cfg!(target_os = "macos") {
-            eprintln!("    ld emits an LC_UUID by default — this binary was linked with");
-            eprintln!("    -no_uuid; drop that flag to restore its identity.");
-        } else {
-            eprintln!("    link with a build-id to enable it: -Wl,--build-id=sha1");
-        }
+        eprintln!("{ADVICE}");
     }
 }
 
