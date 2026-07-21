@@ -1,0 +1,4 @@
+module: ok 3/3 $WORK/fixture
+names: sismo_fix_leaf=yes sismo_fix_mid=yes main=yes
+lines: no
+diags: no-build-id

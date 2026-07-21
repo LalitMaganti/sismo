@@ -341,18 +341,6 @@ pub fn file_build_id(path: &str) -> Option<Vec<u8>> {
     read_build_id(path)
 }
 
-/// Whether the file at `path` is safe to symbolize as the module the trace
-/// recorded with `trace_bid`. Safe when there is no real id to verify (empty or
-/// synthetic — a note-less binary opened by path can't be checked) or the file's
-/// current GNU note still matches. A mismatch means the on-disk file was rebuilt
-/// or replaced since recording, so its symbols would be wrong for this trace.
-pub fn byte_source_matches(path: &str, trace_bid: &[u8]) -> bool {
-    if trace_bid.is_empty() || is_synthetic(trace_bid) {
-        return true;
-    }
-    file_build_id(path).as_deref() == Some(trace_bid)
-}
-
 const NT_GNU_BUILD_ID: u32 = 3;
 
 fn align4(n: usize) -> usize {
@@ -606,22 +594,6 @@ mod tests {
     fn has_gnu_build_id_false_for_non_elf_and_missing() {
         assert!(!has_gnu_build_id("/no/such/binary"));
         assert!(!has_gnu_build_id("/etc/hostname")); // present but not an ELF
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn byte_source_matches_guards_only_real_ids() {
-        // Empty and synthetic ids carry no verifiable note → always "matches".
-        assert!(byte_source_matches("/no/such/path", &[]));
-        assert!(byte_source_matches("/no/such/path", &synthetic_build_id(7)));
-        // A real id against a file that can't be read (gone) is a mismatch.
-        assert!(!byte_source_matches("/no/such/path", &[0xde, 0xad, 0xbe, 0xef]));
-        // Against the file it actually came from, it matches; a wrong id doesn't.
-        let exe = std::fs::read_link("/proc/self/exe").unwrap();
-        let path = exe.to_str().unwrap();
-        let real = file_build_id(path).expect("test binary carries a GNU note");
-        assert!(byte_source_matches(path, &real));
-        assert!(!byte_source_matches(path, &[0xaau8; 20]));
     }
 
     #[test]

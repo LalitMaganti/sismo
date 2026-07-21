@@ -212,7 +212,14 @@ mod macos_run {
         };
 
         if has_sched || has_cpu {
-            match RingHost::start(RingConfig { sched: has_sched, offcpu: has_sched, oncpu: has_cpu }) {
+            // keep: None — a sidecar producer can't hand held fds to the
+            // recorder process, so pinning module files here would leak them.
+            match RingHost::start(RingConfig {
+                sched: has_sched,
+                offcpu: has_sched,
+                oncpu: has_cpu,
+                keep: sismo_core::cpu::module_registry::KeepPolicy::None,
+            }) {
                 Some(c) => {
                     eprintln!("sismo datasource: kdebug ring host registered (sched={has_sched} cpu={has_cpu})");
                     slots.push(Slot::Ring(c));

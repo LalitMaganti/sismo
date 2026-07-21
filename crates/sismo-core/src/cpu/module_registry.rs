@@ -4,29 +4,34 @@
 //! CAP-3(b): the registry of module files a recording sampled, so a binary
 //! rebuilt or deleted mid-run still symbolizes.
 //!
-//! Two threads share it. A dedicated **capture thread** drains the `module_hints`
-//! ringbuf and, promptly on first sight of a module — before the main sample
-//! queue (which backlogs under load) has even reached that sample — parses its
-//! build-id from the in-band page and pins an fd to its file per policy. The
-//! **main drain** looks the build-id up when it interns the module's mapping.
+//! The registry is platform-neutral: it settles each sampled module's trace
+//! build-id exactly once (the real identity when the capture read one, else a
+//! synthetic magic+random id), and pins an fd to the module's file per the
+//! `--keep-module-files` policy so a since-deleted binary's bytes stay
+//! readable until the post-record symbolize pass. How a capture *names* a
+//! module is the capture's business, expressed as a [`ModuleKey`]:
 //!
-//! Whichever thread reaches a module first mints its trace build-id and both then
-//! agree; only the capture thread pins fds. Because the capture thread is prompt
-//! and the main drain backlogs, the capture thread wins under load and supplies
-//! the in-band (replace-immune) id; under light load the main drain reaches the
-//! module early — before any mid-run change — so its /proc read is correct too.
+//! - The Linux bpf capture keys by mapping (`pid`, `base`), because identity
+//!   arrives from two threads that only share those coordinates: a dedicated
+//!   capture thread drains the `module_hints` ringbuf and registers each
+//!   module promptly (in-band build-id, fd pinned), while the main drain —
+//!   which backlogs under load — looks the id up when it interns the mapping.
+//!   Whichever thread reaches a module first mints the id and both then agree.
+//! - The macOS kperf snapshotter keys by file ([`ModuleKey::for_file`]),
+//!   registering each dyld image with the LC_UUID it read from the task.
 //!
-//! Identity: the per-process `(pid, base)` the two threads share names a module's
-//! mapping; fds are additionally deduped by `(dev, inode)` so one library mapped
-//! by many processes is held once. That `(dev, inode)` dedup is what lets this
-//! scale to system-wide unchanged — only the hint source grows, not the registry.
+//! Held fds are deduped by `(dev, inode)` across keys, so one library mapped
+//! by a thousand processes is held once — the property that lets this scale to
+//! system-wide profiling unchanged. An fd keeps its inode readable after an
+//! unlink; the symbolizer opens held fds via self-fd paths (see
+//! [`ModuleRegistry::held_fd_paths`]) — no copy, no on-disk cache.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 
-use crate::symbolize::proc_maps::{build_id_from_image_prefix, synthetic_build_id};
+use crate::symbolize::proc_maps::synthetic_build_id;
 
 /// Which sampled module files to hold an fd open for, from `--keep-module-files`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,29 +57,73 @@ impl KeepPolicy {
     }
 }
 
-/// Distro-managed prefixes whose files are replaced atomically by the package
-/// manager and effectively never rewritten under a running process. `Auto`
-/// treats everything else as unstable and worth holding open.
+/// Distro/installer-managed prefixes whose files are replaced atomically and
+/// effectively never rewritten under a running process. `Auto` treats
+/// everything else as unstable and worth holding open. The macOS list adds the
+/// SIP-protected system trees (whose dylibs mostly live in the dyld shared
+/// cache and have no on-disk file to hold anyway) and application bundles.
+#[cfg(not(target_os = "macos"))]
 const STABLE_PREFIXES: &[&str] = &["/usr/", "/lib/", "/lib64/", "/bin/", "/sbin/", "/opt/"];
+#[cfg(target_os = "macos")]
+const STABLE_PREFIXES: &[&str] = &[
+    "/usr/", "/bin/", "/sbin/", "/opt/", "/System/", "/Library/", "/Applications/",
+];
 
 fn is_unstable(path: &str) -> bool {
     !STABLE_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
+/// FNV-1a of a path, the key fallback for a file we could not stat.
+fn path_hash(path: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in path.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// How a capture names a module. Identity settling is memoized per key, so a
+/// capture must use the same key every time it reaches the same module.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ModuleKey {
+    /// A per-process mapping, for captures whose events carry `(pid, base)`.
+    Mapping { pid: u32, base: u64 },
+    /// A file identity, for captures that enumerate images by path.
+    File { dev: u64, ino: u64 },
+}
+
+impl ModuleKey {
+    /// Key a module by its file: `(dev, inode)` when the file is on disk, else
+    /// a hash of the path (the file is already gone — no fd can be held for
+    /// it, and a re-observation of the same path should still dedupe).
+    pub fn for_file(path: &str) -> ModuleKey {
+        match std::fs::metadata(path) {
+            Ok(m) => ModuleKey::File { dev: m.dev(), ino: m.ino() },
+            Err(_) => ModuleKey::File { dev: 0, ino: path_hash(path) },
+        }
+    }
+}
+
 struct Entry {
-    // The build-id the trace carries for this module: a real GNU note when it has
-    // one, else a synthetic magic+random id minted on first sight.
+    // The build-id the trace carries for this module: the real identity when
+    // the capture read one, else a synthetic magic+random id minted on first
+    // sight.
     build_id: Vec<u8>,
     // The (dev, inode) whose fd (in `fds`) backs this module, if one was held.
     inode: Option<(u64, u64)>,
+    // Whether a `register` call already decided the pin for this module, so
+    // re-registrations don't re-stat or re-open the file.
+    pin_done: bool,
 }
 
-/// Shared between the capture thread (writes) and the main drain (reads).
+/// One registry per recording, shared by however many threads the platform's
+/// capture uses (behind a mutex at the call sites).
 pub struct ModuleRegistry {
     policy: KeepPolicy,
-    by_key: HashMap<(u32, u64), Entry>,        // (pid, base) -> module identity
-    fds: HashMap<(u64, u64), File>,            // (dev, inode) -> held fd, deduped
-    rng: u64,                                  // splitmix64 state for synthetic ids
+    entries: HashMap<ModuleKey, Entry>,
+    fds: HashMap<(u64, u64), File>, // (dev, inode) -> held fd, deduped
+    rng: u64,                       // splitmix64 state for synthetic ids
 }
 
 impl ModuleRegistry {
@@ -83,7 +132,7 @@ impl ModuleRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        ModuleRegistry { policy, by_key: HashMap::new(), fds: HashMap::new(), rng: seed }
+        ModuleRegistry { policy, entries: HashMap::new(), fds: HashMap::new(), rng: seed }
     }
 
     fn next_rand(&mut self) -> u64 {
@@ -94,53 +143,35 @@ impl ModuleRegistry {
         z ^ (z >> 31)
     }
 
-    /// The build-id to intern for the module at `(pid, base)`. Called by the main
-    /// drain. Mints one from `host_hint` (the real GNU note it read, or empty →
-    /// synthetic) only if this module has not been seen yet; otherwise returns the
-    /// id the capture thread (or an earlier call) already settled on, so the two
-    /// threads never disagree.
-    pub fn id_for(&mut self, pid: u32, base: u64, host_hint: &[u8]) -> Vec<u8> {
-        if let Some(e) = self.by_key.get(&(pid, base)) {
+    /// The build-id the trace should use for the module at `key`. Mints one
+    /// from `id_hint` (the real identity the caller read, or empty →
+    /// synthetic) only if this module has not been seen yet; otherwise returns
+    /// the id already settled — so every observer of a module agrees, however
+    /// many threads race to reach it first.
+    pub fn id_for(&mut self, key: ModuleKey, id_hint: &[u8]) -> Vec<u8> {
+        if let Some(e) = self.entries.get(&key) {
             return e.build_id.clone();
         }
-        let build_id = self.mint(host_hint);
-        self.by_key.insert((pid, base), Entry { build_id: build_id.clone(), inode: None });
+        let build_id = self.mint(id_hint);
+        self.entries.insert(key, Entry { build_id: build_id.clone(), inode: None, pin_done: false });
         build_id
     }
 
-    /// Record the module at `(pid, base)` from a `module_hints` record: settle its
-    /// build-id from the in-band `page` (real GNU note, else synthetic) if unseen,
-    /// and pin an fd to `path` per policy so a later deletion does not lose it.
-    /// Called by the capture thread.
-    pub fn record_module(&mut self, pid: u32, base: u64, page: &[u8], path: &str) {
-        if !self.by_key.contains_key(&(pid, base)) {
-            let hint = build_id_from_image_prefix(page).unwrap_or_default();
-            let build_id = self.mint(&hint);
-            self.by_key.insert((pid, base), Entry { build_id, inode: None });
+    /// Register a sampled module: settle its build-id (as [`id_for`]) and pin
+    /// an fd to `path` per the policy, so a later deletion or rebuild does not
+    /// lose its bytes. Idempotent — the pin is decided once per key.
+    ///
+    /// [`id_for`]: ModuleRegistry::id_for
+    pub fn register(&mut self, key: ModuleKey, id_hint: &[u8], path: &str) -> Vec<u8> {
+        let build_id = self.id_for(key, id_hint);
+        let e = self.entries.get(&key).expect("id_for interned it");
+        if !e.pin_done {
+            let inode = self.pin_fd(path);
+            let e = self.entries.get_mut(&key).expect("id_for interned it");
+            e.inode = inode;
+            e.pin_done = true;
         }
-        // Pin the fd (deduped by inode) per policy, and point this module at it.
-        let hold = match self.policy {
-            KeepPolicy::All => true,
-            KeepPolicy::Auto => is_unstable(path),
-            KeepPolicy::None => false,
-        };
-        if !hold {
-            return;
-        }
-        let Ok(meta) = std::fs::metadata(path) else {
-            return; // already gone; the in-band build-id is all we get
-        };
-        let inode = (meta.dev(), meta.ino());
-        if !self.fds.contains_key(&inode) {
-            if let Ok(f) = File::open(path) {
-                self.fds.insert(inode, f);
-            } else {
-                return;
-            }
-        }
-        if let Some(e) = self.by_key.get_mut(&(pid, base)) {
-            e.inode = Some(inode);
-        }
+        build_id
     }
 
     fn mint(&mut self, hint: &[u8]) -> Vec<u8> {
@@ -152,17 +183,44 @@ impl ModuleRegistry {
         }
     }
 
-    /// Map each held module's build-id to a `/proc/self/fd/<n>` path a symbolizer
-    /// can open. Valid only while `self` is alive (it owns the fds).
+    /// Pin an fd for `path` per the policy, deduped by `(dev, inode)`. Returns
+    /// the key the fd is held under, or `None` when the policy declined, the
+    /// file is already gone, or the open failed.
+    fn pin_fd(&mut self, path: &str) -> Option<(u64, u64)> {
+        let hold = match self.policy {
+            KeepPolicy::All => true,
+            KeepPolicy::Auto => is_unstable(path),
+            KeepPolicy::None => false,
+        };
+        if !hold {
+            return None;
+        }
+        let meta = std::fs::metadata(path).ok()?;
+        let key = (meta.dev(), meta.ino());
+        if !self.fds.contains_key(&key) {
+            self.fds.insert(key, File::open(path).ok()?);
+        }
+        Some(key)
+    }
+
+    /// Map each held module's build-id to a self-fd path a symbolizer can open
+    /// (`/proc/self/fd/<n>` on Linux, `/dev/fd/<n>` on macOS — the latter has
+    /// dup semantics, sharing the held fd's offset, which is fine for the
+    /// seek/mmap reads symbolization does). Valid only while `self` is alive
+    /// (it owns the fds).
     pub fn held_fd_paths(&self) -> HashMap<Vec<u8>, String> {
+        #[cfg(target_os = "macos")]
+        const FD_DIR: &str = "/dev/fd";
+        #[cfg(not(target_os = "macos"))]
+        const FD_DIR: &str = "/proc/self/fd";
         let mut out = HashMap::new();
-        for e in self.by_key.values() {
+        for e in self.entries.values() {
             if e.build_id.is_empty() {
                 continue;
             }
             if let Some(inode) = e.inode {
                 if let Some(f) = self.fds.get(&inode) {
-                    out.insert(e.build_id.clone(), format!("/proc/self/fd/{}", f.as_raw_fd()));
+                    out.insert(e.build_id.clone(), format!("{FD_DIR}/{}", f.as_raw_fd()));
                 }
             }
         }
@@ -191,31 +249,36 @@ mod tests {
     #[test]
     fn id_for_mints_once_and_agrees_across_calls() {
         let mut reg = ModuleRegistry::new(KeepPolicy::None);
-        // A real note passes through and is stable.
+        let key = |pid, base| ModuleKey::Mapping { pid, base };
+        // A real id passes through and is stable.
         let real = [0xde, 0xad, 0xbe, 0xef];
-        assert_eq!(reg.id_for(7, 0x400000, &real), real);
-        assert_eq!(reg.id_for(7, 0x400000, &[]), real); // second call agrees, ignores new hint
-        // A note-less module gets a synthetic id, distinct per (pid, base).
-        let a = reg.id_for(7, 0x500000, &[]);
-        let b = reg.id_for(8, 0x500000, &[]);
+        assert_eq!(reg.id_for(key(7, 0x400000), &real), real);
+        assert_eq!(reg.id_for(key(7, 0x400000), &[]), real); // second call agrees, ignores new hint
+        // An id-less module gets a synthetic id, distinct per key.
+        let a = reg.id_for(key(7, 0x500000), &[]);
+        let b = reg.id_for(key(8, 0x500000), &[]);
         assert!(is_synthetic(&a) && is_synthetic(&b));
         assert_ne!(a, b);
-        assert_eq!(reg.id_for(7, 0x500000, &[]), a); // stable
+        assert_eq!(reg.id_for(key(7, 0x500000), &[]), a); // stable
     }
 
     #[test]
-    fn record_module_pins_fd_and_survives_deletion() {
-        let dir = std::env::temp_dir().join(format!("sismo-reg2-{}", std::process::id()));
+    fn register_pins_fd_and_survives_deletion() {
+        let dir = std::env::temp_dir().join(format!("sismo-reg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("prog"); // unstable path → auto holds it
         std::fs::write(&p, b"\x7fELF-bytes").unwrap();
 
         let mut reg = ModuleRegistry::new(KeepPolicy::Auto);
-        // No GNU note in these bytes → synthetic id, and a held fd.
-        reg.record_module(42, 0x400000, b"not-an-elf", p.to_str().unwrap());
-        assert_eq!(reg.held_count(), 1);
-        let id = reg.id_for(42, 0x400000, &[]); // main drain agrees with the minted id
+        let key = ModuleKey::Mapping { pid: 42, base: 0x400000 };
+        // No identity in the hint → synthetic id, and a held fd.
+        let id = reg.register(key, &[], p.to_str().unwrap());
         assert!(is_synthetic(&id));
+        assert_eq!(reg.held_count(), 1);
+        assert_eq!(reg.id_for(key, &[]), id); // any later observer agrees
+        // Re-registration adds no second fd.
+        assert_eq!(reg.register(key, &[], p.to_str().unwrap()), id);
+        assert_eq!(reg.held_count(), 1);
 
         std::fs::remove_file(&p).unwrap(); // deleted; held fd keeps the bytes readable
         let paths = reg.held_fd_paths();
@@ -225,15 +288,54 @@ mod tests {
     }
 
     #[test]
-    fn none_policy_ids_but_holds_no_fd() {
-        let dir = std::env::temp_dir().join(format!("sismo-reg2-none-{}", std::process::id()));
+    fn file_keys_dedupe_by_inode_and_survive_deletion() {
+        let dir = std::env::temp_dir().join(format!("sismo-reg-file-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let p = dir.join("prog");
-        std::fs::write(&p, b"x").unwrap();
-        let mut reg = ModuleRegistry::new(KeepPolicy::None);
-        reg.record_module(1, 0x1000, b"x", p.to_str().unwrap());
-        assert_eq!(reg.held_count(), 0);
-        assert!(is_synthetic(&reg.id_for(1, 0x1000, &[])));
+        let p = dir.join("prog"); // unstable path → auto holds it
+        std::fs::write(&p, b"MH-bytes").unwrap();
+        let path = p.to_str().unwrap();
+        let real = [1u8, 2, 3, 4]; // pretend a real identity (e.g. an LC_UUID)
+
+        let mut reg = ModuleRegistry::new(KeepPolicy::Auto);
+        let id = reg.register(ModuleKey::for_file(path), &real, path);
+        assert_eq!(id, real); // a real id passes through unchanged
+        assert_eq!(reg.held_count(), 1);
+        // Re-observing the same file dedupes: same key, same id, no second fd.
+        assert_eq!(reg.register(ModuleKey::for_file(path), &real, path), real);
+        assert_eq!(reg.held_count(), 1);
+
+        std::fs::remove_file(&p).unwrap(); // deleted, but the held fd keeps it readable
+        let paths = reg.held_fd_paths();
+        let fd_path = paths.get(&real[..].to_vec()).expect("held by build-id");
+        assert_eq!(std::fs::read(fd_path).unwrap(), b"MH-bytes");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn distinct_files_get_distinct_synthetic_ids() {
+        let dir = std::env::temp_dir().join(format!("sismo-reg-syn-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+        let (pa, pb) = (a.to_str().unwrap(), b.to_str().unwrap());
+
+        let mut reg = ModuleRegistry::new(KeepPolicy::None);
+        let ida = reg.register(ModuleKey::for_file(pa), &[], pa); // no real identity
+        let idb = reg.register(ModuleKey::for_file(pb), &[], pb);
+        assert!(is_synthetic(&ida) && is_synthetic(&idb));
+        assert_ne!(ida, idb); // distinct files → distinct ids
+        assert_eq!(reg.register(ModuleKey::for_file(pa), &[], pa), ida); // stable per inode
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn none_policy_ids_but_holds_nothing() {
+        let mut reg = ModuleRegistry::new(KeepPolicy::None);
+        let path = "/tmp/whatever-nonexistent";
+        let id = reg.register(ModuleKey::for_file(path), &[9, 9], path);
+        assert_eq!(id, vec![9, 9]); // still assigns the id
+        assert_eq!(reg.held_count(), 0); // but holds no fd
+        assert!(reg.held_fd_paths().is_empty());
     }
 }

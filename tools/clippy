@@ -26,7 +26,7 @@ from python.tools.run_rust_binary import get_platform_dir
 
 # Crates that build (and thus clippy) on the Linux host. heap-preload is a
 # macOS cdylib but its lib still compiles for the host, so it lints too.
-CRATES = ["sismo-proto", "sismo-symbolize", "sismo-core", "sismo-cli", "sismo-sys", "sismo-run", "sismo-heap-preload"]
+CRATES = ["sismo-proto", "sismo-macho", "sismo-symbolize", "sismo-core", "sismo-cli", "sismo-sys", "sismo-run", "sismo-heap-preload"]
 
 
 def main() -> int:

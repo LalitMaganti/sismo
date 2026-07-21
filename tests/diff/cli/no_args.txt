@@ -6,10 +6,12 @@ cross-platform desktop tracing/profiling tool
 Usage: sismo [COMMAND]
 
 Commands:
-  record      Spawn a command (or attach to --pid) and record sched + CPU samples + heap into a single Perfetto trace. Stops on SIGINT, target exit, or --duration. Requires sudo on macOS for kdebug + task_for_pid
+  record      Spawn a command (or attach to --pid) and record sched + CPU samples + heap into a single Perfetto trace. Stops on SIGINT, target exit, or --duration. On macOS, task attach needs `sismo doctor --fix`; kdebug scheduler/CPU collection needs a privileged external datasource
   prepare     Launch a command with sismo's dormant heap client preloaded, so it can be attached to later via `sismo record --pid <pid>`
-  snapshot    Snapshot a running flight-recorder session (`sismo record --flight-recorder`): clone it as a fresh consumer and write the trace
+  snapshot    Snapshot a running `sismo record`: clone its rolling buffer as a fresh consumer and write the trace, while recording continues
   datasource  Run a daemonized data-source producer for an external `sismo record`
+  doctor      Diagnose local setup problems and optionally apply safe fixes
+  symbolize   Symbolize a trace offline: resolve the native frames of a trace recorded with `--no-symbolize` (or any unsymbolized trace) and append the symbols in place. The deferred half of the record/symbolize split
   help        Print this message or the help of the given subcommand(s)
 
 Options:

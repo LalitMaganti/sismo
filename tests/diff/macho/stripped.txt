@@ -1,0 +1,4 @@
+module: no names 0/3 $WORK/fixture
+names: sismo_fix_leaf=no sismo_fix_mid=no main=no
+lines: no
+diags: partial

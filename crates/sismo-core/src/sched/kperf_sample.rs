@@ -20,6 +20,7 @@
 //!
 //! macOS-only; gated in sched/mod.rs.
 
+use crate::cpu::module_registry::{ModuleKey, ModuleRegistry};
 use crate::ffi::sismo_ds_emit;
 use crate::mach::MachPort;
 use crate::proto::ProtoWriter;
@@ -28,7 +29,7 @@ use crate::sched::ring::{ConsumerCtl, KdEvent, KdThreadMap, RingConsumer};
 use crate::symbolize::dyld_images::{read_macho_meta, ImageList};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ---- kperf event codes (osfmk/kperf/buffer.h) ------------------------------
 
@@ -212,11 +213,11 @@ pub struct OffCpuConsumer {
 }
 
 impl OffCpuConsumer {
-    pub fn new(ctl: Arc<ConsumerCtl>, task: MachPort) -> Self {
+    pub fn new(ctl: Arc<ConsumerCtl>, task: MachPort, registry: Arc<Mutex<ModuleRegistry>>) -> Self {
         let slot = ctl.ds_slot.load(Ordering::Acquire);
         OffCpuConsumer {
             ctl,
-            emitter: PerfEmitter::new(slot, task, b"off-cpu-ns"),
+            emitter: PerfEmitter::new(slot, task, b"off-cpu-ns", registry),
             stacks: UserStacks::default(),
             pending_wait: HashMap::new(),
         }
@@ -289,11 +290,16 @@ pub struct OnCpuConsumer {
 }
 
 impl OnCpuConsumer {
-    pub fn new(ctl: Arc<ConsumerCtl>, task: MachPort, period_ns: u64) -> Self {
+    pub fn new(
+        ctl: Arc<ConsumerCtl>,
+        task: MachPort,
+        period_ns: u64,
+        registry: Arc<Mutex<ModuleRegistry>>,
+    ) -> Self {
         let slot = ctl.ds_slot.load(Ordering::Acquire);
         OnCpuConsumer {
             ctl,
-            emitter: PerfEmitter::new(slot, task, b"cpu-ns"),
+            emitter: PerfEmitter::new(slot, task, b"cpu-ns", registry),
             stacks: UserStacks::default(),
             pending_fire: HashMap::new(),
             period_ns,
@@ -362,29 +368,44 @@ impl RingConsumer for OnCpuConsumer {
 
 // ---- shared module table + interner ----------------------------------------
 
-/// A loaded mach-o module: address range + path + UUID (the Mach-O build-id),
-/// used to emit Perfetto Mapping entries so frames symbolize post-record.
+/// A loaded mach-o module: address range + path + build-id, used to emit
+/// Perfetto Mapping entries so frames symbolize post-record. The build-id is
+/// the image's LC_UUID when it has one, else the registry's synthetic id —
+/// either way it is the id the module registry keyed the module under, so a
+/// held fd (--keep-module-files) is found again at symbolize time.
 struct Module {
     base: u64,
     end: u64,
     path: Vec<u8>,
-    uuid: [u8; 16],
+    build_id: Vec<u8>,
 }
 
 /// Enumerate the target's mach-o images into a base-sorted module table. Reads
 /// only each image's metadata (UUID + __TEXT vmsize), not its bytes. The end is
 /// base + __TEXT vmsize — NOT clamped to the next image's base: under the dyld
 /// shared cache image headers are packed together, so a next-base clamp would
-/// truncate ranges and make in-cache frames miss.
-fn load_modules(task: MachPort) -> Vec<Module> {
+/// truncate ranges and make in-cache frames miss. Each image is observed by the
+/// shared module registry, which decides the trace id and whether to pin an fd.
+fn load_modules(task: MachPort, registry: &Mutex<ModuleRegistry>) -> Vec<Module> {
     let list = match ImageList::enumerate(task) {
         Ok(l) => l,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            // Loud, not silent: an empty table maps every user frame to
+            // nothing, which reads as "no symbols" much later with no clue.
+            // The emitter retries (see emit), so this can be transient.
+            eprintln!("kperf_sample: module enumeration failed (err {e}) — user frames unmapped until retry");
+            return Vec::new();
+        }
     };
     let mut mods = Vec::with_capacity(list.len());
     for (base, path) in list.images() {
         if let Some((uuid, text_vmsize)) = read_macho_meta(task, *base) {
-            mods.push(Module { base: *base, end: base.wrapping_add(text_vmsize), path: path.clone(), uuid });
+            let real: &[u8] = if uuid.iter().any(|&b| b != 0) { &uuid } else { &[] };
+            let build_id = match std::str::from_utf8(path) {
+                Ok(p) => registry.lock().unwrap().register(ModuleKey::for_file(p), real, p),
+                Err(_) => real.to_vec(),
+            };
+            mods.push(Module { base: *base, end: base.wrapping_add(text_vmsize), path: path.clone(), build_id });
         }
     }
     mods.sort_by_key(|m| m.base);
@@ -460,13 +481,13 @@ impl Interner {
         iid
     }
 
-    fn intern_mapping(&mut self, idw: &mut ProtoWriter, base: u64, end: u64, path: &[u8], uuid: &[u8]) -> u64 {
+    fn intern_mapping(&mut self, idw: &mut ProtoWriter, base: u64, end: u64, path: &[u8], build_id: &[u8]) -> u64 {
         if let Some(&iid) = self.mappings.get(&base) {
             return iid;
         }
         let path_iid = Self::intern_string(idw, 17, path, &mut self.paths, &mut self.next_path);
-        let build_iid = if uuid.iter().any(|&b| b != 0) {
-            Self::intern_string(idw, 16, uuid, &mut self.build_ids, &mut self.next_build_id)
+        let build_iid = if !build_id.is_empty() {
+            Self::intern_string(idw, 16, build_id, &mut self.build_ids, &mut self.next_build_id)
         } else {
             0
         };
@@ -497,7 +518,10 @@ impl Interner {
         idw.message(6, |fr| {
             fr.write_uint64(1, iid);
             fr.write_uint64(3, mapping_iid);
-            fr.write_uint64(4, pc); // rel_pc = absolute PC; Perfetto subtracts load_bias
+            // rel_pc = the absolute PC. trace_processor stores it verbatim;
+            // the symbolize pass recovers the __TEXT-relative offset as
+            // rel_pc - load_bias (load_bias = image base, set above).
+            fr.write_uint64(4, pc);
         });
         iid
     }
@@ -533,6 +557,9 @@ struct PerfEmitter {
     task: MachPort,
     timebase_name: &'static [u8],
     modules: Vec<Module>,
+    /// Shared with the other perf consumer and the recorder: assigns each
+    /// module its trace id and pins fds per --keep-module-files.
+    registry: Arc<Mutex<ModuleRegistry>>,
     interner: Interner,
     need_defaults: bool,
     tb_numer: u64,
@@ -548,13 +575,19 @@ struct PerfEmitter {
 }
 
 impl PerfEmitter {
-    fn new(ds_slot: u32, task: MachPort, timebase_name: &'static [u8]) -> Self {
+    fn new(
+        ds_slot: u32,
+        task: MachPort,
+        timebase_name: &'static [u8],
+        registry: Arc<Mutex<ModuleRegistry>>,
+    ) -> Self {
         let (tb_numer, tb_denom) = timebase();
         PerfEmitter {
             ds_slot,
             task,
             timebase_name,
-            modules: load_modules(task),
+            modules: load_modules(task, &registry),
+            registry,
             interner: Interner::new(),
             need_defaults: true,
             tb_numer,
@@ -571,7 +604,7 @@ impl PerfEmitter {
         // Disjoint field borrows so the interner + both scratch writers + the
         // module table can all be used in one pass with no per-sample alloc.
         let PerfEmitter {
-            ds_slot, task, timebase_name, modules, interner, need_defaults, tb_numer, tb_denom, since_reload, idw, tp, fids,
+            ds_slot, task, timebase_name, modules, registry, interner, need_defaults, tb_numer, tb_denom, since_reload, idw, tp, fids,
         } = self;
         let ds_slot = *ds_slot;
 
@@ -592,10 +625,17 @@ impl PerfEmitter {
 
         // A dlopen after startup can leave frames unmapped — re-enumerate, but at
         // most once every 512 samples so an always-unmappable frame can't reload
-        // on every sample.
+        // on every sample. An EMPTY table is worse than a stale one (every user
+        // frame of every sample drops, silently, for the whole recording — seen
+        // when enumeration races the target's early dyld window), so retry that
+        // state much sooner.
         *since_reload = since_reload.saturating_add(1);
-        if *since_reload > 512 && s.frames.iter().any(|&pc| pc != 0 && find_module(modules, pc).is_none()) {
-            *modules = load_modules(*task);
+        let retry_at = if modules.is_empty() { 8 } else { 512 };
+        if *since_reload > retry_at
+            && (modules.is_empty()
+                || s.frames.iter().any(|&pc| pc != 0 && find_module(modules, pc).is_none()))
+        {
+            *modules = load_modules(*task, registry);
             *since_reload = 0;
         }
 
@@ -621,7 +661,7 @@ impl PerfEmitter {
             if let Some(i) = find_module(modules, pc) {
                 let (base, end) = (modules[i].base, modules[i].end);
                 let m = &modules[i];
-                let mapping_iid = interner.intern_mapping(idw, base, end, &m.path, &m.uuid);
+                let mapping_iid = interner.intern_mapping(idw, base, end, &m.path, &m.build_id);
                 let frame_iid = interner.intern_frame(idw, mapping_iid, pc);
                 fids.push(frame_iid);
             }
@@ -673,12 +713,17 @@ mod tests {
         }
     }
 
+    fn test_registry() -> Arc<Mutex<ModuleRegistry>> {
+        use crate::cpu::module_registry::KeepPolicy;
+        Arc::new(Mutex::new(ModuleRegistry::new(KeepPolicy::None)))
+    }
+
     // A consumer with a bogus (unused-in-test) emitter: decode is exercised
     // directly, never emit, so the ds_slot / task never touch the C shim.
     fn offcpu() -> OffCpuConsumer {
         OffCpuConsumer {
             ctl: Arc::new(ConsumerCtl::new()),
-            emitter: PerfEmitter { ds_slot: u32::MAX, task: 0, timebase_name: b"", modules: Vec::new(), interner: Interner::new(), need_defaults: false, tb_numer: 1, tb_denom: 1, since_reload: 0, idw: ProtoWriter::new(), tp: ProtoWriter::new(), fids: Vec::new() },
+            emitter: PerfEmitter { ds_slot: u32::MAX, task: 0, timebase_name: b"", modules: Vec::new(), registry: test_registry(), interner: Interner::new(), need_defaults: false, tb_numer: 1, tb_denom: 1, since_reload: 0, idw: ProtoWriter::new(), tp: ProtoWriter::new(), fids: Vec::new() },
             stacks: UserStacks::default(),
             pending_wait: HashMap::new(),
         }
@@ -687,7 +732,7 @@ mod tests {
     fn oncpu() -> OnCpuConsumer {
         OnCpuConsumer {
             ctl: Arc::new(ConsumerCtl::new()),
-            emitter: PerfEmitter { ds_slot: u32::MAX, task: 0, timebase_name: b"", modules: Vec::new(), interner: Interner::new(), need_defaults: false, tb_numer: 1, tb_denom: 1, since_reload: 0, idw: ProtoWriter::new(), tp: ProtoWriter::new(), fids: Vec::new() },
+            emitter: PerfEmitter { ds_slot: u32::MAX, task: 0, timebase_name: b"", modules: Vec::new(), registry: test_registry(), interner: Interner::new(), need_defaults: false, tb_numer: 1, tb_denom: 1, since_reload: 0, idw: ProtoWriter::new(), tp: ProtoWriter::new(), fids: Vec::new() },
             stacks: UserStacks::default(),
             pending_fire: HashMap::new(),
             period_ns: 1_000_000,
@@ -755,8 +800,8 @@ mod tests {
     #[test]
     fn find_module_ranges() {
         let mods = vec![
-            Module { base: 0x1000, end: 0x2000, path: b"a".to_vec(), uuid: [0; 16] },
-            Module { base: 0x4000, end: 0x5000, path: b"b".to_vec(), uuid: [0; 16] },
+            Module { base: 0x1000, end: 0x2000, path: b"a".to_vec(), build_id: Vec::new() },
+            Module { base: 0x4000, end: 0x5000, path: b"b".to_vec(), build_id: Vec::new() },
         ];
         assert_eq!(find_module(&mods, 0x1500), Some(0));
         assert_eq!(find_module(&mods, 0x4000), Some(1));

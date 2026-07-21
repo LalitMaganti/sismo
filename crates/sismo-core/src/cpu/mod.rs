@@ -11,8 +11,9 @@
 #[cfg(target_os = "linux")]
 pub mod linux_bpf_capture;
 // CAP-3(b): registry of sampled module files (holds fds so deleted binaries
-// still symbolize). Platform-agnostic policy + (dev,inode) dedup.
-#[cfg(target_os = "linux")]
+// still symbolize). Platform-agnostic policy + (dev,inode) dedup; the held-fd
+// path is /proc/self/fd on Linux, /dev/fd on macOS. POSIX-only.
+#[cfg(not(target_os = "windows"))]
 pub mod module_registry;
 #[cfg(target_os = "linux")]
 pub mod pmu_events;

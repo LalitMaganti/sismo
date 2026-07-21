@@ -782,10 +782,10 @@ impl Interner {
 
 // ---- Capture: the collector object (output half) ---------------------------
 
-use crate::cpu::module_registry::{KeepPolicy, ModuleRegistry};
+use crate::cpu::module_registry::{KeepPolicy, ModuleKey, ModuleRegistry};
 use crate::symbolize::data_regions::DataRegions;
 use crate::symbolize::gopclntab::GoPclntab;
-use crate::symbolize::proc_maps::{ProcMaps, ResidualMap};
+use crate::symbolize::proc_maps::{build_id_from_image_prefix, ProcMaps, ResidualMap};
 use crate::symbolize::python_offsets::PyDebugOffsets;
 use crate::symbolize::unwinder::{StackRegs, Unwinder};
 use crate::ffi::{sismo_ds_emit, sismo_ds_emit_offcpu};
@@ -1039,7 +1039,7 @@ impl Capture {
                     .modules
                     .lock()
                     .unwrap()
-                    .id_for(rec.hdr.pid, m.base_avma, &m.build_id);
+                    .id_for(ModuleKey::Mapping { pid: rec.hdr.pid, base: m.base_avma }, &m.build_id);
                 let mapping_iid = self.interner.intern_mapping(
                     m.start,
                     m.end,
@@ -1601,11 +1601,12 @@ extern "C" fn on_flush(user: *mut c_void, flusher: *mut c_void) {
 }
 
 // CAP-3(b): resolve a module-hint record's file and hand it to the shared
-// registry (build-id from the in-band page; fd pinned per policy). `registry` is
-// the capture thread's own Arc handle — this touches no `Capture`.
+// registry (build-id parsed from the in-band page; fd pinned per policy).
+// `registry` is the capture thread's own Arc handle — this touches no `Capture`.
 fn capture_module_record(registry: &Mutex<ModuleRegistry>, rec: &SismoModuleRec) {
     let n = (rec.prefix_len as usize).min(SISMO_MODULE_PREFIX);
     let page = &rec.prefix[..n];
+    let hint = build_id_from_image_prefix(page).unwrap_or_default();
     // The path the module's base is mapped from (empty if the file is already
     // gone; the in-band page still yields the build-id).
     let path = ProcMaps::parse(rec.tgid)
@@ -1616,7 +1617,8 @@ fn capture_module_record(registry: &Mutex<ModuleRegistry>, rec: &SismoModuleRec)
                 .map(|(_, p)| p.to_string())
         })
         .unwrap_or_default();
-    registry.lock().unwrap().record_module(rec.tgid, rec.base, page, &path);
+    let key = ModuleKey::Mapping { pid: rec.tgid, base: rec.base };
+    registry.lock().unwrap().register(key, &hint, &path);
 }
 
 // The ctx is a boxed `Arc<Mutex<ModuleRegistry>>` (see capture_init); the capture

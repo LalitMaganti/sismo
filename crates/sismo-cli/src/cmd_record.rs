@@ -444,7 +444,12 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
     let host_sched = sched_mode == SourceMode::InProcess;
     let host_oncpu = cpu_mode == SourceMode::InProcess;
     let mut ring: Option<Box<RingHost>> = if host_sched || host_oncpu {
-        let c = RingHost::start(RingConfig { sched: host_sched, offcpu: host_sched, oncpu: host_oncpu });
+        let c = RingHost::start(RingConfig {
+            sched: host_sched,
+            offcpu: host_sched,
+            oncpu: host_oncpu,
+            keep: config.keep_module_files,
+        });
         if c.is_none() {
             eprintln!("sismo record: ring host init failed");
         }
@@ -610,6 +615,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
 
     wait_for_workload_exit(rd, target_pid, is_attach);
 
+    let mut wrote_trace = false;
     if long_trace {
         // Streaming mode: traced already wrote the file; stop finalizes it.
         unsafe { sismo_consumer_session_stop_blocking(session) };
@@ -617,6 +623,7 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
         if !append_privileged_marker(output_path_str, &[target_pid], None, false) {
             eprintln!("sismo record: failed to write privileged marker");
         }
+        wrote_trace = true;
     } else {
         // Rolling-buffer mode: clone the live session to the file (the clone
         // flushes the capture workers, exactly like `sismo snapshot`), then stop.
@@ -627,14 +634,43 @@ fn run_macos_flow(config: &RecordConfig) -> c_int {
                 if !append_privileged_marker(output_path_str, &[target_pid], None, false) {
                     eprintln!("sismo record: failed to write privileged marker");
                 }
+                wrote_trace = true;
             }
             Err(e) => eprintln!("sismo record: failed to write trace: {e}"),
         }
         unsafe { sismo_consumer_session_stop_blocking(session) };
     }
 
+    // The registry Arc must outlive shutdown: it owns the fds --keep-module-files
+    // pinned, and the held /dev/fd paths below point at them.
+    let registry = ring.as_ref().map(|r| r.module_registry());
+
     // Capture shutdowns (with stats).
     shutdown_captures(&mut heap, &mut ring);
+
+    // Post-record symbolization: resolve the trace's {UUID, PC} native frames
+    // to names — the same pass the Linux runner and `sismo symbolize` run.
+    // Skipped when no perf-sample source was on (nothing to resolve).
+    let had_samples = host_oncpu
+        || host_sched
+        || cpu_mode == SourceMode::External
+        || sched_mode == SourceMode::External;
+    if wrote_trace && had_samples && !config.no_symbolize {
+        let held = match registry.as_ref() {
+            Some(r) => {
+                let reg = r.lock().unwrap();
+                if reg.held_count() > 0 {
+                    eprintln!(
+                        "sismo record: keeping {} module file(s) open for symbolization",
+                        reg.held_count()
+                    );
+                }
+                reg.held_fd_paths()
+            }
+            None => std::collections::HashMap::new(),
+        };
+        sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str, &held);
+    }
 
     // Join the exit watcher (it has fired 'X' or is about to), then tear down.
     let _ = watch.join();
@@ -684,7 +720,9 @@ use sismo_core::ffi::{sismo_traced_probes_create, sismo_traced_probes_destroy, s
 
 #[cfg(target_os = "linux")]
 use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
+#[cfg(target_os = "linux")]
 use sismo_core::cpu::module_registry::{KeepPolicy, ModuleRegistry};
+#[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 
 

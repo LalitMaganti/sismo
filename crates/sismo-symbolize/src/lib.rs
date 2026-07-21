@@ -32,10 +32,17 @@ pub mod stack_quality;
 // no frame pointers — the one build shape sismo cannot unwind by any path.
 #[cfg(not(target_os = "windows"))]
 pub mod unwind_tables;
-// macOS Mach-based module enumeration + mach-o reading.
+// macOS module registration glue over sismo-macho's dyld image reading (the
+// Mach/mach-o platform code itself lives in the sismo-macho crate).
 #[cfg(target_os = "macos")]
 pub mod dyld_images;
-// Post-record symbolization + source/asm sidecar (Linux bpf path; POSIX-only).
+// Trust decisions about on-disk byte sources — the one place a trace build-id
+// is matched against a file's platform identity (ELF note vs mach-o LC_UUID).
+pub mod byte_source;
+// The names-only fallback sources behind wholesym, and the one place the
+// per-platform set is chosen.
+pub mod fallback;
+// Post-record symbolization + source/asm sidecar (both record paths; POSIX-only).
 #[cfg(not(target_os = "windows"))]
 pub mod perf_symbolize;
 pub mod proc_maps;

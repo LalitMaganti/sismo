@@ -79,14 +79,10 @@ struct SymModule {
     /// returns 0 (= no match) instead of falling through to a wrong
     /// neighbor module's range.
     map: Option<SymbolMap>,
-    /// `.dynsym`-via-PT_DYNAMIC fallback, populated only when wholesym found
-    /// zero symbols (a section-header-stripped ELF). Names only, no line info.
-    #[cfg(not(target_os = "windows"))]
-    dynsym: Option<crate::dynsym::DynSyms>,
-    /// `.gopclntab` fallback for a stripped Go binary — recovers the Go function
-    /// names wholesym can't see once `-s` drops the symbol table. Names only.
-    #[cfg(not(target_os = "windows"))]
-    gopclntab: Option<crate::gopclntab::GoPclntab>,
+    /// Names-only fallback sources behind wholesym, in resolution order
+    /// (`fallback::load_fallbacks` is the one place the per-platform set is
+    /// chosen).
+    fallbacks: Vec<Box<dyn crate::fallback::SymbolSource>>,
 }
 
 /// Build the wholesym config. Debuginfod is opt-in (it does network I/O),
@@ -173,43 +169,18 @@ impl Symbolizer {
             Err(e) => (None, ModuleLoad { symbol_count: 0, error: Some(format!("{e}")) }),
         };
 
-        // When wholesym found no symbols, the ELF may have had its section
-        // header table stripped — its names are still reachable through the
-        // dynamic segment. Try that fallback and, if it works, report the
-        // recovered count so the module status is honest rather than the
-        // misleading "0 symbols / binary changed" it produced before.
-        #[cfg(not(target_os = "windows"))]
-        let dynsym = if result.symbol_count == 0 {
-            let d = path.to_str().and_then(crate::dynsym::DynSyms::from_path);
-            if let Some(d) = d.as_ref() {
-                result = ModuleLoad { symbol_count: d.len() as u64, error: None };
-            }
-            d
-        } else {
-            None
-        };
-
-        // A stripped Go binary keeps `.gopclntab`; load it so `resolve` can
-        // recover Go names wholesym can't (it only saw synthetic placeholders).
-        // Cheap to skip: non-Go ELFs have no `.gopclntab` and `from_path` bails.
-        #[cfg(not(target_os = "windows"))]
-        let gopclntab = path.to_str().and_then(crate::gopclntab::GoPclntab::from_path);
-        #[cfg(not(target_os = "windows"))]
-        if let Some(g) = gopclntab.as_ref() {
-            if result.symbol_count == 0 {
-                result = ModuleLoad { symbol_count: g.len() as u64, error: None };
+        // When wholesym found nothing, a fallback source may still be able to
+        // name this module's functions. Report the first non-empty fallback's
+        // count so the module status is honest rather than the misleading
+        // "0 symbols / binary changed" it produced before.
+        let fallbacks = crate::fallback::load_fallbacks(path, uuid, result.symbol_count);
+        if result.symbol_count == 0 {
+            if let Some(n) = fallbacks.iter().map(|f| f.len()).find(|&n| n > 0) {
+                result = ModuleLoad { symbol_count: n as u64, error: None };
             }
         }
 
-        self.modules.push(SymModule {
-            base_avma,
-            end_avma,
-            map,
-            #[cfg(not(target_os = "windows"))]
-            dynsym,
-            #[cfg(not(target_os = "windows"))]
-            gopclntab,
-        });
+        self.modules.push(SymModule { base_avma, end_avma, map, fallbacks });
         result
     }
 
@@ -218,15 +189,7 @@ impl Symbolizer {
     /// on-disk file was replaced since recording and must not be trusted for
     /// symbols.
     pub fn add_range_no_symbols(&mut self, base_avma: u64, end_avma: u64) {
-        self.modules.push(SymModule {
-            base_avma,
-            end_avma,
-            map: None,
-            #[cfg(not(target_os = "windows"))]
-            dynsym: None,
-            #[cfg(not(target_os = "windows"))]
-            gopclntab: None,
-        });
+        self.modules.push(SymModule { base_avma, end_avma, map: None, fallbacks: Vec::new() });
     }
 
     /// Resolve `avma` to its inline chain (innermost inlinee first, physical
@@ -268,22 +231,10 @@ impl Symbolizer {
             }
         }
 
-        // `.gopclntab` for a stripped Go binary — real Go names, no line info.
-        #[cfg(not(target_os = "windows"))]
-        if let Some(gopclntab) = module.gopclntab.as_ref() {
-            if let Some((name, offset)) = gopclntab.resolve(rel_u64) {
-                return Some(Resolved {
-                    frames: vec![Frame { name: name.to_owned(), file: None, line: 0 }],
-                    offset,
-                });
-            }
-        }
-
-        // `.dynsym` via PT_DYNAMIC for a section-header-stripped ELF, where
-        // wholesym found no symbols. Names only — no source location.
-        #[cfg(not(target_os = "windows"))]
-        if let Some(dynsym) = module.dynsym.as_ref() {
-            if let Some((name, offset)) = dynsym.resolve(rel_u64) {
+        // The names-only fallback chain (gopclntab / dynsym / dyld cache — see
+        // fallback::load_fallbacks), in quality order.
+        for source in &module.fallbacks {
+            if let Some((name, offset)) = source.resolve(rel_u64) {
                 return Some(Resolved {
                     frames: vec![Frame { name: name.to_owned(), file: None, line: 0 }],
                     offset,

@@ -25,11 +25,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from python.tools.diff_suites import cli, matrix, trace
+from python.tools.diff_suites import cli, matrix, symbolize_mac, trace
 from python.tools.diff_suites.common import SuiteContext
 
 # Ordered registry. Order is the run order.
-_SUITES = [cli, trace, matrix]
+_SUITES = [cli, trace, symbolize_mac, matrix]
 
 
 def main() -> int:

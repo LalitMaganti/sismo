@@ -1,0 +1,23 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
+# All of sismo's Mach-O / dyld platform support in one place: in-memory image
+# enumeration + reading (capture side) and dyld-shared-cache symbol extraction
+# (symbolize side). Everything is gated on macOS in lib.rs, so the crate
+# compiles to nothing elsewhere and stays safe for cross-platform lint/test
+# sweeps.
+[package]
+name = "sismo-macho"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "sismo_macho"
+path = "src/lib.rs"
+
+[dependencies]
+# Mach-O + dyld-shared-cache parsing (same pin as sismo-symbolize).
+object = { version = "0.39.1", default-features = false, features = ["std", "read", "macho"] }
+# task_info and friends.
+libc = "0.2"

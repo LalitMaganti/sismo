@@ -17,6 +17,7 @@
 //!
 //! macOS only; gated in lib.rs.
 
+use crate::cpu::module_registry::{KeepPolicy, ModuleRegistry};
 use crate::ffi::{sismo_ds_emit, sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use crate::mach::{mach_task_self_, mach_timebase_info, MachPort, TimebaseInfo, KERN_SUCCESS};
 use crate::proto::sched_protos::{encode_kernel_process_tree, macos_sched_vm_program, ProcessC, ThreadC};
@@ -287,12 +288,14 @@ fn emit_task_state(slot: u32, w: &mut ProtoWriter, ts_ns: u64, cpu: i32, comm: &
 // ---- Ring host -------------------------------------------------------------
 
 /// Which consumers to host. off-CPU + on-CPU each need a target pid (carried in
-/// the sched / cpu data-source configs).
+/// the sched / cpu data-source configs). `keep` is the --keep-module-files
+/// policy for the shared module registry (CAP-3(b)).
 #[derive(Clone, Copy)]
 pub struct RingConfig {
     pub sched: bool,
     pub offcpu: bool,
     pub oncpu: bool,
+    pub keep: KeepPolicy,
 }
 
 /// Stats reported by [`RingHost::shutdown`].
@@ -322,6 +325,12 @@ pub struct RingHost {
     sched_ctl: Option<Arc<ConsumerCtl>>,
     offcpu_ctl: Option<Arc<ConsumerCtl>>,
     oncpu_ctl: Option<Arc<ConsumerCtl>>,
+
+    // Module registry shared by both perf consumers: assigns each sampled
+    // module its trace id (LC_UUID or synthetic) and pins fds per
+    // --keep-module-files. The recorder clones the Arc so held fds outlive
+    // shutdown and feed the post-record symbolize pass.
+    registry: Arc<Mutex<ModuleRegistry>>,
 
     drain_calls: AtomicU64,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -503,11 +512,11 @@ impl RingHost {
                     Ok(_counter_count) => {
                         if want_offcpu {
                             eprintln!("ring_host: off-CPU armed for pid {target_pid} (wait threshold {}us)", threshold_ns / 1_000);
-                            offcpu = Some(OffCpuConsumer::new(self.offcpu_ctl.clone().unwrap(), task));
+                            offcpu = Some(OffCpuConsumer::new(self.offcpu_ctl.clone().unwrap(), task, self.registry.clone()));
                         }
                         if want_oncpu {
                             eprintln!("ring_host: on-CPU armed for pid {target_pid} (timer {}us)", period_ns / 1_000);
-                            oncpu = Some(OnCpuConsumer::new(self.oncpu_ctl.clone().unwrap(), task, period_ns));
+                            oncpu = Some(OnCpuConsumer::new(self.oncpu_ctl.clone().unwrap(), task, period_ns, self.registry.clone()));
                         }
                     }
                 }
@@ -630,6 +639,7 @@ impl RingHost {
             sched_ctl: None,
             offcpu_ctl: None,
             oncpu_ctl: None,
+            registry: Arc::new(Mutex::new(ModuleRegistry::new(cfg.keep))),
             drain_calls: AtomicU64::new(0),
             thread: Mutex::new(None),
         });
@@ -687,6 +697,12 @@ impl RingHost {
         });
         *host.thread.lock().unwrap() = Some(handle);
         Some(host)
+    }
+
+    /// The shared module registry. Clone the Arc before [`Self::shutdown`] and
+    /// keep it alive through symbolization — it owns the held module fds.
+    pub fn module_registry(&self) -> Arc<Mutex<ModuleRegistry>> {
+        self.registry.clone()
     }
 
     /// Signal exit, join the worker (its ring drops, tearing the kdebug session

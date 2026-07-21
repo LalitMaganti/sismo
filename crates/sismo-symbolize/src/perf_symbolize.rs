@@ -11,11 +11,14 @@
 //! TrackEvent "sidecar" (the same HACK as sismo_privileged_marker — see the
 //! block comment on `append_sidecar`).
 //!
-//! Only invoked on the Linux bpf path (cmd_record), so its *runtime* is
-//! Linux-only and rides the LINUX-UNVALIDATED flag; it compiles + links on
-//! macOS and its pure helpers are unit-tested here. The trace query is bound
-//! to the C++ shim; the symbolizer, disassembler, and proto writer are Rust
-//! siblings (direct calls, no FFI round-trip). POSIX-only (file append).
+//! Runs on both record paths — Linux bpf and macOS kperf — and offline via
+//! `sismo symbolize`. The address convention is shared: both captures emit
+//! mappings whose `load_bias` is the value to subtract from a frame's
+//! `rel_pc` to reach the symbolizer's module-relative space (the ELF
+//! link-time vaddr on Linux, the offset from the `__TEXT` base on macOS).
+//! The trace query is bound to the C++ shim; the symbolizer, disassembler,
+//! and proto writer are Rust siblings (direct calls, no FFI round-trip).
+//! POSIX-only (file append).
 
 use crate::disasm::{disasm_module, Arch};
 use sismo_proto::ProtoWriter;
@@ -460,7 +463,7 @@ fn build_module_symbols(
     let mut build_id_raw = [0u8; 64];
     let bid = hex_to_bytes(&m.build_id_hex, &mut build_id_raw);
     let path_matches = recorded.exists()
-        && recorded_str.is_some_and(|p| crate::proc_maps::byte_source_matches(p, bid));
+        && recorded_str.is_some_and(|p| crate::byte_source::matches(p, bid));
     let held = held_fds.get(bid);
     let byte_source = if path_matches {
         recorded
@@ -479,7 +482,8 @@ fn build_module_symbols(
     } else {
         recorded // gone and not held: let add_module fail gracefully
     };
-    let load = sym.add_module(m.load_bias, end_avma, byte_source, None, None);
+    let uuid = crate::byte_source::uuid_disambiguator(bid);
+    let load = sym.add_module(m.load_bias, end_avma, byte_source, uuid, None);
     stat.symbols_loaded = load.error.is_none();
     stat.symbol_count = load.symbol_count;
     stat.err = load.error.unwrap_or_default().into_bytes();
@@ -861,27 +865,33 @@ fn print_runtime_diagnostic(name: &[u8], rt: Runtime) {
     }
 }
 
-/// Warn once per sampled module whose on-disk file has no real GNU build-id.
-/// The recording still symbolized locally, but a synthetic per-run id means the
-/// binary can't be matched across runs or against a symbol server — a silent
-/// loss until now. Orthogonal to symbolization status: a fully-resolved module
-/// can still lack a build-id.
+/// Warn once per sampled module whose trace build-id is synthetic or absent.
+/// The recording still symbolized locally, but without the binary's real
+/// identity (GNU build-id note on ELF, LC_UUID on mach-o) it can't be matched
+/// across runs or against a symbol server — a silent loss until now. The trace
+/// id is what every downstream consumer keys on, so judge that rather than
+/// re-probing the on-disk file for a GNU note (which would misread a mach-o —
+/// or a dyld-shared-cache dylib with no file at all — as id-less). Orthogonal
+/// to symbolization status: a fully-resolved module can still lack an id.
 fn report_missing_build_ids(stats: &[ModuleStat]) {
     for st in stats {
-        if !file_exists(&st.name) {
+        let mut raw = [0u8; 64];
+        let bid = hex_to_bytes(&st.build_id_hex, &mut raw);
+        if !bid.is_empty() && !crate::proc_maps::is_synthetic(bid) {
             continue;
         }
-        let p = match std::str::from_utf8(&st.name) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if crate::proc_maps::has_gnu_build_id(p) {
+        if !file_exists(&st.name) {
             continue;
         }
         eprintln!("\nsismo record: {} has no build-id", s(&st.name));
         eprintln!("    without one, sismo can't match this binary across runs or against a");
         eprintln!("    symbol server, so offline symbolization is unavailable.");
-        eprintln!("    link with a build-id to enable it: -Wl,--build-id=sha1");
+        if cfg!(target_os = "macos") {
+            eprintln!("    ld emits an LC_UUID by default — this binary was linked with");
+            eprintln!("    -no_uuid; drop that flag to restore its identity.");
+        } else {
+            eprintln!("    link with a build-id to enable it: -Wl,--build-id=sha1");
+        }
     }
 }
 
