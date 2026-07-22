@@ -24,8 +24,8 @@ value is runtime frames, which the offline synth flow cannot fabricate.
 Shapes that only exist on one OS live in matrix-linux and matrix-mac.
 
 Default-on where something is always cheap to run (macOS: the offline
-half); opt-in on Linux, where recording needs a setcap'd sismo-run — run it
-there with `tools/difftest --suite matrix`.
+half); opt-in on Linux, where recording needs a caps-granted sismo (see
+`sismo doctor --fix`) — run it there with `tools/difftest --suite matrix`.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ import subprocess
 
 from python.tools.diff_suites import matrix_linux, matrix_mac
 from python.tools.diff_suites.common import (
-    SISMO, SISMO_RUN, TP_SHELL, Skip, SuiteContext, run_golden_cases)
+    SISMO, TP_SHELL, Skip, SuiteContext, ensure_record_env, run_golden_cases)
 
 NAME = "matrix"
 DESCRIPTION = "cross-platform build shapes, one golden per OS/mode"
@@ -113,9 +113,13 @@ def run(ctx: SuiteContext) -> int:
     sysname = platform.system()
     if sysname == "Linux":
         matrix_linux.reserve_cpu_headroom()
+        if not ensure_record_env():
+            print("skip matrix (recording env not ready — "
+                  "run: sudo sismo doctor --fix)")
+            return 0
         variants = matrix_linux.cross_variants()
         _check(variants, CROSS_NAMES, "linux")
-        needs = [SISMO_RUN, TP_SHELL, SISMO]
+        needs = [SISMO, TP_SHELL]
         cases = [(f"{n}.linux",
                   functools.partial(matrix_linux.variant_facts, variants[n]),
                   needs) for n in CROSS_NAMES]

@@ -5,6 +5,6 @@ mapping: present
 leaf: symbolized
 chain: full
 module_status: ok
-build_id: synthetic
-diagnostics: build-id
+build_id: gnu
+diagnostics: none
 residual: none

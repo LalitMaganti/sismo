@@ -25,8 +25,9 @@ golden that records degraded output today; when a roadmap feature lands and the
 output improves, the golden diff fails and prompts a --rebaseline. That diff is
 the "gap closed → update expectation" flow — no separate xfail bookkeeping.
 
-This suite is ENABLED_BY_DEFAULT = False: heavy, needs a setcap'd sismo-run and
-the Perfetto build, run it with `tools/difftest --suite matrix-linux`. Scope is
+This suite is ENABLED_BY_DEFAULT = False: heavy, needs a caps-granted sismo
+(see `sismo doctor --fix`) and the Perfetto build, run it with
+`tools/difftest --suite matrix-linux`. Scope is
 local only for now; the kernel-version axis, the multi-version toolchain
 matrix, and the CI gate are deferred — see the testing design doc.
 """
@@ -43,7 +44,8 @@ import subprocess
 import time
 
 from python.tools.diff_suites.common import (
-    ROOT_DIR, SISMO, SISMO_RUN, TP_SHELL, Skip, SuiteContext, run_golden_cases)
+    ROOT_DIR, SISMO, TP_SHELL, Skip, SuiteContext, crashmark,
+    ensure_record_env, run_golden_cases)
 
 NAME = "matrix-linux"
 DESCRIPTION = "Linux-only workloads × compilers × flags × env (heavy, needs BPF caps)"
@@ -109,7 +111,7 @@ class Variant:
     outer: str = "sismo_wl_outer"
     map_substr: str = ""                 # mapping-name substring; default:
                                          # basename of cmd[0]
-    runner: str = "caps"                 # caps (sismo-run) | plain (sismo)
+    runner: str = "caps"                 # caps (sismo) | plain (uncapped copy)
     chain_need: int = 2                  # distinct chain symbols for "full"
     mid_run: tuple[float, str] | None = None   # (delay_s, "delete"|"replace")
     # Build command run at the mid_run point for action "replace" — rebuilds the
@@ -324,7 +326,11 @@ def cross_variants() -> dict[str, Variant]:
         # symbolize correctly from the retained original inode.
         keep_module_files="none",
         mid_run=(0.5, "replace"),
-        mid_run_build=[["gcc", "-O0", fp, "-o", b, wl_c]]))
+        # Build to a sibling and rename() over the target: linking straight to
+        # the path hits ETXTBSY while the workload still runs it, silently
+        # leaving the file unreplaced (and the timing-dependent outcome flaky).
+        mid_run_build=[["gcc", "-O0", fp, "-o", b + ".new", wl_c],
+                       ["mv", b + ".new", b]]))
 
     return {x.name: x for x in v}
 
@@ -534,9 +540,7 @@ def build_variants() -> list[Variant]:
         [b, "{DUR}"],
         Expect(samples=False, offcpu=False, mapping=False, leaf="none",
                chain="na", module_status=None,
-               diags=[r"bpf capture init failed"],
-               gremlin="failure message must explain the remedy (sismo-run "
-                       "+ setcap, or root); verify it actually does"),
+               diags=[r"bpf capture init failed", r"doctor --fix"]),
         [["gcc", "-O2", fp, "-o", b, wl_c]],
         runner="plain"))
     b = _bin("env-deleted-binary")
@@ -607,9 +611,12 @@ def build_is_current(variant: Variant) -> bool:
 
 def run_build(variant: Variant) -> None:
     # Reuse an up-to-date binary from a previous run — the common case when
-    # only sismo changed between matrix runs.
-    if build_is_current(variant):
+    # only sismo changed between matrix runs. A variant whose mid_run replaces
+    # its own binary must always rebuild: the leftover replacement is newer
+    # than the sources, so the mtime check would wrongly keep it.
+    if not variant.mid_run_build and build_is_current(variant):
         return
+    crashmark(f"build begin {variant.name}")
     os.makedirs(BIN_DIR, exist_ok=True)
     env = dict(os.environ, GOCACHE=GOCACHE)
     for cmd in variant.build:
@@ -619,6 +626,7 @@ def run_build(variant: Variant) -> None:
             if variant.build_may_skip and re.search(variant.build_may_skip, err):
                 raise BuildSkip(f"build prerequisite missing ({cmd[0]})")
             raise BuildError(f"build failed: {' '.join(cmd)}\n{err[-2000:]}")
+    crashmark(f"build end {variant.name}")
 
 
 @dataclasses.dataclass
@@ -628,6 +636,18 @@ class RecordResult:
     stderr: str
     trace: str
     wall_s: float
+
+
+def _uncapped_sismo() -> str:
+    """A copy of the sismo binary without its file caps, for the unprivileged
+    env case (copyfile does not carry the security.capability xattr)."""
+    dst = os.path.join(BIN_DIR, "sismo-nocaps")
+    os.makedirs(BIN_DIR, exist_ok=True)
+    if (not os.path.exists(dst)
+            or os.path.getmtime(dst) < os.path.getmtime(SISMO)):
+        shutil.copyfile(SISMO, dst)
+        os.chmod(dst, 0o755)
+    return dst
 
 
 def run_record(variant: Variant, duration_ms: int, no_symbolize: bool = False,
@@ -647,13 +667,14 @@ def run_record(variant: Variant, duration_ms: int, no_symbolize: bool = False,
         # gates the target's main() on the recorder attaching).
         cmd = prefix + [SISMO, "record", "--no-heap", "--output", trace]
     else:
-        runner = SISMO_RUN if variant.runner == "caps" else SISMO
+        runner = SISMO if variant.runner == "caps" else _uncapped_sismo()
         cmd = [runner, "record", "--keep-module-files", variant.keep_module_files,
                "--output", trace]
     if no_symbolize:
         cmd.append("--no-symbolize")
     cmd += [a.replace("{DUR}", str(duration_ms)) for a in variant.cmd]
     t0 = time.monotonic()
+    crashmark(f"record begin {variant.name}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, cwd=ROOT_DIR)
     if variant.mid_run:
@@ -669,11 +690,17 @@ def run_record(variant: Variant, duration_ms: int, no_symbolize: bool = False,
                 subprocess.run(step, capture_output=True, cwd=ROOT_DIR)
     try:
         out, err = proc.communicate(timeout=120)
+        rc = proc.returncode
     except subprocess.TimeoutExpired:
         proc.kill()
         out, err = proc.communicate()
-        return RecordResult(-9, out, err, trace, time.monotonic() - t0)
-    return RecordResult(proc.returncode, out, err, trace, time.monotonic() - t0)
+        rc = -9
+    crashmark(f"record end {variant.name} exit={rc}")
+    # Keep the record's stderr on disk: when a golden diff shows a stray
+    # diagnostic, this is the only way to see which module emitted it.
+    with open(os.path.join(TRACE_DIR, variant.name + ".stderr.txt"), "w") as f:
+        f.write(err)
+    return RecordResult(rc, out, err, trace, time.monotonic() - t0)
 
 
 def query_trace(variant: Variant, trace: str) -> dict[str, int]:
@@ -760,7 +787,14 @@ def query_residual(trace: str) -> list[str]:
         mo = re.search(r'(\[[a-z0-9:_-]+\])', line)
         if mo:
             labels.add(mo.group(1))
-    return sorted(labels)
+    out = sorted(labels)
+    # A JIT runtime frees code regions continuously, so a longer or throttled
+    # run samples PCs in regions unmapped by trace end — expected churn there,
+    # load-dependent, not a diagnostic. Native targets keep [unmapped]'s
+    # meaning (a real attribution gap).
+    if any(lbl.startswith("[jit:") for lbl in out):
+        out = [lbl for lbl in out if lbl != "[unmapped]"]
+    return out
 
 
 MODULE_RE = re.compile(
@@ -958,23 +992,36 @@ def query_target_path(variant: Variant, trace: str) -> str:
     return ""
 
 
+_headroom_reserved = False
+
+
 def reserve_cpu_headroom() -> None:
-    """Pin this run and its build/record children off one CPU so the machine
+    """Pin this run and its build/record children off four CPUs so the machine
     stays usable — parallel toolchain builds and the hot-loop workloads
-    otherwise saturate every core. Children inherit the affinity."""
-    if not hasattr(os, "sched_setaffinity"):
+    otherwise saturate every core. Children inherit the affinity. Note this
+    only bounds userspace: kernel-side work (BPF programs, perf interrupts,
+    ftrace) runs on every CPU regardless. Idempotent, so running several
+    suites in one process doesn't stack reservations."""
+    global _headroom_reserved
+    if _headroom_reserved or not hasattr(os, "sched_setaffinity"):
         return
     try:
         avail = sorted(os.sched_getaffinity(0))
-        if len(avail) > 1:
-            os.sched_setaffinity(0, set(avail[:-1]))  # drop the top core
+        reserve = min(4, len(avail) - 1)
+        if reserve > 0:
+            os.sched_setaffinity(0, set(avail[:-reserve]))
+        _headroom_reserved = True
     except OSError:
         pass
 
 
 def run(ctx: SuiteContext) -> int:
     reserve_cpu_headroom()
-    needs = [SISMO_RUN, TP_SHELL, SISMO]
+    if platform.system() == "Linux" and not ensure_record_env():
+        print("skip matrix-linux (recording env not ready — "
+              "run: sudo sismo doctor --fix)")
+        return 0
+    needs = [SISMO, TP_SHELL]
     cases = [
         (v.name, functools.partial(variant_facts, v), needs)
         for v in build_variants()

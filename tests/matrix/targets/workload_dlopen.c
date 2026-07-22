@@ -26,6 +26,13 @@ NOINLINE uint64_t sismo_wl_outer(uint64_t x) {
   return x;
 }
 
+// Same designed-in block as workload.c: a deterministic off-CPU source, so
+// the offcpu golden fact doesn't ride on incidental blocking.
+NOINLINE void sismo_wl_block(void) {
+  struct timespec ts = {0, 2 * 1000 * 1000};
+  nanosleep(&ts, NULL);
+}
+
 static uint64_t now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -41,6 +48,7 @@ int main(int argc, char **argv) {
   while (now_ms() < phase1_end) {
     x = sismo_wl_outer(x);
     iters++;
+    if (iters % 32 == 0) sismo_wl_block();
   }
 
   void *h = dlopen(plugin_path, RTLD_NOW);
@@ -59,6 +67,7 @@ int main(int argc, char **argv) {
   while (now_ms() < phase2_end) {
     x = plugin_outer(x);
     iters++;
+    if (iters % 32 == 0) sismo_wl_block();
   }
 
   sink = x;

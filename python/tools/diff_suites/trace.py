@@ -4,8 +4,9 @@
 """trace suite — record sample-target and golden stable structural facts.
 
 Records sample-target through the BPF sampler and queries the trace, golden-ing
-stable facts (not raw sample counts). Needs a setcap'd sismo-run with BPF caps
-plus the Perfetto build, so cases self-skip when unavailable.
+stable facts (not raw sample counts). Needs a caps-granted sismo (see
+`sismo doctor --fix`) plus the Perfetto build, so cases self-skip when
+unavailable.
 """
 
 from __future__ import annotations
@@ -15,7 +16,8 @@ import subprocess
 import tempfile
 
 from python.tools.diff_suites.common import (
-    SAMPLE_TARGET, SISMO_RUN, TP_SHELL, Skip, SuiteContext, run_golden_cases)
+    SAMPLE_TARGET, SISMO, TP_SHELL, Skip, SuiteContext, ensure_record_env,
+    run_golden_cases)
 
 NAME = "trace"
 DESCRIPTION = "record sample-target, golden stable trace facts (needs BPF caps)"
@@ -39,14 +41,16 @@ def _cpu_symbolize_actual() -> str:
     with tempfile.NamedTemporaryFile(suffix=".pftrace", delete=False) as tf:
         trace = tf.name
     try:
+        if not ensure_record_env():
+            raise Skip("recording env not ready — run: sudo sismo doctor --fix")
         rec = subprocess.run(
-            [SISMO_RUN, "record", "--output", trace, SAMPLE_TARGET, "1500"],
+            [SISMO, "record", "--output", trace, SAMPLE_TARGET, "1500"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
         )
         if rec.returncode != 0 or not os.path.getsize(trace):
-            raise Skip("recording produced no trace (BPF caps on sismo-run?)")
+            raise Skip("recording produced no trace (sudo sismo doctor --fix?)")
         if _tp_scalar(trace, "SELECT count(*) FROM perf_sample;") == 0:
-            raise Skip("recording captured no CPU samples (setcap sismo-run?)")
+            raise Skip("recording captured no CPU samples (sudo sismo doctor --fix?)")
         mapping = _tp_scalar(
             trace,
             "SELECT count(*) FROM stack_profile_mapping "
@@ -70,7 +74,7 @@ def _cpu_symbolize_actual() -> str:
 
 def run(ctx: SuiteContext) -> int:
     cases = [
-        ("cpu_symbolize", _cpu_symbolize_actual, [SISMO_RUN, SAMPLE_TARGET, TP_SHELL]),
+        ("cpu_symbolize", _cpu_symbolize_actual, [SISMO, SAMPLE_TARGET, TP_SHELL]),
     ]
     _passed, failed, _skipped = run_golden_cases(ctx, NAME, cases)
     return failed
