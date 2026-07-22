@@ -10,8 +10,9 @@
 //! everything down.
 
 use super::{
-    duration_timer, handle_sigint, maybe_spawn, print_start_banner, teardown_early,
-    wait_for_workload_exit, waitpid_exit_watch, watchpipe_write, SIGINT_PIPE_FD,
+    duration_timer, finalize_memory_deep_dump, handle_sigint, maybe_spawn, print_start_banner,
+    take_memory_deep_dump, teardown_early, wait_for_workload_exit, waitpid_exit_watch,
+    watchpipe_write, TakenDump, SIGINT_PIPE_FD,
 };
 use crate::privileged_marker::append_privileged_marker;
 use crate::record_args::{RecordConfig, SourceMode};
@@ -199,6 +200,9 @@ pub fn run(config: &RecordConfig) -> c_int {
             unsafe { unlink(c.as_ptr()) };
         }
     }
+    // Same reasoning for a crashed session's meta file: we hold the lock, so
+    // any existing one is stale.
+    sismo_core::sismo_paths::remove_session_meta();
 
     let my_pid = unsafe { getpid() };
     eprintln!(
@@ -422,6 +426,16 @@ pub fn run(config: &RecordConfig) -> c_int {
     }
 
     unsafe { sismo_consumer_session_start_blocking(session) };
+
+    // Describe the live session for `sismo snapshot` (target pid + focus —
+    // which decide whether a snapshot also takes a heap dump).
+    if !sismo_core::sismo_paths::write_session_meta(&sismo_core::sismo_paths::SessionMeta {
+        target_pid,
+        focus: config.focus.clone(),
+    }) {
+        eprintln!("sismo record: failed to write session meta — `sismo snapshot` will treat this as an unfocused session");
+    }
+
     print_start_banner(long_trace, buffer_kb, output_path_str);
 
     // Self-pipe + watch threads.
@@ -430,6 +444,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         eprintln!("sismo record: pipe() failed");
         unsafe { sismo_consumer_session_destroy(session) };
         shutdown_captures(&mut heap, &mut ring);
+        sismo_core::sismo_paths::remove_session_meta();
         teardown_early(svc, lock_fd);
         return 0;
     }
@@ -450,14 +465,25 @@ pub fn run(config: &RecordConfig) -> c_int {
         std::thread::spawn(move || duration_timer(secs, wr));
     }
 
-    wait_for_workload_exit(rd, target_pid, is_attach);
+    // memory-deep: take the single heap dump on the stop signal, before the
+    // spawned workload is SIGTERMed (attach targets survive anyway). The dump
+    // lands in a temp file and is attached after the trace is finalized.
+    let memory_deep = config.focus.as_deref() == Some("memory-deep");
+    let taken_dump: std::cell::RefCell<Option<TakenDump>> = std::cell::RefCell::new(None);
+    let dump_hook = || {
+        *taken_dump.borrow_mut() = take_memory_deep_dump(target_pid, output_path_str, "sismo record");
+    };
+    let pre_stop: Option<&dyn Fn()> = if memory_deep { Some(&dump_hook) } else { None };
 
+    wait_for_workload_exit(rd, target_pid, is_attach, pre_stop);
+
+    let focus_preset: Option<&[u8]> = config.focus.as_deref().map(str::as_bytes);
     let mut wrote_trace = false;
     if long_trace {
         // Streaming mode: traced already wrote the file; stop finalizes it.
         unsafe { sismo_consumer_session_stop_blocking(session) };
         eprintln!("sismo record: saved {output_path_str}");
-        if !append_privileged_marker(output_path_str, &[target_pid], None, false) {
+        if !append_privileged_marker(output_path_str, &[target_pid], focus_preset, false) {
             eprintln!("sismo record: failed to write privileged marker");
         }
         wrote_trace = true;
@@ -468,7 +494,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         match crate::trace_sink::clone_session_to_file("sismo_record", output_path_str) {
             Ok(bytes) => {
                 eprintln!("sismo record: saved {output_path_str} ({bytes} bytes)");
-                if !append_privileged_marker(output_path_str, &[target_pid], None, false) {
+                if !append_privileged_marker(output_path_str, &[target_pid], focus_preset, false) {
                     eprintln!("sismo record: failed to write privileged marker");
                 }
                 wrote_trace = true;
@@ -509,8 +535,35 @@ pub fn run(config: &RecordConfig) -> c_int {
         sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str, &held);
     }
 
-    // Join the exit watcher (it has fired 'X' or is about to), then tear down.
-    let _ = watch.join();
+    // memory-deep: attach the dump taken at the stop signal to the now-final
+    // (marker + symbols) trace — hprof bundles into a tar, a V8 snapshot lands
+    // as a sibling file. If the workload exited on its own there is no dump
+    // and the output stays a plain trace.
+    match taken_dump.into_inner() {
+        Some(dump) => {
+            if wrote_trace {
+                finalize_memory_deep_dump(output_path_str, &dump, target_pid, "sismo record");
+            } else {
+                let _ = std::fs::remove_file(&dump.tmp_path);
+            }
+        }
+        None if memory_deep && wrote_trace => {
+            eprintln!("sismo record: memory-deep — no heap dump taken (workload exited before the stop signal?); output is a plain trace");
+        }
+        None => {}
+    }
+
+    // Join the exit watcher, then tear down. Spawn mode only: there the
+    // watcher's waitpid has returned (stop SIGTERMs the child) and joining
+    // reaps it. In attach mode the watcher blocks in kevent until the target
+    // *eventually* exits — which may be never for a signal/--duration stop
+    // where the target keeps running — so joining would hang record and hold
+    // the session lock; the thread dies with the process instead.
+    if !is_attach {
+        let _ = watch.join();
+    } else {
+        drop(watch);
+    }
     unsafe { sismo_consumer_session_destroy(session) };
     SIGINT_PIPE_FD.store(-1, Ordering::Release);
     unsafe {
@@ -519,6 +572,15 @@ pub fn run(config: &RecordConfig) -> c_int {
     }
     unsafe { sismo_traced_stop(svc) };
     unsafe { sismo_traced_destroy(svc) };
+    // Unlink our sockets before releasing the lock: traced does not remove
+    // them, and a root session's leftovers would EADDRINUSE every later
+    // unprivileged record (which cannot unlink root-owned files in /tmp).
+    for sock in [PRODUCER_SOCK, CONSUMER_SOCK] {
+        if let Ok(c) = CString::new(sock) {
+            unsafe { unlink(c.as_ptr()) };
+        }
+    }
+    sismo_core::sismo_paths::remove_session_meta();
     release_session_lock(lock_fd);
     0
 }

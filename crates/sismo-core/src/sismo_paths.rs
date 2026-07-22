@@ -76,6 +76,60 @@ fn read_pid_at(path: &str) -> Option<i32> {
     std::str::from_utf8(&buf[..n]).ok()?.trim().parse::<i32>().ok()
 }
 
+// ---- Session metadata --------------------------------------------------------
+//
+// `sismo record` describes the live session in a small key=value file so that
+// `sismo snapshot` (a separate process) knows the target pid and the session's
+// focus preset — which decide whether a snapshot also materializes heavy state
+// (a heap dump) next to its buffer clone.
+
+const SESSION_META_PATH: &str = "/tmp/sismo-session.meta";
+
+/// A live-session description, written by record, read by snapshot.
+pub struct SessionMeta {
+    pub target_pid: i32,
+    /// The session's `--focus` preset, if any.
+    pub focus: Option<String>,
+}
+
+/// Write the session meta file (0644; snapshot only reads it).
+pub fn write_session_meta(meta: &SessionMeta) -> bool {
+    write_meta_at(SESSION_META_PATH, meta)
+}
+
+fn write_meta_at(path: &str, meta: &SessionMeta) -> bool {
+    let mut body = format!("target_pid={}\n", meta.target_pid);
+    if let Some(f) = &meta.focus {
+        body.push_str(&format!("focus={f}\n"));
+    }
+    std::fs::write(path, body).is_ok()
+}
+
+/// Read the session meta file, `None` if absent or malformed.
+pub fn read_session_meta() -> Option<SessionMeta> {
+    read_meta_at(SESSION_META_PATH)
+}
+
+fn read_meta_at(path: &str) -> Option<SessionMeta> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let mut target_pid: Option<i32> = None;
+    let mut focus: Option<String> = None;
+    for line in body.lines() {
+        if let Some(v) = line.strip_prefix("target_pid=") {
+            target_pid = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("focus=") {
+            focus = Some(v.trim().to_string());
+        }
+    }
+    Some(SessionMeta { target_pid: target_pid?, focus })
+}
+
+/// Remove the session meta file (record exit; also crash-leftover cleanup at
+/// record startup, under the session lock).
+pub fn remove_session_meta() {
+    let _ = std::fs::remove_file(SESSION_META_PATH);
+}
+
 /// Resolve the heap-preload dylib path relative to the running binary. Tries the
 /// install / cargo-dev / legacy layouts and returns the first that exists, else
 /// the cargo-dev candidate as a best-effort. Shared with `cmd_prepare`.
@@ -129,6 +183,25 @@ mod tests {
         let path = std::env::temp_dir().join("sismo-paths-nonexistent-xyz.lock");
         let _ = std::fs::remove_file(&path);
         assert_eq!(read_pid_at(path.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn session_meta_roundtrip_focus_optional() {
+        let path = std::env::temp_dir().join("sismo-paths-selftest.meta");
+        let p = path.to_str().unwrap();
+        assert!(write_meta_at(p, &SessionMeta { target_pid: 777, focus: Some("memory-deep".into()) }));
+        let back = read_meta_at(p).expect("read");
+        assert_eq!(back.target_pid, 777);
+        assert_eq!(back.focus.as_deref(), Some("memory-deep"));
+
+        assert!(write_meta_at(p, &SessionMeta { target_pid: 8, focus: None }));
+        let back = read_meta_at(p).expect("read");
+        assert_eq!(back.target_pid, 8);
+        assert!(back.focus.is_none());
+
+        std::fs::write(p, "garbage\n").unwrap();
+        assert!(read_meta_at(p).is_none());
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]

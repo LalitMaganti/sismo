@@ -22,6 +22,16 @@ pub mod cmd_prepare;
 // `sismo snapshot` subcommand (clone the recorder's rolling buffer). POSIX-only.
 #[cfg(not(target_os = "windows"))]
 pub mod cmd_snapshot;
+// ustar writer for the record-output bundle (trace + heap-dump sidecar).
+#[cfg(not(target_os = "windows"))]
+pub mod tar_bundle;
+// memory-deep heap-dump machinery: per-runtime triggers + dispatch.
+#[cfg(not(target_os = "windows"))]
+pub mod heap_dump;
+#[cfg(not(target_os = "windows"))]
+pub mod jvm_heap_dump;
+#[cfg(not(target_os = "windows"))]
+pub mod v8_heap_dump;
 pub mod cmd_symbolize;
 // Shared trace-output plumbing: clone-a-session-to-file + default output path.
 // Used by snapshot and by record's dump-on-exit. POSIX-only.

@@ -241,9 +241,14 @@ impl RecordArgs {
             eprintln!("sismo record: --pid attach is not supported on this platform");
             return Err(0);
         }
-        // --focus / --sample-density are Linux-only (BPF/PEBS path).
-        if self.focus.is_some() && !cfg!(target_os = "linux") {
-            eprintln!("sismo record: --focus needs the Linux BPF/PEBS path (not supported on this platform)");
+        // --focus preset availability is per-OS: the PEBS presets need the
+        // Linux BPF path; `memory-deep` (single heap dump at stop/snapshot)
+        // works everywhere. Linux validates its own presets in the runner.
+        if self.focus.is_some() && !cfg!(target_os = "linux") && self.focus.as_deref() != Some("memory-deep") {
+            eprintln!(
+                "sismo record: unsupported focus preset '{}' on this platform (supported here: memory-deep)",
+                self.focus.as_deref().unwrap_or_default()
+            );
             return Err(0);
         }
 

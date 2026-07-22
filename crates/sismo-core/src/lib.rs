@@ -31,3 +31,7 @@ pub mod worker_sdk;
 // POSIX-only.
 #[cfg(not(target_os = "windows"))]
 pub mod sismo_paths;
+// macOS memory-map snapshot (SmapsPacket via mach_vm_region_recurse), the
+// cheap state rung of `sismo dump`.
+#[cfg(target_os = "macos")]
+pub mod smaps_macos;

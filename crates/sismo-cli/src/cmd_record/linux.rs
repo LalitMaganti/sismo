@@ -244,7 +244,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         std::thread::spawn(move || duration_timer(secs, wr));
     }
 
-    wait_for_workload_exit(rd, target_pid, false);
+    wait_for_workload_exit(rd, target_pid, false, None);
 
     let focus_preset: Option<&[u8]> = if focus_int == 0 { Some(b"cache".as_slice()) } else { None };
     if long_trace {

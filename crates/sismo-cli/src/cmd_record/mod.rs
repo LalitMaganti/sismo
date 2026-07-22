@@ -125,9 +125,14 @@ fn waitpid_exit_watch(pid: c_int, write_fd: c_int) {
 /// arrives ('I' SIGINT / 'T' --duration). For a spawned workload a stop signal
 /// SIGTERMs it and the loop keeps waiting for its 'X'; for an attached pid it
 /// just ends recording, leaving the target running.
-fn wait_for_workload_exit(rd: c_int, target_pid: c_int, is_attach: bool) {
+///
+/// `pre_stop` (if any) runs once on the first stop signal, before the workload
+/// is terminated — while both the target and the recording are still live.
+/// memory-deep uses it to take the heap dump.
+fn wait_for_workload_exit(rd: c_int, target_pid: c_int, is_attach: bool, pre_stop: Option<&dyn Fn()>) {
     let mut read_buf = [0u8; 16];
     let mut workload_done = false;
+    let mut pre_stop_fired = false;
     while !workload_done {
         let n = unsafe { read(rd, read_buf.as_mut_ptr() as *mut c_void, read_buf.len()) };
         if n <= 0 {
@@ -137,6 +142,10 @@ fn wait_for_workload_exit(rd: c_int, target_pid: c_int, is_attach: bool) {
             match b {
                 b'I' | b'T' => {
                     let reason = if b == b'I' { "SIGINT" } else { "--duration reached" };
+                    if let (Some(hook), false) = (pre_stop, pre_stop_fired) {
+                        pre_stop_fired = true;
+                        hook();
+                    }
                     if is_attach {
                         eprintln!("sismo record: {reason} — stopping recording (attached pid={target_pid} keeps running)");
                         workload_done = true;
@@ -191,4 +200,80 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
         sismo_traced_destroy(svc);
     }
     release_session_lock(lock_fd);
+}
+
+// ---- memory-deep: the single heap dump at a materialization point -----------
+//
+// In a `--focus memory-deep` session, each materialization point — record
+// stop, `sismo snapshot` — takes exactly one JVM heap dump and bundles it with
+// that artifact's trace (which becomes a tar). At record stop the dump must
+// fire on the stop *signal*, before the spawned workload is SIGTERMed, so it
+// runs via `wait_for_workload_exit`'s pre-stop hook while recording is still
+// live (the dump's stop-the-world pause is itself visible in the trace).
+
+/// A dump taken at a materialization point, waiting to be attached to a
+/// finished trace by [`finalize_memory_deep_dump`].
+pub(crate) struct TakenDump {
+    pub tmp_path: String,
+    pub runtime: crate::heap_dump::DumpRuntime,
+}
+
+/// Take the memory-deep heap dump of `target_pid`, spooling it to a temp file
+/// derived from `output_path`. `prefix` labels the log lines ("sismo record" /
+/// "sismo snapshot"). Returns the taken dump, ready to finalize once the trace
+/// itself is written.
+pub(crate) fn take_memory_deep_dump(target_pid: i32, output_path: &str, prefix: &str) -> Option<TakenDump> {
+    let alive = unsafe { kill(target_pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !alive {
+        eprintln!("{prefix}: memory-deep heap dump skipped — target pid {target_pid} already exited");
+        return None;
+    }
+    let Some(rt) = crate::heap_dump::detect(target_pid) else {
+        eprintln!(
+            "{prefix}: memory-deep heap dump skipped — no dumpable runtime detected on pid {target_pid} (JVM and Node are supported)"
+        );
+        return None;
+    };
+    let tmp_path = format!("{output_path}.heap.{}", rt.ext());
+    eprintln!(
+        "{prefix}: dumping {} heap (stop-the-world; large heaps pause for seconds)",
+        rt.label()
+    );
+    match crate::heap_dump::take(rt, target_pid, &tmp_path) {
+        Some(size) => {
+            eprintln!("{prefix}: {} heap dump written ({size} bytes)", rt.label());
+            Some(TakenDump { tmp_path, runtime: rt })
+        }
+        None => {
+            eprintln!("{prefix}: {} heap dump failed", rt.label());
+            None
+        }
+    }
+}
+
+/// Attach a taken dump to the finished trace at `trace_path`: bundleable
+/// artifacts (hprof) turn the trace into a tar; the rest (V8 .heapsnapshot)
+/// land as a sibling file next to it. The temp file is consumed either way.
+pub(crate) fn finalize_memory_deep_dump(trace_path: &str, dump: &TakenDump, target_pid: i32, prefix: &str) {
+    let rt = dump.runtime;
+    if rt.bundleable() {
+        let member = format!("heap-{target_pid}.{}", rt.ext());
+        match crate::tar_bundle::bundle_trace_with_heap_dump(trace_path, &dump.tmp_path, &member) {
+            Ok(bytes) => {
+                eprintln!("{prefix}: bundled heap dump with the trace into {trace_path} (tar, {bytes} bytes)")
+            }
+            Err(e) => eprintln!("{prefix}: heap dump bundling failed: {e} — trace left plain"),
+        }
+        let _ = std::fs::remove_file(&dump.tmp_path);
+    } else {
+        let sibling = format!("{trace_path}.{}", rt.ext());
+        match std::fs::rename(&dump.tmp_path, &sibling) {
+            Ok(()) => eprintln!(
+                "{prefix}: {} heap dump saved next to the trace: {sibling} (trace_processor has no V8 importer yet; open it in Chrome DevTools)",
+                rt.label()
+            ),
+            Err(e) => eprintln!("{prefix}: failed to place heap dump at {sibling}: {e}"),
+        }
+    }
 }
