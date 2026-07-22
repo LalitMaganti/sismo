@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -120,29 +121,41 @@ extern "C" int sismo_consumer_clone_and_stream(const char* source_session_name,
     auto session = perfetto::Tracing::NewTrace(perfetto::kSystemBackend);
     if (!session) return 2;
 
+    // Sync state shared with the async callbacks BY VALUE (shared_ptr): on a
+    // timeout this function returns while a late callback may still fire on
+    // the muxer thread — a [&] capture would then write through a dead stack
+    // frame. `abandoned` (set under the lock before returning) also stops a
+    // late ReadTrace callback from invoking the caller's freed cb/user_arg.
+    struct SyncState {
+        std::mutex m;
+        std::condition_variable cv;
+        bool abandoned = false;
+        bool clone_done = false;
+        bool clone_ok = false;
+        std::string clone_err;
+        bool read_done = false;
+    };
+    auto st = std::make_shared<SyncState>();
+
     // (1) CloneTrace — attach as a read-only clone of the source
     //     session. Async; we wait via condvar with a timeout.
-    std::mutex m;
-    std::condition_variable cv;
-    bool clone_done = false;
-    bool clone_ok = false;
-    std::string clone_err;
-
     perfetto::TracingSession::CloneTraceArgs args;
     args.unique_session_name = source_session_name;
     session->CloneTrace(
         args,
-        [&](perfetto::TracingSession::CloneTraceCallbackArgs cb_args) {
-            std::lock_guard<std::mutex> lk(m);
-            clone_done = true;
-            clone_ok = cb_args.success;
-            if (!cb_args.success) clone_err = cb_args.error;
-            cv.notify_one();
+        [st](perfetto::TracingSession::CloneTraceCallbackArgs cb_args) {
+            std::lock_guard<std::mutex> lk(st->m);
+            st->clone_done = true;
+            st->clone_ok = cb_args.success;
+            if (!cb_args.success) st->clone_err = cb_args.error;
+            st->cv.notify_one();
         });
 
     {
-        std::unique_lock<std::mutex> lk(m);
-        if (!cv.wait_for(lk, std::chrono::seconds(10), [&] { return clone_done; })) {
+        std::unique_lock<std::mutex> lk(st->m);
+        if (!st->cv.wait_for(lk, std::chrono::seconds(10),
+                             [&] { return st->clone_done; })) {
+            st->abandoned = true;
             std::fprintf(stderr,
                          "sismo: CloneTrace(\"%s\") timed out after 10s "
                          "(is `sismo record --flight-recorder` running?)\n",
@@ -150,10 +163,10 @@ extern "C" int sismo_consumer_clone_and_stream(const char* source_session_name,
             return 7;
         }
     }
-    if (!clone_ok) {
+    if (!st->clone_ok) {
         std::fprintf(stderr,
                      "sismo: CloneTrace(\"%s\") failed: %s\n",
-                     source_session_name, clone_err.c_str());
+                     source_session_name, st->clone_err.c_str());
         return 3;
     }
 
@@ -161,19 +174,22 @@ extern "C" int sismo_consumer_clone_and_stream(const char* source_session_name,
     //     Perfetto-internal thread; we relay each chunk to the
     //     caller's C callback unchanged. Wait until we observe
     //     has_more=false on the final chunk.
-    bool read_done = false;
-    session->ReadTrace([&](perfetto::TracingSession::ReadTraceCallbackArgs ra) {
-        cb(ra.data, ra.size, ra.has_more, user_arg);
-        if (!ra.has_more) {
-            std::lock_guard<std::mutex> lk(m);
-            read_done = true;
-            cv.notify_one();
-        }
-    });
+    session->ReadTrace(
+        [st, cb, user_arg](perfetto::TracingSession::ReadTraceCallbackArgs ra) {
+            std::lock_guard<std::mutex> lk(st->m);
+            if (st->abandoned) return;
+            cb(ra.data, ra.size, ra.has_more, user_arg);
+            if (!ra.has_more) {
+                st->read_done = true;
+                st->cv.notify_one();
+            }
+        });
 
     {
-        std::unique_lock<std::mutex> lk(m);
-        if (!cv.wait_for(lk, std::chrono::seconds(30), [&] { return read_done; })) {
+        std::unique_lock<std::mutex> lk(st->m);
+        if (!st->cv.wait_for(lk, std::chrono::seconds(30),
+                             [&] { return st->read_done; })) {
+            st->abandoned = true;
             std::fprintf(stderr,
                          "sismo: ReadTrace timed out after 30s\n");
             return 8;

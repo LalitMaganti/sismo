@@ -40,8 +40,23 @@ pub fn run(config: &RecordConfig) -> c_int {
     let duration_secs = config.duration_secs;
     let long_trace = config.long_trace;
     let buffer_kb = config.buffer_kb;
-    let no_sched = config.sched_mode == SourceMode::Off;
+    let mut no_sched = config.sched_mode == SourceMode::Off;
     let no_cpu = config.cpu_mode == SourceMode::Off;
+    // A tracefs this user can't use makes its consumers fail late and badly
+    // (an unwritable ftrace source crashes Perfetto's controller mid-setup;
+    // an unreadable one stalls session start) — degrade up front instead.
+    // Off-CPU futex tracking only reads tracepoint ids; ftrace also writes.
+    let mut capture_offcpu = config.capture_offcpu;
+    if capture_offcpu && !tracefs_readable() {
+        eprintln!("sismo record: tracefs is not readable — off-CPU tracking disabled");
+        eprintln!("  fix: sudo sismo doctor --fix");
+        capture_offcpu = false;
+    }
+    if !no_sched && !tracefs_writable() {
+        eprintln!("sismo record: tracefs is not writable — sched events disabled");
+        eprintln!("  fix: sudo sismo doctor --fix");
+        no_sched = true;
+    }
     let no_instrumentation = config.no_instrumentation;
     let no_symbolize = config.no_symbolize;
     let sample_density = config.sample_density;
@@ -56,6 +71,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         }
     };
 
+    tracing::info!("record: start");
     let lock_fd = match acquire_session_lock(unsafe { getpid() }) {
         Ok(fd) => fd,
         Err(LockError::Held) => {
@@ -85,6 +101,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         return 0;
     }
     unsafe { sismo_init(prod_c.as_ptr()) };
+    tracing::info!("record: traced up");
 
     // traced_probes (ftrace + procfs) — the sched producer. Skipped by --no-sched.
     let probes = if no_sched {
@@ -96,12 +113,15 @@ pub fn run(config: &RecordConfig) -> c_int {
         }
         p
     };
+    tracing::info!(present = !probes.is_null(), "record: probes up");
     let stop_probes = |probes: *mut c_void| {
         if !probes.is_null() {
+            tracing::info!("record: probes stop begin");
             unsafe {
                 sismo_traced_probes_stop(probes);
                 sismo_traced_probes_destroy(probes);
             }
+            tracing::info!("record: probes stopped");
         }
     };
 
@@ -123,6 +143,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         }
     };
     eprintln!("sismo record: spawned '{workload_cmd}' pid={target_pid}");
+    tracing::info!(pid = target_pid, "record: workload spawned");
 
     // BPF CPU collector (per-thread counters + stack sampling), scoped to the
     // workload. Drains on its own worker thread; shut down on the way out.
@@ -130,18 +151,22 @@ pub fn run(config: &RecordConfig) -> c_int {
         None
     } else {
         let focus = if focus_int == 0 { Some(FocusPreset::Cache) } else { None };
+        tracing::info!("record: bpf init begin");
         let c = linux_bpf_capture::init(
-            target_pid as u32, focus, sample_density, config.capture_offcpu, config.keep_module_files);
+            target_pid as u32, focus, sample_density, capture_offcpu, config.keep_module_files);
         if c.is_none() {
             eprintln!("sismo record: bpf capture init failed — CPU samples disabled");
+            eprintln!("  fix: sudo sismo doctor --fix   (grants cap_bpf,cap_perfmon,cap_sys_resource; or record as root)");
         }
         c
     };
     let had_bpf = bpf.is_some();
+    tracing::info!(ok = had_bpf, "record: bpf init done");
     let shutdown_bpf = |bpf: Option<Box<Capture>>| -> (u8, Arc<Mutex<ModuleRegistry>>) {
         let Some(c) = bpf else {
             return (0, Arc::new(Mutex::new(ModuleRegistry::new(KeepPolicy::None))));
         };
+        tracing::info!("record: bpf shutdown begin");
         let precise = c.precise_ip();
         let (s, modules) = c.shutdown();
         eprintln!(
@@ -161,6 +186,7 @@ pub fn run(config: &RecordConfig) -> c_int {
                 s.offcpu_ns / 1_000_000
             );
         }
+        tracing::info!("record: bpf shutdown done");
         let held = modules.lock().unwrap().held_count();
         if held > 0 {
             eprintln!("sismo record: keeping {held} module file(s) open for symbolization");
@@ -222,7 +248,9 @@ pub fn run(config: &RecordConfig) -> c_int {
         return 0;
     }
 
+    tracing::info!("record: session start begin");
     unsafe { sismo_consumer_session_start_blocking(session) };
+    tracing::info!("record: session started");
     print_start_banner(long_trace, buffer_kb, output_path_str);
 
     // Self-pipe + watch threads (Linux is spawn-only — no attach).
@@ -245,6 +273,7 @@ pub fn run(config: &RecordConfig) -> c_int {
     }
 
     wait_for_workload_exit(rd, target_pid, false, None);
+    tracing::info!("record: workload exited");
 
     let focus_preset: Option<&[u8]> = if focus_int == 0 { Some(b"cache".as_slice()) } else { None };
     if long_trace {
@@ -267,6 +296,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         // session to the file, then stop.
         let (precise, modules) = shutdown_bpf(bpf.take());
         eprintln!("sismo record: stopping — writing trace to {output_path_str}");
+        tracing::info!("record: clone begin");
         match crate::trace_sink::clone_session_to_file("sismo_record", output_path_str) {
             Ok(bytes) => {
                 eprintln!("sismo record: saved {output_path_str} ({bytes} bytes)");
@@ -280,7 +310,9 @@ pub fn run(config: &RecordConfig) -> c_int {
             }
             Err(e) => eprintln!("sismo record: failed to write trace: {e}"),
         }
+        tracing::info!("record: session stop begin");
         unsafe { sismo_consumer_session_stop_blocking(session) };
+        tracing::info!("record: session stopped");
     }
 
     SIGINT_PIPE_FD.store(-1, Ordering::Release);
@@ -289,8 +321,31 @@ pub fn run(config: &RecordConfig) -> c_int {
     let _ = watch.join();
 
     unsafe { sismo_consumer_session_destroy(session) };
+    tracing::info!("record: session destroyed");
     stop_probes(probes);
     unsafe { sismo_traced_stop(svc) };
+    tracing::info!("record: exit");
     release_session_lock(lock_fd);
     0
+}
+
+/// Whether tracefs tracepoint ids are readable — what the off-CPU futex
+/// tracepoint attach needs. `sismo doctor --fix` opens this up; a reboot
+/// closes it again.
+fn tracefs_readable() -> bool {
+    ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"].iter().any(|base| {
+        std::fs::File::open(format!("{base}/events/syscalls/sys_enter_futex/id")).is_ok()
+    })
+}
+
+/// Whether tracefs is writable — what the ftrace data source needs (it writes
+/// `tracing_on`/`set_event` during setup, and crashes rather than degrades
+/// when it can't).
+fn tracefs_writable() -> bool {
+    ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"].iter().any(|base| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("{base}/tracing_on"))
+            .is_ok()
+    })
 }

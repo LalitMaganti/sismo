@@ -30,6 +30,11 @@ struct State {
 
   std::atomic<bool> ready{false};
   std::atomic<bool> failed{false};
+  // Exactly one Quit() may ever be posted: after the worker consumes it, it
+  // frees task_runner (RunWorker below), so a second cross-thread Quit() —
+  // which is a PostTask under the lock-free runner — writes into freed slab
+  // memory. stop() followed by destroy() used to do exactly that.
+  std::atomic<bool> quit_posted{false};
 };
 
 void RunWorker(State* s) {
@@ -78,13 +83,16 @@ extern "C" SismoTracedProbes* sismo_traced_probes_create(
 
 extern "C" void sismo_traced_probes_stop(SismoTracedProbes* self) {
   if (!self || !self->state.task_runner) return;
+  if (self->state.quit_posted.exchange(true)) return;
   self->state.task_runner->Quit();
 }
 
 extern "C" void sismo_traced_probes_destroy(SismoTracedProbes* self) {
   if (!self) return;
   if (self->state.worker.joinable()) {
-    if (self->state.task_runner) self->state.task_runner->Quit();
+    if (!self->state.quit_posted.exchange(true) && self->state.task_runner) {
+      self->state.task_runner->Quit();
+    }
     self->state.worker.join();
   }
   delete self;
