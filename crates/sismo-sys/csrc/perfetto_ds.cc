@@ -274,6 +274,13 @@ extern "C" void sismo_ds_flush_offcpu(uint32_t slot) {
   }
 }
 
+// Destroy the per-slot aux writers while the SDK is still alive. Their
+// destructors flush into the muxer-owned arbiter, so they must not survive
+// Tracing::Shutdown() as process-exit statics.
+extern "C" void sismo_ds_destroy_writers(void) {
+    for (auto& w : g_aux_writer) w.reset();
+}
+
 extern "C" void sismo_stop_done(void* handle) {
     if (!handle) return;
     auto* fn = static_cast<std::function<void()>*>(handle);

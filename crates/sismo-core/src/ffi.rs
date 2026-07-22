@@ -51,6 +51,7 @@ extern "C" {
     pub fn sismo_consumer_session_start_blocking(session: *mut ConsumerSession);
     pub fn sismo_consumer_session_stop_blocking(session: *mut ConsumerSession);
     pub fn sismo_consumer_session_destroy(session: *mut ConsumerSession);
+    pub fn sismo_consumer_shutdown();
     pub fn sismo_consumer_query_service_state(
         session: *mut ConsumerSession,
         out_buf: *mut c_void,

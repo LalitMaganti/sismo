@@ -41,6 +41,8 @@ int sismo_consumer_session_setup(struct SismoConsumerSession* session,
 void sismo_consumer_session_start_blocking(struct SismoConsumerSession* session);
 void sismo_consumer_session_stop_blocking(struct SismoConsumerSession* session);
 void sismo_consumer_session_destroy(struct SismoConsumerSession* session);
+// Blocking SDK shutdown: drains + destroys the muxer thread. Call last.
+void sismo_consumer_shutdown(void);
 
 // Chunk callback invoked by sismo_consumer_clone_and_stream as the
 // cloned session's trace is read out. Fires on a Perfetto-internal

@@ -18,7 +18,8 @@ use sismo_core::cpu::linux_bpf_capture::{self, Capture, FocusPreset};
 use sismo_core::cpu::module_registry::{KeepPolicy, ModuleRegistry};
 use sismo_core::ffi::{
     sismo_consumer_session_create, sismo_consumer_session_destroy, sismo_consumer_session_setup,
-    sismo_consumer_session_start_blocking, sismo_consumer_session_stop_blocking, sismo_init,
+    sismo_consumer_session_start_blocking, sismo_consumer_session_stop_blocking,
+    sismo_consumer_shutdown, sismo_init,
     sismo_traced_create, sismo_traced_probes_create, sismo_traced_probes_destroy,
     sismo_traced_probes_stop, sismo_traced_stop,
 };
@@ -321,6 +322,10 @@ pub fn run(config: &RecordConfig) -> c_int {
     let _ = watch.join();
 
     unsafe { sismo_consumer_session_destroy(session) };
+    // Session destruction is async (posted to the SDK muxer thread); block
+    // until that thread is fully torn down so its IPC-client frees can't
+    // interleave with the probes/service teardown below.
+    unsafe { sismo_consumer_shutdown() };
     tracing::info!("record: session destroyed");
     stop_probes(probes);
     unsafe { sismo_traced_stop(svc) };

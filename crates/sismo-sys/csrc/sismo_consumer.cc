@@ -82,6 +82,21 @@ extern "C" void sismo_consumer_session_destroy(SismoConsumerSession* s) {
     delete s;  // unique_ptr cleans up the underlying TracingSession.
 }
 
+// Session destruction above is asynchronous: the SDK posts the real teardown
+// (ConsumerIPCClient, ipc::Client) to its muxer thread and returns. This
+// blocks until that thread has fully drained and destroyed the muxer, so no
+// consumer-side frees float concurrently with the rest of record teardown.
+// Call only when every session is destroyed and no SDK use follows: the aux
+// trace writers must go first — their destructors flush into the arbiter the
+// muxer owns, and as process-exit statics they would otherwise outlive it
+// (observed as a SEGV in __run_exit_handlers).
+extern "C" void sismo_ds_destroy_writers(void);
+extern "C" void sismo_consumer_shutdown(void) {
+    if (!perfetto::Tracing::IsInitialized()) return;
+    sismo_ds_destroy_writers();
+    perfetto::Tracing::Shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot — clone an existing named session and stream its buffer
 // out chunk-by-chunk via the caller's callback.
