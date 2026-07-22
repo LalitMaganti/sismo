@@ -292,6 +292,12 @@ fn report_truncation(trace_path: &str) {
         if row.name.first() != Some(&b'/') {
             continue;
         }
+        // A language runtime truncates inherently (interpreter loops, JIT
+        // frames); "rebuild with frame pointers" is wrong advice there and
+        // the interpreted-runtime notice already explains the shape.
+        if classify_runtime(&row.name).is_some() {
+            continue;
+        }
         let shape = crate::stack_quality::StackShape {
             total: row.total,
             single_frame: row.single_frame,
@@ -344,8 +350,9 @@ fn print_fp_diagnostic(name: &[u8], shape: &crate::stack_quality::StackShape) {
 /// (DIA-1), whose "rebuild with frame pointers" is not the only remedy here.
 /// Static reads of the on-disk ELF; best-effort, silent on any read failure.
 fn report_missing_unwind_tables(sym: &Symbolizer, m: &Module) {
-    // Only file-backed user modules, matching the frame-pointer diagnostic.
-    if m.name.first() != Some(&b'/') {
+    // Only file-backed user modules, matching the frame-pointer diagnostic —
+    // and like it, never toolchain advice for a language runtime's own code.
+    if m.name.first() != Some(&b'/') || classify_runtime(&m.name).is_some() {
         return;
     }
     let Ok(path) = std::str::from_utf8(&m.name) else {
@@ -724,8 +731,12 @@ impl ModuleStat {
             return Status::NamesStripped;
         }
         // Partial keys on addresses that resolved to nothing at all, not on the
-        // placeholder count, so a mostly-named module isn't downgraded.
-        if self.n_resolved < self.n_addrs {
+        // placeholder count, so a mostly-named module isn't downgraded. A lone
+        // stray address (a PLT stub, a startup-phase PC) is never signal — a
+        // throttled run can sample so few distinct addresses that one stray
+        // exceeds any fraction — so partial needs at least two misses and >=2%.
+        let unresolved = self.n_addrs - self.n_resolved;
+        if unresolved >= 2 && unresolved * 50 >= self.n_addrs {
             return Status::Partial;
         }
         Status::Ok
@@ -1323,6 +1334,14 @@ mod tests {
         assert!(mk(true, 10, 10, 10).status() == Status::NamesStripped);
         // A few real names among placeholders is still partial.
         assert!(mk(true, 10, 8, 6).status() == Status::Partial);
+        // A lone stray unresolved address stays ok at any size; from two
+        // misses on, the 2% fraction decides.
+        assert!(mk(true, 300, 299, 0).status() == Status::Ok);
+        assert!(mk(true, 20, 19, 0).status() == Status::Ok);
+        assert!(mk(true, 10, 9, 0).status() == Status::Ok);
+        assert!(mk(true, 100, 98, 0).status() == Status::Partial);
+        assert!(mk(true, 20, 18, 0).status() == Status::Partial);
+        assert!(mk(true, 300, 297, 0).status() == Status::Ok); // 3 = 1% < 2%
     }
 
     #[test]
