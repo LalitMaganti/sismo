@@ -1,0 +1,28 @@
+# Copyright 2026 The Sismo Authors. All rights reserved.
+# Licensed under the MIT License.
+
+# The passive JVMTI perf-map agent: loaded into a target JVM (at launch via
+# -agentpath, or live via `jcmd <pid> JVMTI.agent_load`), it registers
+# CompiledMethodLoad/DynamicCodeGenerated callbacks and appends each JIT'd
+# method to the standard /tmp/perf-<pid>.map, which sismo's JIT-1 reader
+# already consumes. It never samples and owns no threads — a symbol producer,
+# nothing more. In-process on purpose: it works where task_for_pid does not
+# (hardened-runtime JDKs on macOS), and JVMTI is portable to Windows.
+#
+# No JDK headers at build time: the small JVMTI surface it needs is declared
+# by hand from the spec (see lib.rs), so the crate builds with no Java
+# installed and no GPL header vendored.
+
+[package]
+name = "sismo-jvmti-agent"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+# cdylib = the loadable agent; rlib = so the pure logic unit-tests standalone.
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+panic = "abort"    # never unwind into the host JVM
+opt-level = 2
