@@ -2,24 +2,30 @@
 // Licensed under the MIT License.
 
 //! Linux setup checks: file capabilities on this binary, tracefs access (the
-//! reboot-resets-it-to-root-only trap), perf paranoia, kernel vintage, and
-//! debuginfod. `--fix` re-executes itself under sudo and applies the fixes:
-//! the capability grant (a setcap-style `security.capability` xattr on this
-//! binary — rebuilds shed it, so this recurs) and the tracefs chown (reboots
-//! shed that one). It never touches sudoers; install a NOPASSWD rule for
-//! `sismo doctor` yourself if you want the re-fixes passwordless.
+//! reboot-resets-it-to-root-only trap), perf paranoia, kernel-symbol
+//! readability, kernel vintage, and debuginfod. `--fix` re-executes itself
+//! under sudo and applies only ephemeral fixes: the capability grant (a
+//! setcap-style `security.capability` xattr — rebuilds shed it), the tracefs
+//! chown, and a live perf_event_paranoid lower (both reset on reboot). It
+//! makes no persistent system edits and never touches sudoers; install a
+//! NOPASSWD rule for `sismo doctor` yourself if you want the re-fixes
+//! passwordless.
 
 use super::DoctorArgs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-/// cap_sys_resource (24), cap_perfmon (38), cap_bpf (39) as a 64-bit mask —
-/// the caps the BPF collector needs to record unprivileged.
-const CAP_MASK: u64 = (1 << 24) | (1 << 38) | (1 << 39);
-const CAP_NAMES: &str = "cap_bpf,cap_perfmon,cap_sys_resource";
+/// The caps the sismo binary needs, as a 64-bit `security.capability` mask:
+/// cap_sys_resource (24), cap_syslog (34), cap_perfmon (38), cap_bpf (39).
+/// bpf/perfmon/sys_resource are for the BPF collector; cap_syslog unmasks
+/// `/proc/kallsyms` addresses so kernel frames can be symbolized host-side
+/// (the `kallsyms_show_value` capability gate, independent of kptr_restrict).
+const CAP_MASK: u64 = (1 << 24) | (1 << 34) | (1 << 38) | (1 << 39);
+const CAP_NAMES: &str = "cap_bpf,cap_perfmon,cap_sys_resource,cap_syslog";
 
 const TRACEFS_BASES: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
+const PARANOID_PATH: &str = "/proc/sys/kernel/perf_event_paranoid";
 
 /// Diagnose the things that make Linux recording fail or silently degrade.
 /// Exit non-zero if a check that blocks recording fails.
@@ -42,21 +48,22 @@ pub fn run(args: DoctorArgs) -> i32 {
     } else {
         println!("  ✓ tracefs: writable (sched + off-CPU available)");
     }
-    check_perf_paranoid();
+    let paranoid_fix = check_perf_paranoid();
+    check_kernel_symbols(&exe);
     check_kernel_version();
     check_debuginfod();
 
     let root = unsafe { libc::geteuid() } == 0;
 
     if args.fix {
-        if caps_ok && tracefs_fix.is_none() {
+        if caps_ok && tracefs_fix.is_none() && paranoid_fix.is_none() {
             println!("  nothing to fix");
             return 0;
         }
         if !root {
             return escalate_fix(&exe, &args);
         }
-        return apply_fixes(&exe, caps_ok, tracefs_fix);
+        return apply_fixes(&exe, caps_ok, tracefs_fix, paranoid_fix);
     }
 
     if caps_ok && tracefs_fix.is_none() {
@@ -139,20 +146,83 @@ fn recording_uid() -> u32 {
         .unwrap_or(0)
 }
 
-fn check_perf_paranoid() {
-    match std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid") {
+/// Returns the current `perf_event_paranoid` value when it is above 1 (so
+/// `--fix` should lower it), else `None`. cap_perfmon already covers sismo's
+/// perf use; lowering also opens the kallsyms-for-perf path as a fallback for
+/// kernel symbolization when caps are shed. Lowered live only — a reboot
+/// restores the distro default, like the tracefs chown.
+fn check_perf_paranoid() -> Option<i32> {
+    match std::fs::read_to_string(PARANOID_PATH) {
         Ok(s) => {
             let v: i32 = s.trim().parse().unwrap_or(99);
             if v <= 1 {
                 println!("  ✓ perf_event_paranoid = {v} (permissive)");
+                None
             } else {
                 println!("  ! perf_event_paranoid = {v} (restrictive)");
-                println!("    sismo bypasses this via cap_perfmon on the sismo binary; if you");
-                println!("    record without caps, lower it: sudo sysctl kernel.perf_event_paranoid=1");
+                println!("    a reboot restores this — fix: sudo sismo doctor --fix");
+                Some(v)
             }
         }
-        Err(_) => println!("  ? perf_event_paranoid: could not read /proc/sys/kernel/perf_event_paranoid"),
+        Err(_) => {
+            println!("  ? perf_event_paranoid: could not read {PARANOID_PATH}");
+            None
+        }
     }
+}
+
+/// Whether kernel frames will symbolize host-side: sismo resolves them from
+/// `/proc/kallsyms` (needs cap_syslog, in the caps grant), falling back to a
+/// `vmlinux` debug image if kallsyms is masked. Advisory — recording works
+/// regardless; only kernel frame names are affected.
+fn check_kernel_symbols(exe: &Path) {
+    if kallsyms_readable() {
+        println!("  ✓ kernel symbols: /proc/kallsyms is readable");
+        return;
+    }
+    let has_syslog = read_file_caps(exe).is_some_and(|p| p & (1 << 34) != 0);
+    if vmlinux_debug_present() {
+        println!("  ✓ kernel symbols: /proc/kallsyms masked, but a vmlinux debug image is present");
+        return;
+    }
+    println!("  ! kernel symbols: /proc/kallsyms is masked and no vmlinux debug image found");
+    if has_syslog {
+        println!("    kptr_restrict may be >0 with restrictive paranoia — try: sudo sismo doctor --fix");
+    } else {
+        println!("    grant cap_syslog (and lower paranoia): sudo sismo doctor --fix");
+    }
+    println!("    or install kernel debuginfo (Fedora: sudo dnf debuginfo-install kernel)");
+}
+
+/// True when `/proc/kallsyms` exposes real (non-zero) symbol addresses to this
+/// process — the precondition for host-side kernel symbolization.
+fn kallsyms_readable() -> bool {
+    let Ok(f) = std::fs::File::open("/proc/kallsyms") else { return false };
+    use std::io::{BufRead, BufReader};
+    for line in BufReader::new(f).lines().map_while(Result::ok).take(200) {
+        // "<hex addr> <type> <name>"; masked reads render the addr as all-zero.
+        if let Some(addr) = line.split_whitespace().next() {
+            if addr.bytes().any(|b| b != b'0') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a symbol-bearing kernel image exists on disk for wholesym to use
+/// when kallsyms is masked (the debuginfo route).
+fn vmlinux_debug_present() -> bool {
+    let rel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
+    [
+        format!("/usr/lib/debug/lib/modules/{rel}/vmlinux"),
+        format!("/usr/lib/debug/boot/vmlinux-{rel}"),
+        format!("/boot/vmlinux-{rel}"),
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists())
 }
 
 fn check_kernel_version() {
@@ -201,9 +271,10 @@ fn check_debuginfod() {
 /// this process with `sudo <exe> doctor --fix -y`.
 fn escalate_fix(exe: &Path, args: &DoctorArgs) -> i32 {
     println!();
-    println!("--fix will re-run this command under sudo to:");
+    println!("--fix will re-run this command under sudo to (all reversible, none persistent):");
     println!("  - grant {CAP_NAMES} to {} (setcap-style xattr)", exe.display());
-    println!("  - chown the tracefs mount to your user (re-applied after each reboot)");
+    println!("  - chown the tracefs mount to your user (reset on reboot)");
+    println!("  - lower perf_event_paranoid if restrictive (reset on reboot)");
     if !args.yes && !confirm("Continue? [y/N] ") {
         println!("    skipped");
         return 1;
@@ -218,7 +289,10 @@ fn escalate_fix(exe: &Path, args: &DoctorArgs) -> i32 {
 }
 
 /// Root side of `--fix`: apply whatever the checks flagged, then re-verify.
-fn apply_fixes(exe: &Path, caps_ok: bool, tracefs_fix: Option<&str>) -> i32 {
+/// Every action is ephemeral by design — caps die on rebuild, the tracefs
+/// chown and the paranoid write reset on reboot; re-running `--fix` restores
+/// them. Doctor makes no persistent system edits.
+fn apply_fixes(exe: &Path, caps_ok: bool, tracefs_fix: Option<&str>, paranoid_fix: Option<i32>) -> i32 {
     let mut failed = false;
 
     if !caps_ok {
@@ -247,6 +321,17 @@ fn apply_fixes(exe: &Path, caps_ok: bool, tracefs_fix: Option<&str>) -> i32 {
         }
     }
 
+    if paranoid_fix.is_some() {
+        // Live write only — no sysctl.d drop-in; a reboot restores the default.
+        match std::fs::write(PARANOID_PATH, "1\n") {
+            Ok(()) => println!("  ✓ set perf_event_paranoid = 1 (until next reboot)"),
+            Err(e) => {
+                eprintln!("  ✗ failed to write {PARANOID_PATH}: {e}");
+                failed = true;
+            }
+        }
+    }
+
     if failed {
         1
     } else {
@@ -254,8 +339,8 @@ fn apply_fixes(exe: &Path, caps_ok: bool, tracefs_fix: Option<&str>) -> i32 {
     }
 }
 
-/// `setcap cap_bpf,cap_perfmon,cap_sys_resource=ep <path>` without depending
-/// on libcap: write the VFS_CAP_REVISION_2 xattr directly.
+/// `setcap <CAP_NAMES>=ep <path>` without depending on libcap: write the
+/// VFS_CAP_REVISION_2 xattr directly.
 fn write_file_caps(path: &Path) -> Result<(), String> {
     let bytes = caps_xattr_bytes();
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -317,7 +402,8 @@ mod tests {
     }
 
     // VFS_CAP_REVISION_2 | EFFECTIVE, permitted lo = cap_sys_resource (bit 24),
-    // permitted hi = cap_perfmon | cap_bpf (bits 6,7 of the second word).
+    // permitted hi = cap_syslog | cap_perfmon | cap_bpf (bits 2,6,7 of the
+    // second word = 0x04 | 0x40 | 0x80 = 0xC4).
     #[test]
     fn caps_xattr_layout() {
         assert_eq!(
@@ -326,7 +412,7 @@ mod tests {
                 0x01, 0x00, 0x00, 0x02, // magic_etc
                 0x00, 0x00, 0x00, 0x01, // data[0].permitted
                 0x00, 0x00, 0x00, 0x00, // data[0].inheritable
-                0xC0, 0x00, 0x00, 0x00, // data[1].permitted
+                0xC4, 0x00, 0x00, 0x00, // data[1].permitted
                 0x00, 0x00, 0x00, 0x00, // data[1].inheritable
             ]
         );
