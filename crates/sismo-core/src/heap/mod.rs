@@ -81,7 +81,9 @@ const PHS_SAMPLING_INTERVAL_BYTES: u32 = 12;
 // HeapSample
 const HS_CALLSTACK_ID: u32 = 1;
 const HS_SELF_ALLOCATED: u32 = 2;
+const HS_SELF_FREED: u32 = 3;
 const HS_ALLOC_COUNT: u32 = 5;
+const HS_FREE_COUNT: u32 = 6;
 
 const HEAP_NAME: &[u8] = b"libc.malloc";
 
@@ -95,11 +97,14 @@ pub struct HeapImage<'a> {
 }
 
 /// An aggregated allocation site: a callstack (leaf-first PCs) with its total
-/// sampled bytes and allocation count.
+/// sampled bytes/count allocated and the portion observed freed again
+/// (heapprofd semantics: retained = allocated - freed at snapshot time).
 pub struct HeapSite<'a> {
     pub pcs: &'a [u64],
     pub count: u64,
     pub total_size: u64,
+    pub freed: u64,
+    pub free_count: u64,
 }
 
 // ---- Internal assembled tables --------------------------------------------
@@ -127,7 +132,9 @@ struct Callstack {
 struct Sample {
     callstack_iid: u64,
     self_allocated: u64,
+    self_freed: u64,
     alloc_count: u64,
+    free_count: u64,
 }
 
 struct TraceData {
@@ -179,7 +186,10 @@ fn build_trace_data(
     let mut samples: Vec<Sample> = Vec::new();
     for (site_idx, site) in sites.iter().enumerate() {
         let mut frame_iids: Vec<u64> = Vec::with_capacity(site.pcs.len());
-        for &pc in site.pcs {
+        // Sites carry leaf-first PCs; Perfetto's Callstack.frame_ids are
+        // root-first (trace_processor takes the LAST frame as the leaf the
+        // HeapSample attributes to), so emit reversed.
+        for &pc in site.pcs.iter().rev() {
             let frame_iid = match frame_by_pc.get(&pc) {
                 Some(&fid) => fid,
                 None => {
@@ -218,7 +228,9 @@ fn build_trace_data(
         samples.push(Sample {
             callstack_iid: cs_iid,
             self_allocated: site.total_size,
+            self_freed: site.freed,
             alloc_count: site.count,
+            free_count: site.free_count,
         });
     }
 
@@ -284,7 +296,9 @@ fn encode_profile_packet(
         let mut c = ProtoWriter::new();
         c.write_uint64(HS_CALLSTACK_ID, s.callstack_iid);
         c.write_uint64(HS_SELF_ALLOCATED, s.self_allocated);
+        c.write_uint64(HS_SELF_FREED, s.self_freed);
         c.write_uint64(HS_ALLOC_COUNT, s.alloc_count);
+        c.write_uint64(HS_FREE_COUNT, s.free_count);
         phs.write_message(PHS_SAMPLES, c.bytes());
     }
     w.write_message(PP_PROCESS_DUMPS, phs.bytes());
@@ -382,7 +396,7 @@ mod tests {
         // count=5, total=100. No symbolizer -> function name "?".
         let images = [HeapImage { base_avma: 0x1000, path: b"img" }];
         let pcs = [0x1010u64];
-        let sites = [HeapSite { pcs: &pcs, count: 5, total_size: 100 }];
+        let sites = [HeapSite { pcs: &pcs, count: 5, total_size: 100, freed: 40, free_count: 2 }];
         let got = build_profile_packet(4242, 4096, 150, None, &images, &sites);
 
         // String pool: image path "img" (iid 1) then function name "?" (iid 2).
@@ -407,8 +421,8 @@ mod tests {
         let pcs_a = [0x2000u64];
         let pcs_b = [0x2000u64, 0x3000u64];
         let sites = [
-            HeapSite { pcs: &pcs_a, count: 1, total_size: 10 },
-            HeapSite { pcs: &pcs_b, count: 2, total_size: 20 },
+            HeapSite { pcs: &pcs_a, count: 1, total_size: 10, freed: 0, free_count: 0 },
+            HeapSite { pcs: &pcs_b, count: 2, total_size: 20, freed: 0, free_count: 0 },
         ];
         let td = build_trace_data(None, &images, &sites);
         assert_eq!(td.frames.len(), 2, "pc 0x2000 shared -> deduped");

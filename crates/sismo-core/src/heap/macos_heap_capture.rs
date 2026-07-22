@@ -62,6 +62,7 @@ const MAX_FRAMES: usize = 32;
 const ALLOC_METADATA_BYTES: usize = 328;
 
 // AllocMetadata field offsets (8-byte aligned extern struct).
+const OFF_SEQUENCE: usize = 0;
 const OFF_SAMPLE_SIZE: usize = 16;
 const OFF_ALLOC_ADDRESS: usize = 24;
 const OFF_STACK_POINTER: usize = 32;
@@ -70,14 +71,76 @@ const OFF_REG_PC: usize = 48;
 const OFF_REG_LR: usize = 56;
 const OFF_REG_FP: usize = 64;
 
+// Free-batch record shape (mirror of sismo-heap-preload's wire.rs, which owns
+// the ABI): FreeBatchHeader { magic, num } then num × FreeEntry { seq, addr }.
+const FREE_BATCH_MAGIC: u64 = 0x5346_5245_454e_5452;
+const FREE_HEADER_BYTES: usize = 16;
+const FREE_ENTRY_BYTES: usize = 16;
+
 use crate::mach::{mach_task_self_, MachPort, KERN_SUCCESS};
 
-/// An aggregated allocation site keyed by leaf PC.
-struct AllocStats {
-    count: u64,
-    total_size: u64,
-    pcs: [u64; MAX_FRAMES],
-    pc_count: usize,
+/// An aggregated allocation site's totals; the site key (its full leaf-first
+/// callstack) lives in the map key.
+#[derive(Default)]
+struct SiteStats {
+    allocated: u64,
+    freed: u64,
+    alloc_count: u64,
+    free_count: u64,
+}
+
+/// One live sampled allocation awaiting its free.
+struct LiveAlloc {
+    seq: u64,
+    sample_size: u64,
+    pcs: Vec<u64>,
+}
+
+/// heapprofd-style bookkeeping: sampled allocations tracked by address until
+/// their (batched) free arrives; sites keyed by the FULL callstack, so two
+/// paths sharing a leaf stay distinct.
+///
+/// Frees are batched client-side, so they arrive LATE relative to allocations
+/// of the same (reused) address: alloc(A,1) free(A,2) alloc(A,3) free(A,4)
+/// can arrive as alloc(1) alloc(3) free(2) free(4). The shared sequence
+/// counter makes this unambiguous without a global reorder: each address
+/// keeps its live allocations seq-ascending, and a free matches the NEWEST
+/// live allocation older than it — free(2) takes alloc(1), free(4) takes
+/// alloc(3), regardless of arrival order.
+#[derive(Default)]
+struct HeapBook {
+    sites: HashMap<Vec<u64>, SiteStats>,
+    live: HashMap<u64, Vec<LiveAlloc>>,
+}
+
+impl HeapBook {
+    fn apply_alloc(&mut self, seq: u64, addr: u64, sample_size: u64, pcs: Vec<u64>) {
+        let s = self.sites.entry(pcs.clone()).or_default();
+        s.allocated += sample_size;
+        s.alloc_count += 1;
+        // Allocations arrive in seq order (written to the ring at alloc
+        // time), so pushing keeps the per-address list ascending.
+        self.live.entry(addr).or_default().push(LiveAlloc { seq, sample_size, pcs });
+    }
+
+    fn apply_free(&mut self, seq: u64, addr: u64) {
+        // Unmatched frees are the common case: frees of unsampled allocations.
+        let Some(list) = self.live.get_mut(&addr) else {
+            return;
+        };
+        let i = list.partition_point(|l| l.seq < seq);
+        if i == 0 {
+            return; // stale: older than every live allocation at this address
+        }
+        let l = list.remove(i - 1);
+        if list.is_empty() {
+            self.live.remove(&addr);
+        }
+        if let Some(s) = self.sites.get_mut(&l.pcs) {
+            s.freed += l.sample_size;
+            s.free_count += 1;
+        }
+    }
 }
 
 // ---- Worker ----------------------------------------------------------------
@@ -222,7 +285,11 @@ impl HeapCapture {
         // Enumerate + register the target's modules into the symbolizer +
         // unwinder (all in Rust). Retries the post-spawn empty-list window,
         // polling the abort closure so shutdown interrupts the wait. The returned
-        // list (sorted by base) is kept for the profile's mappings.
+        // list (sorted by base) is kept for the profile's mappings. This runs
+        // BEFORE the attach on purpose: it copies __TEXT slabs for every image
+        // (seconds of mach reads for a big process), and doing it here pipelines
+        // with the target's startup — after the attach it would stall the drain
+        // loop while the ring fills.
         let image_list = match load_target_modules(
             task,
             Some(&mut symbolizer),
@@ -266,7 +333,7 @@ impl HeapCapture {
             };
         let mut ctrl_fd_open = true;
 
-        let mut sizes_by_top_pc: HashMap<u64, AllocStats> = HashMap::new();
+        let mut book = HeapBook::default();
 
         // ---- Main loop -------------------------------------------------
         loop {
@@ -277,7 +344,7 @@ impl HeapCapture {
             }
 
             if self.running.load(Ordering::Acquire) {
-                self.drain_into(&ring, &mut unwinder, &mut sizes_by_top_pc);
+                self.drain_into(&ring, &mut unwinder, &mut book);
             }
 
             // Flush: catch up on the ring, stamp the snapshot moment HERE (not
@@ -285,10 +352,10 @@ impl HeapCapture {
             // the emit duration), then emit the ProfilePacket.
             let flusher = self.pending_flusher.swap(0, Ordering::AcqRel);
             if flusher != 0 {
-                self.drain_into(&ring, &mut unwinder, &mut sizes_by_top_pc);
+                self.drain_into(&ring, &mut unwinder, &mut book);
                 let snapshot_ts = now_ns();
-                self.sites_observed.store(sizes_by_top_pc.len() as u32, Ordering::Release);
-                self.emit_profile(&sizes_by_top_pc, &image_list, &symbolizer, snapshot_ts);
+                self.sites_observed.store(book.sites.len() as u32, Ordering::Release);
+                self.emit_profile(&book, &image_list, &symbolizer, snapshot_ts);
                 unsafe { sismo_flush_done(flusher as *mut c_void) };
             }
 
@@ -305,10 +372,16 @@ impl HeapCapture {
                     ctrl_fd_open = false;
                     self.wakeup.wait_timeout(Duration::from_nanos(DETACH_SETTLE_NS));
                 }
-                self.drain_into(&ring, &mut unwinder, &mut sizes_by_top_pc);
+                self.drain_into(&ring, &mut unwinder, &mut book);
+                let dropped = ring.overflow_count();
+                if dropped > 0 {
+                    eprintln!(
+                        "sismo heap: {dropped} record(s) dropped on ring overflow — allocated/freed totals undercount"
+                    );
+                }
                 let snapshot_ts = now_ns();
-                self.sites_observed.store(sizes_by_top_pc.len() as u32, Ordering::Release);
-                self.emit_profile(&sizes_by_top_pc, &image_list, &symbolizer, snapshot_ts);
+                self.sites_observed.store(book.sites.len() as u32, Ordering::Release);
+                self.emit_profile(&book, &image_list, &symbolizer, snapshot_ts);
                 unsafe { sismo_stop_done(stopper as *mut c_void) };
                 self.running.store(false, Ordering::Release);
             }
@@ -330,17 +403,12 @@ impl HeapCapture {
         // ring, image_list, symbolizer, and unwinder drop here.
     }
 
-    /// Drain up to 4096 ring records into the aggregation map.
-    fn drain_into(
-        &self,
-        ring: &RingBuffer,
-        unwinder: &mut Unwinder,
-        sizes: &mut HashMap<u64, AllocStats>,
-    ) {
+    /// Drain up to 4096 ring records into the bookkeeping.
+    fn drain_into(&self, ring: &RingBuffer, unwinder: &mut Unwinder, book: &mut HeapBook) {
         let mut batch = 0u64;
         while let Some((ptr, len)) = ring.begin_read() {
             let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            self.process_record(slice, unwinder, sizes);
+            self.process_record(slice, unwinder, book);
             ring.end_read(len);
             batch += 1;
             if batch > 4096 {
@@ -349,15 +417,25 @@ impl HeapCapture {
         }
     }
 
-    fn process_record(
-        &self,
-        slice: &[u8],
-        unwinder: &mut Unwinder,
-        sizes: &mut HashMap<u64, AllocStats>,
-    ) {
+    fn process_record(&self, slice: &[u8], unwinder: &mut Unwinder, book: &mut HeapBook) {
+        // Free batches are the only other record type; discriminate by magic
+        // (an allocation record's first field is a sequence number, but its
+        // size is also always ALLOC + snapshot, checked below).
+        if slice.len() >= FREE_HEADER_BYTES && read_u64(slice, 0) == FREE_BATCH_MAGIC {
+            let num = read_u64(slice, 8) as usize;
+            let have = (slice.len() - FREE_HEADER_BYTES) / FREE_ENTRY_BYTES;
+            for i in 0..num.min(have) {
+                let off = FREE_HEADER_BYTES + i * FREE_ENTRY_BYTES;
+                let seq = read_u64(slice, off);
+                let addr = read_u64(slice, off + 8);
+                book.apply_free(seq, addr);
+            }
+            return;
+        }
         if slice.len() < ALLOC_METADATA_BYTES + STACK_SNAPSHOT_BYTES {
             return;
         }
+        let seq = read_u64(slice, OFF_SEQUENCE);
         let sample_size = read_u64(slice, OFF_SAMPLE_SIZE);
         let alloc_address = read_u64(slice, OFF_ALLOC_ADDRESS);
         let sp = read_u64(slice, OFF_STACK_POINTER);
@@ -366,19 +444,13 @@ impl HeapCapture {
         let fp = read_u64(slice, OFF_REG_FP);
         let stack_bytes = &slice[ALLOC_METADATA_BYTES..];
 
-        let pcs =
+        let mut pcs =
             unwinder.walk_snapshot(StackRegs { pc, fp, lr, sp }, stack_bytes, sp, MAX_FRAMES);
-
-        let top_pc = pcs.first().copied().unwrap_or(alloc_address);
-        let entry = sizes.entry(top_pc).or_insert_with(|| {
-            let mut stat = AllocStats { count: 0, total_size: 0, pcs: [0; MAX_FRAMES], pc_count: 0 };
-            let cap = pcs.len().min(MAX_FRAMES);
-            stat.pcs[..cap].copy_from_slice(&pcs[..cap]);
-            stat.pc_count = cap;
-            stat
-        });
-        entry.count += 1;
-        entry.total_size += sample_size;
+        if pcs.is_empty() {
+            pcs = vec![alloc_address];
+        }
+        pcs.truncate(MAX_FRAMES);
+        book.apply_alloc(seq, alloc_address, sample_size, pcs);
 
         self.records.fetch_add(1, Ordering::Relaxed);
         self.bytes_alloc.fetch_add(sample_size, Ordering::Relaxed);
@@ -390,7 +462,7 @@ impl HeapCapture {
     /// emit each via the C++ SDK shim and free it.
     fn emit_profile(
         &self,
-        sizes: &HashMap<u64, AllocStats>,
+        book: &HeapBook,
         image_list: &ImageList,
         symbolizer: &Symbolizer,
         snapshot_ts_ns: u64,
@@ -408,9 +480,16 @@ impl HeapCapture {
             .map(|(base, path)| HeapImage { base_avma: *base, path })
             .collect();
 
-        let sites: Vec<HeapSite> = sizes
-            .values()
-            .map(|s| HeapSite { pcs: &s.pcs[..s.pc_count], count: s.count, total_size: s.total_size })
+        let sites: Vec<HeapSite> = book
+            .sites
+            .iter()
+            .map(|(pcs, s)| HeapSite {
+                pcs,
+                count: s.alloc_count,
+                total_size: s.allocated,
+                freed: s.freed,
+                free_count: s.free_count,
+            })
             .collect();
 
         // Clock snapshot first: it registers the MONOTONIC_COARSE clock that the
@@ -496,4 +575,65 @@ pub struct HeapStats {
     pub records: u64,
     pub bytes_alloc: u64,
     pub sites: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HeapBook;
+
+    #[test]
+    fn alloc_then_free_moves_bytes_to_freed() {
+        let mut b = HeapBook::default();
+        b.apply_alloc(1, 0x1000, 4096, vec![0xa, 0xb]);
+        b.apply_alloc(2, 0x2000, 8192, vec![0xa, 0xb]);
+        b.apply_free(3, 0x1000);
+        let s = &b.sites[[0xau64, 0xb].as_slice()];
+        assert_eq!((s.allocated, s.freed), (12288, 4096));
+        assert_eq!((s.alloc_count, s.free_count), (2, 1));
+        assert!(b.live.contains_key(&0x2000) && !b.live.contains_key(&0x1000));
+    }
+
+    #[test]
+    fn delayed_free_batch_matches_across_address_reuse() {
+        // The churn pattern: one address reused every iteration, frees
+        // arriving late as a batch. alloc(1) alloc(3) alloc(5) then
+        // free(2) free(4) free(6): each free must take the newest live
+        // allocation older than itself.
+        let mut b = HeapBook::default();
+        b.apply_alloc(1, 0x1000, 100, vec![0xa]);
+        b.apply_alloc(3, 0x1000, 200, vec![0xa]);
+        b.apply_alloc(5, 0x1000, 300, vec![0xa]);
+        b.apply_free(2, 0x1000);
+        b.apply_free(4, 0x1000);
+        b.apply_free(6, 0x1000);
+        let s = &b.sites[[0xau64].as_slice()];
+        assert_eq!((s.allocated, s.freed), (600, 600));
+        assert_eq!((s.alloc_count, s.free_count), (3, 3));
+        assert!(b.live.is_empty());
+    }
+
+    #[test]
+    fn free_older_than_every_live_alloc_is_stale() {
+        let mut b = HeapBook::default();
+        b.apply_alloc(3, 0x1000, 200, vec![0xb]);
+        b.apply_free(2, 0x1000); // stale: predates the only live alloc
+        assert_eq!(b.sites[[0xbu64].as_slice()].freed, 0);
+        b.apply_free(4, 0x1000);
+        assert_eq!(b.sites[[0xbu64].as_slice()].freed, 200);
+    }
+
+    #[test]
+    fn unmatched_frees_are_ignored() {
+        let mut b = HeapBook::default();
+        b.apply_free(1, 0xdead); // free of an unsampled allocation
+        assert!(b.sites.is_empty() && b.live.is_empty());
+    }
+
+    #[test]
+    fn distinct_paths_to_one_leaf_stay_distinct_sites() {
+        let mut b = HeapBook::default();
+        b.apply_alloc(1, 0x1000, 64, vec![0xf00d, 0x10]);
+        b.apply_alloc(2, 0x2000, 64, vec![0xf00d, 0x20]);
+        assert_eq!(b.sites.len(), 2);
+    }
 }

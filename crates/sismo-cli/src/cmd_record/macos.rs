@@ -190,6 +190,16 @@ pub fn run(config: &RecordConfig) -> c_int {
         }
     };
 
+    // The session lock is held, so sockets still at these paths are leftovers
+    // from a crashed session — traced does not unlink them before bind, and a
+    // stale file (possibly root-owned, from a sudo run) fails every later
+    // record with EADDRINUSE.
+    for sock in [PRODUCER_SOCK, CONSUMER_SOCK] {
+        if let Ok(c) = CString::new(sock) {
+            unsafe { unlink(c.as_ptr()) };
+        }
+    }
+
     let my_pid = unsafe { getpid() };
     eprintln!(
         "sismo record: pid={my_pid} output={output_path_str}\n  producer sock: {PRODUCER_SOCK}\n  consumer sock: {CONSUMER_SOCK}"
@@ -234,6 +244,11 @@ pub fn run(config: &RecordConfig) -> c_int {
                     }
                 };
                 env.push(("DYLD_INSERT_LIBRARIES", heap_dylib.as_str()));
+                // The preload's constructor holds the target's main() until
+                // the recorder attaches (bounded), so allocations from the
+                // first instruction are captured — recorder setup latency
+                // otherwise races the workload's early allocations.
+                env.push(("SISMO_HEAP_WAIT_ATTACH", "1"));
             }
             let pid = match maybe_spawn(workload_cmd, &workload_args, &env) {
                 Some(p) => p,

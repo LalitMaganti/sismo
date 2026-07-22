@@ -173,6 +173,18 @@ impl RingBuffer {
 
     /// Reserve `payload_size` bytes; returns a `*mut u8` payload pointer to write
     /// into, or null if the ring is full. Follow with `end_write`.
+    /// Producer-side overflow count from the shared metadata page: records the
+    /// client could not write because the ring was full. Nonzero means the
+    /// aggregated allocated/freed totals undercount.
+    pub fn overflow_count(&self) -> u64 {
+        self.meta().num_writes_overflow.load(Ordering::Relaxed)
+    }
+
+    /// Producer-side successful-write count from the shared metadata page.
+    pub fn writes_count(&self) -> u64 {
+        self.meta().num_writes_succeeded.load(Ordering::Relaxed)
+    }
+
     pub fn begin_write(&self, payload_size: usize) -> *mut u8 {
         let total = align_up(payload_size as u64 + HEADER_BYTES, RECORD_ALIGN);
         if total > self.size {

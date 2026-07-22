@@ -48,10 +48,38 @@ pub struct RegBlockArm64 {
     pub _padding: u64,
 }
 
-// ABI drift guards — the recorder decodes AllocMetadata by these exact offsets.
+/// One freed pointer, stamped with the shared allocation/free sequence so the
+/// recorder can order a batched free against a racing reuse of the same
+/// address (heapprofd's FreeEntry shape).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FreeEntry {
+    pub sequence_number: u64,
+    pub address: u64,
+}
+
+/// Frees ride the ring in batches: no stack, just (seq, addr) pairs — the
+/// recorder matches them against its live sampled-allocation map. A batch
+/// record is `FreeBatchHeader` followed by `num` FreeEntry values; it is
+/// distinguished from an allocation record by its magic (and its size — an
+/// allocation record is always ALLOC + snapshot bytes).
+#[repr(C)]
+pub struct FreeBatchHeader {
+    pub magic: u64,
+    pub num: u64,
+}
+
+pub const FREE_BATCH_MAGIC: u64 = 0x5346_5245_454e_5452; // "SFREENTR"
+/// Entries per batch: bounds both staleness (flushed when full or stale) and
+/// record size (16 + 128×16 = 2064 bytes, well under any ring size).
+pub const FREE_BATCH_CAP: usize = 128;
+
+// ABI drift guards — the recorder decodes these by exact offsets.
 const _: () = assert!(std::mem::size_of::<AllocMetadata>() == 328);
 const _: () = assert!(std::mem::align_of::<AllocMetadata>() == 8);
 const _: () = assert!(std::mem::size_of::<RegBlockArm64>() == 32);
+const _: () = assert!(std::mem::size_of::<FreeEntry>() == 16);
+const _: () = assert!(std::mem::size_of::<FreeBatchHeader>() == 16);
 
 #[cfg(test)]
 mod tests {
