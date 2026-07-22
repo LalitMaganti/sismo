@@ -7,7 +7,7 @@
 //! almost nothing — but Go always ships `.gopclntab`, the program-counter/line
 //! table the runtime uses for stack traces, and it carries every function's
 //! name. This parses it to recover names when the symbol table is gone. It is
-//! the same table Go's `debug/gosym` and systing read.
+//! the same table Go's `debug/gosym` reads.
 //!
 //! Scope: the go1.18+ table layout (`0xfffffff0` / `0xfffffff1` magic), 64-bit
 //! little-endian, function names only (no file/line). The functab entry offsets
@@ -299,7 +299,7 @@ fn find_sections(f: &std::fs::File) -> Option<((u64, u64), u64)> {
             gopcln_named = Some((off, size));
             continue;
         }
-        // systing #158: some Go binaries rename the section (objcopy
+        // Some Go binaries rename the section (objcopy
         // --rename-section .gopclntab=.data.rel.ro.pcln), so match a PROGBITS
         // section whose content starts with the pcHeader magic + a 64-bit
         // ptrSize instead of relying on the name.

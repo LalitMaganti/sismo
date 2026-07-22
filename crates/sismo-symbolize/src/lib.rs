@@ -17,6 +17,9 @@ pub mod dynsym;
 // `.gopclntab` function-name resolver for stripped Go binaries (Linux/ELF).
 #[cfg(not(target_os = "windows"))]
 pub mod gopclntab;
+// /proc/kallsyms kernel-symbol source: kernel frames ship raw and resolve here.
+#[cfg(target_os = "linux")]
+pub mod kallsyms;
 mod maps_common;
 // PY-1: `_Py_DebugOffsets` table parser (pure, no OS dependency).
 #[cfg(not(target_os = "windows"))]

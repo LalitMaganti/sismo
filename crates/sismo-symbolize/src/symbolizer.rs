@@ -192,6 +192,52 @@ impl Symbolizer {
         self.modules.push(SymModule { base_avma, end_avma, map: None, fallbacks: Vec::new() });
     }
 
+    /// Register the kernel over `[base_avma, end_avma)`: a `vmlinux` debug image
+    /// as the wholesym primary (DWARF — line info + inline frames) with the
+    /// `/proc/kallsyms` names-only source as the fallback, exactly the
+    /// primary+fallback shape user modules use. Either may be absent. Frames
+    /// carry `[kernel.kallsyms]`-relative rel_pcs, which resolve against a
+    /// vmlinux ELF too — the KASLR slide cancels in `runtime_pc - kbase`.
+    /// Returns the symbol count (vmlinux's, or the fallback's when vmlinux gave
+    /// nothing) and any vmlinux load error.
+    pub fn add_kernel_module(
+        &mut self,
+        base_avma: u64,
+        end_avma: u64,
+        vmlinux: Option<&Path>,
+        uuid: Option<[u8; 16]>,
+        kallsyms: Option<Box<dyn crate::fallback::SymbolSource>>,
+    ) -> ModuleLoad {
+        let (map, mut result) = match vmlinux {
+            Some(path) => {
+                let disambiguator = uuid.filter(|u| *u != [0u8; 16]).map(|u| {
+                    MultiArchDisambiguator::DebugId(DebugId::from_uuid(uuid::Uuid::from_bytes(u)))
+                });
+                match self
+                    .rt
+                    .block_on(self.manager.load_symbol_map_for_binary_at_path(path, disambiguator))
+                {
+                    Ok(m) => {
+                        let symbol_count = m.symbol_count() as u64;
+                        (Some(m), ModuleLoad { symbol_count, error: None })
+                    }
+                    Err(e) => (None, ModuleLoad { symbol_count: 0, error: Some(format!("{e}")) }),
+                }
+            }
+            None => (None, ModuleLoad { symbol_count: 0, error: None }),
+        };
+        let fallbacks: Vec<Box<dyn crate::fallback::SymbolSource>> = kallsyms.into_iter().collect();
+        // When vmlinux found nothing, report the kallsyms fallback's count so
+        // the module status is honest.
+        if result.symbol_count == 0 {
+            if let Some(n) = fallbacks.iter().map(|f| f.len()).find(|&n| n > 0) {
+                result = ModuleLoad { symbol_count: n as u64, error: None };
+            }
+        }
+        self.modules.push(SymModule { base_avma, end_avma, map, fallbacks });
+        result
+    }
+
     /// Resolve `avma` to its inline chain (innermost inlinee first, physical
     /// function last) plus the byte offset from the physical function's start,
     /// or `None` if no registered module contains it (or nothing resolved).
