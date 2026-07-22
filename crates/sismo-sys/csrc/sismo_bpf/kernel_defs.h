@@ -93,6 +93,7 @@ struct file {
 // constant across a file's segments and equal to the host's base_avma.
 struct vm_area_struct {
   unsigned long vm_start;
+  unsigned long vm_end;
   unsigned long vm_pgoff;
 } __attribute__((preserve_access_index));
 

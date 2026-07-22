@@ -399,11 +399,27 @@ static __noinline __u32 walk_python(__u32 *py_ids) {
 // offset so the caller derives the module image base.
 struct find_vma_ctx {
   __u64 start;
+  __u64 end;
   __u64 pgoff;
 };
+
+// Per-CPU cache of the last VMA capture_module resolved, so a run of ticks in
+// the same mapping (a hot loop) skips the bpf_find_vma tree walk — the single
+// most expensive thing on the tick after the counter reads.
+struct vma_cache {
+  __u64 start;
+  __u64 end;
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct vma_cache);
+} last_vma SEC(".maps");
 static long vma_info_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx) {
   struct find_vma_ctx *c = ctx;
   c->start = BPF_CORE_READ(vma, vm_start);
+  c->end = BPF_CORE_READ(vma, vm_end);
   c->pgoff = BPF_CORE_READ(vma, vm_pgoff);
   return 0;
 }
@@ -418,9 +434,21 @@ static long vma_info_cb(struct task_struct *task, struct vm_area_struct *vma, vo
 static __noinline void capture_module(struct task_struct *cur, __u64 pc) {
   if (!pc)
     return;
+  // Same VMA as the last tick on this CPU (the common case for a hot loop)?
+  // Then its module was already resolved — skip the find_vma tree walk.
+  __u32 zero = 0;
+  struct vma_cache *vcache = bpf_map_lookup_elem(&last_vma, &zero);
+  if (vcache && pc >= vcache->start && pc < vcache->end)
+    return;
+
   struct find_vma_ctx vc = {};
   if (bpf_find_vma(cur, pc, vma_info_cb, &vc, 0) || !vc.start)
     return;
+  // Cache the resolved range (seen or new) so repeated PCs in it skip find_vma.
+  if (vcache) {
+    vcache->start = vc.start;
+    vcache->end = vc.end;
+  }
   __u64 base = vc.start - (vc.pgoff << 12);  // PAGE_SHIFT = 12
   if (bpf_map_lookup_elem(&module_seen, &base))
     return;
