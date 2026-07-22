@@ -9,16 +9,16 @@
 //! runs the bytecode interpreter loop without one native frame per Python
 //! call.
 //!
-//! Two entry points: [`locate_py_runtime`] resolves `_PyRuntime`'s runtime
-//! address once per target (found via the loaded `libpython*.so`'s dynamic
-//! symbol table), and [`walk_python_stack`] performs the live per-sample
-//! walk. Every read is best-effort: a target that has moved on, freed a
-//! frame, or simply raced the reader yields a short (possibly empty) result,
-//! never a panic.
+//! Two entry points: [`locate_py_runtime`] (or the file-level
+//! [`py_runtime_in_file`]) resolves `_PyRuntime`'s runtime address once per
+//! target, and [`walk_python_stack`] performs the live per-sample walk. The
+//! walk itself is memory-source-generic over [`RemoteMem`] — `/proc/<pid>/mem`
+//! on Linux, `mach_vm_read_overwrite` on macOS, `ReadProcessMemory` on
+//! Windows — so only the few lines that open the source are per-OS. Every
+//! read is best-effort: a target that has moved on, freed a frame, or simply
+//! raced the reader yields a short (possibly empty) result, never a panic.
 
-use std::os::unix::fs::FileExt;
-
-use object::{Object, ObjectSegment, ObjectSymbol};
+use object::{Object, ObjectSegment};
 
 use crate::python_offsets::{self, PyDebugOffsets};
 use crate::proc_maps::ProcMaps;
@@ -30,6 +30,31 @@ const MAX_NAME_LEN: i64 = 512;
 /// Frames walked before giving up, bounding a corrupted/racing linked list.
 const MAX_FRAMES: usize = 64;
 
+/// A source of another process's memory. The only operation the Python walk
+/// needs: read exactly `buf.len()` bytes at an absolute address, or say no.
+pub trait RemoteMem {
+    fn read_exact_at(&self, addr: u64, buf: &mut [u8]) -> Option<()>;
+}
+
+/// `/proc/<pid>/mem`-backed [`RemoteMem`] (Linux).
+#[cfg(target_os = "linux")]
+pub struct ProcMem(std::fs::File);
+
+#[cfg(target_os = "linux")]
+impl ProcMem {
+    pub fn open(pid: u32) -> Option<Self> {
+        std::fs::File::open(format!("/proc/{pid}/mem")).ok().map(ProcMem)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RemoteMem for ProcMem {
+    fn read_exact_at(&self, addr: u64, buf: &mut [u8]) -> Option<()> {
+        use std::os::unix::fs::FileExt;
+        self.0.read_exact_at(buf, addr).ok()
+    }
+}
+
 /// Find the loaded `libpython*.so`'s `_PyRuntime` dynamic symbol and resolve
 /// it to a runtime (avma) address in the target process, using its already-
 /// parsed `/proc/<pid>/maps`. `None` when no libpython is loaded, the symbol
@@ -40,29 +65,60 @@ pub fn locate_py_runtime(_pid: u32, maps: &ProcMaps) -> Option<u64> {
         let base = path.rsplit('/').next().unwrap_or(path);
         base.starts_with("libpython")
     })?;
-    let path = path.to_string();
+    py_runtime_in_file(&path.to_string(), base_avma)
+}
 
-    let data = std::fs::read(&path).ok()?;
+/// Whether a loaded image path looks like the one carrying `_PyRuntime`:
+/// `libpython3.14.so.1` (ELF), `libpython3.14.dylib`, a framework build's
+/// `.../Python.framework/Versions/3.14/Python`, or a `python3.x` binary
+/// (static builds carry the runtime in the executable).
+pub fn is_python_image(path: &[u8]) -> bool {
+    let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    base.starts_with(b"libpython")
+        || base.starts_with(b"python")
+        || path.windows(17).any(|w| w == b"Python.framework/")
+}
+
+/// Find `_PyRuntime` in the on-disk image at `path` (ELF or mach-o — mach-o
+/// exports carry a leading underscore) and rebase it onto the image's actual
+/// load address. `None` when the file can't be read/parsed or exports no
+/// `_PyRuntime` — a native, non-Python image is the common `None` case.
+pub fn py_runtime_in_file(path: &str, base_avma: u64) -> Option<u64> {
+    let data = std::fs::read(path).ok()?;
     let obj = object::File::parse(&*data).ok()?;
-    let sym = obj
-        .dynamic_symbols()
-        .find(|s| s.name() == Ok("_PyRuntime"))?;
+    let link_addr = obj
+        .exports()
+        .ok()?
+        .into_iter()
+        .find(|e| e.name() == b"_PyRuntime" || e.name() == b"__PyRuntime")
+        .map(|e| e.address())?;
 
     // Rebase the symbol's link-time address onto this run's actual load
-    // address, same as disasm.rs: `slide = base_avma - image_base`, where
-    // image_base is the lowest segment vaddr (0 for a normally linked .so).
-    let image_base = obj.segments().map(|s| s.address()).min().unwrap_or(0);
+    // address: `slide = base_avma - image_base`, where image_base is the
+    // lowest real segment vaddr — 0 for a normally linked .so/.dylib, the
+    // __TEXT base for a mach-o executable (whose __PAGEZERO must not count).
+    let image_base = obj
+        .segments()
+        .filter(|s| s.name().ok().flatten() != Some("__PAGEZERO"))
+        .map(|s| s.address())
+        .min()
+        .unwrap_or(0);
     let slide = base_avma.wrapping_sub(image_base);
-    Some(sym.address().wrapping_add(slide))
+    Some(link_addr.wrapping_add(slide))
 }
 
 /// Read the `_Py_DebugOffsets` blob at `_PyRuntime + 0` from the target's
 /// memory. `None` on any read failure (target gone, permission, bad address).
-pub fn read_debug_offsets_blob(pid: u32, py_runtime_avma: u64) -> Option<Vec<u8>> {
-    let mem = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
+pub fn read_debug_offsets_blob_mem(mem: &impl RemoteMem, py_runtime_avma: u64) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; python_offsets::BLOB_LEN];
-    mem.read_exact_at(&mut buf, py_runtime_avma).ok()?;
+    mem.read_exact_at(py_runtime_avma, &mut buf)?;
     Some(buf)
+}
+
+/// [`read_debug_offsets_blob_mem`] over `/proc/<pid>/mem` (Linux).
+#[cfg(target_os = "linux")]
+pub fn read_debug_offsets_blob(pid: u32, py_runtime_avma: u64) -> Option<Vec<u8>> {
+    read_debug_offsets_blob_mem(&ProcMem::open(pid)?, py_runtime_avma)
 }
 
 /// Walk the running interpreter's current-thread frame chain and return the
@@ -75,19 +131,29 @@ pub fn read_debug_offsets_blob(pid: u32, py_runtime_avma: u64) -> Option<Vec<u8>
 /// TSS-key lookup. Correct for a single-threaded target; a multi-threaded
 /// target may attribute to the wrong thread (a known limitation, not a bug
 /// to fix here).
+#[cfg(target_os = "linux")]
 pub fn walk_python_stack(pid: u32, py_runtime_avma: u64, offs: &PyDebugOffsets) -> Vec<String> {
+    match ProcMem::open(pid) {
+        Some(mem) => walk_python_stack_mem(&mem, py_runtime_avma, offs),
+        None => Vec::new(),
+    }
+}
+
+/// [`walk_python_stack`] over any [`RemoteMem`] source.
+pub fn walk_python_stack_mem(
+    mem: &impl RemoteMem,
+    py_runtime_avma: u64,
+    offs: &PyDebugOffsets,
+) -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(mem) = std::fs::File::open(format!("/proc/{pid}/mem")) else {
-        return out;
-    };
     let read_u64 = |addr: u64| -> Option<u64> {
         let mut buf = [0u8; 8];
-        mem.read_exact_at(&mut buf, addr).ok()?;
+        mem.read_exact_at(addr, &mut buf)?;
         Some(u64::from_le_bytes(buf))
     };
     let read_bytes = |addr: u64, len: usize| -> Option<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        mem.read_exact_at(&mut buf, addr).ok()?;
+        mem.read_exact_at(addr, &mut buf)?;
         Some(buf)
     };
 

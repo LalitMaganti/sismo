@@ -20,6 +20,7 @@
 //!
 //! macOS-only; gated in sched/mod.rs.
 
+use crate::cpu::jit_map::JitMap;
 use crate::cpu::module_registry::{ModuleKey, ModuleRegistry};
 use crate::ffi::sismo_ds_emit;
 use crate::mach::MachPort;
@@ -27,6 +28,8 @@ use crate::proto::ProtoWriter;
 use crate::sched::kperf::{ticks_to_ns, timebase};
 use crate::sched::ring::{ConsumerCtl, KdEvent, KdThreadMap, RingConsumer};
 use crate::symbolize::dyld_images::{read_macho_meta, ImageList};
+use crate::symbolize::python_offsets::{self, PyDebugOffsets};
+use crate::symbolize::python_stack::{self, RemoteMem};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -386,7 +389,7 @@ struct Module {
 /// shared cache image headers are packed together, so a next-base clamp would
 /// truncate ranges and make in-cache frames miss. Each image is observed by the
 /// shared module registry, which decides the trace id and whether to pin an fd.
-fn load_modules(task: MachPort, registry: &Mutex<ModuleRegistry>) -> Vec<Module> {
+fn load_modules(task: MachPort, registry: &Mutex<ModuleRegistry>) -> (Vec<Module>, Vec<u8>) {
     let list = match ImageList::enumerate(task) {
         Ok(l) => l,
         Err(e) => {
@@ -394,9 +397,12 @@ fn load_modules(task: MachPort, registry: &Mutex<ModuleRegistry>) -> Vec<Module>
             // nothing, which reads as "no symbols" much later with no clue.
             // The emitter retries (see emit), so this can be transient.
             eprintln!("kperf_sample: module enumeration failed (err {e}) — user frames unmapped until retry");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
+    // dyld's infoArray lists the main executable first — its basename is how
+    // the emitter recognizes an interpreter/JIT runtime target.
+    let main_exe = list.images().first().map(|(_, p)| p.clone()).unwrap_or_default();
     let mut mods = Vec::with_capacity(list.len());
     for (base, path) in list.images() {
         if let Some((uuid, text_vmsize)) = read_macho_meta(task, *base) {
@@ -409,7 +415,78 @@ fn load_modules(task: MachPort, registry: &Mutex<ModuleRegistry>) -> Vec<Module>
         }
     }
     mods.sort_by_key(|m| m.base);
-    mods
+    (mods, main_exe)
+}
+
+/// The interpreter/JIT runtime this main executable is, if any — the gate
+/// for the perf-map (JIT-1) and Python-splice (PY-1) recovery paths, and the
+/// `[jit:<runtime>]` residual label. Mirrors the Linux residual_map runtime
+/// classification.
+fn runtime_of(main_exe: &[u8]) -> Option<&'static str> {
+    let base = main_exe.rsplit(|&b| b == b'/').next().unwrap_or(main_exe);
+    // Case-insensitive: a framework CPython re-execs through the Python.app
+    // stub, whose basename is "Python" (capital P).
+    let base = base.to_ascii_lowercase();
+    if base.starts_with(b"python") {
+        Some("python")
+    } else if base.starts_with(b"node") {
+        Some("node")
+    } else if base == b"java" {
+        Some("java")
+    } else {
+        None
+    }
+}
+
+/// PY-1 (macOS): whether `_PyRuntime` has been located and its
+/// `_Py_DebugOffsets` parsed for this target.
+enum PyState {
+    Untried,
+    Absent,
+    Ready { rt_addr: u64, offs: PyDebugOffsets },
+}
+
+/// Task-port-backed remote memory for the Python frame walk.
+struct MachMem(MachPort);
+
+impl RemoteMem for MachMem {
+    fn read_exact_at(&self, addr: u64, buf: &mut [u8]) -> Option<()> {
+        let mut got: u64 = 0;
+        let kr = unsafe {
+            crate::mach::mach_vm_read_overwrite(
+                self.0,
+                addr,
+                buf.len() as u64,
+                buf.as_mut_ptr() as u64,
+                &mut got,
+            )
+        };
+        (kr == 0 && got == buf.len() as u64).then_some(())
+    }
+}
+
+/// Locate `_PyRuntime` in the loaded Python image and parse its debug-offsets
+/// table, reading through the task port. Absent when no image carries the
+/// symbol or the table doesn't parse (non-CPython, or an unsupported version).
+fn arm_python(modules: &[Module], task: MachPort) -> PyState {
+    for m in modules {
+        if !python_stack::is_python_image(&m.path) {
+            continue;
+        }
+        let Ok(path) = std::str::from_utf8(&m.path) else {
+            continue;
+        };
+        let Some(rt_addr) = python_stack::py_runtime_in_file(path, m.base) else {
+            continue;
+        };
+        let mem = MachMem(task);
+        if let Some(blob) = python_stack::read_debug_offsets_blob_mem(&mem, rt_addr) {
+            if let Some(offs) = python_offsets::parse(&blob) {
+                return PyState::Ready { rt_addr, offs };
+            }
+        }
+    }
+    PyState::Absent
 }
 
 /// Binary-search a PC into the base-sorted module table.
@@ -431,14 +508,16 @@ fn find_module(mods: &[Module], pc: u64) -> Option<usize> {
 struct Interner {
     paths: HashMap<Vec<u8>, u64>,
     build_ids: HashMap<Vec<u8>, u64>,
-    mappings: HashMap<u64, u64>,      // module.base -> iid
-    frames: HashMap<(u64, u64), u64>, // (mapping_iid, pc) -> iid
+    func_names: HashMap<Vec<u8>, u64>,
+    mappings: HashMap<u64, u64>, // module.base (or MAX-path_iid, residual) -> iid
+    frames: HashMap<(u64, u64, u64), u64>, // (mapping_iid, pc, name_iid) -> iid
     callstacks: HashMap<Vec<u8>, u64>,
     /// Reused buffer for the callstack lookup key (frame iids as little-endian
     /// bytes) — cleared per sample, cloned only when a new callstack is interned.
     key_scratch: Vec<u8>,
     next_path: u64,
     next_build_id: u64,
+    next_func_name: u64,
     next_mapping: u64,
     next_frame: u64,
     next_callstack: u64,
@@ -449,12 +528,14 @@ impl Interner {
         Interner {
             paths: HashMap::new(),
             build_ids: HashMap::new(),
+            func_names: HashMap::new(),
             mappings: HashMap::new(),
             frames: HashMap::new(),
             callstacks: HashMap::new(),
             key_scratch: Vec::with_capacity(256),
             next_path: 1,
             next_build_id: 1,
+            next_func_name: 1,
             next_mapping: 1,
             next_frame: 1,
             next_callstack: 1,
@@ -508,15 +589,43 @@ impl Interner {
         iid
     }
 
-    fn intern_frame(&mut self, idw: &mut ProtoWriter, mapping_iid: u64, pc: u64) -> u64 {
-        if let Some(&iid) = self.frames.get(&(mapping_iid, pc)) {
+    /// A synthetic mapping carrying only a label path (`[jit:node]`,
+    /// `[python]`) for frames that belong to no on-disk module. Keyed away
+    /// from the base-keyed real mappings.
+    fn intern_residual_mapping(&mut self, idw: &mut ProtoWriter, label: &[u8]) -> u64 {
+        let path_iid = Self::intern_string(idw, 17, label, &mut self.paths, &mut self.next_path);
+        let key = u64::MAX - path_iid;
+        if let Some(&iid) = self.mappings.get(&key) {
+            return iid;
+        }
+        let iid = self.next_mapping;
+        self.next_mapping += 1;
+        self.mappings.insert(key, iid);
+        idw.message(19, |mp| {
+            mp.write_uint64(1, iid);
+            mp.write_uint64(7, path_iid); // path_string_ids
+        });
+        iid
+    }
+
+    /// A runtime-recovered function name (JIT method, Python qualname),
+    /// carried on the frame directly via function_name_id.
+    fn intern_func_name(&mut self, idw: &mut ProtoWriter, name: &[u8]) -> u64 {
+        Self::intern_string(idw, 5, name, &mut self.func_names, &mut self.next_func_name)
+    }
+
+    fn intern_frame(&mut self, idw: &mut ProtoWriter, mapping_iid: u64, pc: u64, name_iid: u64) -> u64 {
+        if let Some(&iid) = self.frames.get(&(mapping_iid, pc, name_iid)) {
             return iid;
         }
         let iid = self.next_frame;
         self.next_frame += 1;
-        self.frames.insert((mapping_iid, pc), iid);
+        self.frames.insert((mapping_iid, pc, name_iid), iid);
         idw.message(6, |fr| {
             fr.write_uint64(1, iid);
+            if name_iid != 0 {
+                fr.write_uint64(2, name_iid); // function_name_id
+            }
             fr.write_uint64(3, mapping_iid);
             // rel_pc = the absolute PC. trace_processor stores it verbatim;
             // the symbolize pass recovers the __TEXT-relative offset as
@@ -567,6 +676,17 @@ struct PerfEmitter {
     /// Samples since the last module reload — bounds reload frequency so a
     /// persistently-unmappable frame (JIT, etc.) can't reload every sample.
     since_reload: u64,
+    /// The recognized interpreter/JIT runtime of the main executable, if any.
+    runtime: Option<&'static str>,
+    /// `[jit:<runtime>]` label when `runtime` is set, else empty. Non-empty is
+    /// also what turns a no-module PC into a residual frame instead of
+    /// dropping it.
+    jit_label: Vec<u8>,
+    /// JIT-1: lazy perf-map (`/tmp/perf-<pid>.map`) lookup for no-module PCs.
+    jit: JitMap,
+    /// PY-1: the located `_PyRuntime` + parsed debug offsets, when the target
+    /// is CPython.
+    py: PyState,
     /// Reused per-sample scratch: `idw` builds the InternedData delta, `tp` the
     /// TracePacket, `fids` the frame-iid list — cleared, never reallocated.
     idw: ProtoWriter,
@@ -582,17 +702,28 @@ impl PerfEmitter {
         registry: Arc<Mutex<ModuleRegistry>>,
     ) -> Self {
         let (tb_numer, tb_denom) = timebase();
+        let (modules, main_exe) = load_modules(task, &registry);
+        let runtime = runtime_of(&main_exe);
+        let jit_label = match runtime {
+            Some(rt) => format!("[jit:{rt}]").into_bytes(),
+            None => Vec::new(),
+        };
+        let py = if runtime == Some("python") { PyState::Untried } else { PyState::Absent };
         PerfEmitter {
             ds_slot,
             task,
             timebase_name,
-            modules: load_modules(task, &registry),
+            modules,
             registry,
             interner: Interner::new(),
             need_defaults: true,
             tb_numer,
             tb_denom,
             since_reload: 0,
+            runtime,
+            jit_label,
+            jit: JitMap::new(),
+            py,
             idw: ProtoWriter::with_capacity(2048),
             tp: ProtoWriter::with_capacity(256),
             fids: Vec::with_capacity(128),
@@ -604,7 +735,7 @@ impl PerfEmitter {
         // Disjoint field borrows so the interner + both scratch writers + the
         // module table can all be used in one pass with no per-sample alloc.
         let PerfEmitter {
-            ds_slot, task, timebase_name, modules, registry, interner, need_defaults, tb_numer, tb_denom, since_reload, idw, tp, fids,
+            ds_slot, task, timebase_name, modules, registry, interner, need_defaults, tb_numer, tb_denom, since_reload, runtime, jit_label, jit, py, idw, tp, fids,
         } = self;
         let ds_slot = *ds_slot;
 
@@ -635,8 +766,27 @@ impl PerfEmitter {
             && (modules.is_empty()
                 || s.frames.iter().any(|&pc| pc != 0 && find_module(modules, pc).is_none()))
         {
-            *modules = load_modules(*task, registry);
+            let (m, main_exe) = load_modules(*task, registry);
+            *modules = m;
             *since_reload = 0;
+            // The constructor's enumeration can race the child's exec (the
+            // main executable isn't python/node yet), so the runtime is
+            // re-derived on every reload, and a late-loaded libpython
+            // (embedded interpreter) re-arms the walk.
+            let rt = runtime_of(&main_exe);
+            if rt != *runtime {
+                *runtime = rt;
+                *jit_label = match rt {
+                    Some(r) => format!("[jit:{r}]").into_bytes(),
+                    None => Vec::new(),
+                };
+                *py = if rt == Some("python") { PyState::Untried } else { PyState::Absent };
+            } else if rt == Some("python") && matches!(py, PyState::Absent) {
+                *py = PyState::Untried;
+            }
+        }
+        if matches!(py, PyState::Untried) {
+            *py = arm_python(modules, *task);
         }
 
         idw.clear();
@@ -650,8 +800,22 @@ impl PerfEmitter {
                 if pc == 0 {
                     continue;
                 }
-                let frame_iid = interner.intern_frame(idw, kmap, pc);
+                let frame_iid = interner.intern_frame(idw, kmap, pc, 0);
                 fids.push(frame_iid);
+            }
+        }
+        // PY-1: splice the live-recovered Python call chain in ahead of the
+        // native user PCs, so after the reverse below it sits leaf-most in
+        // the user region — the qualnames the native walk can't see, exactly
+        // as the Linux capture emits them.
+        if let PyState::Ready { rt_addr, offs } = py {
+            let names = python_stack::walk_python_stack_mem(&MachMem(*task), *rt_addr, offs);
+            if !names.is_empty() {
+                let map_iid = interner.intern_residual_mapping(idw, b"[python]");
+                for name in &names {
+                    let name_iid = interner.intern_func_name(idw, name.as_bytes());
+                    fids.push(interner.intern_frame(idw, map_iid, 0, name_iid));
+                }
             }
         }
         for &pc in &s.frames {
@@ -662,8 +826,19 @@ impl PerfEmitter {
                 let (base, end) = (modules[i].base, modules[i].end);
                 let m = &modules[i];
                 let mapping_iid = interner.intern_mapping(idw, base, end, &m.path, &m.build_id);
-                let frame_iid = interner.intern_frame(idw, mapping_iid, pc);
+                let frame_iid = interner.intern_frame(idw, mapping_iid, pc, 0);
                 fids.push(frame_iid);
+            } else if !jit_label.is_empty() {
+                // JIT-1: a PC in no module under an interpreter/JIT runtime is
+                // its generated code — name it from the target's perf-map when
+                // one exists, and keep the frame (as `[jit:<rt>]`) either way
+                // instead of dropping it.
+                let name_iid = match jit.name(s.pid as u32, pc) {
+                    Some(n) => interner.intern_func_name(idw, n.as_bytes()),
+                    None => 0,
+                };
+                let map_iid = interner.intern_residual_mapping(idw, jit_label);
+                fids.push(interner.intern_frame(idw, map_iid, pc, name_iid));
             }
         }
         let cs_iid = if fids.is_empty() {
@@ -723,7 +898,7 @@ mod tests {
     fn offcpu() -> OffCpuConsumer {
         OffCpuConsumer {
             ctl: Arc::new(ConsumerCtl::new()),
-            emitter: PerfEmitter { ds_slot: u32::MAX, task: 0, timebase_name: b"", modules: Vec::new(), registry: test_registry(), interner: Interner::new(), need_defaults: false, tb_numer: 1, tb_denom: 1, since_reload: 0, idw: ProtoWriter::new(), tp: ProtoWriter::new(), fids: Vec::new() },
+            emitter: PerfEmitter { ds_slot: u32::MAX, task: 0, timebase_name: b"", modules: Vec::new(), registry: test_registry(), interner: Interner::new(), need_defaults: false, tb_numer: 1, tb_denom: 1, since_reload: 0, runtime: None, jit_label: Vec::new(), jit: JitMap::new(), py: PyState::Absent, idw: ProtoWriter::new(), tp: ProtoWriter::new(), fids: Vec::new() },
             stacks: UserStacks::default(),
             pending_wait: HashMap::new(),
         }
@@ -732,7 +907,7 @@ mod tests {
     fn oncpu() -> OnCpuConsumer {
         OnCpuConsumer {
             ctl: Arc::new(ConsumerCtl::new()),
-            emitter: PerfEmitter { ds_slot: u32::MAX, task: 0, timebase_name: b"", modules: Vec::new(), registry: test_registry(), interner: Interner::new(), need_defaults: false, tb_numer: 1, tb_denom: 1, since_reload: 0, idw: ProtoWriter::new(), tp: ProtoWriter::new(), fids: Vec::new() },
+            emitter: PerfEmitter { ds_slot: u32::MAX, task: 0, timebase_name: b"", modules: Vec::new(), registry: test_registry(), interner: Interner::new(), need_defaults: false, tb_numer: 1, tb_denom: 1, since_reload: 0, runtime: None, jit_label: Vec::new(), jit: JitMap::new(), py: PyState::Absent, idw: ProtoWriter::new(), tp: ProtoWriter::new(), fids: Vec::new() },
             stacks: UserStacks::default(),
             pending_fire: HashMap::new(),
             period_ns: 1_000_000,

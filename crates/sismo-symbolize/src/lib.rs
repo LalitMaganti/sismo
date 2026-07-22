@@ -18,12 +18,13 @@ pub mod dynsym;
 #[cfg(not(target_os = "windows"))]
 pub mod gopclntab;
 mod maps_common;
-// PY-1: `_Py_DebugOffsets` table parser (pure, no OS dependency; Linux-only
-// because its sole consumer, python_stack, reads /proc/<pid>/mem).
-#[cfg(target_os = "linux")]
+// PY-1: `_Py_DebugOffsets` table parser (pure, no OS dependency).
+#[cfg(not(target_os = "windows"))]
 pub mod python_offsets;
-// PY-1: live CPython 3.14+ frame recovery via /proc/<pid>/mem (Linux-only).
-#[cfg(target_os = "linux")]
+// PY-1: live CPython 3.14+ frame recovery. The walk is memory-source-generic
+// (RemoteMem); Linux reads /proc/<pid>/mem, macOS reads via the task port,
+// Windows will read via ReadProcessMemory.
+#[cfg(not(target_os = "windows"))]
 pub mod python_stack;
 // DIA-0: per-module stack-quality primitive (truncation signal + eh_frame probe).
 #[cfg(not(target_os = "windows"))]

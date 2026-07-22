@@ -15,5 +15,9 @@ pub mod linux_bpf_capture;
 // path is /proc/self/fd on Linux, /dev/fd on macOS. POSIX-only.
 #[cfg(not(target_os = "windows"))]
 pub mod module_registry;
+// JIT-1: perf-map (`/tmp/perf-<pid>.map`) JIT symbol lookup, shared by the
+// Linux and macOS capture pipelines.
+#[cfg(not(target_os = "windows"))]
+pub mod jit_map;
 #[cfg(target_os = "linux")]
 pub mod pmu_events;
