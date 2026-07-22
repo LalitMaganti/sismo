@@ -17,7 +17,7 @@ pub const SISMO_PY_NAME_MAX: usize = 128;
 pub const SISMO_MAX_COUNTERS: usize = 12;
 
 pub const SISMO_EVT_SAMPLE: u32 = 0;
-pub const SISMO_EVT_KSYM: u32 = 1;
+// tag 1 retired (kernel symbols now ship raw; see sismo_bpf.h)
 pub const SISMO_EVT_OFFCPU: u32 = 2;
 pub const SISMO_EVT_FILE: u32 = 3;
 pub const SISMO_EVT_SAMPLE_UNWIND: u32 = 4;
@@ -26,6 +26,14 @@ pub const SISMO_EVT_MODULE: u32 = 6;
 
 /// Bytes of a module's mapped-image prefix in `SismoModuleRec` (one page).
 pub const SISMO_MODULE_PREFIX: usize = 4096;
+
+/// Synthetic base the `[kernel.kallsyms]` mapping is anchored at in the trace.
+/// Kernel frames are stored as `(raw_pc − kbase) + this`, which (1) strips the
+/// real KASLR slide — `this` is a constant, the canonical x86-64 kernel image
+/// base — and (2) keeps kernel addresses in the upper canonical half, disjoint
+/// from user modules. Anchoring at 0 instead let low (non-PIE) user addresses
+/// fall inside the kernel's address range and resolve to kernel symbols.
+pub const KERNEL_SYNTH_BASE: u64 = 0xffff_ffff_8000_0000;
 
 /// Bytes of the raw user-stack snapshot in `SismoUnwindRec` (perf's default
 /// PERF_SAMPLE_STACK_USER size).
@@ -51,15 +59,17 @@ pub struct SismoHdr {
     pub ts: u64,
 }
 
-/// SISMO_EVT_SAMPLE. `stack` holds user PCs leaf-first; `kernel_ids` holds
-/// kernel-symbol ids leaf-first (resolved in-BPF, KASLR-safe).
+/// SISMO_EVT_SAMPLE. `stack` holds user PCs leaf-first; `kernel_ids` holds RAW
+/// kernel PCs leaf-first — the host rebases them to [kernel.kallsyms] and
+/// symbolizes host-side (the KASLR base is subtracted before anything reaches
+/// the trace). Field name kept for wire-doc continuity.
 #[repr(C)]
 pub struct SismoSampleRec {
     pub hdr: SismoHdr,
     pub data_addr: u64,
     pub counters: [u64; SISMO_MAX_COUNTERS],
     pub stack: [u64; SISMO_MAX_STACK],
-    pub kernel_ids: [u32; SISMO_MAX_KERNEL_STACK],
+    pub kernel_ids: [u64; SISMO_MAX_KERNEL_STACK],
     pub py_ids: [u32; SISMO_MAX_PY_FRAMES], // CAP-1: Python frame-name ids, leaf-first
 }
 
@@ -79,7 +89,8 @@ pub struct SismoUnwindRec {
     pub stack_bytes: [u8; SISMO_STACK_SNAP_MAX],
 }
 
-/// SISMO_EVT_KSYM. One-time (id -> resolved name) mapping.
+/// One-time (id -> name) mapping record. Today carries SISMO_EVT_FILE (the
+/// KSYM use is retired). `name` NUL-padded.
 #[repr(C)]
 pub struct SismoKsymRec {
     pub r#type: u32,
@@ -700,8 +711,11 @@ impl Interner {
     }
 
     /// The synthetic "[kernel.kallsyms]" mapping every kernel frame shares
-    /// (keyed by sentinel start 0 — real mappings never start at 0).
-    fn intern_kernel_mapping(&mut self, idw: &mut ProtoWriter) -> u64 {
+    /// (keyed by sentinel start 0 — real mappings never start at 0). Carries
+    /// the vmlinux build-id and an explicit load_bias of 0 so the post-record
+    /// symbolize pass picks it up like any other module: frames reference it
+    /// with rel_pc already rebased (raw_pc − kbase), so load_bias must be 0.
+    fn intern_kernel_mapping(&mut self, build_id: &[u8], idw: &mut ProtoWriter) -> u64 {
         if let Some(&iid) = self.mappings.get(&0) {
             return iid;
         }
@@ -709,8 +723,19 @@ impl Interner {
         self.next_mapping += 1;
         self.mappings.insert(0, iid);
         let path_iid = self.intern_path(b"[kernel.kallsyms]", idw);
+        let build_id_iid = if !build_id.is_empty() {
+            self.intern_build_id(build_id, idw)
+        } else {
+            0
+        };
         idw.message(19, |mp| {
             mp.write_uint64(1, iid);
+            if build_id_iid != 0 {
+                mp.write_uint64(2, build_id_iid);
+            }
+            // load_bias = the synthetic base the frames' rel_pc is offset by, so
+            // the symbolize pass computes rel = rel_pc - load_bias = raw - kbase.
+            mp.write_uint64(6, KERNEL_SYNTH_BASE);
             mp.write_uint64(7, path_iid);
         });
         iid
@@ -834,7 +859,14 @@ pub struct Capture {
     // The off-CPU stream is a second perf sequence with its own timebase, so it
     // interns into its own iid space.
     offcpu_interner: Interner,
-    ksym_names: HashMap<u32, Vec<u8>>, // id -> bare function name
+    // Kernel text base (kallsyms _stext) captured once at init: raw kernel PCs
+    // are rebased to [kernel.kallsyms]-relative before interning, so the trace
+    // never carries the KASLR slide. 0 when kallsyms is masked — kernel frames
+    // then stay absolute and go unsymbolized ([kernel]).
+    kbase: u64,
+    // Vmlinux GNU build-id (from /sys/kernel/notes), the kernel module's stable
+    // identity in the trace so the symbolize pass can key it. Empty if absent.
+    kbuild_id: Vec<u8>,
     file_names: HashMap<u32, Vec<u8>>, // interned file id -> base name
     py_names: HashMap<u32, Vec<u8>>,   // CAP-1: id -> Python qualname
     py_cfg_fd: c_int,                  // CAP-1: fd of the py_cfg BPF map (-1 if absent)
@@ -1067,22 +1099,27 @@ impl Capture {
             let mut kfids: Vec<u64> = Vec::new();
             let mut kmap = 0u64;
             for i in 0..knr {
-                let id = rec.kernel_ids[i];
-                if id == 0 {
+                let addr = rec.kernel_ids[i];
+                if addr == 0 {
                     continue;
                 }
                 if kmap == 0 {
-                    kmap = self.interner.intern_kernel_mapping(idw);
+                    kmap = self.interner.intern_kernel_mapping(&self.kbuild_id, idw);
                 }
-                let name = self
-                    .ksym_names
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| b"[kernel]".to_vec());
-                let name_iid = self.interner.intern_func_name(&name, idw);
-                let frame_iid = self
-                    .interner
-                    .intern_frame(FrameKey { mapping_iid: kmap, rel_pc: 0, name_iid }, idw);
+                // Rebase to [kernel.kallsyms]-relative and leave the frame
+                // nameless (name_iid=0) so the post-record wholesym pass names
+                // it from kallsyms — exactly like a user frame. With no kbase
+                // (kallsyms masked) the address can't be rebased, so the frame
+                // degrades to a bare "[kernel]" name here.
+                let frame_iid = if self.kbase != 0 && addr >= self.kbase {
+                    let rel_pc = (addr - self.kbase) + KERNEL_SYNTH_BASE;
+                    self.interner
+                        .intern_frame(FrameKey { mapping_iid: kmap, rel_pc, name_iid: 0 }, idw)
+                } else {
+                    let name_iid = self.interner.intern_func_name(b"[kernel]", idw);
+                    self.interner
+                        .intern_frame(FrameKey { mapping_iid: kmap, rel_pc: 0, name_iid }, idw)
+                };
                 kfids.push(frame_iid);
             }
             kfids.reverse();
@@ -1460,11 +1497,6 @@ impl Capture {
     }
 
     fn handle(&mut self, hdr: &SismoHdr) {
-        if hdr.r#type == SISMO_EVT_KSYM {
-            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoKsymRec) };
-            self.handle_ksym(rec);
-            return;
-        }
         if hdr.r#type == SISMO_EVT_FILE {
             let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoKsymRec) };
             self.handle_file(rec);
@@ -1506,20 +1538,6 @@ impl Capture {
         self.process_sample(rec);
     }
 
-    fn handle_ksym(&mut self, rec: &SismoKsymRec) {
-        if self.ksym_names.contains_key(&rec.id) {
-            return;
-        }
-        // NUL-terminated, strip a trailing "+0xoff/0xsize".
-        let raw: &[u8] =
-            unsafe { std::slice::from_raw_parts(rec.name.as_ptr() as *const u8, SISMO_KSYM_NAME_MAX) };
-        let mut name = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
-        if let Some(p) = name.iter().position(|&b| b == b'+') {
-            name = &name[..p];
-        }
-        self.ksym_names.insert(rec.id, name.to_vec());
-    }
-
     // A file-name definition (reuses the ksym rec layout): the base name for an
     // interned file id, referenced by disk off-CPU blocks.
     fn handle_file(&mut self, rec: &SismoKsymRec) {
@@ -1550,7 +1568,6 @@ impl Capture {
 
 use crate::ffi::{sismo_ds_flush_offcpu, sismo_ds_register, sismo_flush_done, sismo_stop_done};
 use std::ptr;
-use std::time::Duration;
 
 /// Kernel-side BPF object, compiled by the sismo-sys crate (Linux only).
 use sismo_sys::BPF_OBJ;
@@ -1671,10 +1688,14 @@ fn service_acks(cap: *mut Capture) {
 fn worker_entry(cap: *mut Capture) {
     let exit = unsafe { &(*cap).exit_requested };
     let rb = unsafe { (*cap).rb };
+    // Sample submits carry no wakeup until the ring is half full (watermark-
+    // batched, see sched.bpf.c), so poll wakes early only on a burst — and
+    // because poll does NOT consume on a quiet timeout, the explicit consume
+    // keeps the 20 ms drain guarantee for below-watermark traffic.
     while !exit.load(Ordering::Acquire) {
+        unsafe { ring_buffer__poll(rb, 20) };
         unsafe { ring_buffer__consume(rb) };
         service_acks(cap);
-        std::thread::sleep(Duration::from_millis(20));
     }
     unsafe { ring_buffer__consume(rb) };
     service_acks(cap);
@@ -1687,6 +1708,31 @@ fn map_fd(obj: *mut BpfObject, name: &std::ffi::CStr) -> Option<c_int> {
         return None;
     }
     Some(unsafe { bpf_map__fd(m) })
+}
+
+/// The vmlinux GNU build-id from `/sys/kernel/notes` (the kernel's
+/// `.note.gnu.build-id`), used as the `[kernel.kallsyms]` module's stable
+/// identity in the trace. Empty when unavailable.
+fn read_kernel_build_id() -> Vec<u8> {
+    let Ok(notes) = std::fs::read("/sys/kernel/notes") else { return Vec::new() };
+    // ELF notes: [namesz(4) descsz(4) type(4)] name(namesz, padded) desc(...).
+    // NT_GNU_BUILD_ID = 3, name = "GNU\0".
+    let mut off = 0usize;
+    while off + 12 <= notes.len() {
+        let namesz = u32::from_ne_bytes(notes[off..off + 4].try_into().unwrap()) as usize;
+        let descsz = u32::from_ne_bytes(notes[off + 4..off + 8].try_into().unwrap()) as usize;
+        let ntype = u32::from_ne_bytes(notes[off + 8..off + 12].try_into().unwrap());
+        let name_off = off + 12;
+        let desc_off = name_off + namesz.next_multiple_of(4);
+        if desc_off + descsz > notes.len() {
+            break;
+        }
+        if ntype == 3 && notes.get(name_off..name_off + 4) == Some(b"GNU\0") {
+            return notes[desc_off..desc_off + descsz].to_vec();
+        }
+        off = desc_off + descsz.next_multiple_of(4);
+    }
+    Vec::new()
 }
 
 /// Parse a Linux perf JIT symbol map (`/tmp/perf-<pid>.map`): one
@@ -1740,7 +1786,8 @@ fn capture_init(
         last_maps_ns: 0,
         interner: Interner::new(),
         offcpu_interner: Interner::new(),
-        ksym_names: HashMap::new(),
+        kbase: sismo_symbolize::kallsyms::kernel_text_base(),
+        kbuild_id: read_kernel_build_id(),
         file_names: HashMap::new(),
         py_names: HashMap::new(),
         py_cfg_fd: -1,
@@ -2018,12 +2065,12 @@ fn capture_init(
         let exit = Arc::clone(&c.module_exit);
         c.module_worker = Some(std::thread::spawn(move || {
             let rb = rb;
-            // Timed polling, like the main drain: submits carry
-            // BPF_RB_NO_WAKEUP, so there is no wakeup to wait for — and no
-            // per-submit wakeup of this thread for the collector to observe.
+            // Module records submit with adaptive wakeup (one per distinct
+            // module — promptness matters, volume can't storm), so poll
+            // wakes per record; the consume covers a wakeup lost to races.
             while !exit.load(Ordering::Acquire) {
+                unsafe { ring_buffer__poll(rb.0, 20) };
                 unsafe { ring_buffer__consume(rb.0) };
-                std::thread::sleep(std::time::Duration::from_millis(20));
             }
             unsafe { ring_buffer__consume(rb.0) };
         }));

@@ -31,11 +31,12 @@ enum sismo_event_type {
   // thread-scoped timebase/follower counts). Both the per-thread counter
   // timeline and the CPU profile.
   SISMO_EVT_SAMPLE = 0,
-  // A kernel-symbol definition: the (id, name) for a kernel address the BPF
-  // program resolved for the first time. Emitted once per unique address ahead
-  // of the sample that references the id, so userspace can name kernel frames
-  // without ever seeing the address. See sismo_ksym_rec.
-  SISMO_EVT_KSYM = 1,
+  // RETIRED. Kernel symbols were once interned in-kernel and shipped as (id,
+  // name) definitions; kernel frames now ship raw addresses and are symbolized
+  // host-side from /proc/kallsyms. The tag value is reserved (never emitted) so
+  // the numbering below stays stable. The record struct it used
+  // (sismo_ksym_rec) lives on for SISMO_EVT_FILE.
+  SISMO_EVT_KSYM_RETIRED = 1,
   // An off-CPU sample: one thread's blocking stack (captured at sched-switch-
   // out, where its stack is parked in the scheduler = the block site) paired
   // with how long it stayed off-CPU. Reuses sismo_sample_rec verbatim; the
@@ -53,10 +54,10 @@ enum sismo_event_type {
   // the identical record from their native wait/cswitch triggers.
   SISMO_EVT_OFFCPU = 2,
   // A file-name definition: the (id, base name) for a file the BPF program saw
-  // a blocking read on for the first time. Same (id, name) shape as
-  // SISMO_EVT_KSYM (reuses sismo_ksym_rec); emitted once ahead of the OFFCPU
-  // sample that references the id in slot 0, so userspace can resolve the file
-  // name for a disk block without shipping a string per sample.
+  // a blocking read on for the first time. An (id, name) record (reuses the
+  // sismo_ksym_rec layout); emitted once ahead of the OFFCPU sample that
+  // references the id in slot 0, so userspace can resolve the file name for a
+  // disk block without shipping a string per sample.
   SISMO_EVT_FILE = 3,
   // A normal sample that additionally carries the user pt_regs + a raw
   // user-stack snapshot for host-side DWARF unwinding (NAT-1). The embedded
@@ -102,10 +103,11 @@ struct sismo_hdr {
 // SISMO_EVT_SAMPLE. counters[i] is the running thread's cumulative reading of
 // the perf event parked in counters_pe slot i (userspace decides which event
 // each slot holds; slots with no event read as 0). stack[] holds user PCs,
-// leaf-first. kernel_ids[] holds kernel-symbol ids (see SISMO_EVT_KSYM),
-// leaf-first — the BPF program resolves each kernel address to a symbol name
-// in-kernel and ships only the opaque id, so no kernel address (and hence no
-// KASLR slide) ever reaches userspace.
+// leaf-first. kernel_ids[] holds RAW kernel PCs, leaf-first — the host maps
+// them to [kernel.kallsyms]-relative addresses (subtracting the kernel text
+// base) and symbolizes them via wholesym from a /proc/kallsyms snapshot. The
+// KASLR slide stays host-side: the base is subtracted before anything is
+// written to the trace, so only image-relative addresses are stored.
 struct sismo_sample_rec {
   struct sismo_hdr hdr;
   // SAMPLE: linear (virtual) address of the sampled memory access — the
@@ -115,7 +117,7 @@ struct sismo_sample_rec {
   unsigned long long data_addr;
   unsigned long long counters[SISMO_MAX_COUNTERS];
   unsigned long long stack[SISMO_MAX_STACK];
-  unsigned int kernel_ids[SISMO_MAX_KERNEL_STACK];
+  unsigned long long kernel_ids[SISMO_MAX_KERNEL_STACK];  // raw kernel PCs
   // CAP-1: CPython frame-name ids, leaf-first (see SISMO_EVT_PYFRAME). 0 unless
   // the target is a recognized interpreter and the in-BPF walk recovered
   // frames; count in hdr.nr_py_frames.
@@ -139,19 +141,18 @@ struct sismo_unwind_rec {
   unsigned char stack_bytes[SISMO_STACK_SNAP_MAX];
 };
 
-// SISMO_EVT_KSYM. A one-time definition mapping a kernel-symbol id to its
-// resolved name (a `%pB` kallsyms lookup the kernel did for us). `name` is NUL
-// -padded and may carry a trailing `+0xoffset/0xsize` that userspace strips;
-// the offset is relative to the symbol and so reveals nothing about KASLR.
+// A generic (id -> name) definition record. Once used for kernel symbols
+// (SISMO_EVT_KSYM, now retired — kernel frames ship raw); today it carries
+// SISMO_EVT_FILE (id -> file base name). `name` is NUL-padded.
 struct sismo_ksym_rec {
-  unsigned int type;  // = SISMO_EVT_KSYM (aliases sismo_hdr.type)
+  unsigned int type;  // = SISMO_EVT_FILE (aliases sismo_hdr.type)
   unsigned int id;
   char name[SISMO_KSYM_NAME_MAX];
 };
 
-// SISMO_EVT_PYFRAME. A one-time (id -> CPython qualname) mapping, the interpreter
-// analogue of sismo_ksym_rec: the BPF walk read the qualname from the target's
-// interpreter memory and ships the interned id, so the sample carries only ids.
+// SISMO_EVT_PYFRAME. A one-time (id -> CPython qualname) mapping: the BPF walk
+// read the qualname from the target's interpreter memory and ships the interned
+// id, so the sample carries only ids.
 struct sismo_pyframe_rec {
   unsigned int type;  // = SISMO_EVT_PYFRAME (aliases sismo_hdr.type)
   unsigned int id;

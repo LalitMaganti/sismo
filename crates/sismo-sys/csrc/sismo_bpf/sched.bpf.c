@@ -1,25 +1,27 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-// The sismo BPF CPU collector: exact per-thread accounting of up to
-// SISMO_MAX_COUNTERS PMU counters plus stack profiling, push-based.
+// The sismo BPF CPU collector: per-thread PMU counter sampling plus stack
+// profiling, push-based.
 //
 // Userspace parks one free-running counting perf event per (counter slot, CPU)
 // in counters_pe at index slot*SISMO_MAX_CPUS + cpu. Slots it leaves empty
 // (counters the hardware couldn't provide) simply read back as errors and are
-// credited 0. The counters are read at three hook points; each diffs against
-// the value at the previous read on the same CPU (last_pe) and credits the
-// delta to the thread that ran during that interval:
+// credited 0. Counters are read only on the per-CPU timer tick (perf_event):
+// it diffs each event against the value at the previous tick on the same CPU
+// (last_pe) and credits the delta to the thread running now, then captures that
+// thread's stack. This is statistical (perf-style) attribution — the tick
+// samples the counter and credits whoever is on-CPU — not exact per-slice
+// accounting, which cost a PMU read on every context switch system-wide.
 //
-//   sched_switch  -> credit the outgoing thread (exact run-boundary totals)
-//   perf_event    -> a per-CPU timer tick: credit the *running* thread (flushes
-//                    long-running threads that rarely switch out) AND capture
-//                    its stack — both the periodic counter flush and the CPU
-//                    profile.
+//   sched_switch  -> off-CPU accounting only (blocking-stack capture on
+//                    switch-out, wake close-out on switch-in); no counter read.
+//   perf_event    -> the per-CPU timer tick: sample + credit the counters and
+//                    capture the running thread's stack (the CPU profile).
 //
-// last_pe is advanced on every read regardless of whether the thread is in the
-// target process, so deltas always reflect exactly the interval's counts. Per-
-// thread totals live in TASK_STORAGE (auto-freed on task exit).
+// last_pe is advanced on every tick regardless of the running thread, so each
+// inter-tick interval's delta is counted once. Per-thread totals live in
+// TASK_STORAGE (auto-freed on task exit).
 
 #include "kernel_defs.h"
 #include <bpf/bpf_helpers.h>
@@ -31,12 +33,25 @@
 #define BPF_F_USER_STACK (1ULL << 8)
 #endif
 
-// Never wake the ringbuf consumer per submit: both drains are pure timed
-// polling (consume + sleep), so per-submit irq_work wakeups are wasted kernel
-// work on every sched event — and each wakeup is itself a sched event the
-// collector observes, an amplification the machine can do without.
+// bpf_get_stack's flags low byte (BPF_F_SKIP_FIELD_MASK) is a frame-skip count.
+// Skip the leaf-most 3 kernel frames — the BPF trampoline + tracepoint/perf
+// entry frames that are pure collector plumbing, never signal.
+#define SKIP_KERNEL_FRAMES 3
+
+// Watermark-batched consumer wakeups: submits stay silent
+// until the ring's backlog crosses half its size, then force one wakeup.
+// Per-submit irq_work wakeups are wasted kernel work on every sched event —
+// and each wakeup is itself a sched event the collector observes — while the
+// occasional half-full wakeup lets a bursting ring get drained ahead of the
+// consumers' 20 ms poll tick instead of overflowing.
 #ifndef BPF_RB_NO_WAKEUP
 #define BPF_RB_NO_WAKEUP (1ULL << 0)
+#endif
+#ifndef BPF_RB_FORCE_WAKEUP
+#define BPF_RB_FORCE_WAKEUP (1ULL << 1)
+#endif
+#ifndef BPF_RB_AVAIL_DATA
+#define BPF_RB_AVAIL_DATA 0
 #endif
 
 // Ignore sub-threshold off-CPU blocks: a thread that yields for a few µs isn't
@@ -110,28 +125,25 @@ struct {
   __uint(max_entries, 1 << 22);  // 4 MiB
 } module_hints SEC(".maps");
 
-// Kernel-symbol interning. ksym_ids maps a kernel address to the id we assigned
-// it; LRU so a long session self-bounds — an evicted address is just re-resolved
-// and gets a fresh id, harmless because userspace dedups by name. ksym_next is
-// the monotonic id allocator (value 0 is reserved for "unresolved").
-struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 8192);
-  __type(key, __u64);
-  __type(value, __u32);
-} ksym_ids SEC(".maps");
+// Both rings are 4 MiB; wake the consumer once the backlog crosses half.
+static __always_inline long ringbuf_flags(void *rb) {
+  return bpf_ringbuf_query(rb, BPF_RB_AVAIL_DATA) >= (1 << 21)
+             ? BPF_RB_FORCE_WAKEUP
+             : BPF_RB_NO_WAKEUP;
+}
 
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, __u32);
-  __type(value, __u64);
-} ksym_next SEC(".maps");
+
+// Kernel frames ship as RAW addresses, resolved host-side via wholesym from a
+// /proc/kallsyms snapshot. No in-kernel symbol interning: doing it here meant
+// a per-address map updated from sched_switch and the NMI tick, whose eviction
+// (LRU) or fill (plain hash) fails badly on the hottest path — the
+// probe-side-map storm class. Userspace has kallsyms and an unbounded HashMap; the probe
+// just copies u64 PCs into the record.
 
 // CAP-1 CPython interpreter unwind. py_cfg holds the _PyRuntime avma + the
 // _Py_DebugOffsets the in-BPF walk reads (runtime 0 = disabled, the default for
 // non-Python targets). pyframe_ids/pyframe_next intern a qualname object pointer
-// to an id, the same LRU + monotonic-allocator pattern as ksym.
+// to an id, the same intern-once pattern the file/module ids use.
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, 1);
@@ -140,8 +152,8 @@ struct {
 } py_cfg SEC(".maps");
 
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 4096);
+  __uint(type, BPF_MAP_TYPE_HASH);  // not LRU: NMI/probe-context updates evict badly
+  __uint(max_entries, 16384);
   __type(key, __u64);  // co_qualname PyUnicode pointer
   __type(value, __u32);
 } pyframe_ids SEC(".maps");
@@ -155,18 +167,17 @@ struct {
 
 // CAP-2: emit a module's identity page (SISMO_EVT_MODULE) once per image base.
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 1024);
+  __uint(type, BPF_MAP_TYPE_HASH);  // not LRU: NMI/probe-context updates evict badly
+  __uint(max_entries, 4096);
   __type(key, __u64);  // module image base avma
   __type(value, __u8);
 } module_seen SEC(".maps");
 
-// Per-CPU scratch for the kernel stack: bpf_get_stack writes the addresses here
-// (kept off the 512-byte BPF stack and out of the shipped record); the resolve
-// loop then fills `id` in place.
+// Per-CPU scratch for the kernel stack: bpf_get_stack writes the raw addresses
+// here (kept off the 512-byte BPF stack), then they are copied straight into
+// the record's kernel_ids[] — no resolution, no id table.
 struct sismo_kstack {
   __u64 addr[SISMO_MAX_KERNEL_STACK];
-  __u32 id[SISMO_MAX_KERNEL_STACK];
 };
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -175,8 +186,8 @@ struct {
   __type(value, struct sismo_kstack);
 } kstack_scratch SEC(".maps");
 
-// One thread's in-flight off-CPU block: its blocking stack (user PCs + resolved
-// kernel-symbol ids) captured when it was switched out, plus when. Keyed by tid;
+// One thread's in-flight off-CPU block: its blocking stack (user PCs + raw
+// kernel PCs) captured when it was switched out, plus when. Keyed by tid;
 // emitted + deleted when the thread is switched back in. The value is too big
 // for the 512-byte BPF stack, so it is built in offcpu_scratch (per-CPU) and
 // copied into offcpu.
@@ -190,11 +201,13 @@ struct sismo_offcpu_state {
   __u32 nr_frames;
   __u32 nr_kernel;
   __u64 ustack[SISMO_MAX_STACK];
-  __u32 kids[SISMO_MAX_KERNEL_STACK];
+  __u64 kids[SISMO_MAX_KERNEL_STACK];  // raw kernel PCs, leaf-first
 };
 struct {
-  // LRU so a long session self-bounds (like ksym_ids): an evicted in-flight
-  // block just drops that one off-CPU sample, no correctness issue.
+  // LRU so a long session self-bounds: an evicted in-flight block just drops
+  // that one off-CPU sample, no correctness issue. The tid-keyed maps are
+  // safe as LRU: their population is target-scoped threads, far below
+  // capacity, so the eviction path that storms never runs.
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 10240);
   __type(key, __u32);
@@ -239,10 +252,10 @@ struct {
   __type(value, __u64);
 } disk_file SEC(".maps");
 
-// inode pointer -> interned file id (like ksym_ids), + its monotonic allocator.
+// inode pointer -> interned file id, + its monotonic allocator.
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 8192);
+  __uint(type, BPF_MAP_TYPE_HASH);  // not LRU: probe-context updates evict badly
+  __uint(max_entries, 32768);
   __type(key, __u64);
   __type(value, __u32);
 } file_ids SEC(".maps");
@@ -263,42 +276,9 @@ struct sys_enter_futex_ctx {
   __u64 uaddr;
 };
 
-// Resolve a kernel address to a symbol id, assigning + emitting a SISMO_EVT_KSYM
-// definition on first sight. The address is used only as a lookup key and to
-// drive the in-kernel `%pB` kallsyms lookup; it never leaves the kernel, so the
-// KASLR slide can't be reconstructed from the trace. Returns 0 if no id could
-// be assigned (userspace renders such frames as "[kernel]").
-static __always_inline __u32 resolve_ksym(__u64 addr) {
-  __u32 *idp = bpf_map_lookup_elem(&ksym_ids, &addr);
-  if (idp)
-    return *idp;
-
-  __u32 zero = 0;
-  __u64 *next = bpf_map_lookup_elem(&ksym_next, &zero);
-  if (!next)
-    return 0;
-  // Atomic so concurrent CPUs get distinct ids. A race can still mint two ids
-  // for one address (both miss the lookup); that yields two definitions of the
-  // same name, which userspace collapses — no correctness issue.
-  __u32 id = (__u32)__sync_fetch_and_add(next, 1) + 1;
-  bpf_map_update_elem(&ksym_ids, &addr, &id, BPF_ANY);
-
-  struct sismo_ksym_rec *k = bpf_ringbuf_reserve(&events, sizeof(*k), 0);
-  if (k) {
-    k->type = SISMO_EVT_KSYM;
-    k->id = id;
-    // %pB: kallsyms symbol for a return address (it subtracts 1 before the
-    // lookup). Emits "name+0xoff/0xsize"; userspace keeps the bare name.
-    __u64 args[1] = {addr};
-    bpf_snprintf(k->name, sizeof(k->name), "%pB", args, sizeof(args));
-    bpf_ringbuf_submit(k, BPF_RB_NO_WAKEUP);
-  }
-  return id;
-}
-
 // Intern a file (keyed by its inode pointer) to an id, emitting a SISMO_EVT_FILE
-// definition (id + base name from the dentry) on first sight — the same
-// ship-an-id-once pattern as resolve_ksym, so a disk block references a file by
+// definition (id + base name from the dentry) on first sight — a
+// ship-an-id-once pattern, so a disk block references a file by
 // id instead of carrying a string. Returns the id, or 0 if none could be minted.
 static __always_inline __u32 resolve_file(struct file *file) {
   struct inode *inode = BPF_CORE_READ(file, f_inode);
@@ -320,14 +300,14 @@ static __always_inline __u32 resolve_file(struct file *file) {
     k->id = id;
     const unsigned char *namep = BPF_CORE_READ(file, f_path.dentry, d_name.name);
     bpf_probe_read_kernel_str(k->name, sizeof(k->name), namep);
-    bpf_ringbuf_submit(k, BPF_RB_NO_WAKEUP);
+    bpf_ringbuf_submit(k, ringbuf_flags(&events));
   }
   return id;
 }
 
 // CAP-1: intern a CPython code-object qualname (keyed by the PyUnicode pointer)
 // to an id, emitting a SISMO_EVT_PYFRAME (id -> name) on first sight — the
-// resolve_ksym pattern for interpreter frames. `qual` is the co_qualname pointer
+// same intern-once pattern for interpreter frames. `qual` is the co_qualname pointer
 // in the target; `pc` supplies the unicode offsets. Returns 0 if none minted.
 static __noinline __u32 resolve_pyframe(struct sismo_py_cfg *pc, __u64 qual) {
   __u32 *idp = bpf_map_lookup_elem(&pyframe_ids, &qual);
@@ -355,7 +335,7 @@ static __noinline __u32 resolve_pyframe(struct sismo_py_cfg *pc, __u64 qual) {
     if (len)
       bpf_probe_read_user(r->name, len, (void *)(qual + pc->unicode_data));
     r->name[len] = 0;
-    bpf_ringbuf_submit(r, BPF_RB_NO_WAKEUP);
+    bpf_ringbuf_submit(r, ringbuf_flags(&events));
   }
   return id;
 }
@@ -459,7 +439,7 @@ static __noinline void capture_module(struct task_struct *cur, __u64 pc) {
   r->prefix_len = 0;
   if (bpf_probe_read_user(r->prefix, sizeof(r->prefix), (void *)base) == 0)
     r->prefix_len = sizeof(r->prefix);
-  bpf_ringbuf_submit(r, BPF_RB_NO_WAKEUP);
+  bpf_ringbuf_submit(r, 0);
 }
 
 static __always_inline __u32 target_tgid(void) {
@@ -474,10 +454,9 @@ static __always_inline __u32 unwind_enabled(void) {
   return v ? *v : 0;
 }
 
-// Slots actually parked by userspace. read_advance runs on every context
-// switch and tick system-wide; reading only the live slots instead of all
-// SISMO_MAX_COUNTERS drops the fixed per-sched-event cost to what was asked
-// for. Empty slots always credit 0 either way.
+// Slots actually parked by userspace. read_advance runs on the timer tick;
+// reading only the live slots instead of all SISMO_MAX_COUNTERS bounds the
+// per-tick cost. Empty slots always credit 0 either way.
 static __always_inline __u32 counter_slots(void) {
   __u32 two = 2;
   __u32 *v = bpf_map_lookup_elem(&cfg, &two);
@@ -486,8 +465,11 @@ static __always_inline __u32 counter_slots(void) {
 }
 
 // Read every counter slot on the current CPU, diff against last_pe, advance
-// last_pe (always — even for non-target threads, to keep future deltas exact).
-// Slots with no parked event read back an error and yield a 0 delta.
+// last_pe (always — even on a non-target tick, so each interval's delta is
+// counted once). Runs on the timer tick only; the delta since the previous
+// tick is credited to the thread running now — statistical (perf-style)
+// attribution, not exact per-slice accounting. Slots with no parked event read
+// back an error and yield a 0 delta.
 //
 // Counters are multiplexed: more events are parked than the PMU has hardware
 // counters, so the kernel time-shares groups on and off. bpf_perf_event_read_value
@@ -576,17 +558,16 @@ static __always_inline void offcpu_record_block(void *ctx, __u32 tid) {
     nu = SISMO_MAX_STACK;
   st->nr_frames = nu;
 
-  // Kernel frames resolved to symbol ids now, so their KSYM definitions reach
-  // the ringbuf before the OFFCPU sample (emitted at wake) that references them.
+  // Raw kernel PCs, saved in the block state until wake; symbolized host-side.
   struct sismo_kstack *ks = bpf_map_lookup_elem(&kstack_scratch, &zero);
   __u32 nk = 0;
   if (ks) {
-    long kn = bpf_get_stack(ctx, ks->addr, sizeof(ks->addr), 0);
+    long kn = bpf_get_stack(ctx, ks->addr, sizeof(ks->addr), SKIP_KERNEL_FRAMES);
     nk = (kn > 0) ? (__u32)(kn / 8) : 0;
     if (nk > SISMO_MAX_KERNEL_STACK)
       nk = SISMO_MAX_KERNEL_STACK;
     for (int i = 0; i < SISMO_MAX_KERNEL_STACK && i < nk; i++)
-      st->kids[i] = resolve_ksym(ks->addr[i]);
+      st->kids[i] = ks->addr[i];
   }
   st->nr_kernel = nk;
 
@@ -626,7 +607,7 @@ static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
       #pragma clang loop unroll(disable)
       for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
         e->kernel_ids[i] = (i < st->nr_kernel) ? st->kids[i] : 0;
-      bpf_ringbuf_submit(e, BPF_RB_NO_WAKEUP);
+      bpf_ringbuf_submit(e, ringbuf_flags(&events));
     }
   }
   bpf_map_delete_elem(&offcpu, &tid);
@@ -635,19 +616,17 @@ static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
 SEC("tp_btf/sched_switch")
 int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev,
              struct task_struct *next) {
-  struct sismo_counters dc;
-  read_advance(&dc);
-
   __u32 tgt = target_tgid();
 
-  // Outgoing thread (if in the target): credit its exact counter deltas — the
-  // value is carried out by the next timer-tick PerfSample, so no emit here —
-  // and, if it went to sleep (voluntary block, not preemption), record its
-  // off-CPU block. Counter crediting happens for every switch-out; only the
-  // off-CPU block is gated on prev actually blocking.
+  // No PMU work here: counters are sampled on the timer tick, not read at every
+  // switch, so this program does only the target's off-CPU accounting. That
+  // keeps the highest-frequency, system-wide hook down to a couple of field
+  // reads for a non-target switch.
+  //
+  // Outgoing thread (if in the target): if it went to sleep (a voluntary block,
+  // not preemption), record its off-CPU block.
   __u32 prev_tgid = BPF_CORE_READ(prev, tgid);
   if (tgt == 0 || prev_tgid == tgt) {
-    credit(prev, &dc);
     if (BPF_CORE_READ(prev, __state) != TASK_RUNNING)
       offcpu_record_block(ctx, (__u32)BPF_CORE_READ(prev, pid));
   }
@@ -786,14 +765,12 @@ int on_tick(struct bpf_perf_event_data *ctx) {
   struct sismo_kstack *ks = bpf_map_lookup_elem(&kstack_scratch, &zero);
   __u32 nr_kernel = 0;
   if (ks) {
-    long kn = bpf_get_stack(ctx, ks->addr, sizeof(ks->addr), 0);
+    long kn = bpf_get_stack(ctx, ks->addr, sizeof(ks->addr), SKIP_KERNEL_FRAMES);
     nr_kernel = (kn > 0) ? (__u32)(kn / 8) : 0;
     if (nr_kernel > SISMO_MAX_KERNEL_STACK)
       nr_kernel = SISMO_MAX_KERNEL_STACK;
-    // A real bounded loop, not #pragma unroll: resolve_ksym inlines a ringbuf
-    // reserve + bpf_snprintf, so 64 unrolled copies blow the 512-byte BPF stack.
-    for (int i = 0; i < SISMO_MAX_KERNEL_STACK && i < nr_kernel; i++)
-      ks->id[i] = resolve_ksym(ks->addr[i]);
+    // Raw PCs ship straight from ks->addr[] into the record below; no
+    // resolution here — symbolized host-side from kallsyms.
   }
 
   // CAP-2: ship the sampled module's identity page (image base + build-id note)
@@ -826,7 +803,7 @@ int on_tick(struct bpf_perf_event_data *ctx) {
     ue->sample.hdr.nr_frames = (un > 0) ? (__u32)(un / 8) : 0;
     #pragma clang loop unroll(disable)
     for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
-      ue->sample.kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
+      ue->sample.kernel_ids[i] = (ks && i < nr_kernel) ? ks->addr[i] : 0;
     // CAP-1: recover CPython frames from the interpreter's memory at sample time.
     ue->sample.hdr.nr_py_frames = walk_python(ue->sample.py_ids);
 
@@ -857,7 +834,7 @@ int on_tick(struct bpf_perf_event_data *ctx) {
     ue->stack_len = snap;
     ue->stack_trunc = (snap < SISMO_STACK_SNAP_MAX) ? 1 : 0;
 
-    bpf_ringbuf_submit(ue, BPF_RB_NO_WAKEUP);
+    bpf_ringbuf_submit(ue, ringbuf_flags(&events));
     return 0;
   }
 
@@ -883,9 +860,9 @@ int on_tick(struct bpf_perf_event_data *ctx) {
   e->hdr.nr_frames = (n > 0) ? (__u32)(n / 8) : 0;
   #pragma clang loop unroll(disable)
   for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
-    e->kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
+    e->kernel_ids[i] = (ks && i < nr_kernel) ? ks->addr[i] : 0;
   e->hdr.nr_py_frames = walk_python(e->py_ids);  // CAP-1
-  bpf_ringbuf_submit(e, BPF_RB_NO_WAKEUP);
+  bpf_ringbuf_submit(e, ringbuf_flags(&events));
   return 0;
 }
 

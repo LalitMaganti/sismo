@@ -121,6 +121,7 @@ struct bpf_perf_event_value {
 // ABI-stable values from include/uapi/linux/bpf.h, used by the map definitions
 // and helpers below. (vmlinux.h would supply these via the full kernel enums.)
 enum {
+  BPF_MAP_TYPE_HASH = 1,
   BPF_MAP_TYPE_ARRAY = 2,
   BPF_MAP_TYPE_PERF_EVENT_ARRAY = 4,
   BPF_MAP_TYPE_PERCPU_ARRAY = 6,
