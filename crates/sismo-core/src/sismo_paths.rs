@@ -189,10 +189,10 @@ mod tests {
     fn session_meta_roundtrip_focus_optional() {
         let path = std::env::temp_dir().join("sismo-paths-selftest.meta");
         let p = path.to_str().unwrap();
-        assert!(write_meta_at(p, &SessionMeta { target_pid: 777, focus: Some("memory-deep".into()) }));
+        assert!(write_meta_at(p, &SessionMeta { target_pid: 777, focus: Some("memory.dump".into()) }));
         let back = read_meta_at(p).expect("read");
         assert_eq!(back.target_pid, 777);
-        assert_eq!(back.focus.as_deref(), Some("memory-deep"));
+        assert_eq!(back.focus.as_deref(), Some("memory.dump"));
 
         assert!(write_meta_at(p, &SessionMeta { target_pid: 8, focus: None }));
         let back = read_meta_at(p).expect("read");

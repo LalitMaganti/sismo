@@ -144,6 +144,10 @@ pub struct RecordArgs {
     /// Overrides the per-source --no-*/--external-* flags.
     #[arg(long)]
     only: Option<String>,
+    /// Deepen one analysis (default is the lightweight vitals profile: stacks +
+    /// cycles/instructions). Presets: `cpu` (microarchitecture counter set —
+    /// why the core stalls), `cpu.cache_miss` (precise cache-miss data
+    /// addresses — where accesses stall), `memory.dump` (heap dump; macOS).
     #[arg(long)]
     focus: Option<String>,
     #[arg(long, value_parser = clap_density)]
@@ -242,11 +246,11 @@ impl RecordArgs {
             return Err(0);
         }
         // --focus preset availability is per-OS: the PEBS presets need the
-        // Linux BPF path; `memory-deep` (single heap dump at stop/snapshot)
+        // Linux BPF path; `memory.dump` (single heap dump at stop/snapshot)
         // works everywhere. Linux validates its own presets in the runner.
-        if self.focus.is_some() && !cfg!(target_os = "linux") && self.focus.as_deref() != Some("memory-deep") {
+        if self.focus.is_some() && !cfg!(target_os = "linux") && self.focus.as_deref() != Some("memory.dump") {
             eprintln!(
-                "sismo record: unsupported focus preset '{}' on this platform (supported here: memory-deep)",
+                "sismo record: unsupported focus preset '{}' on this platform (supported here: memory.dump)",
                 self.focus.as_deref().unwrap_or_default()
             );
             return Err(0);

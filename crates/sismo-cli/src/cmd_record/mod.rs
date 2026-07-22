@@ -128,7 +128,7 @@ fn waitpid_exit_watch(pid: c_int, write_fd: c_int) {
 ///
 /// `pre_stop` (if any) runs once on the first stop signal, before the workload
 /// is terminated — while both the target and the recording are still live.
-/// memory-deep uses it to take the heap dump.
+/// memory.dump uses it to take the heap dump.
 fn wait_for_workload_exit(rd: c_int, target_pid: c_int, is_attach: bool, pre_stop: Option<&dyn Fn()>) {
     let mut read_buf = [0u8; 16];
     let mut workload_done = false;
@@ -202,9 +202,9 @@ fn teardown_early(svc: *mut TracedSvc, lock_fd: c_int) {
     release_session_lock(lock_fd);
 }
 
-// ---- memory-deep: the single heap dump at a materialization point -----------
+// ---- memory.dump: the single heap dump at a materialization point -----------
 //
-// In a `--focus memory-deep` session, each materialization point — record
+// In a `--focus memory.dump` session, each materialization point — record
 // stop, `sismo snapshot` — takes exactly one JVM heap dump and bundles it with
 // that artifact's trace (which becomes a tar). At record stop the dump must
 // fire on the stop *signal*, before the spawned workload is SIGTERMed, so it
@@ -218,7 +218,7 @@ pub(crate) struct TakenDump {
     pub runtime: crate::heap_dump::DumpRuntime,
 }
 
-/// Take the memory-deep heap dump of `target_pid`, spooling it to a temp file
+/// Take the memory.dump heap dump of `target_pid`, spooling it to a temp file
 /// derived from `output_path`. `prefix` labels the log lines ("sismo record" /
 /// "sismo snapshot"). Returns the taken dump, ready to finalize once the trace
 /// itself is written.
@@ -226,12 +226,12 @@ pub(crate) fn take_memory_deep_dump(target_pid: i32, output_path: &str, prefix: 
     let alive = unsafe { kill(target_pid, 0) } == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     if !alive {
-        eprintln!("{prefix}: memory-deep heap dump skipped — target pid {target_pid} already exited");
+        eprintln!("{prefix}: memory.dump heap dump skipped — target pid {target_pid} already exited");
         return None;
     }
     let Some(rt) = crate::heap_dump::detect(target_pid) else {
         eprintln!(
-            "{prefix}: memory-deep heap dump skipped — no dumpable runtime detected on pid {target_pid} (JVM and Node are supported)"
+            "{prefix}: memory.dump heap dump skipped — no dumpable runtime detected on pid {target_pid} (JVM and Node are supported)"
         );
         return None;
     };

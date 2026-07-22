@@ -25,7 +25,7 @@ pub mod cmd_snapshot;
 // ustar writer for the record-output bundle (trace + heap-dump sidecar).
 #[cfg(not(target_os = "windows"))]
 pub mod tar_bundle;
-// memory-deep heap-dump machinery: per-runtime triggers + dispatch.
+// memory.dump heap-dump machinery: per-runtime triggers + dispatch.
 #[cfg(not(target_os = "windows"))]
 pub mod heap_dump;
 #[cfg(not(target_os = "windows"))]

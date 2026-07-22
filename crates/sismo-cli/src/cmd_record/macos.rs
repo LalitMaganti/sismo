@@ -465,10 +465,10 @@ pub fn run(config: &RecordConfig) -> c_int {
         std::thread::spawn(move || duration_timer(secs, wr));
     }
 
-    // memory-deep: take the single heap dump on the stop signal, before the
+    // memory.dump: take the single heap dump on the stop signal, before the
     // spawned workload is SIGTERMed (attach targets survive anyway). The dump
     // lands in a temp file and is attached after the trace is finalized.
-    let memory_deep = config.focus.as_deref() == Some("memory-deep");
+    let memory_deep = config.focus.as_deref() == Some("memory.dump");
     let taken_dump: std::cell::RefCell<Option<TakenDump>> = std::cell::RefCell::new(None);
     let dump_hook = || {
         *taken_dump.borrow_mut() = take_memory_deep_dump(target_pid, output_path_str, "sismo record");
@@ -535,7 +535,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         sismo_core::symbolize::perf_symbolize::symbolize_trace(output_path_str, &held);
     }
 
-    // memory-deep: attach the dump taken at the stop signal to the now-final
+    // memory.dump: attach the dump taken at the stop signal to the now-final
     // (marker + symbols) trace — hprof bundles into a tar, a V8 snapshot lands
     // as a sibling file. If the workload exited on its own there is no dump
     // and the output stays a plain trace.
@@ -548,7 +548,7 @@ pub fn run(config: &RecordConfig) -> c_int {
             }
         }
         None if memory_deep && wrote_trace => {
-            eprintln!("sismo record: memory-deep — no heap dump taken (workload exited before the stop signal?); output is a plain trace");
+            eprintln!("sismo record: memory.dump — no heap dump taken (workload exited before the stop signal?); output is a plain trace");
         }
         None => {}
     }

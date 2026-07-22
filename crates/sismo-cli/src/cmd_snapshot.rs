@@ -9,7 +9,7 @@
 //! [`crate::trace_sink::clone_session_to_file`]. The recorder is uninvolved and
 //! keeps recording — multiple snapshots can run concurrently.
 //!
-//! In a `--focus memory-deep` session (read from the session meta file), a
+//! In a `--focus memory.dump` session (read from the session meta file), a
 //! snapshot is a materialization point like record stop: it also takes the
 //! single heap dump and attaches it to this snapshot's own artifact (tar for
 //! hprof, sibling file for a V8 snapshot). Each snapshot is self-contained —
@@ -56,13 +56,13 @@ pub fn run(args: SnapshotArgs) -> i32 {
     }
 }
 
-/// memory-deep sessions: a snapshot also materializes the heap dump, attached
+/// memory.dump sessions: a snapshot also materializes the heap dump, attached
 /// to this snapshot's own artifact. Unfocused sessions: no-op.
 fn maybe_take_memory_deep_dump(output_path: &str) {
     let Some(meta) = sismo_core::sismo_paths::read_session_meta() else {
         return;
     };
-    if meta.focus.as_deref() != Some("memory-deep") {
+    if meta.focus.as_deref() != Some("memory.dump") {
         return;
     }
     if let Some(dump) = crate::cmd_record::take_memory_deep_dump(meta.target_pid, output_path, "sismo snapshot") {

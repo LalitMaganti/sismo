@@ -62,14 +62,18 @@ pub fn run(config: &RecordConfig) -> c_int {
     let no_symbolize = config.no_symbolize;
     let sample_density = config.sample_density;
 
-    // Resolve --focus (only "cache" today); unknown = hard error.
-    let focus_int: i32 = match config.focus.as_deref() {
-        None => -1,
-        Some("cache") => 0,
-        Some(other) => {
-            eprintln!("sismo record: unknown focus preset '{other}' (supported: cache)");
-            return 0;
-        }
+    // Resolve --focus. The cpu presets drive the sampler + counter set here;
+    // memory.* is a macOS heap-dump preset, not a Linux BPF mode. Unknown =
+    // hard error.
+    let focus: Option<FocusPreset> = match config.focus.as_deref() {
+        None => None,
+        Some(name) => match FocusPreset::from_name(name.as_bytes()) {
+            Some(p) => Some(p),
+            None => {
+                eprintln!("sismo record: unknown focus preset '{name}' (supported: cpu, cpu.cache_miss)");
+                return 0;
+            }
+        },
     };
 
     tracing::info!("record: start");
@@ -151,7 +155,6 @@ pub fn run(config: &RecordConfig) -> c_int {
     let mut bpf: Option<Box<Capture>> = if no_cpu {
         None
     } else {
-        let focus = if focus_int == 0 { Some(FocusPreset::Cache) } else { None };
         tracing::info!("record: bpf init begin");
         let c = linux_bpf_capture::init(
             target_pid as u32, focus, sample_density, capture_offcpu, config.keep_module_files);
@@ -276,7 +279,7 @@ pub fn run(config: &RecordConfig) -> c_int {
     wait_for_workload_exit(rd, target_pid, false, None);
     tracing::info!("record: workload exited");
 
-    let focus_preset: Option<&[u8]> = if focus_int == 0 { Some(b"cache".as_slice()) } else { None };
+    let focus_preset: Option<&[u8]> = focus.map(|f| f.name().as_bytes());
     if long_trace {
         // Streaming mode: traced already wrote the file; stop finalizes it.
         unsafe { sismo_consumer_session_stop_blocking(session) };

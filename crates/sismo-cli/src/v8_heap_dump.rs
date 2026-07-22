@@ -1,7 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Node/V8 heap-snapshot trigger for the `memory-deep` focus preset.
+//! Node/V8 heap-snapshot trigger for the `memory.dump` focus preset.
 //!
 //! Node opens its inspector on SIGUSR1 (127.0.0.1:9229), after which the
 //! DevTools protocol's `HeapProfiler.takeHeapSnapshot` streams the

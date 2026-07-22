@@ -1,7 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! Runtime dispatch for the `memory-deep` single heap dump.
+//! Runtime dispatch for the `memory.dump` single heap dump.
 //!
 //! One materialization point (record stop, `sismo snapshot`) asks this module
 //! for the target's dump: detect the runtime, trigger its native dumper, and

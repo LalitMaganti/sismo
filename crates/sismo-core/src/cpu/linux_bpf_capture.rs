@@ -395,9 +395,25 @@ fn counters_from_table() -> Option<Vec<Counter>> {
     Some(out)
 }
 
-/// The active candidate counters for this host: the VM hack, else the perfmon
-/// table by CPUID (x86), else the arch fallback.
-fn select_counters() -> Vec<Counter> {
+// The lean default: just the two fixed counters that give IPC. They live on
+// the fixed PMU counters (not general-purpose), so they never multiplex and
+// never need the enabled/running scaling — the cheapest possible read, which
+// matters most at the tick's sampling rate (and doubly in a VM, where each
+// counter read can VM-exit). The rich microarchitecture set is opt-in via
+// `--focus cpu`.
+const LEAN_COUNTERS: &[Counter] = &[
+    Counter { group: 0, src: Src::Hw(HW_CPU_CYCLES), name: "cpu-cycles" },
+    Counter { group: 0, src: Src::Hw(HW_INSTRUCTIONS), name: "instructions" },
+];
+
+/// The counters to park for this recording. Only `--focus cpu` carries the
+/// rich microarchitecture set (perfmon table / VM hack / arch fallback, which
+/// may multiplex and pay the scaling path); every other mode parks the lean
+/// two-fixed-counter set.
+fn select_counters(focus: Option<FocusPreset>) -> Vec<Counter> {
+    if focus != Some(FocusPreset::Cpu) {
+        return LEAN_COUNTERS.to_vec();
+    }
     if let Some(list) = vm_slots_hack_counters() {
         return list.to_vec();
     }
@@ -412,14 +428,17 @@ fn select_counters() -> Vec<Counter> {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum FocusPreset {
-    Cache,
+    /// `--focus cpu`: the microarchitecture counter set (survey sampler, rich
+    /// counters). Answers "why is the core stalling."
+    Cpu,
+    /// `--focus cpu.cache_miss`: precise retired-load-missed-L3 sampling with
+    /// the data address. Answers "where do memory accesses stall."
+    CacheMiss,
 }
 
 enum Leader {
-    // Cycles-leader sampler path: `open_focus_sampler` handles it, but no
-    // `FocusPreset` constructs it yet (the planned stalls preset would). Kept as
-    // the wired integration point, not deleted — see sismo_focus_mode.
-    #[allow(dead_code)]
+    // Cycles-leader survey sampler — the default overflow event, also used by
+    // `--focus cpu` (which changes only the counter set, not the sampler).
     Cycles,
     Role(Role),
 }
@@ -432,23 +451,35 @@ struct FocusSpec {
 }
 
 impl FocusPreset {
+    /// Parse a `--focus` preset value. The single validation point for the CPU
+    /// presets; `memory.*` presets are handled in the CLI heap path, not here.
     pub fn from_name(name: &[u8]) -> Option<FocusPreset> {
         match name {
-            b"cache" => Some(FocusPreset::Cache),
+            b"cpu" => Some(FocusPreset::Cpu),
+            b"cpu.cache_miss" => Some(FocusPreset::CacheMiss),
             _ => None,
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
-            FocusPreset::Cache => "cache",
+            FocusPreset::Cpu => "cpu",
+            FocusPreset::CacheMiss => "cpu.cache_miss",
         }
     }
 
     fn spec(self) -> FocusSpec {
         match self {
+            // Survey sampler (cycles); the rich counter set is what --focus cpu
+            // adds, not a different overflow event.
+            FocusPreset::Cpu => FocusSpec {
+                leader: Leader::Cycles,
+                precise_ip: 0,
+                period: 1_000_003,
+                sample_data_addr: false,
+            },
             // Sample on retired loads that missed L3 (precise, carries Data_LA).
-            FocusPreset::Cache => FocusSpec {
+            FocusPreset::CacheMiss => FocusSpec {
                 leader: Leader::Role(Role::l3_miss_load),
                 precise_ip: 2,
                 period: 2003,
@@ -1172,7 +1203,7 @@ impl Capture {
         // Cache focus: resolve the sampled access's data address to its region.
         let mut data_address = 0u64;
         let mut data_symbol: Option<Vec<u8>> = None;
-        if self.focus == Some(FocusPreset::Cache) && rec.data_addr != 0 {
+        if self.focus == Some(FocusPreset::CacheMiss) && rec.data_addr != 0 {
             data_address = rec.data_addr;
             data_symbol = Some(self.data_region_label(rec.data_addr, rec.hdr.ts));
             self.data_frames += 1;
@@ -1819,7 +1850,7 @@ fn capture_init(
         stop_req: AtomicUsize::new(0),
     }));
     let c = unsafe { &mut *cap };
-    c.counters = select_counters();
+    c.counters = select_counters(focus);
 
     let desc = crate::proto::session_config::encode_data_source_descriptor(DS_NAME, false, false, &[]);
     let slot = unsafe {

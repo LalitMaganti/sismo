@@ -1,14 +1,14 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! JVM heap-dump trigger for the `memory-deep` focus preset.
+//! JVM heap-dump trigger for the `memory.dump` focus preset.
 //!
 //! `jcmd <pid> GC.heap_dump` makes HotSpot write the `.hprof` itself (the
 //! attach mechanism is cooperative — no task port / ptrace needed), so the raw
 //! dump lands on disk with zero conversion; trace_processor reads `.hprof`
 //! natively. The dump is stop-the-world: callers only trigger it at explicit
 //! materialization points (record stop, `sismo snapshot`), and only when the
-//! session opted in via `--focus memory-deep`.
+//! session opted in via `--focus memory.dump`.
 //!
 //! HotSpot's attach handshake requires the initiating euid to match the JVM's
 //! (root is rejected too — "well-known file is not secure"). The recorder
