@@ -197,8 +197,8 @@ impl ModuleRegistry {
         }
         let meta = std::fs::metadata(path).ok()?;
         let key = (meta.dev(), meta.ino());
-        if !self.fds.contains_key(&key) {
-            self.fds.insert(key, File::open(path).ok()?);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.fds.entry(key) {
+            e.insert(File::open(path).ok()?);
         }
         Some(key)
     }

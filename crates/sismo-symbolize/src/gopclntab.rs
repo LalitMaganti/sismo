@@ -50,7 +50,7 @@ impl GoPclntab {
         let image_base = min_pt_load_vaddr(&f)?;
         let text_off = text_vaddr.checked_sub(image_base)?;
         let (off, size) = gopcln;
-        if size < 64 || size > 256 * 1024 * 1024 {
+        if !(64..=256 * 1024 * 1024).contains(&size) {
             return None;
         }
         let mut data = vec![0u8; size as usize];
@@ -189,6 +189,7 @@ impl GoPclntab {
         out
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.nfunc
     }

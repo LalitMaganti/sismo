@@ -65,7 +65,7 @@ pub fn locate_py_runtime(_pid: u32, maps: &ProcMaps) -> Option<u64> {
         let base = path.rsplit('/').next().unwrap_or(path);
         base.starts_with("libpython")
     })?;
-    py_runtime_in_file(&path.to_string(), base_avma)
+    py_runtime_in_file(path, base_avma)
 }
 
 /// Whether a loaded image path looks like the one carrying `_PyRuntime`:

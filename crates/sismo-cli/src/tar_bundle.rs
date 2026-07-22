@@ -106,7 +106,7 @@ pub fn write_tar(out_path: &str, members: &[(String, String)]) -> io::Result<u64
             copied += n as u64;
         }
         if copied != size {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("{src} changed size while tarring")));
+            return Err(io::Error::other(format!("{src} changed size while tarring")));
         }
         total += copied;
         let pad = (BLOCK - (copied as usize % BLOCK)) % BLOCK;
