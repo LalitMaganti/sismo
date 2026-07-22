@@ -31,6 +31,14 @@
 #define BPF_F_USER_STACK (1ULL << 8)
 #endif
 
+// Never wake the ringbuf consumer per submit: both drains are pure timed
+// polling (consume + sleep), so per-submit irq_work wakeups are wasted kernel
+// work on every sched event — and each wakeup is itself a sched event the
+// collector observes, an amplification the machine can do without.
+#ifndef BPF_RB_NO_WAKEUP
+#define BPF_RB_NO_WAKEUP (1ULL << 0)
+#endif
+
 // Ignore sub-threshold off-CPU blocks: a thread that yields for a few µs isn't
 // a latency problem, and capturing a stack on every brief switch-out would
 // dominate the cost. Latency lives in the long waits.
@@ -80,10 +88,11 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 2);
+  __uint(max_entries, 3);
   __type(key, __u32);
   __type(value, __u32);
-} cfg SEC(".maps");  // cfg[0] = target tgid (0 = all), cfg[1] = unwind-capture flag (NAT-1)
+} cfg SEC(".maps");  // cfg[0] = target tgid (0 = all), cfg[1] = unwind-capture flag
+                     // (NAT-1), cfg[2] = parked counter slots (bounds read_advance)
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -282,7 +291,7 @@ static __always_inline __u32 resolve_ksym(__u64 addr) {
     // lookup). Emits "name+0xoff/0xsize"; userspace keeps the bare name.
     __u64 args[1] = {addr};
     bpf_snprintf(k->name, sizeof(k->name), "%pB", args, sizeof(args));
-    bpf_ringbuf_submit(k, 0);
+    bpf_ringbuf_submit(k, BPF_RB_NO_WAKEUP);
   }
   return id;
 }
@@ -311,7 +320,7 @@ static __always_inline __u32 resolve_file(struct file *file) {
     k->id = id;
     const unsigned char *namep = BPF_CORE_READ(file, f_path.dentry, d_name.name);
     bpf_probe_read_kernel_str(k->name, sizeof(k->name), namep);
-    bpf_ringbuf_submit(k, 0);
+    bpf_ringbuf_submit(k, BPF_RB_NO_WAKEUP);
   }
   return id;
 }
@@ -346,7 +355,7 @@ static __noinline __u32 resolve_pyframe(struct sismo_py_cfg *pc, __u64 qual) {
     if (len)
       bpf_probe_read_user(r->name, len, (void *)(qual + pc->unicode_data));
     r->name[len] = 0;
-    bpf_ringbuf_submit(r, 0);
+    bpf_ringbuf_submit(r, BPF_RB_NO_WAKEUP);
   }
   return id;
 }
@@ -450,7 +459,7 @@ static __noinline void capture_module(struct task_struct *cur, __u64 pc) {
   r->prefix_len = 0;
   if (bpf_probe_read_user(r->prefix, sizeof(r->prefix), (void *)base) == 0)
     r->prefix_len = sizeof(r->prefix);
-  bpf_ringbuf_submit(r, 0);
+  bpf_ringbuf_submit(r, BPF_RB_NO_WAKEUP);
 }
 
 static __always_inline __u32 target_tgid(void) {
@@ -463,6 +472,17 @@ static __always_inline __u32 unwind_enabled(void) {
   __u32 one = 1;
   __u32 *v = bpf_map_lookup_elem(&cfg, &one);
   return v ? *v : 0;
+}
+
+// Slots actually parked by userspace. read_advance runs on every context
+// switch and tick system-wide; reading only the live slots instead of all
+// SISMO_MAX_COUNTERS drops the fixed per-sched-event cost to what was asked
+// for. Empty slots always credit 0 either way.
+static __always_inline __u32 counter_slots(void) {
+  __u32 two = 2;
+  __u32 *v = bpf_map_lookup_elem(&cfg, &two);
+  __u32 n = v ? *v : SISMO_MAX_COUNTERS;
+  return n > SISMO_MAX_COUNTERS ? SISMO_MAX_COUNTERS : n;
 }
 
 // Read every counter slot on the current CPU, diff against last_pe, advance
@@ -482,8 +502,11 @@ static __always_inline void read_advance(struct sismo_counters *dc) {
   struct sismo_last *last = bpf_map_lookup_elem(&last_pe, &zero);
   if (!last)
     return;
+  __u32 nslots = counter_slots();
 #pragma clang loop unroll(disable)
-  for (int s = 0; s < SISMO_MAX_COUNTERS; s++) {
+  for (__u32 s = 0; s < SISMO_MAX_COUNTERS; s++) {
+    if (s >= nslots)
+      break;
     struct bpf_perf_event_value val = {};
     __u64 idx = (__u64)s * SISMO_MAX_CPUS + cpu;
     if (bpf_perf_event_read_value(&counters_pe, idx, &val, sizeof(val))) {
@@ -603,7 +626,7 @@ static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
       #pragma clang loop unroll(disable)
       for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
         e->kernel_ids[i] = (i < st->nr_kernel) ? st->kids[i] : 0;
-      bpf_ringbuf_submit(e, 0);
+      bpf_ringbuf_submit(e, BPF_RB_NO_WAKEUP);
     }
   }
   bpf_map_delete_elem(&offcpu, &tid);
@@ -657,7 +680,11 @@ int on_futex_enter(struct sys_enter_futex_ctx *ctx) {
 
 SEC("tracepoint/syscalls/sys_exit_futex")
 int on_futex_exit(void *ctx) {
-  __u32 tid = (__u32)bpf_get_current_pid_tgid();
+  __u32 tgt = target_tgid();
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  if (tgt != 0 && (__u32)(pid_tgid >> 32) != tgt)
+    return 0;  // the map only ever holds target tids
+  __u32 tid = (__u32)pid_tgid;
   bpf_map_delete_elem(&futex_wait, &tid);
   return 0;
 }
@@ -690,7 +717,11 @@ int BPF_KPROBE(on_tcp_recvmsg, struct sock *sk) {
 
 SEC("kretprobe/tcp_recvmsg")
 int BPF_KRETPROBE(on_tcp_recvmsg_ret) {
-  __u32 tid = (__u32)bpf_get_current_pid_tgid();
+  __u32 tgt = target_tgid();
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  if (tgt != 0 && (__u32)(pid_tgid >> 32) != tgt)
+    return 0;  // the map only ever holds target tids
+  __u32 tid = (__u32)pid_tgid;
   bpf_map_delete_elem(&net_peer, &tid);
   return 0;
 }
@@ -722,7 +753,11 @@ int BPF_KPROBE(on_vfs_read, struct file *file) {
 
 SEC("kretprobe/vfs_read")
 int BPF_KRETPROBE(on_vfs_read_ret) {
-  __u32 tid = (__u32)bpf_get_current_pid_tgid();
+  __u32 tgt = target_tgid();
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  if (tgt != 0 && (__u32)(pid_tgid >> 32) != tgt)
+    return 0;  // the map only ever holds target tids
+  __u32 tid = (__u32)pid_tgid;
   bpf_map_delete_elem(&disk_file, &tid);
   return 0;
 }
@@ -822,7 +857,7 @@ int on_tick(struct bpf_perf_event_data *ctx) {
     ue->stack_len = snap;
     ue->stack_trunc = (snap < SISMO_STACK_SNAP_MAX) ? 1 : 0;
 
-    bpf_ringbuf_submit(ue, 0);
+    bpf_ringbuf_submit(ue, BPF_RB_NO_WAKEUP);
     return 0;
   }
 
@@ -850,7 +885,7 @@ int on_tick(struct bpf_perf_event_data *ctx) {
   for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
     e->kernel_ids[i] = (ks && i < nr_kernel) ? ks->id[i] : 0;
   e->hdr.nr_py_frames = walk_python(e->py_ids);  // CAP-1
-  bpf_ringbuf_submit(e, 0);
+  bpf_ringbuf_submit(e, BPF_RB_NO_WAKEUP);
   return 0;
 }
 

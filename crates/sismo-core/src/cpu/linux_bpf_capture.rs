@@ -32,6 +32,7 @@ pub const SISMO_MODULE_PREFIX: usize = 4096;
 pub const SISMO_STACK_SNAP_MAX: usize = 8192;
 
 // block_id (off-CPU slot 0) tag bits: which kind of thing the block waits on.
+#[allow(dead_code)] // mirrors the tag sched.bpf.c stamps; net ids pass through opaquely
 const BLOCK_ID_NET: u64 = 1 << 63; // TCP peer (rest of the bits: packed 5-tuple)
 const BLOCK_ID_FILE: u64 = 1 << 62; // interned file id (low bits)
 
@@ -813,6 +814,8 @@ pub struct Capture {
     module_rb: *mut RingBuffer,
     module_worker: Option<std::thread::JoinHandle<()>>,
     module_exit: Arc<AtomicBool>,
+    // Boxed so the callback gets a stable *mut Arc<..> for the ringbuf ctx.
+    #[allow(clippy::redundant_allocation)]
     module_ctx: Option<Box<Arc<Mutex<ModuleRegistry>>>>,
     links: Vec<*mut BpfLink>,
     perf_fds: Vec<i32>,
@@ -1318,11 +1321,11 @@ impl Capture {
             let m = self.maps.as_ref()?.find(pc)?;
             (m.base_avma, m.path.clone())
         };
-        if !self.go_unwinders.contains_key(&base) {
-            let parsed = GoPclntab::from_path(&path);
-            self.go_unwinders.insert(base, parsed);
-        }
-        let go = self.go_unwinders.get(&base)?.as_ref()?;
+        let go = self
+            .go_unwinders
+            .entry(base)
+            .or_insert_with(|| GoPclntab::from_path(&path))
+            .as_ref()?;
         Some(go.unwind(base, pc, sp, read_stack, SISMO_MAX_STACK))
     }
 
@@ -1606,17 +1609,21 @@ extern "C" fn on_flush(user: *mut c_void, flusher: *mut c_void) {
 fn capture_module_record(registry: &Mutex<ModuleRegistry>, rec: &SismoModuleRec) {
     let n = (rec.prefix_len as usize).min(SISMO_MODULE_PREFIX);
     let page = &rec.prefix[..n];
-    let hint = build_id_from_image_prefix(page).unwrap_or_default();
-    // The path the module's base is mapped from (empty if the file is already
-    // gone; the in-band page still yields the build-id).
-    let path = ProcMaps::parse(rec.tgid)
+    // The path and on-disk build-id of the file the module's base is mapped
+    // from (both empty if the file is already gone).
+    let (path, file_id) = ProcMaps::parse(rec.tgid)
         .and_then(|m| {
-            m.modules()
-                .iter()
-                .find(|(b, _)| *b == rec.base)
-                .map(|(_, p)| p.to_string())
+            m.find(rec.base)
+                .filter(|mp| mp.base_avma == rec.base)
+                .map(|mp| (mp.path.clone(), mp.build_id.clone()))
         })
         .unwrap_or_default();
+    // The in-band page wins (replace-immune, works for deleted files). The
+    // on-disk id fills in when the mapped image's first page carries no GNU
+    // note — notably Go ≥1.26, whose PT_NOTE covers only the Go buildid; the
+    // file read also walks section headers, which the memory image lacks.
+    let hint = build_id_from_image_prefix(page)
+        .unwrap_or(file_id);
     let key = ModuleKey::Mapping { pid: rec.tgid, base: rec.base };
     registry.lock().unwrap().register(key, &hint, &path);
 }
@@ -1785,11 +1792,13 @@ fn capture_init(
     }
     c.ds_slot = slot;
 
+    tracing::info!("bpf: object open");
     let obj = unsafe { bpf_object__open_mem(BPF_OBJ.as_ptr() as *const c_void, BPF_OBJ.len(), ptr::null()) };
     if obj.is_null() {
         drop(unsafe { Box::from_raw(cap) });
         return ptr::null_mut();
     }
+    tracing::info!("bpf: object load begin");
     if unsafe { bpf_object__load(obj) } != 0 {
         unsafe { bpf_object__close(obj) };
         drop(unsafe { Box::from_raw(cap) });
@@ -1856,8 +1865,21 @@ fn capture_init(
         }
     }
 
-    let zero: u32 = 0;
+    tracing::info!(slots = c.active_slots.len(), "bpf: perf events open");
+    // cfg[2] first: the parked-slot count bounds the per-sched-event counter
+    // reads in the BPF read_advance loop.
+    let two: u32 = 2;
+    let nslots: u32 = c.active_slots.len() as u32;
     unsafe {
+        bpf_map_update_elem(
+            cfg_fd,
+            &two as *const u32 as *const c_void,
+            &nslots as *const u32 as *const c_void,
+            0,
+        )
+    };
+    let zero: u32 = 0;
+    let rc = unsafe {
         bpf_map_update_elem(
             cfg_fd,
             &zero as *const u32 as *const c_void,
@@ -1865,6 +1887,13 @@ fn capture_init(
             0,
         )
     };
+    // cfg[0] = 0 means "trace every process" to the BPF programs — the one
+    // state where the collector's own activity feeds back into itself. Never
+    // enter it silently: no target pid, no capture.
+    if rc != 0 {
+        drop(unsafe { Box::from_raw(cap) });
+        return ptr::null_mut();
+    }
 
     // NAT-1: cfg[1] gates the BPF unwind-capture path (regs + raw user-stack
     // snapshot alongside the FP-walked sample), which the host-side unwinder
@@ -1892,6 +1921,7 @@ fn capture_init(
     // Off-CPU capture: the sched_switch blocking-stack program plus the
     // futex/tcp/vfs probes that tag each block with what it waits on. Gated so a
     // CPU-only recording (`--only cpu`) does no scheduler work at all.
+    tracing::info!(offcpu, "bpf: attach begin");
     if offcpu {
         let ss = unsafe { bpf_object__find_program_by_name(obj, c"on_sched_switch".as_ptr()) };
         if !ss.is_null() {
@@ -1988,8 +2018,12 @@ fn capture_init(
         let exit = Arc::clone(&c.module_exit);
         c.module_worker = Some(std::thread::spawn(move || {
             let rb = rb;
+            // Timed polling, like the main drain: submits carry
+            // BPF_RB_NO_WAKEUP, so there is no wakeup to wait for — and no
+            // per-submit wakeup of this thread for the collector to observe.
             while !exit.load(Ordering::Acquire) {
-                unsafe { ring_buffer__poll(rb.0, 20) };
+                unsafe { ring_buffer__consume(rb.0) };
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
             unsafe { ring_buffer__consume(rb.0) };
         }));
@@ -2028,6 +2062,7 @@ impl Capture {
     /// registry (whose held fds must outlive the capture until symbolization).
     /// Consumes self.
     pub fn shutdown(mut self: Box<Self>) -> (LinuxBpfStats, Arc<Mutex<ModuleRegistry>>) {
+        tracing::info!("bpf: shutdown begin");
         self.exit_requested.store(true, Ordering::Release);
         self.module_exit.store(true, Ordering::Release);
         if let Some(w) = self.worker.take() {
@@ -2036,6 +2071,7 @@ impl Capture {
         if let Some(w) = self.module_worker.take() {
             let _ = w.join();
         }
+        tracing::info!("bpf: workers joined");
         // Both workers have joined; hand out the registry Arc (its held fds must
         // outlive the capture until symbolization). Drop the callback's Arc handle
         // first so the returned one is the sole owner.
@@ -2060,12 +2096,14 @@ impl Capture {
             if !self.module_rb.is_null() {
                 ring_buffer__free(self.module_rb);
             }
+            tracing::info!("bpf: detach begin");
             for &l in &self.links {
                 bpf_link__destroy(l);
             }
             for &fd in &self.perf_fds {
                 close(fd);
             }
+            tracing::info!("bpf: detached");
             if !self.obj.is_null() {
                 bpf_object__close(self.obj);
             }
