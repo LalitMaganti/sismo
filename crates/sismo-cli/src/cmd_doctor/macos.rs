@@ -90,8 +90,8 @@ pub fn run(args: DoctorArgs) -> i32 {
 
 /// Diagnose how sched + CPU-sample capture will get root. xnu gates kdebug and
 /// kperf on euid 0 and Apple's kperf entitlement is private, so unlike Linux
-/// (setcap on sismo-run) there is no capability to grant — every option is a
-/// flavor of sudo. Advisory: name the options with exact commands rather than
+/// (setcap on the sismo binary) there is no capability to grant — every option
+/// is a flavor of sudo. Advisory: name the options with exact commands rather than
 /// fail, since `sudo sismo record` always works.
 fn check_privileged_capture(exe: &PathBuf) {
     if unsafe { libc::geteuid() } == 0 {
@@ -162,8 +162,8 @@ fn sudoers_suggestion(exe: &std::path::Path) -> Result<String, String> {
 
 /// The rule names this build's binary and its release/debug sibling — sudoers
 /// matches by path, not inode, so rebuilds keep working without re-blessing
-/// (the reason Linux needs the separate seldom-relinked sismo-run launcher
-/// does not apply here).
+/// (unlike Linux's file caps, which die on relink and need a `doctor --fix`
+/// re-grant).
 fn sudoers_paths(exe: &std::path::Path) -> Vec<String> {
     let mut paths = vec![exe.display().to_string()];
     if let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) {

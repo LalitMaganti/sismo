@@ -15,8 +15,10 @@ mod macos;
 
 #[derive(Args)]
 pub struct DoctorArgs {
-    /// Apply safe local fixes. On macOS this self-signs the current sismo binary
-    /// with com.apple.security.cs.debugger if that entitlement is missing.
+    /// Apply safe local fixes. macOS: self-sign the current sismo binary with
+    /// com.apple.security.cs.debugger if that entitlement is missing. Linux:
+    /// re-run under sudo to grant this binary the recording capabilities
+    /// (setcap-style) and open up tracefs.
     #[arg(long)]
     fix: bool,
 

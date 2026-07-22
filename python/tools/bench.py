@@ -15,7 +15,7 @@ Measures what `sismo record` costs the profiled workload and the machine:
   trace_bytes        — size of the written trace.
 
 Method: N baseline runs of the workload alone, N runs under
-`sismo-run record`, medians reported. The workload is the canonical
+`sismo record`, medians reported. The workload is the canonical
 tests/matrix/targets/workload.c built with clang -O2 -fno-omit-frame-pointer
 (the golden path — clang frames leaf functions, gcc doesn't).
 
@@ -23,7 +23,7 @@ tests/matrix/targets/workload.c built with clang -O2 -fno-omit-frame-pointer
   tools/bench --runs 5 --duration-ms 3000
   tools/bench --json out/bench/report.json    # tracked over time
 
-Needs a setcap'd sismo-run; hardware-only, not part of the fast CI gate.
+Needs a caps-granted sismo (sudo sismo doctor --fix); hardware-only, not part of the fast CI gate.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ import sys
 import time
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SISMO_RUN: str = os.path.join(ROOT_DIR, "crates", "sismo-run", "target", "debug", "sismo-run")
+SISMO: str = os.path.join(ROOT_DIR, "crates", "sismo", "target", "debug", "sismo")
 WL_SRC: str = os.path.join(ROOT_DIR, "tests", "matrix", "targets", "workload.c")
 OUT_DIR: str = os.path.join(ROOT_DIR, "out", "bench")
 WL_BIN: str = os.path.join(OUT_DIR, "workload")
@@ -91,16 +91,15 @@ def main() -> int:
                         default=os.path.join(OUT_DIR, "report.json"))
     args = parser.parse_args()
 
-    if not os.path.exists(SISMO_RUN):
-        print(f"sismo-run not built at {SISMO_RUN}\n"
+    if not os.path.exists(SISMO):
+        print(f"sismo not built at {SISMO}\n"
               f"  build it:  tools/cargo --hermetic build "
-              f"--manifest-path crates/sismo-run/Cargo.toml", file=sys.stderr)
+              f"--manifest-path crates/sismo/Cargo.toml", file=sys.stderr)
         return 2
-    caps = subprocess.run(["getcap", SISMO_RUN], capture_output=True, text=True)
+    caps = subprocess.run(["getcap", SISMO], capture_output=True, text=True)
     if "cap_bpf" not in caps.stdout:
-        print(f"sismo-run has no file capabilities\n"
-              f"  grant them: sudo setcap "
-              f"cap_bpf,cap_perfmon,cap_sys_resource=eip {SISMO_RUN}",
+        print(f"sismo has no file capabilities (rebuilds shed them)\n"
+              f"  grant them: sudo {SISMO} doctor --fix -y",
               file=sys.stderr)
         return 2
 
@@ -111,7 +110,7 @@ def main() -> int:
     dur = str(args.duration_ms)
     trace = os.path.join(OUT_DIR, "bench.pftrace")
     base_cmd = [WL_BIN, dur]
-    rec_cmd = [SISMO_RUN, "record", "--output", trace, WL_BIN, dur]
+    rec_cmd = [SISMO, "record", "--output", trace, WL_BIN, dur]
 
     print(f"warmup + {args.runs} baseline / {args.runs} recorded runs "
           f"of {args.duration_ms} ms each")

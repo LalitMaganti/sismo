@@ -38,7 +38,7 @@ Fairness rules baked in:
   tools/profbench --trials 9 --duration-ms 2000
   tools/profbench --profilers none,perf-dwarf,sismo,systing --json out/pb.json
 
-Linux only. Needs a setcap'd sismo-run; a setcap'd systing at ~/systing-bench and
+Linux only. Needs a caps-granted sismo (sudo sismo doctor --fix); a setcap'd systing at ~/systing-bench and
 perf are auto-skipped if absent. Not part of the fast CI gate.
 """
 
@@ -57,7 +57,7 @@ import threading
 import time
 
 ROOT_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SISMO_RUN: str = os.path.join(ROOT_DIR, "crates", "sismo-run", "target", "debug", "sismo-run")
+SISMO: str = os.path.join(ROOT_DIR, "crates", "sismo", "target", "debug", "sismo")
 SYSTING_BIN: str = os.path.expanduser("~/systing-bench/target/release/systing")
 TP_SHELL: str = os.path.join(
     ROOT_DIR, "third_party", "src", "perfetto", "out", "sismo", "trace_processor_shell")
@@ -329,16 +329,16 @@ class SismoAdapter(Adapter):
         self.name = "sismo-nosym" if no_symbolize else "sismo"
 
     def available(self):
-        if not os.path.exists(SISMO_RUN):
+        if not os.path.exists(SISMO):
             return False
-        caps = subprocess.run(["getcap", SISMO_RUN], capture_output=True, text=True)
+        caps = subprocess.run(["getcap", SISMO], capture_output=True, text=True)
         return "cap_bpf" in caps.stdout
 
     def record_cmd(self, wl_argv, out_path):
         # --only cpu: CPU sampling alone, no off-CPU/heap/instrumentation, so the
         # capture is equal-fidelity with perf's cycles-only record.
         extra = ["--no-symbolize"] if self.no_symbolize else []
-        return [SISMO_RUN, "record", "--only", "cpu", *extra,
+        return [SISMO, "record", "--only", "cpu", *extra,
                 "--output", out_path, *wl_argv]
 
     def _tp(self, out_path, sql):
