@@ -13,6 +13,8 @@
 use sismo_sys as _;
 
 fn main() {
+    // SISMO_CRASHLOG=<path>: fsync'd lifecycle breadcrumbs for lockup forensics.
+    sismo_core::crashlog::init();
     // args_os + lossy so a non-UTF-8 argument mangles rather than panics.
     let args: Vec<String> = std::env::args_os()
         .map(|a| a.to_string_lossy().into_owned())

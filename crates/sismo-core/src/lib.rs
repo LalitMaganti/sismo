@@ -10,6 +10,8 @@
 //! The CLI/command layer lives in the separate `sismo-cli` crate.
 
 pub mod cpu;
+// Fsync'd lifecycle breadcrumbs for diagnosing hard machine lockups.
+pub mod crashlog;
 pub mod heap;
 pub mod sched;
 

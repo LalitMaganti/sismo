@@ -16,4 +16,6 @@ doctest = false
 [dependencies]
 sismo-core = { path = "../sismo-core" }
 libc = "0.2"
+# Crashlog breadcrumb events (sink installed by sismo-core::crashlog).
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }

@@ -22,6 +22,9 @@ sismo-proto = { path = "../sismo-proto" }
 sismo-symbolize = { path = "../sismo-symbolize" }
 # POSIX/libc bindings, so the callouts aren't hand-declared per file.
 libc = "0.2"
+# Breadcrumb events for the crashlog fsync sink (see src/crashlog.rs). Core
+# macros only — the sink is hand-rolled, no tracing-subscriber stack.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # perf_event_open ABI (structs + syscall) for the Linux BPF CPU collector.
 [target.'cfg(target_os = "linux")'.dependencies]
