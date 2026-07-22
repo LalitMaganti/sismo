@@ -1,0 +1,10 @@
+record_exit: 0
+samples: absent
+offcpu: absent
+mapping: absent
+leaf: absent
+chain: none
+module_status: absent
+build_id: absent
+diagnostics: task-port
+residual: none

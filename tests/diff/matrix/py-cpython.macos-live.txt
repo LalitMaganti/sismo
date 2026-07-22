@@ -1,0 +1,10 @@
+record_exit: 0
+samples: present
+offcpu: present
+mapping: present
+leaf: symbolized
+chain: full
+module_status: partial
+build_id: uuid
+diagnostics: none
+residual: none

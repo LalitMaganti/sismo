@@ -1,0 +1,5 @@
+module: ok 3/3 $WORK/fix
+frame main: main [line]
+frame mid: sismo::fix_mid<int>(int) [line]
+frame leaf: sismo::fix_leaf(int) [line]
+diags: (none)

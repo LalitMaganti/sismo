@@ -1,0 +1,5 @@
+module: ok 3/3 $WORK/fix
+frame main: main.main [line]
+frame mid: main.sismoFixMid [line]
+frame leaf: main.sismoFixLeaf [line]
+diags: (none)

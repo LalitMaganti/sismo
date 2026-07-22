@@ -32,18 +32,30 @@ noinline fn sismo_wl_outer(x0: u64) u64 {
     return x;
 }
 
-// Raw linux syscalls: the 0.16 std.Io time/sleep interface is still
-// churning, and this workload is Linux-only anyway.
-const linux = std.os.linux;
+// Time/sleep sidestep the 0.16 std.Io churn by going straight to the OS:
+// raw syscalls on Linux (no libc), libSystem via std.c on macOS (always
+// linked there). The previous Linux-only syscalls returned garbage on
+// macOS — Linux syscall numbers on an XNU kernel.
+const builtin = @import("builtin");
 
 noinline fn sismo_wl_block() void {
-    const req: linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-    _ = linux.nanosleep(&req, null);
+    if (builtin.os.tag == .linux) {
+        const req: std.os.linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&req, null);
+    } else {
+        const req: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&req, null);
+    }
 }
 
 fn now_ms() u64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+    }
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 

@@ -12,8 +12,9 @@ by the shared core in diff_suites/common.py.
 The default run executes the enabled-by-default suites; heavy suites are opt-in
 via --suite.
 
-  tools/difftest                       # enabled-by-default suites (cli, trace)
-  tools/difftest --suite matrix        # the opt-in compatibility matrix
+  tools/difftest                       # enabled-by-default suites
+  tools/difftest --suite matrix        # cross-platform matrix (default on macOS)
+  tools/difftest --suite matrix-linux  # the opt-in Linux-only matrix
   tools/difftest --suite cli --suite matrix
   tools/difftest -k help               # only cases whose name contains "help"
   tools/difftest --rebaseline          # regenerate goldens for the run suites
@@ -25,11 +26,12 @@ from __future__ import annotations
 import argparse
 import sys
 
-from python.tools.diff_suites import cli, matrix, symbolize_mac, trace
+from python.tools.diff_suites import (
+    cli, matrix, matrix_linux, matrix_mac, symbolize_mac, trace)
 from python.tools.diff_suites.common import SuiteContext
 
 # Ordered registry. Order is the run order.
-_SUITES = [cli, trace, symbolize_mac, matrix]
+_SUITES = [cli, trace, symbolize_mac, matrix, matrix_mac, matrix_linux]
 
 
 def main() -> int:

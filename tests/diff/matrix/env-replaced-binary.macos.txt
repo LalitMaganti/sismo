@@ -1,0 +1,5 @@
+module: no symbols 0/0 $WORK/fix
+frame main: (none) [noline]
+frame mid: (none) [noline]
+frame leaf: (none) [noline]
+diags: load-failed, partial, stale-file
