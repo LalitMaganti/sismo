@@ -150,6 +150,45 @@ impl GoPclntab {
         pcvalue(&self.data, self.pctab_off.checked_add(pcsp as usize)?, entryoff, q)
     }
 
+    /// Every Go function's `pcsp` table decoded into `(image-relative pc,
+    /// frame size)` segments, sorted by pc, with a `None` size marking each
+    /// function's table end — the input for building precomputed unwind rows
+    /// (the NAT-2 in-kernel unwinder). At equal pcs the `None` end marker
+    /// sorts first so the next function's real segment wins a
+    /// last-row-at-or-below lookup.
+    pub fn pcsp_rows(&self) -> Vec<(u64, Option<i32>)> {
+        let mut out = Vec::new();
+        for i in 0..self.nfunc {
+            let (entryoff, funcoff) = self.functab(i);
+            let pcsp_pos = self.functab_off + funcoff as usize + 16;
+            let Some(b) = self.data.get(pcsp_pos..pcsp_pos + 4) else { continue };
+            let pcsp = u32::from_le_bytes(b.try_into().unwrap());
+            let Some(mut cur) = self.pctab_off.checked_add(pcsp as usize) else { continue };
+            let mut val: i32 = -1;
+            let mut pc: u32 = entryoff;
+            let mut first = true;
+            loop {
+                let Some(uvdelta) = read_uvarint(&self.data, &mut cur) else { break };
+                if uvdelta == 0 && !first {
+                    break;
+                }
+                first = false;
+                let vdelta = if uvdelta & 1 != 0 {
+                    !(uvdelta >> 1) as i32
+                } else {
+                    (uvdelta >> 1) as i32
+                };
+                val = val.wrapping_add(vdelta);
+                out.push((self.text_off + pc as u64, Some(val)));
+                let Some(pcdelta) = read_uvarint(&self.data, &mut cur) else { break };
+                pc = pc.wrapping_add(pcdelta);
+            }
+            out.push((self.text_off + pc as u64, None));
+        }
+        out.sort_by_key(|&(pc, fs)| (pc, fs.is_some()));
+        out
+    }
+
     /// Unwind a Go stack from a captured snapshot, returning the PC chain
     /// (leaf first, AVMAs). Go carries no `.eh_frame`, but its `pcsp` frame
     /// sizes are enough to step frames without a frame pointer: on amd64 the

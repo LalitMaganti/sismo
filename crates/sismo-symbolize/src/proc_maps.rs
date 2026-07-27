@@ -54,6 +54,12 @@ impl ProcMaps {
         crate::maps_common::find_range(&self.mappings, addr, |m| (m.start, m.end))
     }
 
+    /// Every executable file-backed mapping, ascending by start — for callers
+    /// that need the raw segments (e.g. registering unwind-table ranges).
+    pub fn mappings(&self) -> &[Mapping] {
+        &self.mappings
+    }
+
     /// Distinct loaded modules as `(image base avma, file path)`, one entry per
     /// unique base — the inputs a per-module unwinder or symbolizer wants to
     /// register once. Order follows ascending mapping start.
