@@ -20,7 +20,6 @@ pub const SISMO_EVT_SAMPLE: u32 = 0;
 // tag 1 retired (kernel symbols now ship raw; see sismo_bpf.h)
 pub const SISMO_EVT_OFFCPU: u32 = 2;
 pub const SISMO_EVT_FILE: u32 = 3;
-pub const SISMO_EVT_SAMPLE_UNWIND: u32 = 4;
 pub const SISMO_EVT_PYFRAME: u32 = 5;
 pub const SISMO_EVT_MODULE: u32 = 6;
 
@@ -34,10 +33,6 @@ pub const SISMO_MODULE_PREFIX: usize = 4096;
 /// from user modules. Anchoring at 0 instead let low (non-PIE) user addresses
 /// fall inside the kernel's address range and resolve to kernel symbols.
 pub const KERNEL_SYNTH_BASE: u64 = 0xffff_ffff_8000_0000;
-
-/// Bytes of the raw user-stack snapshot in `SismoUnwindRec` (perf's default
-/// PERF_SAMPLE_STACK_USER size).
-pub const SISMO_STACK_SNAP_MAX: usize = 8192;
 
 // block_id (off-CPU slot 0) tag bits: which kind of thing the block waits on.
 #[allow(dead_code)] // mirrors the tag sched.bpf.c stamps; net ids pass through opaquely
@@ -71,22 +66,6 @@ pub struct SismoSampleRec {
     pub stack: [u64; SISMO_MAX_STACK],
     pub kernel_ids: [u64; SISMO_MAX_KERNEL_STACK],
     pub py_ids: [u32; SISMO_MAX_PY_FRAMES], // CAP-1: Python frame-name ids, leaf-first
-}
-
-/// SISMO_EVT_SAMPLE_UNWIND. Composes `SismoSampleRec` verbatim (byte-identical
-/// leading bytes) plus the user pt_regs at sample time and a bounded raw copy
-/// of the user stack from the captured stack pointer — captured for a later
-/// host-side DWARF-unwind step. Not yet consumed: today's processing runs the
-/// embedded `sample` through the exact same path as SISMO_EVT_SAMPLE.
-#[repr(C)]
-pub struct SismoUnwindRec {
-    pub sample: SismoSampleRec,
-    pub regs_ip: u64,
-    pub regs_sp: u64,
-    pub regs_bp: u64,
-    pub stack_len: u32,
-    pub stack_trunc: u32,
-    pub stack_bytes: [u8; SISMO_STACK_SNAP_MAX],
 }
 
 /// One-time (id -> name) mapping record. Today carries SISMO_EVT_FILE (the
@@ -184,6 +163,7 @@ extern "C" {
         value: *const c_void,
         flags: u64,
     ) -> c_int;
+    pub fn bpf_program__fd(prog: *mut BpfProgram) -> c_int;
     pub fn bpf_program__attach(prog: *mut BpfProgram) -> *mut BpfLink;
     pub fn bpf_program__attach_perf_event(prog: *mut BpfProgram, pfd: c_int) -> *mut BpfLink;
     pub fn bpf_link__destroy(link: *mut BpfLink) -> c_int;
@@ -841,12 +821,9 @@ impl Interner {
 
 use crate::cpu::module_registry::{KeepPolicy, ModuleKey, ModuleRegistry};
 use crate::symbolize::data_regions::DataRegions;
-use crate::symbolize::gopclntab::GoPclntab;
 use crate::symbolize::proc_maps::{build_id_from_image_prefix, ProcMaps, ResidualMap};
 use crate::symbolize::python_offsets::PyDebugOffsets;
-use crate::symbolize::unwinder::{StackRegs, Unwinder};
 use crate::ffi::{sismo_ds_emit, sismo_ds_emit_offcpu};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -916,18 +893,6 @@ pub struct Capture {
     data_frames: u64,
     offcpu_samples: u64,
     offcpu_ns: u64,
-    // NAT-1: count of SISMO_EVT_SAMPLE_UNWIND records seen, for the
-    // SISMO_DEBUG_UNWIND verification hook.
-    unwind_snapshots: u64,
-    // NAT-1 host-side DWARF unwinder (framehop, x86-64/ELF) fed the captured
-    // regs + stack snapshot, plus the set of module base avmas already
-    // registered into it. Built lazily on the first unwind sample.
-    unwinder: Option<Unwinder>,
-    unwind_registered: HashSet<u64>,
-    // NAT-1b: per-module Go unwinders (base avma -> parsed .gopclntab, None when
-    // the module isn't Go / didn't parse). Go carries no .eh_frame, so framehop
-    // can't unwind it; this walks Go frames from the pcsp frame-size tables.
-    go_unwinders: HashMap<u64, Option<GoPclntab>>,
     // JIT-1: the target's JIT symbol map (`/tmp/perf-<pid>.map`, e.g. node
     // --perf-basic-prof), sorted by start address, mapping an anon-exec JIT PC
     // to its runtime method name. None until first loaded; empty when absent.
@@ -941,6 +906,11 @@ pub struct Capture {
     python_tried: bool,
     python_runtime: Option<(u64, PyDebugOffsets)>,
     python_debug_count: u64,
+    // In-kernel unwind-table loader thread; None when the unwinder could not
+    // be armed and samples keep the frame-pointer walk. Runs off the drain
+    // worker — conversion on the worker stalls draining and overflows the
+    // sample ring. The worker pings it from ensure_maps/reparse_maps.
+    unwind_loader: Option<crate::cpu::unwind_tables::UnwindLoader>,
     sampler_precise_ip: u8,
     ds_slot: u32,
     active: AtomicBool,
@@ -959,6 +929,7 @@ impl Capture {
         self.maps = ProcMaps::parse(self.target_pid);
         self.residual_map = ResidualMap::parse(self.target_pid);
         self.last_maps_ns = now_ns;
+        self.load_unwind_tables();
     }
 
     fn reparse_maps(&mut self, now_ns: u64) {
@@ -972,6 +943,17 @@ impl Capture {
         // JIT code is mmap'd late and churns, so refresh the residual view too.
         if let Some(fresh) = ResidualMap::parse(self.target_pid) {
             self.residual_map = Some(fresh);
+        }
+        // A reparse means new mappings may exist (dlopen); load their
+        // unwind tables (idempotent per module).
+        self.load_unwind_tables();
+    }
+
+    // Nudge the unwind-table loader thread; it parses the target's maps
+    // itself so the drain worker never blocks on conversion.
+    fn load_unwind_tables(&mut self) {
+        if let Some(loader) = &self.unwind_loader {
+            loader.ping();
         }
     }
 
@@ -1002,12 +984,9 @@ impl Capture {
         b"[unmapped]".to_vec()
     }
 
-    /// Intern the sample's full callstack (user leaf-first reversed to root-
-    /// first, then kernel above), returning the callstack iid (0 if empty).
-    /// Intern a sample's callstack. `user_pcs` are the leaf-first user PCs —
-    /// either the BPF frame-pointer walk (`rec.stack`) or, for a NAT-1 unwind
-    /// sample, framehop's DWARF-recovered return addresses. Kernel frames come
-    /// from `rec.kernel_ids` regardless.
+    /// Intern a sample's callstack, returning the callstack iid (0 if empty).
+    /// `user_pcs` are the leaf-first user PCs from `rec.stack`; kernel frames
+    /// come from `rec.kernel_ids`.
     fn intern_callstack(
         &mut self,
         user_pcs: &[u64],
@@ -1317,86 +1296,6 @@ impl Capture {
         self.emit_sample(rec, &user_pcs);
     }
 
-    /// A SISMO_EVT_SAMPLE_UNWIND: DWARF-unwind the captured snapshot host-side
-    /// and emit that chain instead of the FP walk (falling back to the FP walk
-    /// when the snapshot is empty or the unwind doesn't beat it).
-    fn process_unwind_sample(&mut self, urec: &SismoUnwindRec) {
-        if !self.begin_sample(&urec.sample) {
-            return;
-        }
-        let user_pcs = self.unwind_user_stack(urec);
-        self.emit_sample(&urec.sample, &user_pcs);
-    }
-
-    /// Framehop-recovered user PCs for an unwind sample, or the FP walk as a
-    /// fallback. Empty `stack_len` (a kernel-context sample, or a failed copy)
-    /// has no user snapshot to walk; a walk that recovers no more than the FP
-    /// walk isn't worth preferring.
-    fn unwind_user_stack(&mut self, urec: &SismoUnwindRec) -> Vec<u64> {
-        let nr = (urec.sample.hdr.nr_frames as usize).min(SISMO_MAX_STACK);
-        let fp: Vec<u64> = urec.sample.stack[..nr].to_vec();
-        if urec.stack_len == 0 {
-            return fp;
-        }
-        self.ensure_maps(urec.sample.hdr.ts);
-        let sp0 = urec.regs_sp;
-        let len = (urec.stack_len as usize).min(SISMO_STACK_SNAP_MAX);
-        let bytes = &urec.stack_bytes[..len];
-        let read_stack = |addr: u64| -> Option<u64> {
-            let off = addr.checked_sub(sp0)? as usize;
-            let end = off.checked_add(8)?;
-            bytes.get(off..end).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        };
-
-        // Go carries no .eh_frame, so framehop can't unwind it; when the leaf is
-        // in a Go module walk it from the pcsp frame-size tables instead. Prefer
-        // whichever recovered more than the frame-pointer walk (which truncates
-        // on FP-less code), so a module neither can unwind keeps the FP frames.
-        if let Some(pcs) = self.go_unwind(urec.regs_ip, sp0, read_stack) {
-            if pcs.len() > fp.len() {
-                return pcs;
-            }
-        }
-
-        self.ensure_unwinder();
-        let Some(unw) = self.unwinder.as_mut() else {
-            return fp;
-        };
-        let regs = StackRegs {
-            pc: urec.regs_ip,
-            fp: urec.regs_bp,
-            lr: 0,
-            sp: sp0,
-        };
-        let pcs = unw.walk_snapshot(regs, bytes, sp0, SISMO_MAX_STACK);
-        if pcs.len() > fp.len() {
-            pcs
-        } else {
-            fp
-        }
-    }
-
-    /// Go-unwind from the snapshot when `pc` is in a Go module (has a parseable
-    /// `.gopclntab`), else `None`. The per-module `GoPclntab` is parsed once and
-    /// cached (including the negative result for non-Go modules).
-    fn go_unwind(
-        &mut self,
-        pc: u64,
-        sp: u64,
-        read_stack: impl FnMut(u64) -> Option<u64>,
-    ) -> Option<Vec<u64>> {
-        let (base, path) = {
-            let m = self.maps.as_ref()?.find(pc)?;
-            (m.base_avma, m.path.clone())
-        };
-        let go = self
-            .go_unwinders
-            .entry(base)
-            .or_insert_with(|| GoPclntab::from_path(&path))
-            .as_ref()?;
-        Some(go.unwind(base, pc, sp, read_stack, SISMO_MAX_STACK))
-    }
-
     /// JIT-1: the runtime method name for an anon-exec PC from the target's
     /// `/tmp/perf-<pid>.map`, or None. The runtime appends to the map as it
     /// compiles (V8 writes builtins at startup, then each JS method when it
@@ -1416,34 +1315,6 @@ impl Capture {
         syms.get(i.checked_sub(1)?)
             .filter(|(start, size, _)| pc < start.wrapping_add(*size))
             .map(|(_, _, name)| name.clone())
-    }
-
-    /// Build the host-side unwinder on first use and register every target
-    /// module not yet registered (new ones appear as the target dlopen's).
-    fn ensure_unwinder(&mut self) {
-        if self.unwinder.is_none() {
-            self.unwinder = Some(Unwinder::new_x86_64());
-        }
-        let Some(maps) = self.maps.as_ref() else {
-            return;
-        };
-        let to_add: Vec<(u64, String)> = maps
-            .modules()
-            .into_iter()
-            .filter(|(base, path)| {
-                // Anonymous regions ([vdso]/[stack]/…) have no ELF to parse.
-                !self.unwind_registered.contains(base) && !path.starts_with('[')
-            })
-            .map(|(base, path)| (base, path.to_string()))
-            .collect();
-        for (base, path) in to_add {
-            self.unwind_registered.insert(base);
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Some(unw) = self.unwinder.as_mut() {
-                    unw.add_module(base, &bytes);
-                }
-            }
-        }
     }
 
     /// Locate + parse `_PyRuntime`'s `_Py_DebugOffsets` once per run, when the
@@ -1548,18 +1419,6 @@ impl Capture {
             if self.active.load(Ordering::Acquire) {
                 self.emit_offcpu_sample(rec);
             }
-            return;
-        }
-        if hdr.r#type == SISMO_EVT_SAMPLE_UNWIND {
-            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoUnwindRec) };
-            self.unwind_snapshots += 1;
-            if self.unwind_snapshots <= 3 && std::env::var_os("SISMO_DEBUG_UNWIND").is_some() {
-                eprintln!(
-                    "sismo: unwind snapshot #{} regs_ip=0x{:x} regs_sp=0x{:x} stack_len={} stack_trunc={}",
-                    self.unwind_snapshots, rec.regs_ip, rec.regs_sp, rec.stack_len, rec.stack_trunc
-                );
-            }
-            self.process_unwind_sample(rec);
             return;
         }
         if hdr.r#type != SISMO_EVT_SAMPLE {
@@ -1832,15 +1691,12 @@ fn capture_init(
         data_frames: 0,
         offcpu_samples: 0,
         offcpu_ns: 0,
-        unwind_snapshots: 0,
-        unwinder: None,
-        unwind_registered: HashSet::new(),
-        go_unwinders: HashMap::new(),
         jit_syms: None,
         jit_map_size: 0,
         python_tried: false,
         python_runtime: None,
         python_debug_count: 0,
+        unwind_loader: None,
         sampler_precise_ip: 0,
         ds_slot: u32::MAX,
         active: AtomicBool::new(false),
@@ -1973,16 +1829,46 @@ fn capture_init(
         return ptr::null_mut();
     }
 
-    // NAT-1: cfg[1] gates the BPF unwind-capture path (regs + raw user-stack
-    // snapshot alongside the FP-walked sample), which the host-side unwinder
-    // turns into a DWARF-recovered chain. On by default on x86-64 — it is what
-    // recovers stacks for frame-pointer-less binaries. The 8 KiB/sample cost is
-    // the framehop-offline baseline (NAT-2's in-kernel tables shrink it later);
-    // SISMO_UNWIND_CAPTURE=0 forces it off to fall back to the pure FP walk.
+    // cfg[1] turns on in-kernel unwinding from precomputed tables (x86-64):
+    // arm the table loader and register the tail-call walker in
+    // unwind_progs[0]. Without the walker the tail call in on_tick fails
+    // silently, so an unwired walker means staying off — the BPF side then
+    // keeps the plain frame-pointer walk.
     #[cfg(target_arch = "x86_64")]
-    let unwind_flag: u32 = match std::env::var("SISMO_UNWIND_CAPTURE").as_deref() {
-        Ok("0") => 0,
-        _ => 1,
+    let unwind_flag: u32 = {
+        let tables = crate::cpu::unwind_tables::UnwindTables::new(obj, pid);
+        let wired = tables.is_some() && {
+            let prog =
+                unsafe { bpf_object__find_program_by_name(obj, c"sismo_unwind_walk".as_ptr()) };
+            let progs = unsafe { bpf_object__find_map_by_name(obj, c"unwind_progs".as_ptr()) };
+            !prog.is_null() && !progs.is_null() && {
+                let pfd = unsafe { bpf_program__fd(prog) };
+                let mfd = unsafe { bpf_map__fd(progs) };
+                let slot: u32 = 0;
+                let pfd_u = pfd as u32;
+                pfd >= 0
+                    && mfd >= 0
+                    && unsafe {
+                        bpf_map_update_elem(
+                            mfd,
+                            &slot as *const u32 as *const c_void,
+                            &pfd_u as *const u32 as *const c_void,
+                            0,
+                        )
+                    } == 0
+            }
+        };
+        if wired {
+            c.unwind_loader =
+                Some(crate::cpu::unwind_tables::UnwindLoader::spawn(tables.unwrap()));
+            tracing::info!("bpf: in-kernel unwind armed");
+            1
+        } else {
+            eprintln!(
+                "sismo record: unwind tables/walker unavailable; stacks fall back to frame pointers"
+            );
+            0
+        }
     };
     #[cfg(not(target_arch = "x86_64"))]
     let unwind_flag: u32 = 0;
@@ -2150,6 +2036,25 @@ impl Capture {
             let _ = w.join();
         }
         tracing::info!("bpf: workers joined");
+        // Surface the in-kernel unwinder's outcome counters. Joining the
+        // loader first also guarantees no table write races the teardown.
+        if let Some(ut) = self.unwind_loader.take().and_then(|l| l.join()) {
+            let s = ut.read_stats();
+            tracing::info!(
+                modules = ut.modules_loaded,
+                rows = ut.rows_loaded,
+                total = s.total,
+                success = s.success,
+                partial = s.partial,
+                "bpf: in-kernel unwind stats"
+            );
+            if std::env::var_os("SISMO_DEBUG_UNWIND").is_some() {
+                eprintln!(
+                    "sismo: in-kernel unwind: modules={} rows={} stats={:?}",
+                    ut.modules_loaded, ut.rows_loaded, s
+                );
+            }
+        }
         // Both workers have joined; hand out the registry Arc (its held fds must
         // outlive the capture until symbolization). Drop the callback's Arc handle
         // first so the returned one is the sole owner.

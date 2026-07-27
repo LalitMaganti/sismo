@@ -21,3 +21,9 @@ pub mod module_registry;
 pub mod jit_map;
 #[cfg(target_os = "linux")]
 pub mod pmu_events;
+// Loads lightswitch-format unwind tables (.eh_frame -> compact
+// rows via the lightswitch-unwind-info crate) into the BPF maps the in-kernel
+// unwinder in sismo_unwind.bpf.h walks. The walker is x86-64-only; activation
+// is gated in capture_init.
+#[cfg(target_os = "linux")]
+pub mod unwind_tables;

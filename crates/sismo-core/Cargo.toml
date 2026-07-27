@@ -31,3 +31,8 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 perf-event-open-sys = "4"
 # Compiled kernel BPF object (sismo_sys::BPF_OBJ).
 sismo-sys = { path = "../sismo-sys" }
+# .eh_frame -> compact unwind rows for the in-kernel
+# unwinder (src/cpu/unwind_tables.rs). Upstream crate from the lightswitch
+# profiler, MIT-licensed, pinned by rev while we evaluate sharing this code
+# with upstream.
+lightswitch-unwind-info = { git = "https://github.com/javierhonduco/lightswitch", rev = "62fc32b4ce5a36d2693973a65b65649007743e3f" }

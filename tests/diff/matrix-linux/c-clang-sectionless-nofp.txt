@@ -3,7 +3,7 @@ samples: present
 offcpu: present
 mapping: present
 leaf: symbolized
-chain: full
+chain: truncated
 module_status: ok
 build_id: gnu
 diagnostics: none

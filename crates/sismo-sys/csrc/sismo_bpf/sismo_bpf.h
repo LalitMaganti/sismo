@@ -59,10 +59,8 @@ enum sismo_event_type {
   // references the id in slot 0, so userspace can resolve the file name for a
   // disk block without shipping a string per sample.
   SISMO_EVT_FILE = 3,
-  // A normal sample that additionally carries the user pt_regs + a raw
-  // user-stack snapshot for host-side DWARF unwinding (NAT-1). The embedded
-  // `sample` is byte-identical to a SISMO_EVT_SAMPLE record.
-  SISMO_EVT_SAMPLE_UNWIND = 4,
+  // RETIRED. The tag value is reserved so the numbering below stays stable.
+  SISMO_EVT_SAMPLE_UNWIND_RETIRED = 4,
   // A CPython qualname definition: the (id, name) for an interpreter frame's
   // code-object qualname the BPF program recovered for the first time (CAP-1).
   // Same (id, name) shape/role as SISMO_EVT_KSYM, emitted once ahead of the
@@ -81,10 +79,6 @@ enum sismo_event_type {
 // which holds the ELF header, program headers, and (essentially always) the
 // .note.gnu.build-id.
 #define SISMO_MODULE_PREFIX 4096
-
-// Max bytes of the raw user-stack snapshot carried by SISMO_EVT_SAMPLE_UNWIND;
-// perf's default PERF_SAMPLE_STACK_USER size.
-#define SISMO_STACK_SNAP_MAX 8192
 
 struct sismo_hdr {
   unsigned int type;          // enum sismo_event_type
@@ -122,23 +116,6 @@ struct sismo_sample_rec {
   // the target is a recognized interpreter and the in-BPF walk recovered
   // frames; count in hdr.nr_py_frames.
   unsigned int py_ids[SISMO_MAX_PY_FRAMES];
-};
-
-// SISMO_EVT_SAMPLE_UNWIND. Composes sismo_sample_rec verbatim (hdr.type =
-// SISMO_EVT_SAMPLE_UNWIND) so the leading bytes are layout-identical to a
-// plain sample, plus the user pt_regs at sample time and a bounded raw copy
-// of the user stack starting at the captured stack pointer. `stack_len` is
-// the number of valid bytes in `stack_bytes` (0 if the copy failed);
-// `stack_trunc` is set when the copy failed or was partial — a later step
-// DWARF-unwinds this snapshot host-side.
-struct sismo_unwind_rec {
-  struct sismo_sample_rec sample;   // hdr.type = SISMO_EVT_SAMPLE_UNWIND
-  unsigned long long regs_ip;
-  unsigned long long regs_sp;
-  unsigned long long regs_bp;
-  unsigned int stack_len;    // valid bytes in stack_bytes (0 if the copy failed)
-  unsigned int stack_trunc;  // 1 if the user-stack copy failed/was partial
-  unsigned char stack_bytes[SISMO_STACK_SNAP_MAX];
 };
 
 // A generic (id -> name) definition record. Once used for kernel symbols
