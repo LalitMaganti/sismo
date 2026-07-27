@@ -41,6 +41,16 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Translate a file offset through this PT_LOAD segment. The upper bound is
+    /// exclusive; bytes in the zero-filled memsz tail have no file offset.
+    pub fn file_offset_to_vaddr(&self, file_offset: u64) -> Option<u64> {
+        if self.p_type != PT_LOAD {
+            return None;
+        }
+        let delta = file_offset.checked_sub(self.offset)?;
+        (delta < self.filesz).then(|| self.vaddr.checked_add(delta)).flatten()
+    }
+
     /// Whether `vaddr` lies in this segment's virtual range.
     fn contains_vaddr(&self, vaddr: u64) -> bool {
         vaddr >= self.vaddr && vaddr < self.vaddr.saturating_add(self.filesz)
@@ -105,6 +115,12 @@ impl<'d, R: ReadRef<'d>> Elf<'d, R> {
             .filter(|s| s.p_type == PT_LOAD)
             .map(|s| s.vaddr)
             .min()
+    }
+
+    /// Translate an ELF file offset to link-time vaddr through the first PT_LOAD
+    /// whose file-backed interval contains it.
+    pub fn file_offset_to_vaddr(&self, file_offset: u64) -> Option<u64> {
+        self.segments().find_map(|s| s.file_offset_to_vaddr(file_offset))
     }
 
     /// Map a `vaddr` range of `len` bytes to a file offset through the containing
@@ -203,6 +219,18 @@ mod tests {
         let base_disk =
             with_elf_at_path("/proc/self/exe", |elf| elf.image_base()).unwrap();
         assert_eq!(base_mem, base_disk);
+    }
+
+    #[test]
+    fn file_offsets_translate_for_pie_and_non_pie_layouts() {
+        let pie = Segment { p_type: PT_LOAD, offset: 0x1000, vaddr: 0x1000, filesz: 0x200, memsz: 0x300 };
+        assert_eq!(pie.file_offset_to_vaddr(0x1000), Some(0x1000));
+        assert_eq!(pie.file_offset_to_vaddr(0x11ff), Some(0x11ff));
+        assert_eq!(pie.file_offset_to_vaddr(0x1200), None);
+
+        let exec = Segment { p_type: PT_LOAD, offset: 0x2000, vaddr: 0x402000, filesz: 0x100, memsz: 0x100 };
+        assert_eq!(exec.file_offset_to_vaddr(0x2042), Some(0x402042));
+        assert_eq!(exec.file_offset_to_vaddr(0x1fff), None);
     }
 
     #[test]

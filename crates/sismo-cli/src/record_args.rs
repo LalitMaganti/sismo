@@ -114,8 +114,8 @@ pub struct RecordArgs {
     buffer: Option<u32>,
     #[arg(long)]
     no_instrumentation: bool,
-    /// Skip the post-record symbolization pass, leaving the trace's native
-    /// frames as `{build-id, file-offset}` for a later offline pass. Cuts the
+    /// Skip the post-record symbolization pass, leaving native coordinates
+    /// (Linux build-id/file-offset; macOS UUID/PC) for a later offline pass. Cuts the
     /// recorder's stop-time CPU/memory; the profile is symbolized elsewhere.
     #[arg(long)]
     no_symbolize: bool,
@@ -186,7 +186,7 @@ pub struct RecordConfig {
     pub no_symbolize: bool,
     pub focus: Option<String>,
     pub sample_density: Option<f64>,
-    /// CAP-3(b): which sampled module files to hold open for symbolization.
+    /// Userspace-only policy for retaining sampled module inodes.
     pub keep_module_files: KeepPolicy,
 }
 

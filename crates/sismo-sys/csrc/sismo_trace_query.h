@@ -20,14 +20,17 @@ extern "C" {
 // Invoked once per unsymbolized frame. `name`/`build_id` are NOT
 // NUL-terminated — use the paired length. `build_id` is the lowercase-hex
 // string as stored by trace_processor. All pointers are valid only for the
-// duration of the call. Rows arrive grouped by (name, build_id, load_bias).
+// duration of the call. Rows arrive grouped by
+// (name, build_id, load_bias, address_kind), where kind 0 is virtual and 1 is
+// an ELF file offset.
 typedef void (*sismo_unsym_row_cb)(void* ctx,
                                    const char* name,
                                    size_t name_len,
                                    const char* build_id,
                                    size_t build_id_len,
                                    uint64_t rel_pc,
-                                   uint64_t load_bias);
+                                   uint64_t load_bias,
+                                   uint32_t address_kind);
 
 // Loads `trace_path` into trace_processor and runs the unsymbolized-frames
 // query, invoking `cb(ctx, ...)` once per row. Returns 0 on success,
@@ -48,6 +51,7 @@ typedef void (*sismo_stack_quality_cb)(void* ctx,
                                        const char* build_id,
                                        size_t build_id_len,
                                        uint64_t load_bias,
+                                       uint32_t address_kind,
                                        uint64_t total,
                                        uint64_t single_frame);
 

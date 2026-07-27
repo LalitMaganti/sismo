@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sismo Authors <sismo@users.noreply.github.com>
+Date: Mon, 27 Jul 2026 11:05:33 +0100
+Subject: nopr: preserve stack mapping address kind
+
+---
+ protos/perfetto/trace/profiling/profile_common.proto   | 10 ++++++++++
+ .../importers/common/create_mapping_params.h           |  8 ++++++--
+ .../importers/common/virtual_memory_mapping.cc         |  3 ++-
+ .../importers/proto/profile_packet_sequence_state.cc   |  1 +
+ .../importers/proto/profile_packet_sequence_state.h    |  1 +
+ .../proto/profile_packet_sequence_state_unittest.cc    |  4 ++++
+ .../importers/proto/profile_packet_utils.cc            |  6 ++++++
+ .../importers/proto/profile_packet_utils.h             |  1 +
+ .../importers/proto/stack_profile_sequence_state.cc    |  1 +
+ .../perfetto_sql/stdlib/prelude/after_eof/views.sql    |  2 ++
+ src/trace_processor/tables/profiler_tables.py          |  7 +++++++
+ 11 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/protos/perfetto/trace/profiling/profile_common.proto b/protos/perfetto/trace/profiling/profile_common.proto
+index 456e303f..9c4d8761 100644
+--- a/protos/perfetto/trace/profiling/profile_common.proto
++++ b/protos/perfetto/trace/profiling/profile_common.proto
+@@ -69,6 +69,14 @@ message ModuleSymbols {
+ }
+ 
+ message Mapping {
++  // Coordinate represented by Frame.rel_pc for this mapping. Old traces and
++  // ordinary process mappings use virtual addresses; FILE_OFFSET is for a
++  // process-independent whole-file mapping keyed by build ID.
++  enum AddressKind {
++    VIRTUAL_ADDRESS = 0;
++    FILE_OFFSET = 1;
++  }
++
+   // Interning key.
+   // Starts from 1, 0 is the same as "not set".
+   optional uint64 iid = 1;
+@@ -125,6 +133,8 @@ message Mapping {
+   // E.g. ["system", "lib64", "libc.so"]
+   // id of string.
+   repeated uint64 path_string_ids = 7;
++
++  optional AddressKind address_kind = 9;
+ }
+ 
+ message Frame {
+diff --git a/src/trace_processor/importers/common/create_mapping_params.h b/src/trace_processor/importers/common/create_mapping_params.h
+index faab933b..1ea074f5 100644
+--- a/src/trace_processor/importers/common/create_mapping_params.h
++++ b/src/trace_processor/importers/common/create_mapping_params.h
+@@ -41,10 +41,14 @@ struct CreateMappingParams {
+   uint64_t load_bias = 0;
+   std::string name;
+   std::optional<BuildId> build_id;
++  // protos::pbzero::Mapping::AddressKind numeric value. Kept as an integer so
++  // importers which do not depend on the profiling proto retain a light API.
++  // Last to preserve existing aggregate initializers in other importers.
++  uint32_t address_kind = 0;
+ 
+   auto ToTuple() const {
+-    return std::tie(memory_range, exact_offset, start_offset, load_bias, name,
+-                    build_id);
++    return std::tie(memory_range, address_kind, exact_offset, start_offset,
++                    load_bias, name, build_id);
+   }
+ 
+   bool operator==(const CreateMappingParams& o) const {
+diff --git a/src/trace_processor/importers/common/virtual_memory_mapping.cc b/src/trace_processor/importers/common/virtual_memory_mapping.cc
+index 31651665..e9a8ab7e 100644
+--- a/src/trace_processor/importers/common/virtual_memory_mapping.cc
++++ b/src/trace_processor/importers/common/virtual_memory_mapping.cc
+@@ -42,7 +42,8 @@ MappingId CreateMapping(TraceProcessorContext* context,
+   MappingId mapping_id =
+       context->storage->mutable_stack_profile_mapping_table()
+           ->Insert(
+-              {build_id, static_cast<int64_t>(params.exact_offset),
++              {build_id, static_cast<int64_t>(params.address_kind),
++               static_cast<int64_t>(params.exact_offset),
+                static_cast<int64_t>(params.start_offset),
+                static_cast<int64_t>(params.memory_range.start()),
+                static_cast<int64_t>(params.memory_range.end()),
+diff --git a/src/trace_processor/importers/proto/profile_packet_sequence_state.cc b/src/trace_processor/importers/proto/profile_packet_sequence_state.cc
+index 81d9df0e..faaa616f 100644
+--- a/src/trace_processor/importers/proto/profile_packet_sequence_state.cc
++++ b/src/trace_processor/importers/proto/profile_packet_sequence_state.cc
+@@ -79,6 +79,7 @@ void ProfilePacketSequenceState::AddMapping(SourceMappingId id,
+         stats::stackprofile_invalid_string_id);
+     return;
+   }
++  params.address_kind = mapping.address_kind;
+   params.exact_offset = mapping.exact_offset;
+   params.start_offset = mapping.start_offset;
+   params.memory_range = AddressRange(mapping.start, mapping.end);
+diff --git a/src/trace_processor/importers/proto/profile_packet_sequence_state.h b/src/trace_processor/importers/proto/profile_packet_sequence_state.h
+index 95123ffc..503e2c52 100644
+--- a/src/trace_processor/importers/proto/profile_packet_sequence_state.h
++++ b/src/trace_processor/importers/proto/profile_packet_sequence_state.h
+@@ -47,6 +47,7 @@ class ProfilePacketSequenceState final
+ 
+   struct SourceMapping {
+     SourceStringId build_id = 0;
++    uint32_t address_kind = 0;
+     uint64_t exact_offset = 0;
+     uint64_t start_offset = 0;
+     uint64_t start = 0;
+diff --git a/src/trace_processor/importers/proto/profile_packet_sequence_state_unittest.cc b/src/trace_processor/importers/proto/profile_packet_sequence_state_unittest.cc
+index 9e93432e..7071d08e 100644
+--- a/src/trace_processor/importers/proto/profile_packet_sequence_state_unittest.cc
++++ b/src/trace_processor/importers/proto/profile_packet_sequence_state_unittest.cc
+@@ -48,6 +48,7 @@ struct Packet {
+ constexpr Packet kFirstPacket{1, 2, 3, 1, 1};
+ constexpr Packet kSecondPacket{3, 2, 1, 2, 2};
+ 
++constexpr auto kMappingAddressKind = 1;
+ constexpr auto kMappingExactOffset = 123;
+ constexpr auto kMappingStartOffset = 1231;
+ constexpr auto kMappingStart = 234;
+@@ -92,6 +93,7 @@ class HeapProfileTrackerDupTest : public ::testing::Test {
+ 
+     ProfilePacketSequenceState::SourceMapping first_frame;
+     first_frame.build_id = packet.build_id;
++    first_frame.address_kind = kMappingAddressKind;
+     first_frame.exact_offset = kMappingExactOffset;
+     first_frame.start_offset = kMappingStartOffset;
+     first_frame.start = kMappingStart;
+@@ -140,6 +142,8 @@ TEST_F(HeapProfileTrackerDupTest, Mapping) {
+ 
+   EXPECT_THAT(context.storage->stack_profile_mapping_table()[0].build_id(),
+               context.storage->InternString(kBuildIDHexName));
++  EXPECT_THAT(context.storage->stack_profile_mapping_table()[0].address_kind(),
++              kMappingAddressKind);
+   EXPECT_THAT(context.storage->stack_profile_mapping_table()[0].exact_offset(),
+               kMappingExactOffset);
+   EXPECT_THAT(context.storage->stack_profile_mapping_table()[0].start_offset(),
+diff --git a/src/trace_processor/importers/proto/profile_packet_utils.cc b/src/trace_processor/importers/proto/profile_packet_utils.cc
+index 3cc5dc18..69ada5a1 100644
+--- a/src/trace_processor/importers/proto/profile_packet_utils.cc
++++ b/src/trace_processor/importers/proto/profile_packet_utils.cc
+@@ -23,6 +23,12 @@ namespace trace_processor {
+ // static
+ std::string ProfilePacketUtils::MakeMappingName(
+     const std::vector<base::StringView>& path_components) {
++  // Synthetic bracket mappings are display names rather than filesystem paths.
++  // Preserve them exactly (not as `/[name]`).
++  if (path_components.size() == 1 && !path_components[0].empty() &&
++      path_components[0].at(0) == '[') {
++    return path_components[0].ToStdString();
++  }
+   std::string name;
+   for (base::StringView p : path_components) {
+     name.push_back('/');
+diff --git a/src/trace_processor/importers/proto/profile_packet_utils.h b/src/trace_processor/importers/proto/profile_packet_utils.h
+index 68e4e50a..f8a295f1 100644
+--- a/src/trace_processor/importers/proto/profile_packet_utils.h
++++ b/src/trace_processor/importers/proto/profile_packet_utils.h
+@@ -37,6 +37,7 @@ class ProfilePacketUtils {
+       const protos::pbzero::Mapping::Decoder& entry) {
+     ProfilePacketSequenceState::SourceMapping src_mapping{};
+     src_mapping.build_id = entry.build_id();
++    src_mapping.address_kind = entry.address_kind();
+     src_mapping.exact_offset = entry.exact_offset();
+     src_mapping.start_offset = entry.start_offset();
+     src_mapping.start = entry.start();
+diff --git a/src/trace_processor/importers/proto/stack_profile_sequence_state.cc b/src/trace_processor/importers/proto/stack_profile_sequence_state.cc
+index 6cdf64fe..f0a1fcc9 100644
+--- a/src/trace_processor/importers/proto/stack_profile_sequence_state.cc
++++ b/src/trace_processor/importers/proto/stack_profile_sequence_state.cc
+@@ -117,6 +117,7 @@ VirtualMemoryMapping* StackProfileSequenceState::FindOrInsertMappingImpl(
+   }
+ 
+   params.memory_range = AddressRange(decoder->start(), decoder->end());
++  params.address_kind = decoder->address_kind();
+   params.exact_offset = decoder->exact_offset();
+   params.start_offset = decoder->start_offset();
+   params.load_bias = decoder->load_bias();
+diff --git a/src/trace_processor/perfetto_sql/stdlib/prelude/after_eof/views.sql b/src/trace_processor/perfetto_sql/stdlib/prelude/after_eof/views.sql
+index 80a29811..f979be0e 100644
+--- a/src/trace_processor/perfetto_sql/stdlib/prelude/after_eof/views.sql
++++ b/src/trace_processor/perfetto_sql/stdlib/prelude/after_eof/views.sql
+@@ -491,6 +491,8 @@ CREATE PERFETTO VIEW stack_profile_mapping(
+   id ID,
+   -- Hex-encoded Build ID of the binary / library.
+   build_id STRING,
++  -- Coordinate kind: 0 virtual address, 1 ELF file offset.
++  address_kind LONG,
+   -- Exact offset.
+   exact_offset LONG,
+   -- Start offset.
+diff --git a/src/trace_processor/tables/profiler_tables.py b/src/trace_processor/tables/profiler_tables.py
+index 3110d6f7..60551d70 100644
+--- a/src/trace_processor/tables/profiler_tables.py
++++ b/src/trace_processor/tables/profiler_tables.py
+@@ -279,6 +279,12 @@ STACK_PROFILE_MAPPING_TABLE = Table(
+             cpp_access=CppAccess.READ,
+             cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+         ),
++        C(
++            'address_kind',
++            CppInt64(),
++            cpp_access=CppAccess.READ,
++            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
++        ),
+         C(
+             'exact_offset',
+             CppInt64(),
+@@ -324,6 +330,7 @@ STACK_PROFILE_MAPPING_TABLE = Table(
+         group='Callstack profilers',
+         columns={
+             'build_id': '''Hex-encoded Build ID of the binary / library.''',
++            'address_kind': '''0 for virtual addresses, 1 for ELF file offsets.''',
+             'start': '''Start of the mapping in the process' address space.''',
+             'end': '''End of the mapping in the process' address space.''',
+             'name': '''Filename of the binary / library.''',

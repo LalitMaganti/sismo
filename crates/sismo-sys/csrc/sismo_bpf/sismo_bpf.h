@@ -24,6 +24,12 @@
 // list may be shorter (unused slots read back as errors → 0). Bump when adding
 // counter groups (e.g. an L2 memory group).
 #define SISMO_MAX_COUNTERS 12
+#define SISMO_BUILD_ID_SIZE 20
+
+// Stable UAPI values used by bpf_get_stack(BPF_F_USER_BUILD_ID).
+#define SISMO_STACK_BUILD_ID_EMPTY 0
+#define SISMO_STACK_BUILD_ID_VALID 1
+#define SISMO_STACK_BUILD_ID_IP 2
 
 enum sismo_event_type {
   // A timer-tick stack sample of the running thread, carrying its cumulative
@@ -59,26 +65,21 @@ enum sismo_event_type {
   // references the id in slot 0, so userspace can resolve the file name for a
   // disk block without shipping a string per sample.
   SISMO_EVT_FILE = 3,
-  // RETIRED. The tag value is reserved so the numbering below stays stable.
-  SISMO_EVT_SAMPLE_UNWIND_RETIRED = 4,
+  // An on-CPU sample whose raw user chain was selected by the in-kernel
+  // lightswitch-format unwinder. The durable build-id helper chain remains in
+  // the embedded sample; the selected raw PCs ride in sismo_unwind_rec.
+  SISMO_EVT_SAMPLE_UNWIND = 4,
   // A CPython qualname definition: the (id, name) for an interpreter frame's
   // code-object qualname the BPF program recovered for the first time (CAP-1).
   // Same (id, name) shape/role as SISMO_EVT_KSYM, emitted once ahead of the
   // sample whose py_ids[] reference it, so userspace names Python frames
   // without the host walking the interpreter's memory.
   SISMO_EVT_PYFRAME = 5,
-  // A module identity page: a loaded module's image base + the first page of its
-  // mapped image (ELF header + build-id note), copied from the target's memory
-  // in-band at sample time (CAP-2). Emitted once per module base; the host
-  // parses the build-id from it, so a binary deleted before symbolization keeps
-  // a real id instead of a synthetic one. See sismo_module_rec.
-  SISMO_EVT_MODULE = 6,
+  // RETIRED. Module image prefixes once rode a dedicated ring here (CAP-2).
+  // User stacks now carry build-id/file-offset identities directly. Keep the
+  // number reserved so later event tags never change meaning.
+  SISMO_EVT_MODULE_RETIRED = 6,
 };
-
-// Bytes of a module's mapped-image prefix carried by SISMO_EVT_MODULE — one page,
-// which holds the ELF header, program headers, and (essentially always) the
-// .note.gnu.build-id.
-#define SISMO_MODULE_PREFIX 4096
 
 struct sismo_hdr {
   unsigned int type;          // enum sismo_event_type
@@ -94,10 +95,22 @@ struct sismo_hdr {
   unsigned long long ts;      // CLOCK_MONOTONIC ns
 };
 
+// Exact mirror of Linux UAPI `struct bpf_stack_build_id`. For VALID entries,
+// offset_or_ip is an ELF file offset; for IP entries it is a raw user PC.
+struct sismo_stack_build_id {
+  int status;
+  unsigned char build_id[SISMO_BUILD_ID_SIZE];
+  unsigned long long offset_or_ip;
+};
+_Static_assert(sizeof(struct sismo_stack_build_id) == 32,
+               "bpf_stack_build_id size mismatch");
+_Static_assert(__builtin_offsetof(struct sismo_stack_build_id, offset_or_ip) == 24,
+               "bpf_stack_build_id offset mismatch");
+
 // SISMO_EVT_SAMPLE. counters[i] is the running thread's cumulative reading of
 // the perf event parked in counters_pe slot i (userspace decides which event
-// each slot holds; slots with no event read as 0). stack[] holds user PCs,
-// leaf-first. kernel_ids[] holds RAW kernel PCs, leaf-first — the host maps
+// each slot holds; slots with no event read as 0). stack[] holds typed kernel
+// build-id entries, leaf-first. kernel_ids[] holds RAW kernel PCs, leaf-first — the host maps
 // them to [kernel.kallsyms]-relative addresses (subtracting the kernel text
 // base) and symbolizes them via wholesym from a /proc/kallsyms snapshot. The
 // KASLR slide stays host-side: the base is subtracted before anything is
@@ -110,13 +123,33 @@ struct sismo_sample_rec {
   // memory region (heap/stack/object) the miss landed in.
   unsigned long long data_addr;
   unsigned long long counters[SISMO_MAX_COUNTERS];
-  unsigned long long stack[SISMO_MAX_STACK];
+  struct sismo_stack_build_id stack[SISMO_MAX_STACK];
   unsigned long long kernel_ids[SISMO_MAX_KERNEL_STACK];  // raw kernel PCs
   // CAP-1: CPython frame-name ids, leaf-first (see SISMO_EVT_PYFRAME). 0 unless
   // the target is a recognized interpreter and the in-BPF walk recovered
   // frames; count in hdr.nr_py_frames.
   unsigned int py_ids[SISMO_MAX_PY_FRAMES];
 };
+
+// SISMO_EVT_SAMPLE_UNWIND. The embedded sample preserves the durable typed
+// helper chain. `unwind_stack` is the raw chain already selected by the
+// in-kernel lightswitch walker and is normalized to build-id/file-offset by
+// userspace where live mappings permit.
+struct sismo_unwind_rec {
+  struct sismo_sample_rec sample;  // hdr.type = SISMO_EVT_SAMPLE_UNWIND
+  unsigned int nr_unwind_frames;
+  unsigned int _pad;
+  unsigned long long unwind_stack[SISMO_MAX_STACK];
+};
+_Static_assert(sizeof(struct sismo_hdr) == 40, "sismo_hdr layout mismatch");
+_Static_assert(__builtin_offsetof(struct sismo_sample_rec, stack) == 144,
+               "sample build-id stack offset mismatch");
+_Static_assert(sizeof(struct sismo_sample_rec) == 2768,
+               "sample build-id record size mismatch");
+_Static_assert(__builtin_offsetof(struct sismo_unwind_rec, unwind_stack) == 2776,
+               "unwind raw stack offset mismatch");
+_Static_assert(sizeof(struct sismo_unwind_rec) == 3288,
+               "unwind build-id record size mismatch");
 
 // A generic (id -> name) definition record. Once used for kernel symbols
 // (SISMO_EVT_KSYM, now retired — kernel frames ship raw); today it carries
@@ -134,22 +167,6 @@ struct sismo_pyframe_rec {
   unsigned int type;  // = SISMO_EVT_PYFRAME (aliases sismo_hdr.type)
   unsigned int id;
   char name[SISMO_PY_NAME_MAX];
-};
-
-// SISMO_EVT_MODULE. A module's image base + the first mapped page of its image,
-// read from the target's memory in-band at sample time (CAP-2). `prefix_len` is
-// the valid byte count (0 if the copy failed). The host parses the build-id from
-// `prefix` via the same code that reads it from a file. Carried on the dedicated
-// `module_hints` ringbuf and drained by its own thread, so this capture (and the
-// fd pin it drives) is not stuck behind the sample backlog. `tgid` lets that
-// thread read the owning process's /proc/<tgid>/maps to pin the file.
-struct sismo_module_rec {
-  unsigned int type;        // = SISMO_EVT_MODULE (aliases sismo_hdr.type)
-  unsigned int prefix_len;  // valid bytes in prefix[]
-  unsigned int tgid;        // owning process (for /proc/<tgid>/maps)
-  unsigned int _pad;        // keep `base` 8-byte aligned
-  unsigned long long base;  // module image base avma (== host base_avma)
-  unsigned char prefix[SISMO_MODULE_PREFIX];
 };
 
 // CAP-1 config: the `_PyRuntime` runtime address + the `_Py_DebugOffsets` field

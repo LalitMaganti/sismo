@@ -15,16 +15,19 @@ pub const SISMO_MAX_PY_FRAMES: usize = 16;
 pub const SISMO_KSYM_NAME_MAX: usize = 96;
 pub const SISMO_PY_NAME_MAX: usize = 128;
 pub const SISMO_MAX_COUNTERS: usize = 12;
+pub const SISMO_BUILD_ID_SIZE: usize = 20;
+
+pub const SISMO_STACK_BUILD_ID_EMPTY: i32 = 0;
+pub const SISMO_STACK_BUILD_ID_VALID: i32 = 1;
+pub const SISMO_STACK_BUILD_ID_IP: i32 = 2;
 
 pub const SISMO_EVT_SAMPLE: u32 = 0;
 // tag 1 retired (kernel symbols now ship raw; see sismo_bpf.h)
 pub const SISMO_EVT_OFFCPU: u32 = 2;
 pub const SISMO_EVT_FILE: u32 = 3;
+pub const SISMO_EVT_SAMPLE_UNWIND: u32 = 4;
 pub const SISMO_EVT_PYFRAME: u32 = 5;
-pub const SISMO_EVT_MODULE: u32 = 6;
-
-/// Bytes of a module's mapped-image prefix in `SismoModuleRec` (one page).
-pub const SISMO_MODULE_PREFIX: usize = 4096;
+// tag 6 retired (CAP-2 module image-prefix records)
 
 /// Synthetic base the `[kernel.kallsyms]` mapping is anchored at in the trace.
 /// Kernel frames are stored as `(raw_pc − kbase) + this`, which (1) strips the
@@ -54,7 +57,39 @@ pub struct SismoHdr {
     pub ts: u64,
 }
 
-/// SISMO_EVT_SAMPLE. `stack` holds user PCs leaf-first; `kernel_ids` holds RAW
+/// Exact Rust mirror of Linux UAPI `struct bpf_stack_build_id`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SismoStackBuildId {
+    pub status: i32,
+    pub build_id: [u8; SISMO_BUILD_ID_SIZE],
+    pub offset_or_ip: u64,
+}
+
+/// Typed userspace view of a kernel build-id stack entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UserFrame {
+    RawIp(u64),
+    BuildIdOffset { build_id: [u8; SISMO_BUILD_ID_SIZE], file_offset: u64 },
+}
+
+fn decode_user_frames(entries: &[SismoStackBuildId], count: u32) -> Vec<UserFrame> {
+    entries
+        .iter()
+        .take((count as usize).min(SISMO_MAX_STACK))
+        .filter_map(|entry| match entry.status {
+            SISMO_STACK_BUILD_ID_VALID => Some(UserFrame::BuildIdOffset {
+                build_id: entry.build_id,
+                file_offset: entry.offset_or_ip,
+            }),
+            SISMO_STACK_BUILD_ID_IP => Some(UserFrame::RawIp(entry.offset_or_ip)),
+            SISMO_STACK_BUILD_ID_EMPTY => None,
+            _ => None,
+        })
+        .collect()
+}
+
+/// SISMO_EVT_SAMPLE. `stack` holds typed user entries leaf-first; `kernel_ids` holds RAW
 /// kernel PCs leaf-first — the host rebases them to [kernel.kallsyms] and
 /// symbolizes host-side (the KASLR base is subtracted before anything reaches
 /// the trace). Field name kept for wire-doc continuity.
@@ -63,9 +98,20 @@ pub struct SismoSampleRec {
     pub hdr: SismoHdr,
     pub data_addr: u64,
     pub counters: [u64; SISMO_MAX_COUNTERS],
-    pub stack: [u64; SISMO_MAX_STACK],
+    pub stack: [SismoStackBuildId; SISMO_MAX_STACK],
     pub kernel_ids: [u64; SISMO_MAX_KERNEL_STACK],
     pub py_ids: [u32; SISMO_MAX_PY_FRAMES], // CAP-1: Python frame-name ids, leaf-first
+}
+
+/// SISMO_EVT_SAMPLE_UNWIND. The embedded sample preserves the durable typed
+/// helper chain; `unwind_stack` is the raw chain selected by the in-kernel
+/// lightswitch-format walker.
+#[repr(C)]
+pub struct SismoUnwindRec {
+    pub sample: SismoSampleRec,
+    pub nr_unwind_frames: u32,
+    pub _pad: u32,
+    pub unwind_stack: [u64; SISMO_MAX_STACK],
 }
 
 /// One-time (id -> name) mapping record. Today carries SISMO_EVT_FILE (the
@@ -83,19 +129,6 @@ pub struct SismoPyframeRec {
     pub r#type: u32,
     pub id: u32,
     pub name: [c_char; SISMO_PY_NAME_MAX],
-}
-
-/// SISMO_EVT_MODULE. A module's image base + the first mapped page of its image,
-/// read from the target in-band at sample time (CAP-2); the host parses the
-/// build-id from `prefix`.
-#[repr(C)]
-pub struct SismoModuleRec {
-    pub r#type: u32,
-    pub prefix_len: u32,
-    pub tgid: u32,
-    pub _pad: u32,
-    pub base: u64,
-    pub prefix: [u8; SISMO_MODULE_PREFIX],
 }
 
 /// CAP-1 config pushed into the BPF `py_cfg` map: `_PyRuntime` avma + the
@@ -605,7 +638,22 @@ fn open_sampler(cpu: u32, cfg: &SamplerCfg, tick_prog: *mut BpfProgram) -> Optio
 // ---- InternedData interner -------------------------------------------------
 
 use crate::proto::ProtoWriter;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum MappingKey {
+    Virtual {
+        start: u64,
+        end: u64,
+        offset: u64,
+        base_avma: u64,
+        path: Vec<u8>,
+        build_id: Vec<u8>,
+    },
+    BuildId([u8; SISMO_BUILD_ID_SIZE]),
+    Kernel,
+    Residual(u64),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct FrameKey {
@@ -622,7 +670,7 @@ struct Interner {
     paths: HashMap<Vec<u8>, u64>,
     build_ids: HashMap<Vec<u8>, u64>,
     func_names: HashMap<Vec<u8>, u64>,
-    mappings: HashMap<u64, u64>, // map.start -> iid
+    mappings: HashMap<MappingKey, u64>,
     frames: HashMap<FrameKey, u64>,
     callstacks: HashMap<Vec<u8>, u64>, // frame-id bytes -> iid
     next_path: u64,
@@ -695,12 +743,20 @@ impl Interner {
         build_id: &[u8],
         idw: &mut ProtoWriter,
     ) -> u64 {
-        if let Some(&iid) = self.mappings.get(&start) {
+        let key = MappingKey::Virtual {
+            start,
+            end,
+            offset,
+            base_avma,
+            path: path.to_vec(),
+            build_id: build_id.to_vec(),
+        };
+        if let Some(&iid) = self.mappings.get(&key) {
             return iid;
         }
         let iid = self.next_mapping;
         self.next_mapping += 1;
-        self.mappings.insert(start, iid);
+        self.mappings.insert(key, iid);
         let path_iid = self.intern_path(path, idw);
         let build_id_iid = if !build_id.is_empty() {
             self.intern_build_id(build_id, idw)
@@ -717,6 +773,37 @@ impl Interner {
             mp.write_uint64(6, base_avma);
             mp.write_uint64(8, offset);
             mp.write_uint64(7, path_iid);
+            mp.write_uint32(9, 0); // Mapping::VIRTUAL_ADDRESS
+        });
+        iid
+    }
+
+    /// Process-independent whole-file mapping for durable build-id frames.
+    /// Its frame coordinates are ELF file offsets, not process addresses.
+    fn intern_build_id_mapping(
+        &mut self,
+        build_id: [u8; SISMO_BUILD_ID_SIZE],
+        path: &[u8],
+        idw: &mut ProtoWriter,
+    ) -> u64 {
+        let key = MappingKey::BuildId(build_id);
+        if let Some(&iid) = self.mappings.get(&key) {
+            return iid;
+        }
+        let iid = self.next_mapping;
+        self.next_mapping += 1;
+        self.mappings.insert(key, iid);
+        let path_iid = self.intern_path(path, idw);
+        let build_id_iid = self.intern_build_id(&build_id, idw);
+        idw.message(19, |mp| {
+            mp.write_uint64(1, iid);
+            mp.write_uint64(2, build_id_iid);
+            mp.write_uint64(4, 0);
+            mp.write_uint64(5, 0);
+            mp.write_uint64(6, 0);
+            mp.write_uint64(8, 0);
+            mp.write_uint64(7, path_iid);
+            mp.write_uint32(9, 1); // Mapping::FILE_OFFSET
         });
         iid
     }
@@ -727,12 +814,12 @@ impl Interner {
     /// symbolize pass picks it up like any other module: frames reference it
     /// with rel_pc already rebased (raw_pc − kbase), so load_bias must be 0.
     fn intern_kernel_mapping(&mut self, build_id: &[u8], idw: &mut ProtoWriter) -> u64 {
-        if let Some(&iid) = self.mappings.get(&0) {
+        if let Some(&iid) = self.mappings.get(&MappingKey::Kernel) {
             return iid;
         }
         let iid = self.next_mapping;
         self.next_mapping += 1;
-        self.mappings.insert(0, iid);
+        self.mappings.insert(MappingKey::Kernel, iid);
         let path_iid = self.intern_path(b"[kernel.kallsyms]", idw);
         let build_id_iid = if !build_id.is_empty() {
             self.intern_build_id(build_id, idw)
@@ -748,6 +835,7 @@ impl Interner {
             // the symbolize pass computes rel = rel_pc - load_bias = raw - kbase.
             mp.write_uint64(6, KERNEL_SYNTH_BASE);
             mp.write_uint64(7, path_iid);
+            mp.write_uint32(9, 0);
         });
         iid
     }
@@ -763,7 +851,7 @@ impl Interner {
         // Reuse the mappings map keyed by a sentinel derived from the path iid
         // (path iids are >=1 and never collide with real mapping starts, which
         // are page-aligned user addresses, nor with the kernel sentinel 0).
-        let key = u64::MAX - path_iid;
+        let key = MappingKey::Residual(path_iid);
         if let Some(&iid) = self.mappings.get(&key) {
             return iid;
         }
@@ -773,6 +861,7 @@ impl Interner {
         idw.message(19, |mp| {
             mp.write_uint64(1, iid);
             mp.write_uint64(7, path_iid);
+            mp.write_uint32(9, 0);
         });
         iid
     }
@@ -821,7 +910,7 @@ impl Interner {
 
 use crate::cpu::module_registry::{KeepPolicy, ModuleKey, ModuleRegistry};
 use crate::symbolize::data_regions::DataRegions;
-use crate::symbolize::proc_maps::{build_id_from_image_prefix, ProcMaps, ResidualMap};
+use crate::symbolize::proc_maps::{file_build_id, ProcMaps, ResidualMap};
 use crate::symbolize::python_offsets::PyDebugOffsets;
 use crate::ffi::{sismo_ds_emit, sismo_ds_emit_offcpu};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -836,20 +925,50 @@ const SAMPLE_SCOPE_THREAD: u32 = 2;
 // x86-64 user space tops out at the 47-bit canonical boundary.
 const USER_ADDR_MAX: u64 = 0x0000_7fff_ffff_ffff;
 
+/// Common Perfetto packet shell for both sample streams. Trigger semantics,
+/// metric projection, IID namespaces, and terminal writers remain separate.
+fn build_perf_sample_packet(
+    rec: &SismoSampleRec,
+    callstack_iid: u64,
+    interned_data: &[u8],
+    timebase_count: u64,
+    follower_counts: &[u64],
+    data_address: u64,
+    data_symbol: Option<&[u8]>,
+) -> ProtoWriter {
+    let mut tp = ProtoWriter::new();
+    tp.write_uint64(8, rec.hdr.ts);
+    tp.write_uint32(13, SEQ_NEEDS_INCREMENTAL_STATE);
+    if !interned_data.is_empty() {
+        tp.write_message(12, interned_data);
+    }
+    tp.write_perf_sample(
+        TP_FIELD_PERF_SAMPLE,
+        rec.hdr.cpu,
+        rec.hdr.pid,
+        rec.hdr.tid,
+        callstack_iid,
+        timebase_count,
+        follower_counts,
+        data_address,
+        data_symbol,
+    );
+    tp
+}
+
+fn mapping_was_sampled(
+    observed_build_ids: &HashSet<[u8; SISMO_BUILD_ID_SIZE]>,
+    observed_mappings: &HashSet<ModuleKey>,
+    key: ModuleKey,
+    build_id: Option<[u8; SISMO_BUILD_ID_SIZE]>,
+) -> bool {
+    observed_mappings.contains(&key)
+        || build_id.is_some_and(|id| observed_build_ids.contains(&id))
+}
+
 pub struct Capture {
     obj: *mut BpfObject,
     rb: *mut RingBuffer,
-    // CAP-3(b): the module_hints ringbuf + its dedicated drain thread, so module
-    // build-id capture and fd pinning run promptly, off the sample backlog. The
-    // thread touches ONLY Arc-shared state (`modules`, `module_exit`) — never this
-    // Capture — so it never aliases the main drain's `&mut Capture`. `module_ctx`
-    // owns the boxed Arc the ringbuf callback receives.
-    module_rb: *mut RingBuffer,
-    module_worker: Option<std::thread::JoinHandle<()>>,
-    module_exit: Arc<AtomicBool>,
-    // Boxed so the callback gets a stable *mut Arc<..> for the ringbuf ctx.
-    #[allow(clippy::redundant_allocation)]
-    module_ctx: Option<Box<Arc<Mutex<ModuleRegistry>>>>,
     links: Vec<*mut BpfLink>,
     perf_fds: Vec<i32>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -863,6 +982,17 @@ pub struct Capture {
     residual_map: Option<ResidualMap>,
     maps_tried: bool,
     last_maps_ns: u64,
+    build_id_paths: HashMap<[u8; SISMO_BUILD_ID_SIZE], Vec<u8>>,
+    // Module retention is sample-driven: map scans may catalog every mapping,
+    // but only identities observed in a user stack are eligible for an fd.
+    observed_build_ids: HashSet<[u8; SISMO_BUILD_ID_SIZE]>,
+    pending_build_ids: HashSet<[u8; SISMO_BUILD_ID_SIZE]>,
+    observed_mappings: HashSet<ModuleKey>,
+    mapping_retry_ns: HashMap<ModuleKey, u64>,
+    // Exact IDs read through map_files (or an inode-verified pathname), keyed
+    // by the mapping identity. Never normalize a raw PC using a mutable path's
+    // unverified ID from the initial /proc/maps parse.
+    mapping_build_ids: HashMap<ModuleKey, Vec<u8>>,
     interner: Interner,
     // The off-CPU stream is a second perf sequence with its own timebase, so it
     // interns into its own iid space.
@@ -879,11 +1009,7 @@ pub struct Capture {
     py_names: HashMap<u32, Vec<u8>>,   // CAP-1: id -> Python qualname
     py_cfg_fd: c_int,                  // CAP-1: fd of the py_cfg BPF map (-1 if absent)
     python_bpf: bool,                  // CAP-1: in-BPF walk armed (py_cfg pushed)
-    // CAP-3(b): the module files this recording sampled — build-ids + held fds.
-    // Shared between the capture thread (fills it from module_hints) and the main
-    // drain (reads a module's build-id when interning its mapping). Arc<Mutex>, so
-    // the capture thread holds its own handle without touching this Capture. Handed
-    // out by `shutdown` so its fds outlive the capture until symbolization runs.
+    // Userspace-only catalog of sampled module identities and retained exact inodes.
     modules: Arc<Mutex<ModuleRegistry>>,
     counters: Vec<Counter>,
     active_slots: Vec<u8>, // indices into `counters`; [0] is the timebase
@@ -921,26 +1047,178 @@ pub struct Capture {
 }
 
 impl Capture {
-    fn ensure_maps(&mut self, now_ns: u64) {
-        if self.maps_tried {
+    fn mapping_key(
+        &self,
+        base: u64,
+        dev_major: u32,
+        dev_minor: u32,
+        ino: u64,
+    ) -> ModuleKey {
+        ModuleKey::Mapping {
+            pid: self.target_pid,
+            base,
+            dev_major,
+            dev_minor,
+            ino,
+        }
+    }
+
+    /// Open the exact mapped inode, preferring map_files and accepting the
+    /// display path only while it still has the device/inode reported by maps.
+    /// The returned build ID is read through this same fd.
+    fn open_exact_mapping(
+        &self,
+        start: u64,
+        end: u64,
+        dev_major: u32,
+        dev_minor: u32,
+        ino: u64,
+        path: &str,
+    ) -> Option<(std::fs::File, Vec<u8>)> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let map_file = format!(
+            "/proc/{}/map_files/{:x}-{:x}",
+            self.target_pid, start, end
+        );
+        for candidate in [map_file.as_str(), path] {
+            let Ok(file) = std::fs::File::open(candidate) else { continue };
+            let Ok(meta) = file.metadata() else { continue };
+            if libc::major(meta.dev()) as u32 != dev_major
+                || libc::minor(meta.dev()) as u32 != dev_minor
+                || meta.ino() != ino
+            {
+                continue;
+            }
+            let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+            let build_id = file_build_id(&fd_path).unwrap_or_default();
+            return Some((file, build_id));
+        }
+        None
+    }
+
+    /// Install an on-demand map snapshot. Every mapping is cataloged for raw-PC
+    /// lookup and unwinding, but only identities already observed in a sample
+    /// are allowed to reach ModuleRegistry and retain an fd.
+    fn install_maps(&mut self, maps: ProcMaps) {
+        let entries: Vec<_> = maps
+            .mappings()
+            .iter()
+            .map(|m| {
+                (
+                    m.start,
+                    m.end,
+                    m.base_avma,
+                    m.dev_major,
+                    m.dev_minor,
+                    m.inode,
+                    m.path.clone(),
+                )
+            })
+            .collect();
+
+        // Preserve unresolved sampled IDs across snapshots where their module
+        // is temporarily absent; seeing the module again can then retry.
+        let mut pending_build_ids = self.pending_build_ids.clone();
+        for (start, end, base, dev_major, dev_minor, ino, path) in entries {
+            let key = self.mapping_key(base, dev_major, dev_minor, ino);
+            let key_sampled = self.observed_mappings.contains(&key);
+            let mut exact = None;
+            let build_id = if let Some(id) = self.mapping_build_ids.get(&key) {
+                id.clone()
+            } else if !self.observed_build_ids.is_empty() || key_sampled {
+                // A valid build-ID frame has no raw VMA, so its first reverse
+                // lookup must inspect candidate mappings. Cache exact results;
+                // later scans inspect only newly loaded/replaced identities.
+                exact = self.open_exact_mapping(
+                    start,
+                    end,
+                    dev_major,
+                    dev_minor,
+                    ino,
+                    &path,
+                );
+                let id = exact
+                    .as_ref()
+                    .map(|(_, id)| id.clone())
+                    .unwrap_or_default();
+                if exact.is_some() {
+                    // Empty is a successful inspection of an id-less inode,
+                    // distinct from a failed open (which remains uncached).
+                    self.mapping_build_ids.insert(key, id.clone());
+                }
+                id
+            } else {
+                // A raw-IP-driven scan needs only layout. Defer ELF identity
+                // I/O until its containing mapping is selected below.
+                Vec::new()
+            };
+
+            let mut id20 = None;
+            if build_id.len() == SISMO_BUILD_ID_SIZE {
+                let mut id = [0; SISMO_BUILD_ID_SIZE];
+                id.copy_from_slice(&build_id);
+                self.build_id_paths
+                    .entry(id)
+                    .or_insert_with(|| path.as_bytes().to_vec());
+                id20 = Some(id);
+            }
+
+            let sampled = mapping_was_sampled(
+                &self.observed_build_ids,
+                &self.observed_mappings,
+                key,
+                id20,
+            );
+            if !sampled {
+                continue;
+            }
+
+            let mut modules = self.modules.lock().unwrap();
+            let needs_registration = modules.needs_exact_retry(key, &build_id, &path);
+            if needs_registration {
+                // A cached identity may have come from an earlier catalog scan;
+                // open this sampled mapping now so the same fd can transfer.
+                if exact.is_none() {
+                    exact = self.open_exact_mapping(
+                        start,
+                        end,
+                        dev_major,
+                        dev_minor,
+                        ino,
+                        &path,
+                    );
+                }
+                if let Some((file, exact_id)) = exact {
+                    modules.register_exact_file(key, &exact_id, &path, file);
+                } else {
+                    // Retains nothing unless the pathname can now be reopened
+                    // and independently passes the same identity checks.
+                    modules.register_exact(key, &build_id, &path, &path);
+                }
+            }
+            if let Some(id) = id20 {
+                if modules.needs_exact_retry(key, &build_id, &path) {
+                    pending_build_ids.insert(id);
+                } else {
+                    pending_build_ids.remove(&id);
+                }
+            }
+        }
+        self.pending_build_ids = pending_build_ids;
+        self.maps = Some(maps);
+    }
+
+    fn refresh_maps(&mut self, now_ns: u64, force: bool) {
+        if !force && now_ns.wrapping_sub(self.last_maps_ns) < 1_000_000_000 {
             return;
         }
         self.maps_tried = true;
-        self.maps = ProcMaps::parse(self.target_pid);
-        self.residual_map = ResidualMap::parse(self.target_pid);
         self.last_maps_ns = now_ns;
-        self.load_unwind_tables();
-    }
-
-    fn reparse_maps(&mut self, now_ns: u64) {
-        if now_ns.wrapping_sub(self.last_maps_ns) < 1_000_000_000 {
-            return;
+        if let Some(fresh) = ProcMaps::parse_layout(self.target_pid) {
+            self.install_maps(fresh);
         }
-        self.last_maps_ns = now_ns;
-        if let Some(fresh) = ProcMaps::parse(self.target_pid) {
-            self.maps = Some(fresh);
-        }
-        // JIT code is mmap'd late and churns, so refresh the residual view too.
         if let Some(fresh) = ResidualMap::parse(self.target_pid) {
             self.residual_map = Some(fresh);
         }
@@ -955,6 +1233,105 @@ impl Capture {
         if let Some(loader) = &self.unwind_loader {
             loader.ping();
         }
+    }
+
+    fn ensure_maps(&mut self, now_ns: u64) {
+        if !self.maps_tried {
+            self.refresh_maps(now_ns, true);
+        }
+    }
+
+    fn reparse_maps(&mut self, now_ns: u64) {
+        self.refresh_maps(now_ns, false);
+    }
+
+    /// Mark all durable identities in one sample before any frame is interned.
+    /// Multiple new IDs cause one process map scan, not one scan per frame.
+    fn observe_build_ids(&mut self, frames: &[UserFrame], now_ns: u64) {
+        let mut newly_observed = false;
+        let mut unresolved = false;
+        for frame in frames {
+            if let UserFrame::BuildIdOffset { build_id, .. } = frame {
+                newly_observed |= self.observed_build_ids.insert(*build_id);
+                unresolved |= !self.build_id_paths.contains_key(build_id)
+                    || self.pending_build_ids.contains(build_id);
+            }
+        }
+        if newly_observed {
+            self.refresh_maps(now_ns, true);
+        } else if unresolved {
+            // A failed first lookup remains retryable, but only while another
+            // sample demonstrates demand and only at the ordinary cooldown.
+            self.refresh_maps(now_ns, false);
+        }
+    }
+
+    fn path_for_build_id(&self, build_id: [u8; SISMO_BUILD_ID_SIZE]) -> Vec<u8> {
+        self.build_id_paths.get(&build_id).cloned().unwrap_or_else(|| {
+            let mut path = String::from("[buildid:");
+            for b in build_id {
+                use std::fmt::Write as _;
+                let _ = write!(path, "{b:02x}");
+            }
+            path.push(']');
+            path.into_bytes()
+        })
+    }
+
+    /// Mark one raw-PC mapping as sampled and immediately attempt exact-inode
+    /// registration. Returns the ID read through that exact inode, if any.
+    #[allow(clippy::too_many_arguments)]
+    fn observe_mapping(
+        &mut self,
+        start: u64,
+        end: u64,
+        base: u64,
+        dev_major: u32,
+        dev_minor: u32,
+        ino: u64,
+        path: &str,
+        now_ns: u64,
+    ) -> Vec<u8> {
+        let key = self.mapping_key(base, dev_major, dev_minor, ino);
+        let first = self.observed_mappings.insert(key);
+        let cached_id = self.mapping_build_ids.get(&key).cloned().unwrap_or_default();
+        if !first {
+            let retry = self
+                .modules
+                .lock()
+                .unwrap()
+                .needs_exact_retry(key, &cached_id, path);
+            let last = self.mapping_retry_ns.get(&key).copied().unwrap_or(0);
+            if !retry || now_ns.wrapping_sub(last) < 1_000_000_000 {
+                return cached_id;
+            }
+        }
+        self.mapping_retry_ns.insert(key, now_ns);
+
+        let exact = self.open_exact_mapping(start, end, dev_major, dev_minor, ino, path);
+        let build_id = exact
+            .as_ref()
+            .map(|(_, id)| id.clone())
+            .unwrap_or_default();
+        if exact.is_some() {
+            self.mapping_build_ids.insert(key, build_id.clone());
+        }
+        if build_id.len() == SISMO_BUILD_ID_SIZE {
+            let mut id = [0; SISMO_BUILD_ID_SIZE];
+            id.copy_from_slice(&build_id);
+            self.observed_build_ids.insert(id);
+            self.build_id_paths
+                .entry(id)
+                .or_insert_with(|| path.as_bytes().to_vec());
+        }
+
+        let mut modules = self.modules.lock().unwrap();
+        if let Some((file, _)) = exact {
+            modules.register_exact_file(key, &build_id, path, file);
+        } else {
+            modules.register_exact(key, &build_id, path, path);
+        }
+        build_id
     }
 
     /// Resolve a data address to its memory-region label (owned copy).
@@ -984,125 +1361,153 @@ impl Capture {
         b"[unmapped]".to_vec()
     }
 
-    /// Intern a sample's callstack, returning the callstack iid (0 if empty).
-    /// `user_pcs` are the leaf-first user PCs from `rec.stack`; kernel frames
-    /// come from `rec.kernel_ids`.
+    /// Intern typed user frames leaf-first, normalize every live file-backed
+    /// raw PC to a build-id/file-offset coordinate, then append kernel frames.
     fn intern_callstack(
         &mut self,
-        user_pcs: &[u64],
+        user_frames: &[UserFrame],
         rec: &SismoSampleRec,
         idw: &mut ProtoWriter,
     ) -> u64 {
         let mut combined: Vec<u64> = Vec::new();
+        self.observe_build_ids(user_frames, rec.hdr.ts);
+        if user_frames.iter().any(|frame| matches!(frame, UserFrame::RawIp(_))) {
+            self.ensure_maps(rec.hdr.ts);
+        }
+        let mut fids: Vec<u64> = Vec::new();
 
-        self.ensure_maps(rec.hdr.ts);
-        if self.maps.is_some() {
-            let mut fids: Vec<u64> = Vec::new();
-
-            // PY-1: splice in the live-recovered Python call chain, leaf
-            // first, ahead of the native frames below — reversed together
-            // with them, this lands Python as the leaf-most frames (CPython
-            // 3.11+ runs the bytecode loop without one native frame per
-            // Python call, so the FP walk alone never sees these).
-            if self.residual_map.as_ref().and_then(|r| r.runtime()) == Some("python") {
-                // Arm the in-BPF walk on first sight (idempotent); pushes py_cfg.
-                self.ensure_python_runtime();
-                // CAP-1: in BPF mode use the frame ids the in-BPF walk attached
-                // to this exact sample — no host `/proc/<pid>/mem` walk at all,
-                // so nothing is stale and no per-sample memory read happens. A
-                // handful of samples captured before py_cfg was armed carry no
-                // ids and simply show no Python frames. Only SISMO_PYSTACK_BPF=0
-                // takes the legacy host walk.
-                let py_frames: Vec<Vec<u8>> = if self.python_bpf {
-                    let n = (rec.hdr.nr_py_frames as usize).min(SISMO_MAX_PY_FRAMES);
-                    rec.py_ids[..n]
-                        .iter()
-                        .filter_map(|id| self.py_names.get(id).cloned())
-                        .collect()
-                } else {
-                    self.python_frames().into_iter().map(String::into_bytes).collect()
-                };
-                if !py_frames.is_empty() {
-                    let mapping_iid = self.interner.intern_residual_mapping(b"[python]", idw);
-                    for name in &py_frames {
-                        let name_iid = self.interner.intern_func_name(name, idw);
-                        let frame_iid = self.interner.intern_frame(
-                            FrameKey { mapping_iid, rel_pc: 0, name_iid },
-                            idw,
-                        );
-                        fids.push(frame_iid);
-                    }
+        if self.residual_map.as_ref().and_then(|r| r.runtime()) == Some("python") {
+            self.ensure_python_runtime();
+            let py_frames: Vec<Vec<u8>> = if self.python_bpf {
+                let n = (rec.hdr.nr_py_frames as usize).min(SISMO_MAX_PY_FRAMES);
+                rec.py_ids[..n]
+                    .iter()
+                    .filter_map(|id| self.py_names.get(id).cloned())
+                    .collect()
+            } else {
+                self.python_frames().into_iter().map(String::into_bytes).collect()
+            };
+            if !py_frames.is_empty() {
+                let mapping_iid = self.interner.intern_residual_mapping(b"[python]", idw);
+                for name in &py_frames {
+                    let name_iid = self.interner.intern_func_name(name, idw);
+                    fids.push(self.interner.intern_frame(
+                        FrameKey { mapping_iid, rel_pc: 0, name_iid },
+                        idw,
+                    ));
                 }
             }
+        }
 
-            let mut reparsed = false;
-            for &pc in user_pcs {
-                if pc == 0 {
-                    continue;
-                }
-                // First lookup; on a miss, reparse once (the binary may have
-                // dlopen'd since) and retry. The reparse needs `&mut self.maps`,
-                // so this probe must not hold a borrow of it.
-                if self.maps.as_ref().and_then(|m| m.find(pc)).is_none() && !reparsed {
-                    reparsed = true;
-                    self.reparse_maps(rec.hdr.ts);
-                }
-                let Some(m) = self.maps.as_ref().and_then(|mp| mp.find(pc)) else {
-                    // Residual PC: no file-backed mapping. In a process running a
-                    // recognized JIT runtime, label and record it (a JIT method in
-                    // an anon exec page, etc.) instead of dropping it; a native
-                    // process has no runtime, so this is a no-op and its capture
-                    // is unchanged.
-                    let label = self.residual_map.as_ref().and_then(|r| r.residual_label(pc));
-                    if let Some(label) = label {
-                        // JIT-1: if the runtime published a symbol map (node
-                        // --perf-basic-prof et al.), name the method instead of
-                        // recording a bare [jit:*] placeholder.
-                        let name = self.jit_name(pc);
-                        let mapping_iid =
-                            self.interner.intern_residual_mapping(label.as_bytes(), idw);
-                        let name_iid = match &name {
-                            Some(n) => self.interner.intern_func_name(n.as_bytes(), idw),
-                            None => 0,
-                        };
-                        let frame_iid = self.interner.intern_frame(
-                            FrameKey { mapping_iid, rel_pc: pc, name_iid },
-                            idw,
-                        );
-                        fids.push(frame_iid);
-                    }
-                    continue;
-                };
-                // CAP-3(b): the module's trace build-id comes from the shared
-                // registry. Under load the capture thread has already settled it
-                // in-band (replace-immune); if not, our /proc read (`m.build_id`,
-                // or empty → a synthetic id) settles it, and both threads then
-                // agree. `m.build_id` here is correct because a light-enough load
-                // to beat the capture thread also means we intern early, before any
-                // mid-run change.
-                let build_id = self
-                    .modules
-                    .lock()
-                    .unwrap()
-                    .id_for(ModuleKey::Mapping { pid: rec.hdr.pid, base: m.base_avma }, &m.build_id);
-                let mapping_iid = self.interner.intern_mapping(
+        let mut reparsed = false;
+        for &frame in user_frames {
+            if let UserFrame::BuildIdOffset { build_id, file_offset } = frame {
+                let path = self.path_for_build_id(build_id);
+                let mapping_iid =
+                    self.interner.intern_build_id_mapping(build_id, &path, idw);
+                fids.push(self.interner.intern_frame(
+                    FrameKey { mapping_iid, rel_pc: file_offset, name_iid: 0 },
+                    idw,
+                ));
+                continue;
+            }
+
+            let UserFrame::RawIp(pc) = frame else { unreachable!() };
+            if pc == 0 {
+                continue;
+            }
+            if self.maps.as_ref().and_then(|m| m.find(pc)).is_none() && !reparsed {
+                reparsed = true;
+                self.reparse_maps(rec.hdr.ts);
+            }
+            let mapped = self.maps.as_ref().and_then(|mp| mp.find(pc)).map(|m| {
+                (
                     m.start,
                     m.end,
                     m.offset,
                     m.base_avma,
-                    m.path.as_bytes(),
-                    &build_id,
-                    idw,
-                );
-                let frame_iid = self.interner.intern_frame(
-                    FrameKey { mapping_iid, rel_pc: pc, name_iid: 0 },
-                    idw,
-                );
-                fids.push(frame_iid);
+                    m.dev_major,
+                    m.dev_minor,
+                    m.inode,
+                    m.path.clone(),
+                )
+            });
+            let Some((start, end, offset, base_avma, dev_major, dev_minor, ino, path)) = mapped else {
+                let label = self.residual_map.as_ref().and_then(|r| r.residual_label(pc));
+                if let Some(label) = label {
+                    let name = self.jit_name(pc);
+                    let mapping_iid =
+                        self.interner.intern_residual_mapping(label.as_bytes(), idw);
+                    let name_iid = name
+                        .as_ref()
+                        .map(|n| self.interner.intern_func_name(n.as_bytes(), idw))
+                        .unwrap_or(0);
+                    fids.push(self.interner.intern_frame(
+                        FrameKey { mapping_iid, rel_pc: pc, name_iid },
+                        idw,
+                    ));
+                }
+                continue;
+            };
+
+            let local_id = self.observe_mapping(
+                start,
+                end,
+                base_avma,
+                dev_major,
+                dev_minor,
+                ino,
+                &path,
+                rec.hdr.ts,
+            );
+            if local_id.len() == SISMO_BUILD_ID_SIZE {
+                let mut build_id = [0; SISMO_BUILD_ID_SIZE];
+                build_id.copy_from_slice(&local_id);
+                self.build_id_paths
+                    .entry(build_id)
+                    .or_insert_with(|| path.as_bytes().to_vec());
+                if let Some(file_offset) = pc.checked_sub(start).and_then(|d| offset.checked_add(d)) {
+                    let mapping_iid = self.interner.intern_build_id_mapping(
+                        build_id,
+                        path.as_bytes(),
+                        idw,
+                    );
+                    fids.push(self.interner.intern_frame(
+                        FrameKey { mapping_iid, rel_pc: file_offset, name_iid: 0 },
+                        idw,
+                    ));
+                    continue;
+                }
             }
-            fids.reverse();
-            combined.extend_from_slice(&fids);
+
+            // Id-less/nonstandard-ID files retain the existing virtual-address
+            // path and recording-local synthetic identity.
+            let build_id = self.modules.lock().unwrap().id_for(
+                ModuleKey::Mapping {
+                    pid: rec.hdr.pid,
+                    base: base_avma,
+                    dev_major,
+                    dev_minor,
+                    ino,
+                },
+                &local_id,
+            );
+            let mapping_iid = self.interner.intern_mapping(
+                start,
+                end,
+                offset,
+                base_avma,
+                path.as_bytes(),
+                &build_id,
+                idw,
+            );
+            fids.push(self.interner.intern_frame(
+                FrameKey { mapping_iid, rel_pc: pc, name_iid: 0 },
+                idw,
+            ));
         }
+        fids.reverse();
+        combined.extend_from_slice(&fids);
 
         let knr = (rec.hdr.nr_kernel_frames as usize).min(SISMO_MAX_KERNEL_STACK);
         if knr > 0 {
@@ -1163,9 +1568,9 @@ impl Capture {
         unsafe { sismo_ds_emit(self.ds_slot, w.bytes().as_ptr(), w.bytes().len()) };
     }
 
-    fn emit_sample(&mut self, rec: &SismoSampleRec, user_pcs: &[u64]) {
+    fn emit_oncpu_sample(&mut self, rec: &SismoSampleRec, user_frames: &[UserFrame]) {
         let mut idw = ProtoWriter::new();
-        let cs_iid = self.intern_callstack(user_pcs, rec, &mut idw);
+        let cs_iid = self.intern_callstack(user_frames, rec, &mut idw);
 
         // Project the cumulative counters onto the active set.
         let mut follower_buf = [0u64; SISMO_MAX_COUNTERS];
@@ -1188,19 +1593,10 @@ impl Capture {
             self.data_frames += 1;
         }
 
-        // TracePacket { timestamp, sequence_flags, interned_data?, perf_sample }.
-        let mut tp = ProtoWriter::new();
-        tp.write_uint64(8, rec.hdr.ts);
-        tp.write_uint32(13, SEQ_NEEDS_INCREMENTAL_STATE);
-        if !idw.bytes().is_empty() {
-            tp.write_message(12, idw.bytes());
-        }
-        tp.write_perf_sample(
-            TP_FIELD_PERF_SAMPLE,
-            rec.hdr.cpu,
-            rec.hdr.pid,
-            rec.hdr.tid,
+        let tp = build_perf_sample_packet(
+            rec,
             cs_iid,
+            idw.bytes(),
             timebase_count,
             &follower_buf[..nf],
             data_address,
@@ -1224,6 +1620,20 @@ impl Capture {
         unsafe { sismo_ds_emit_offcpu(self.ds_slot, w.bytes().as_ptr(), w.bytes().len()) };
     }
 
+    fn intern_offcpu_callstack(
+        &mut self,
+        rec: &SismoSampleRec,
+        user_frames: &[UserFrame],
+        idw: &mut ProtoWriter,
+    ) -> u64 {
+        // Perfetto interning IDs are sequence-local. Temporarily install the
+        // auxiliary sequence's namespace around the common stack pipeline.
+        std::mem::swap(&mut self.interner, &mut self.offcpu_interner);
+        let iid = self.intern_callstack(user_frames, rec, idw);
+        std::mem::swap(&mut self.interner, &mut self.offcpu_interner);
+        iid
+    }
+
     // Emit an off-CPU sample: the blocking stack, weighted by the off-CPU
     // duration (rec.data_addr) as the timebase count, on the off-CPU sequence.
     // Interning goes into that sequence's own iid space (swap the active
@@ -1234,19 +1644,10 @@ impl Capture {
             self.emit_offcpu_defaults();
         }
 
-        std::mem::swap(&mut self.interner, &mut self.offcpu_interner);
         let mut idw = ProtoWriter::new();
-        let nr = (rec.hdr.nr_frames as usize).min(SISMO_MAX_STACK);
-        let user_pcs: Vec<u64> = rec.stack[..nr].to_vec();
-        let cs_iid = self.intern_callstack(&user_pcs, rec, &mut idw);
-        std::mem::swap(&mut self.interner, &mut self.offcpu_interner);
+        let user_frames = decode_user_frames(&rec.stack, rec.hdr.nr_frames);
+        let cs_iid = self.intern_offcpu_callstack(rec, &user_frames, &mut idw);
 
-        let mut tp = ProtoWriter::new();
-        tp.write_uint64(8, rec.hdr.ts);
-        tp.write_uint32(13, SEQ_NEEDS_INCREMENTAL_STATE);
-        if !idw.bytes().is_empty() {
-            tp.write_message(12, idw.bytes());
-        }
         // For a disk block, slot 0 is a bit-62-tagged file id: resolve it to the
         // file name and ship it as data_symbol (the queryable label), like the
         // cache focus does for a memory region.
@@ -1257,23 +1658,21 @@ impl Capture {
         } else {
             None
         };
-        tp.write_perf_sample(
-            TP_FIELD_PERF_SAMPLE,
-            rec.hdr.cpu,
-            rec.hdr.pid,
-            rec.hdr.tid,
+        let tp = build_perf_sample_packet(
+            rec,
             cs_iid,
+            idw.bytes(),
             rec.data_addr, // timebase_count = off-CPU duration (ns) = the weight
             &[],
-            block_id,     // data_address = block identity (futex uaddr / peer / file id)
-            data_symbol,  // set only for disk blocks (the file name)
+            block_id,    // data_address = block identity (futex uaddr / peer / file id)
+            data_symbol, // set only for disk blocks (the file name)
         );
         unsafe { sismo_ds_emit_offcpu(self.ds_slot, tp.bytes().as_ptr(), tp.bytes().len()) };
     }
 
     /// Counter/run bookkeeping every sample needs, then whether a session is
     /// active (and defaults emitted) so the caller should emit the sample.
-    fn begin_sample(&mut self, rec: &SismoSampleRec) -> bool {
+    fn begin_oncpu_sample(&mut self, rec: &SismoSampleRec) -> bool {
         self.samples += 1;
         self.acc.insert(rec.hdr.tid, rec.counters[0]);
         if !self.active.load(Ordering::Acquire) {
@@ -1286,14 +1685,40 @@ impl Capture {
         true
     }
 
-    /// A plain SISMO_EVT_SAMPLE: emit its frame-pointer-walked stack.
+    /// A plain SISMO_EVT_SAMPLE: emit its typed kernel-helper stack.
     fn process_sample(&mut self, rec: &SismoSampleRec) {
-        if !self.begin_sample(rec) {
+        if !self.begin_oncpu_sample(rec) {
             return;
         }
-        let nr = (rec.hdr.nr_frames as usize).min(SISMO_MAX_STACK);
-        let user_pcs: Vec<u64> = rec.stack[..nr].to_vec();
-        self.emit_sample(rec, &user_pcs);
+        let user_frames = decode_user_frames(&rec.stack, rec.hdr.nr_frames);
+        self.emit_oncpu_sample(rec, &user_frames);
+    }
+
+    /// A SISMO_EVT_SAMPLE_UNWIND: the in-kernel walker already chose this raw
+    /// chain using its completed/partial authority rules. Observe the embedded
+    /// durable helper identities for retention, then normalize and emit the raw
+    /// selected PCs through the common callstack path.
+    fn process_unwind_sample(&mut self, urec: &SismoUnwindRec) {
+        if !self.begin_oncpu_sample(&urec.sample) {
+            return;
+        }
+        let fallback = decode_user_frames(
+            &urec.sample.stack,
+            urec.sample.hdr.nr_frames,
+        );
+        self.observe_build_ids(&fallback, urec.sample.hdr.ts);
+        let n = (urec.nr_unwind_frames as usize).min(SISMO_MAX_STACK);
+        let user_frames: Vec<UserFrame> = urec.unwind_stack[..n]
+            .iter()
+            .copied()
+            .filter(|pc| *pc != 0)
+            .map(UserFrame::RawIp)
+            .collect();
+        if user_frames.is_empty() {
+            self.emit_oncpu_sample(&urec.sample, &fallback);
+        } else {
+            self.emit_oncpu_sample(&urec.sample, &user_frames);
+        }
     }
 
     /// JIT-1: the runtime method name for an anon-exec PC from the target's
@@ -1409,7 +1834,6 @@ impl Capture {
             self.handle_pyframe(rec);
             return;
         }
-        // SISMO_EVT_MODULE rides the module_hints ringbuf, not this one.
         if hdr.r#type == SISMO_EVT_OFFCPU {
             // The blocking stack + off-CPU duration (in data_addr). Emitted onto
             // the off-CPU sequence — same data source, own timebase.
@@ -1419,6 +1843,11 @@ impl Capture {
             if self.active.load(Ordering::Acquire) {
                 self.emit_offcpu_sample(rec);
             }
+            return;
+        }
+        if hdr.r#type == SISMO_EVT_SAMPLE_UNWIND {
+            let rec = unsafe { &*(hdr as *const SismoHdr as *const SismoUnwindRec) };
+            self.process_unwind_sample(rec);
             return;
         }
         if hdr.r#type != SISMO_EVT_SAMPLE {
@@ -1480,11 +1909,6 @@ pub struct LinuxBpfStats {
 struct SendPtr(*mut Capture);
 unsafe impl Send for SendPtr {}
 
-// A module-hints ringbuf pointer smuggled into the capture thread. The ringbuf is
-// alive for the thread's lifetime (freed in shutdown after the join).
-struct SendRb(*mut RingBuffer);
-unsafe impl Send for SendRb {}
-
 extern "C" fn on_setup(_user: *mut c_void, _cfg: *const c_void, _cfg_len: usize) {}
 
 extern "C" fn on_start(user: *mut c_void) {
@@ -1510,47 +1934,27 @@ extern "C" fn on_flush(user: *mut c_void, flusher: *mut c_void) {
     }
 }
 
-// CAP-3(b): resolve a module-hint record's file and hand it to the shared
-// registry (build-id parsed from the in-band page; fd pinned per policy).
-// `registry` is the capture thread's own Arc handle — this touches no `Capture`.
-fn capture_module_record(registry: &Mutex<ModuleRegistry>, rec: &SismoModuleRec) {
-    let n = (rec.prefix_len as usize).min(SISMO_MODULE_PREFIX);
-    let page = &rec.prefix[..n];
-    // The path and on-disk build-id of the file the module's base is mapped
-    // from (both empty if the file is already gone).
-    let (path, file_id) = ProcMaps::parse(rec.tgid)
-        .and_then(|m| {
-            m.find(rec.base)
-                .filter(|mp| mp.base_avma == rec.base)
-                .map(|mp| (mp.path.clone(), mp.build_id.clone()))
-        })
-        .unwrap_or_default();
-    // The in-band page wins (replace-immune, works for deleted files). The
-    // on-disk id fills in when the mapped image's first page carries no GNU
-    // note — notably Go ≥1.26, whose PT_NOTE covers only the Go buildid; the
-    // file read also walks section headers, which the memory image lacks.
-    let hint = build_id_from_image_prefix(page)
-        .unwrap_or(file_id);
-    let key = ModuleKey::Mapping { pid: rec.tgid, base: rec.base };
-    registry.lock().unwrap().register(key, &hint, &path);
-}
-
-// The ctx is a boxed `Arc<Mutex<ModuleRegistry>>` (see capture_init); the capture
-// thread reaches nothing else, so it never aliases the main drain's `&mut Capture`.
-unsafe extern "C" fn on_module_event(ctx: *mut c_void, data: *mut c_void, _size: usize) -> c_int {
-    let registry = &*(ctx as *const Arc<Mutex<ModuleRegistry>>);
-    let hdr = &*(data as *const SismoHdr);
-    if hdr.r#type == SISMO_EVT_MODULE {
-        let rec = &*(data as *const SismoModuleRec);
-        capture_module_record(registry, rec);
+unsafe extern "C" fn on_event(
+    ctx: *mut c_void,
+    data: *mut c_void,
+    size: usize,
+) -> c_int {
+    if ctx.is_null() || data.is_null() || size < std::mem::size_of::<u32>() {
+        return 0;
     }
-    0
-}
-
-unsafe extern "C" fn on_event(ctx: *mut c_void, data: *mut c_void, _size: usize) -> c_int {
-    let c = &mut *(ctx as *mut Capture);
-    let hdr = &*(data as *const SismoHdr);
-    c.handle(hdr);
+    let event_type = std::ptr::read_unaligned(data.cast::<u32>());
+    let expected = match event_type {
+        SISMO_EVT_FILE => std::mem::size_of::<SismoKsymRec>(),
+        SISMO_EVT_PYFRAME => std::mem::size_of::<SismoPyframeRec>(),
+        SISMO_EVT_SAMPLE | SISMO_EVT_OFFCPU => std::mem::size_of::<SismoSampleRec>(),
+        SISMO_EVT_SAMPLE_UNWIND => std::mem::size_of::<SismoUnwindRec>(),
+        _ => return 0,
+    };
+    if size < expected {
+        return 0;
+    }
+    let c = &mut *ctx.cast::<Capture>();
+    c.handle(&*data.cast::<SismoHdr>());
     0
 }
 
@@ -1659,10 +2063,6 @@ fn capture_init(
     let cap = Box::into_raw(Box::new(Capture {
         obj: ptr::null_mut(),
         rb: ptr::null_mut(),
-        module_rb: ptr::null_mut(),
-        module_worker: None,
-        module_exit: Arc::new(AtomicBool::new(false)),
-        module_ctx: None,
         links: Vec::new(),
         perf_fds: Vec::new(),
         worker: None,
@@ -1674,6 +2074,12 @@ fn capture_init(
         residual_map: None,
         maps_tried: false,
         last_maps_ns: 0,
+        build_id_paths: HashMap::new(),
+        observed_build_ids: HashSet::new(),
+        pending_build_ids: HashSet::new(),
+        observed_mappings: HashSet::new(),
+        mapping_retry_ns: HashMap::new(),
+        mapping_build_ids: HashMap::new(),
         interner: Interner::new(),
         offcpu_interner: Interner::new(),
         kbase: sismo_symbolize::kallsyms::kernel_text_base(),
@@ -1967,33 +2373,6 @@ fn capture_init(
         worker_entry(send.0)
     }));
 
-    // CAP-3(b): the module_hints ringbuf + its dedicated drain thread. The thread
-    // and the ringbuf callback share only `c.modules` (via an Arc handle) and
-    // `c.module_exit` — never the Capture — so nothing aliases the main worker's
-    // `&mut Capture`. Best-effort: if the map/ringbuf is unavailable, module
-    // capture degrades to the main drain's /proc read (no prompt fd pin).
-    c.module_ctx = Some(Box::new(Arc::clone(&c.modules)));
-    let mctx = c.module_ctx.as_ref().unwrap().as_ref() as *const Arc<Mutex<ModuleRegistry>>;
-    c.module_rb = map_fd(obj, c"module_hints")
-        .map(|fd| unsafe { ring_buffer__new(fd, on_module_event, mctx as *mut c_void, ptr::null()) })
-        .unwrap_or(ptr::null_mut());
-    if !c.module_rb.is_null() {
-        let rb = SendRb(c.module_rb);
-        let exit = Arc::clone(&c.module_exit);
-        c.module_worker = Some(std::thread::spawn(move || {
-            let rb = rb;
-            // Module records submit with adaptive wakeup (one per distinct
-            // module — promptness matters, volume can't storm), so poll
-            // wakes per record; the consume covers a wakeup lost to races.
-            while !exit.load(Ordering::Acquire) {
-                unsafe { ring_buffer__poll(rb.0, 20) };
-                unsafe { ring_buffer__consume(rb.0) };
-            }
-            unsafe { ring_buffer__consume(rb.0) };
-        }));
-    } else {
-        eprintln!("sismo record: module_hints ringbuf unavailable — deleted-binary capture degraded");
-    }
     cap
 }
 
@@ -2028,11 +2407,7 @@ impl Capture {
     pub fn shutdown(mut self: Box<Self>) -> (LinuxBpfStats, Arc<Mutex<ModuleRegistry>>) {
         tracing::info!("bpf: shutdown begin");
         self.exit_requested.store(true, Ordering::Release);
-        self.module_exit.store(true, Ordering::Release);
         if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
-        if let Some(w) = self.module_worker.take() {
             let _ = w.join();
         }
         tracing::info!("bpf: workers joined");
@@ -2055,10 +2430,8 @@ impl Capture {
                 );
             }
         }
-        // Both workers have joined; hand out the registry Arc (its held fds must
-        // outlive the capture until symbolization). Drop the callback's Arc handle
-        // first so the returned one is the sole owner.
-        self.module_ctx = None;
+        // Hand out the registry Arc; its held fds must outlive capture until
+        // symbolization.
         let modules = std::mem::replace(
             &mut self.modules,
             Arc::new(Mutex::new(ModuleRegistry::new(KeepPolicy::None))),
@@ -2076,9 +2449,6 @@ impl Capture {
             if !self.rb.is_null() {
                 ring_buffer__free(self.rb);
             }
-            if !self.module_rb.is_null() {
-                ring_buffer__free(self.module_rb);
-            }
             tracing::info!("bpf: detach begin");
             for &l in &self.links {
                 bpf_link__destroy(l);
@@ -2093,5 +2463,153 @@ impl Capture {
         }
         (stats, modules)
         // maps / data_regions dropped with self.
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use sismo_proto::{ProtoReader, WireValue};
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn build_id_wire_layout_matches_linux_uapi() {
+        assert_eq!(size_of::<SismoStackBuildId>(), 32);
+        assert_eq!(align_of::<SismoStackBuildId>(), 8);
+        assert_eq!(offset_of!(SismoStackBuildId, status), 0);
+        assert_eq!(offset_of!(SismoStackBuildId, build_id), 4);
+        assert_eq!(offset_of!(SismoStackBuildId, offset_or_ip), 24);
+        assert_eq!(size_of::<SismoHdr>(), 40);
+        assert_eq!(offset_of!(SismoSampleRec, stack), 144);
+        assert_eq!(offset_of!(SismoSampleRec, kernel_ids), 2192);
+        assert_eq!(size_of::<SismoSampleRec>(), 2768);
+        assert_eq!(offset_of!(SismoUnwindRec, unwind_stack), 2776);
+        assert_eq!(size_of::<SismoUnwindRec>(), 3288);
+    }
+
+    #[test]
+    fn build_id_status_decode_is_typed_and_keeps_offset_zero() {
+        let mut entries = [SismoStackBuildId::default(); 4];
+        entries[0] = SismoStackBuildId {
+            status: SISMO_STACK_BUILD_ID_VALID,
+            build_id: [0x11; SISMO_BUILD_ID_SIZE],
+            offset_or_ip: 0,
+        };
+        entries[1] = SismoStackBuildId {
+            status: SISMO_STACK_BUILD_ID_IP,
+            build_id: [0; SISMO_BUILD_ID_SIZE],
+            offset_or_ip: 0x1234,
+        };
+        entries[2].status = SISMO_STACK_BUILD_ID_EMPTY;
+        entries[3].status = 99;
+        assert_eq!(
+            decode_user_frames(&entries, 4),
+            vec![
+                UserFrame::BuildIdOffset {
+                    build_id: [0x11; SISMO_BUILD_ID_SIZE],
+                    file_offset: 0,
+                },
+                UserFrame::RawIp(0x1234),
+            ]
+        );
+        assert_ne!(
+            UserFrame::RawIp(0),
+            UserFrame::BuildIdOffset {
+                build_id: [0; SISMO_BUILD_ID_SIZE],
+                file_offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn shared_sample_packet_preserves_stream_specific_payload_fields() {
+        let mut rec: SismoSampleRec = unsafe { std::mem::zeroed() };
+        rec.hdr.ts = 11;
+        rec.hdr.cpu = 2;
+        rec.hdr.pid = 3;
+        rec.hdr.tid = 4;
+        let packet = build_perf_sample_packet(
+            &rec,
+            5,
+            b"interned",
+            6,
+            &[7, 8],
+            9,
+            Some(b"symbol"),
+        );
+        let fields: Vec<_> = ProtoReader::new(packet.bytes()).collect();
+        assert!(fields.iter().any(|(f, v)| *f == 8 && matches!(v, WireValue::Varint(11))));
+        assert!(fields.iter().any(|(f, v)| *f == 12 && matches!(v, WireValue::Len(b"interned"))));
+        let perf = fields
+            .iter()
+            .find_map(|(f, v)| (*f == TP_FIELD_PERF_SAMPLE).then_some(v))
+            .and_then(|v| match v { WireValue::Len(body) => Some(*body), _ => None })
+            .expect("perf sample");
+        let perf_fields: Vec<_> = ProtoReader::new(perf).collect();
+        for (field, value) in [(1, 2), (2, 3), (3, 4), (4, 5), (6, 6), (20, 9)] {
+            assert!(perf_fields
+                .iter()
+                .any(|(f, v)| *f == field && matches!(v, WireValue::Varint(x) if *x == value)));
+        }
+        let followers: Vec<_> = perf_fields
+            .iter()
+            .filter_map(|(f, v)| (*f == 7).then_some(v))
+            .filter_map(|v| match v { WireValue::Varint(x) => Some(*x), _ => None })
+            .collect();
+        assert_eq!(followers, [7, 8]);
+        assert!(perf_fields
+            .iter()
+            .any(|(f, v)| *f == 21 && matches!(v, WireValue::Len(b"symbol"))));
+    }
+
+    #[test]
+    fn only_sampled_mapping_identities_are_retention_eligible() {
+        let key = ModuleKey::Mapping {
+            pid: 7,
+            base: 0x400000,
+            dev_major: 8,
+            dev_minor: 1,
+            ino: 42,
+        };
+        let id = [9; SISMO_BUILD_ID_SIZE];
+        let mut ids = HashSet::new();
+        let mut mappings = HashSet::new();
+        assert!(!mapping_was_sampled(&ids, &mappings, key, Some(id)));
+        ids.insert(id);
+        assert!(mapping_was_sampled(&ids, &mappings, key, Some(id)));
+        ids.clear();
+        mappings.insert(key);
+        assert!(mapping_was_sampled(&ids, &mappings, key, None));
+    }
+
+    #[test]
+    fn build_id_mapping_is_process_independent_and_non_aliasing() {
+        let mut interner = Interner::new();
+        let mut writer = ProtoWriter::new();
+        let id = [7; SISMO_BUILD_ID_SIZE];
+        let a = interner.intern_build_id_mapping(id, b"/first", &mut writer);
+        let b = interner.intern_build_id_mapping(id, b"/second", &mut writer);
+        let raw = interner.intern_mapping(
+            0x7000,
+            0x8000,
+            0,
+            0x7000,
+            b"/first",
+            &id,
+            &mut writer,
+        );
+        assert_eq!(a, b);
+        assert_ne!(a, raw);
+
+        let reused = interner.intern_mapping(
+            0x7000,
+            0x8000,
+            0,
+            0x7000,
+            b"/replacement",
+            &[8; SISMO_BUILD_ID_SIZE],
+            &mut writer,
+        );
+        assert_ne!(raw, reused, "a reused start must not inherit the old mapping iid");
     }
 }

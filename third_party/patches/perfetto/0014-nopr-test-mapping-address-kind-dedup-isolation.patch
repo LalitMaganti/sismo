@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lalit Maganti <lalitmaganti@gmail.com>
+Date: Mon, 27 Jul 2026 11:59:44 +0100
+Subject: nopr: test mapping address-kind dedup isolation
+
+---
+ .../profile_packet_sequence_state_unittest.cc   | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/trace_processor/importers/proto/profile_packet_sequence_state_unittest.cc b/src/trace_processor/importers/proto/profile_packet_sequence_state_unittest.cc
+index 7071d08e..70e3b31c 100644
+--- a/src/trace_processor/importers/proto/profile_packet_sequence_state_unittest.cc
++++ b/src/trace_processor/importers/proto/profile_packet_sequence_state_unittest.cc
+@@ -85,7 +85,8 @@ class HeapProfileTrackerDupTest : public ::testing::Test {
+   ProfilePacketSequenceState& profile_packet_sequence_state() {
+     return *sequence_state->GetCustomState<ProfilePacketSequenceState>();
+   }
+-  void InsertMapping(const Packet& packet) {
++  void InsertMapping(const Packet& packet,
++                     uint32_t address_kind = kMappingAddressKind) {
+     profile_packet_sequence_state().AddString(packet.mapping_name_id,
+                                               "[mapping]");
+ 
+@@ -93,7 +94,7 @@ class HeapProfileTrackerDupTest : public ::testing::Test {
+ 
+     ProfilePacketSequenceState::SourceMapping first_frame;
+     first_frame.build_id = packet.build_id;
+-    first_frame.address_kind = kMappingAddressKind;
++    first_frame.address_kind = address_kind;
+     first_frame.exact_offset = kMappingExactOffset;
+     first_frame.start_offset = kMappingStartOffset;
+     first_frame.start = kMappingStart;
+@@ -158,6 +159,18 @@ TEST_F(HeapProfileTrackerDupTest, Mapping) {
+               fully_qualified_mapping_name);
+ }
+ 
++TEST_F(HeapProfileTrackerDupTest, MappingAddressKindPreventsDeduplication) {
++  InsertMapping(kFirstPacket, 0);
++  profile_packet_sequence_state().FinalizeProfile(sequence_state.get());
++  InsertMapping(kSecondPacket, 1);
++  profile_packet_sequence_state().FinalizeProfile(sequence_state.get());
++
++  const auto& mappings = context.storage->stack_profile_mapping_table();
++  ASSERT_EQ(mappings.row_count(), 2u);
++  EXPECT_EQ(mappings[0].address_kind(), 0);
++  EXPECT_EQ(mappings[1].address_kind(), 1);
++}
++
+ // Insert the same mapping from two different packets, with different strings
+ // interned, and assert we only store one.
+ TEST_F(HeapProfileTrackerDupTest, Frame) {

@@ -358,8 +358,8 @@ def build_variants() -> list[Variant]:
 
     # --- flags that strip or reshape the data sismo needs -----------------
     # No unwind tables: the workload's own functions get no .eh_frame FDEs
-    # (crt/libc still ship theirs), so framehop has nothing to DWARF-unwind and
-    # -O2's omitted frame pointers leave the FP walk truncated too.
+    # (crt/libc still ship theirs), so the in-kernel lightswitch walker has no
+    # rows and -O2's omitted frame pointers leave the helper chain truncated.
     c_variant("c-gcc-O2-noeh", ["gcc"],
               ["-O2", "-fno-asynchronous-unwind-tables", "-fno-unwind-tables"],
               Expect(chain="partial",
@@ -368,7 +368,7 @@ def build_variants() -> list[Variant]:
                              "emits no diagnostic naming the missing unwind tables"),
               "gcc -O2, no unwind tables: neither DWARF CFI nor frame pointers")
     # No .eh_frame_hdr (and no PT_GNU_EH_FRAME): the `.eh_frame` section is still
-    # present, so framehop indexes it directly and the FP-less stacks unwind to
+    # present, so the unwind-table loader indexes it directly and FP-less stacks unwind to
     # full chains — a regression guard for the no-hdr path. The point of the
     # variant is Finding B: the phdr-only probe used to under-report this binary
     # as having no CFI; it now also checks the `.eh_frame` section.
@@ -551,10 +551,9 @@ def build_variants() -> list[Variant]:
         Expect(leaf="none", chain="na", module_status="no symbols",
                diags=[r"no longer|deleted|not found|missing"]),
         [["gcc", "-O2", fp, "-o", b, wl_c]],
-        # Delete before the host's first /proc/<pid>/maps read (~0.2s in), so the
-        # only path to a real build-id is CAP-2's in-band copy from mapped memory
-        # at sample time. A later deletion lets the host file read win and the
-        # test would pass even with CAP-2 off.
+        # Delete before a later userspace maps refresh. Per-frame
+        # BPF_F_USER_BUILD_ID capture must still retain the real identity; bytes
+        # may remain unavailable when the initial userspace fd pin lost the race.
         mid_run=(0.1, "delete")))
     b = _bin("env-deleted-binary-kept")
     v.append(Variant(
@@ -567,7 +566,7 @@ def build_variants() -> list[Variant]:
         # open to the executable (it lives under out/, an unstable path, so the
         # default --keep-module-files=auto holds it), but before the post-record
         # symbolize pass. The file is gone at symbolize time, so `leaf: symbolized`
-        # here is due entirely to CAP-3(b) reading the bytes back through the held
+        # here is due entirely to userspace fd retention reading the bytes back through the held
         # fd; with --keep-module-files=none it reverts to `leaf: absent`.
         mid_run=(0.6, "delete")))
     # (env-replaced-binary moved to the cross-platform matrix suite.)
@@ -896,8 +895,8 @@ def variant_facts(variant: Variant, duration_ms: int = DEFAULT_DURATION_MS,
     residual = query_residual(rec.trace) if os.path.exists(rec.trace) else []
 
     # build_id: what identity does the trace carry for the target module? `gnu`
-    # means a real GNU note matching the module's own file (CAP-2 captures it in-
-    # band, so even a binary deleted mid-record keeps it); `synthetic` means sismo
+    # means a real GNU note matching the module's own file (Linux captures it per
+    # frame with BPF_F_USER_BUILD_ID); `synthetic` means sismo
     # fabricated an id, recognized precisely by its magic prefix; `absent` means
     # none at all; `mismatch` is a real-looking id that does not match the file —
     # expected for a replaced binary (env-replaced-binary), a capture bug on any

@@ -87,16 +87,6 @@ struct file {
   struct inode *f_inode;
 } __attribute__((preserve_access_index));
 
-// The vma fields the CAP-2 module capture reads via bpf_find_vma's callback:
-// vm_start and vm_pgoff (file offset in pages). image_base = vm_start -
-// (vm_pgoff << PAGE_SHIFT) — the address file-offset-0 (the ELF header) maps to,
-// constant across a file's segments and equal to the host's base_avma.
-struct vm_area_struct {
-  unsigned long vm_start;
-  unsigned long vm_end;
-  unsigned long vm_pgoff;
-} __attribute__((preserve_access_index));
-
 // perf_event program context. We forward it to bpf_get_stack and read `addr`
 // (the PERF_SAMPLE_ADDR data linear address). The kernel rewrites loads from
 // this context type (convert_ctx_access for BPF_PROG_TYPE_PERF_EVENT), so only

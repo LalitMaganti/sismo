@@ -36,6 +36,9 @@
 #ifndef BPF_F_USER_STACK
 #define BPF_F_USER_STACK (1ULL << 8)
 #endif
+#ifndef BPF_F_USER_BUILD_ID
+#define BPF_F_USER_BUILD_ID (1ULL << 11)
+#endif
 
 // bpf_get_stack's flags low byte (BPF_F_SKIP_FIELD_MASK) is a frame-skip count.
 // Skip the leaf-most 3 kernel frames — the BPF trampoline + tracepoint/perf
@@ -116,23 +119,14 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 1 << 22);  // 4 MiB
+  // Build-id stack entries are four times the size of raw PCs. Keep burst
+  // capacity comparable to the former wire format.
+  __uint(max_entries, 1 << 24);  // 16 MiB
 } events SEC(".maps");
 
-// CAP-3(b): module-identity records (SISMO_EVT_MODULE) ride their own ringbuf,
-// drained by a dedicated host thread. This keeps build-id capture and the fd pin
-// it drives off the sample backlog, so a binary deleted or replaced mid-run is
-// pinned/identified promptly instead of after the main queue catches up. Sized
-// for the page-carrying records; module discovery is deduped in-BPF (module_seen)
-// so the volume is one record per distinct module.
-struct {
-  __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 1 << 22);  // 4 MiB
-} module_hints SEC(".maps");
-
-// Both rings are 4 MiB; wake the consumer once the backlog crosses half.
+// Wake the consumer once the backlog crosses half the ring.
 static __always_inline long ringbuf_flags(void *rb) {
-  return bpf_ringbuf_query(rb, BPF_RB_AVAIL_DATA) >= (1 << 21)
+  return bpf_ringbuf_query(rb, BPF_RB_AVAIL_DATA) >= (1 << 23)
              ? BPF_RB_FORCE_WAKEUP
              : BPF_RB_NO_WAKEUP;
 }
@@ -170,14 +164,6 @@ struct {
   __type(value, __u64);
 } pyframe_next SEC(".maps");
 
-// CAP-2: emit a module's identity page (SISMO_EVT_MODULE) once per image base.
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);  // not LRU: NMI/probe-context updates evict badly
-  __uint(max_entries, 4096);
-  __type(key, __u64);  // module image base avma
-  __type(value, __u8);
-} module_seen SEC(".maps");
-
 // Per-CPU scratch for the kernel stack: bpf_get_stack writes the raw addresses
 // here (kept off the 512-byte BPF stack), then they are copied straight into
 // the record's kernel_ids[] — no resolution, no id table.
@@ -191,7 +177,7 @@ struct {
   __type(value, struct sismo_kstack);
 } kstack_scratch SEC(".maps");
 
-// One thread's in-flight off-CPU block: its blocking stack (user PCs + raw
+// One thread's in-flight off-CPU block: its blocking stack (build-id entries + raw
 // kernel PCs) captured when it was switched out, plus when. Keyed by tid;
 // emitted + deleted when the thread is switched back in. The value is too big
 // for the 512-byte BPF stack, so it is built in offcpu_scratch (per-CPU) and
@@ -205,7 +191,7 @@ struct sismo_offcpu_state {
   __u64 block_id;
   __u32 nr_frames;
   __u32 nr_kernel;
-  __u64 ustack[SISMO_MAX_STACK];
+  struct sismo_stack_build_id ustack[SISMO_MAX_STACK];
   __u64 kids[SISMO_MAX_KERNEL_STACK];  // raw kernel PCs, leaf-first
 };
 struct {
@@ -400,81 +386,6 @@ static __noinline __u32 walk_python(__u32 *py_ids) {
   return n;
 }
 
-// CAP-2: bpf_find_vma callback — stash the containing vma's start + file page
-// offset so the caller derives the module image base.
-struct find_vma_ctx {
-  __u64 start;
-  __u64 end;
-  __u64 pgoff;
-};
-
-// Per-CPU cache of the last VMA capture_module resolved, so a run of ticks in
-// the same mapping (a hot loop) skips the bpf_find_vma tree walk — the single
-// most expensive thing on the tick after the counter reads.
-struct vma_cache {
-  __u64 start;
-  __u64 end;
-};
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, __u32);
-  __type(value, struct vma_cache);
-} last_vma SEC(".maps");
-static long vma_info_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx) {
-  struct find_vma_ctx *c = ctx;
-  c->start = BPF_CORE_READ(vma, vm_start);
-  c->end = BPF_CORE_READ(vma, vm_end);
-  c->pgoff = BPF_CORE_READ(vma, vm_pgoff);
-  return 0;
-}
-
-// CAP-2: on first sight of the module containing `pc`, copy its first mapped
-// page (ELF header + build-id note) from the target's memory and ship it, so the
-// host can name the module by build-id even if its file is later deleted. The
-// image base is `vm_start - (vm_pgoff << PAGE_SHIFT)` — the address file-offset-0
-// maps to, constant across the file's segments and equal to the host base_avma.
-// bpf_find_vma trylocks mmap_lock, so it is best-effort in interrupt context; a
-// miss just retries next sample (module_seen is set only on success).
-static __noinline void capture_module(struct task_struct *cur, __u64 pc) {
-  if (!pc)
-    return;
-  // Same VMA as the last tick on this CPU (the common case for a hot loop)?
-  // Then its module was already resolved — skip the find_vma tree walk.
-  __u32 zero = 0;
-  struct vma_cache *vcache = bpf_map_lookup_elem(&last_vma, &zero);
-  if (vcache && pc >= vcache->start && pc < vcache->end)
-    return;
-
-  struct find_vma_ctx vc = {};
-  if (bpf_find_vma(cur, pc, vma_info_cb, &vc, 0) || !vc.start)
-    return;
-  // Cache the resolved range (seen or new) so repeated PCs in it skip find_vma.
-  if (vcache) {
-    vcache->start = vc.start;
-    vcache->end = vc.end;
-  }
-  __u64 base = vc.start - (vc.pgoff << 12);  // PAGE_SHIFT = 12
-  if (bpf_map_lookup_elem(&module_seen, &base))
-    return;
-  __u8 one = 1;
-  bpf_map_update_elem(&module_seen, &base, &one, BPF_ANY);
-
-  // Emit on the dedicated module_hints ringbuf so the capture thread pins this
-  // module's fd and reads its build-id promptly, not behind the sample backlog.
-  struct sismo_module_rec *r = bpf_ringbuf_reserve(&module_hints, sizeof(*r), 0);
-  if (!r)
-    return;
-  r->type = SISMO_EVT_MODULE;
-  r->base = base;
-  r->tgid = bpf_get_current_pid_tgid() >> 32;
-  r->_pad = 0;
-  r->prefix_len = 0;
-  if (bpf_probe_read_user(r->prefix, sizeof(r->prefix), (void *)base) == 0)
-    r->prefix_len = sizeof(r->prefix);
-  bpf_ringbuf_submit(r, 0);
-}
-
 static __always_inline __u32 target_tgid(void) {
   __u32 zero = 0;
   __u32 *t = bpf_map_lookup_elem(&cfg, &zero);
@@ -585,8 +496,9 @@ static __always_inline void offcpu_record_block(void *ctx, __u32 tid) {
   __u64 *df = bpf_map_lookup_elem(&disk_file, &tid);
   st->block_id = fu ? *fu : (pe ? *pe : (df ? *df : 0));
 
-  long un = bpf_get_stack(ctx, st->ustack, sizeof(st->ustack), BPF_F_USER_STACK);
-  __u32 nu = (un > 0) ? (__u32)(un / 8) : 0;
+  long un = bpf_get_stack(ctx, st->ustack, sizeof(st->ustack),
+                          BPF_F_USER_STACK | BPF_F_USER_BUILD_ID);
+  __u32 nu = (un > 0) ? (__u32)(un / sizeof(st->ustack[0])) : 0;
   if (nu > SISMO_MAX_STACK)
     nu = SISMO_MAX_STACK;
   st->nr_frames = nu;
@@ -626,6 +538,7 @@ static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
       e->hdr.timebase = 0;
       e->hdr.nr_frames = st->nr_frames;
       e->hdr.nr_kernel_frames = st->nr_kernel;
+      e->hdr.nr_py_frames = 0;
       e->hdr.ts = now;
       e->data_addr = delta; // off-CPU duration (ns) = the sample's weight
 #pragma clang loop unroll(disable)
@@ -635,8 +548,12 @@ static __always_inline void offcpu_emit_wake(__u32 tid, __u32 tgid) {
       // block identity (futex uaddr or packed TCP peer), 0 when unnamed.
       e->counters[0] = st->block_id;
       #pragma clang loop unroll(disable)
-      for (int i = 0; i < SISMO_MAX_STACK; i++)
-        e->stack[i] = (i < st->nr_frames) ? st->ustack[i] : 0;
+      for (int i = 0; i < SISMO_MAX_STACK; i++) {
+        if (i < st->nr_frames)
+          e->stack[i] = st->ustack[i];
+        else
+          e->stack[i].status = SISMO_STACK_BUILD_ID_EMPTY;
+      }
       #pragma clang loop unroll(disable)
       for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
         e->kernel_ids[i] = (i < st->nr_kernel) ? st->kids[i] : 0;
@@ -775,8 +692,8 @@ int BPF_KRETPROBE(on_vfs_read_ret) {
 }
 
 // Per-CPU staging for the tail-call unwind chain. on_tick builds the
-// COMPLETE sample record here (counters, kernel stack, Python frames, FP
-// stack — all on the same tick), then tail-calls the walker, which refines
+// COMPLETE sample record here (counters, kernel stack, Python frames, typed
+// helper stack — all on the same tick), then tail-calls the walker, which refines
 // the user stack from the unwind tables and emits. A tail call never
 // returns, so the emit must live downstream of it; staging is what carries
 // the record across the program boundary (a ringbuf reservation cannot be
@@ -784,7 +701,7 @@ int BPF_KRETPROBE(on_vfs_read_ret) {
 struct sismo_unwind_stage {
   struct sismo_sample_rec rec;
   struct sismo_unwind_run run;
-  __u32 fp_frames;   // rec.hdr.nr_frames from the FP walk
+  __u32 helper_frames;  // rec.hdr.nr_frames from bpf_get_stack
   __u32 tail_calls;
 };
 struct {
@@ -802,8 +719,8 @@ struct {
   __type(value, __u32);
 } unwind_progs SEC(".maps");
 
-// Fill a sample record: hdr, counters, FP user stack, raw kernel PCs, CPython
-// frames. Shared by the plain emit path (destination = ringbuf reservation)
+// Fill a sample record: hdr, counters, durable build-id user stack, raw
+// kernel PCs, and CPython frames. Shared by the plain emit path (destination = ringbuf reservation)
 // and the staging path (destination = per-CPU stage).
 static __always_inline void fill_sample(struct sismo_sample_rec *e,
                                         struct bpf_perf_event_data *ctx,
@@ -826,18 +743,39 @@ static __always_inline void fill_sample(struct sismo_sample_rec *e,
 #pragma clang loop unroll(disable)
   for (int s = 0; s < SISMO_MAX_COUNTERS; s++)
     e->counters[s] = tc->v[s];
-  long n = bpf_get_stack(ctx, e->stack, sizeof(e->stack), BPF_F_USER_STACK);
-  e->hdr.nr_frames = (n > 0) ? (__u32)(n / 8) : 0;
+  long n = bpf_get_stack(ctx, e->stack, sizeof(e->stack),
+                         BPF_F_USER_STACK | BPF_F_USER_BUILD_ID);
+  e->hdr.nr_frames =
+      (n > 0) ? (__u32)(n / sizeof(e->stack[0])) : 0;
 #pragma clang loop unroll(disable)
   for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
     e->kernel_ids[i] = (ks && i < nr_kernel) ? ks->addr[i] : 0;
   e->hdr.nr_py_frames = walk_python(e->py_ids);  // CAP-1
 }
 
-// Ship the staged record: account the walk's outcome, splice in the unwound
-// chain when it reached bottom-of-stack AND beat the FP frame count, then
-// copy the record into the ringbuf. Called by the walker when the walk ends,
-// and by on_tick directly when the walk never starts.
+static __always_inline void copy_sample(struct sismo_sample_rec *dst,
+                                        const struct sismo_sample_rec *src) {
+  // Field-wise copy: a whole-struct assign lowers to a memcpy libcall, which
+  // the BPF backend rejects at this size.
+  dst->hdr = src->hdr;
+  dst->data_addr = src->data_addr;
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < SISMO_MAX_COUNTERS; i++)
+    dst->counters[i] = src->counters[i];
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < SISMO_MAX_STACK; i++)
+    dst->stack[i] = src->stack[i];
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
+    dst->kernel_ids[i] = src->kernel_ids[i];
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < SISMO_MAX_PY_FRAMES; i++)
+    dst->py_ids[i] = src->py_ids[i];
+}
+
+// Ship the staged record: account the walk's outcome and emit either the
+// durable typed helper chain or a dual-chain record carrying the selected raw
+// lightswitch result alongside that fallback.
 static __always_inline void unwind_stage_emit(void) {
   __u32 zero = 0;
   struct sismo_unwind_stage *st = bpf_map_lookup_elem(&unwind_stage, &zero);
@@ -865,46 +803,34 @@ static __always_inline void unwind_stage_emit(void) {
       }
     }
   }
-  // A COMPLETED walk is authoritative, even when shorter than the FP walk:
-  // DWARF stops where glibc marks the return address undefined
-  // (__libc_start_call_main), while the FP walk happily rolls through more
-  // libc frames — but skips the frame above any FP-less leaf (the gcc
-  // leaf-FP gremlin). Preferring "more frames" chose that wrong chain.
-  //
-  // A FAILED walk keeps its partial progress only when it got FURTHER than
-  // the FP walk: a walk failing at a tables-less module boundary has still
-  // recovered the return address INTO that module — a frame the FP walk
-  // never sees. (lightswitch drops truncated stacks entirely; sismo's
-  // best-effort-chain semantic keeps them.)
-  if ((run->status == UNWIND_DONE && run->n > 0) ||
-      (run->status == UNWIND_FAILED && run->n > st->fp_frames)) {
+  // A completed walk is authoritative even when shorter than the helper
+  // chain. A failed partial walk wins only when it got further.
+  __u32 use_unwind =
+      (run->status == UNWIND_DONE && run->n > 0) ||
+      (run->status == UNWIND_FAILED && run->n > st->helper_frames);
+  if (use_unwind) {
     struct sismo_unwind_out *out = bpf_map_lookup_elem(&unwind_out, &zero);
     if (out) {
+      struct sismo_unwind_rec *ue =
+          bpf_ringbuf_reserve(&events, sizeof(*ue), 0);
+      if (!ue)
+        return;
+      copy_sample(&ue->sample, &st->rec);
+      ue->sample.hdr.type = SISMO_EVT_SAMPLE_UNWIND;
+      ue->nr_unwind_frames = run->n;
+      ue->_pad = 0;
 #pragma clang loop unroll(disable)
       for (int i = 0; i < SISMO_MAX_STACK; i++)
-        st->rec.stack[i] = (i < run->n) ? out->pcs[i] : 0;
-      st->rec.hdr.nr_frames = run->n;
+        ue->unwind_stack[i] = (i < run->n) ? out->pcs[i] : 0;
+      bpf_ringbuf_submit(ue, ringbuf_flags(&events));
+      return;
     }
   }
+
   struct sismo_sample_rec *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (!e)
     return;
-  // Field-wise copy: a whole-struct assign lowers to a memcpy libcall, which
-  // the BPF backend rejects at this size.
-  e->hdr = st->rec.hdr;
-  e->data_addr = st->rec.data_addr;
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < SISMO_MAX_COUNTERS; i++)
-    e->counters[i] = st->rec.counters[i];
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < SISMO_MAX_STACK; i++)
-    e->stack[i] = st->rec.stack[i];
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < SISMO_MAX_KERNEL_STACK; i++)
-    e->kernel_ids[i] = st->rec.kernel_ids[i];
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < SISMO_MAX_PY_FRAMES; i++)
-    e->py_ids[i] = st->rec.py_ids[i];
+  copy_sample(e, &st->rec);
   bpf_ringbuf_submit(e, ringbuf_flags(&events));
 }
 
@@ -971,23 +897,18 @@ int on_tick(struct bpf_perf_event_data *ctx) {
     // resolution here — symbolized host-side from kallsyms.
   }
 
-  // CAP-2: ship the sampled module's identity page (image base + build-id note)
-  // in-band, once per module, so a binary deleted before symbolization still
-  // resolves to a real build-id.
-  capture_module(cur, PT_REGS_IP((struct pt_regs *)&ctx->regs));
-
   // In-kernel unwind (the default): build the COMPLETE record into the
   // per-CPU staging area, then hand off to the tail-call walker chain, which
   // refines the user stack from the unwind tables and emits. Everything
-  // sampled here — counters, kernel stack, Python frames, FP walk — happened
+  // sampled here — counters, kernel stack, Python frames, helper chain — happened
   // on this same tick; the tail call only takes over the user-stack
   // refinement and the emit. Mode 0 (non-x86-64, or the walker failed to
-  // wire) takes the plain FP path below.
+  // wire) takes the plain typed-helper path below.
   if (unwind_enabled()) {
     struct sismo_unwind_stage *st = bpf_map_lookup_elem(&unwind_stage, &zero);
     if (st) {
       fill_sample(&st->rec, ctx, cur, tgid, tc, ks, nr_kernel);
-      st->fp_frames = st->rec.hdr.nr_frames;
+      st->helper_frames = st->rec.hdr.nr_frames;
       st->tail_calls = 0;
       st->run.status = UNWIND_NOTRUN;
       st->run.err = UWERR_NONE;
@@ -996,7 +917,7 @@ int on_tick(struct bpf_perf_event_data *ctx) {
       __u64 uip = PT_REGS_IP(uregs);
       // A tick that fired in kernel context has kernel regs (top bit set);
       // its user stack can't be walked from ctx->regs, so the record keeps
-      // the FP walk (same limitation as the mode-1 snapshot path).
+      // the typed helper chain.
       if (!(uip & (1ULL << 63))) {
         st->run.ip = uip;
         st->run.sp = PT_REGS_SP(uregs);
@@ -1005,13 +926,13 @@ int on_tick(struct bpf_perf_event_data *ctx) {
         st->run.status = UNWIND_RUNNING;
         bpf_tail_call(ctx, &unwind_progs, 0);
         // Only reached if the tail call failed (walker not registered):
-        // emit the FP record as-is, uncounted.
+        // emit the typed helper record as-is, uncounted.
         st->run.status = UNWIND_NOTRUN;
       }
       unwind_stage_emit();
       return 0;
     }
-    // Staging unavailable: fall through to the plain FP path.
+    // Staging unavailable: fall through to the plain typed-helper path.
   }
 
   struct sismo_sample_rec *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);

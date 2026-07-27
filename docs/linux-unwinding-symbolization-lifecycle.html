@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sismo Linux Unwinding and Symbolization Lifecycle</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fa;
+      --paper: #ffffff;
+      --text: #1d2433;
+      --muted: #5f6b7a;
+      --line: #d9dee8;
+      --accent: #3157d5;
+      --accent-soft: #edf1ff;
+      --kernel: #9a3412;
+      --kernel-bg: #fff3e8;
+      --runtime: #166534;
+      --runtime-bg: #ecfdf3;
+      --post: #6b21a8;
+      --post-bg: #f8efff;
+      --code: #182033;
+      --code-bg: #eef1f6;
+      --warn: #854d0e;
+      --warn-bg: #fff9db;
+      --shadow: 0 12px 38px rgba(28, 39, 62, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10131a;
+        --paper: #181d27;
+        --text: #e9edf5;
+        --muted: #aab4c4;
+        --line: #323a49;
+        --accent: #91a8ff;
+        --accent-soft: #222d52;
+        --kernel: #ffb48a;
+        --kernel-bg: #3b241b;
+        --runtime: #8de0aa;
+        --runtime-bg: #183326;
+        --post: #d7a3ff;
+        --post-bg: #32213f;
+        --code: #e7ecf5;
+        --code-bg: #222936;
+        --warn: #f6cf70;
+        --warn-bg: #3a311c;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.65 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(220px, 290px) minmax(0, 900px);
+      gap: 38px;
+      max-width: 1260px;
+      margin: 0 auto;
+      padding: 34px 28px 80px;
+    }
+    nav {
+      position: sticky;
+      top: 20px;
+      align-self: start;
+      max-height: calc(100vh - 40px);
+      overflow: auto;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+    nav strong { display: block; margin-bottom: 10px; }
+    nav ol { margin: 0; padding-left: 22px; }
+    nav li { margin: 5px 0; color: var(--muted); }
+    nav a { color: inherit; text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    main {
+      min-width: 0;
+      padding: 46px 56px 70px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+    h1 { font-size: clamp(2.1rem, 5vw, 3.55rem); line-height: 1.05; letter-spacing: -0.045em; margin: 0 0 22px; }
+    h2 { margin: 64px 0 18px; padding-top: 6px; font-size: 1.75rem; line-height: 1.2; letter-spacing: -0.02em; }
+    h3 { margin: 34px 0 10px; font-size: 1.22rem; line-height: 1.3; }
+    h4 { margin: 24px 0 8px; }
+    p { margin: 10px 0 18px; }
+    ul, ol { padding-left: 25px; }
+    li { margin: 5px 0; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { padding: .12em .35em; border-radius: 5px; background: var(--code-bg); color: var(--code); }
+    pre {
+      overflow-x: auto;
+      margin: 18px 0 24px;
+      padding: 18px 20px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--code-bg);
+      color: var(--code);
+      line-height: 1.5;
+    }
+    table { width: 100%; border-collapse: collapse; margin: 20px 0 30px; font-size: .94rem; }
+    th, td { padding: 11px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--code-bg); }
+    blockquote { margin: 22px 0; padding: 4px 20px; border-left: 4px solid var(--accent); color: var(--muted); }
+    .lede { font-size: 1.22rem; color: var(--muted); }
+    .theory {
+      margin: 32px 0;
+      padding: 24px 26px;
+      border: 1px solid var(--accent);
+      border-radius: 14px;
+      background: var(--accent-soft);
+    }
+    .theory h2 { margin: 0 0 12px; padding: 0; font-size: 1.35rem; }
+    .stage {
+      margin: 34px 0;
+      padding: 22px 24px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+    .stage h3 { margin-top: 0; }
+    .kernel { border-left: 6px solid var(--kernel); background: var(--kernel-bg); }
+    .runtime { border-left: 6px solid var(--runtime); background: var(--runtime-bg); }
+    .post { border-left: 6px solid var(--post); background: var(--post-bg); }
+    .tag { display: inline-block; margin-right: 7px; padding: 2px 8px; border-radius: 99px; font-size: .75rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+    .tag.kernel-tag { color: var(--kernel); background: var(--kernel-bg); border: 1px solid currentColor; }
+    .tag.runtime-tag { color: var(--runtime); background: var(--runtime-bg); border: 1px solid currentColor; }
+    .tag.post-tag { color: var(--post); background: var(--post-bg); border: 1px solid currentColor; }
+    .flow { display: grid; gap: 10px; margin: 24px 0 34px; }
+    .flow > div { padding: 14px 18px; border: 1px solid var(--line); border-radius: 10px; text-align: center; background: var(--code-bg); }
+    .flow .arrow { padding: 0; border: 0; background: none; color: var(--muted); font-size: 1.35rem; }
+    .glossary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .glossary > div { padding: 16px 18px; border: 1px solid var(--line); border-radius: 11px; }
+    .glossary h3 { margin: 0 0 7px; }
+    .note { margin: 20px 0; padding: 16px 18px; border-left: 5px solid var(--warn); background: var(--warn-bg); color: var(--text); }
+    .invariant { margin: 12px 0; padding: 15px 18px; border: 1px solid var(--line); border-radius: 10px; }
+    .invariant strong { color: var(--accent); }
+    .small { color: var(--muted); font-size: .9rem; }
+    a { color: var(--accent); }
+    @media (max-width: 900px) {
+      .layout { display: block; padding: 0; }
+      nav { position: static; max-height: none; margin: 14px; }
+      main { padding: 34px 22px 60px; border-width: 1px 0 0; border-radius: 0; }
+      .glossary { grid-template-columns: 1fr; }
+    }
+    @media print {
+      body { background: #fff; color: #111; }
+      .layout { display: block; max-width: none; padding: 0; }
+      nav { display: none; }
+      main { border: 0; box-shadow: none; padding: 0; }
+      .stage, .theory, .invariant { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <nav aria-label="Table of contents">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#theory">The theory</a></li>
+      <li><a href="#vocabulary">Vocabulary</a></li>
+      <li><a href="#overview">Lifecycle overview</a></li>
+      <li><a href="#startup">Startup and map inventory</a></li>
+      <li><a href="#retention">Exact-inode fd retention</a></li>
+      <li><a href="#bpf-setup">BPF setup</a></li>
+      <li><a href="#oncpu">On-CPU capture</a></li>
+      <li><a href="#offcpu">Off-CPU capture</a></li>
+      <li><a href="#runtime">Runtime unwind</a></li>
+      <li><a href="#normalize">Frame normalization</a></li>
+      <li><a href="#trace">Perfetto representation</a></li>
+      <li><a href="#shutdown">Shutdown and fd lifetime</a></li>
+      <li><a href="#symbolization">Post-record symbolization</a></li>
+      <li><a href="#attachment">ModuleSymbols attachment</a></li>
+      <li><a href="#scenarios">Common scenarios</a></li>
+      <li><a href="#work">Work distribution</a></li>
+      <li><a href="#invariants">Design invariants</a></li>
+      <li><a href="#summary">Short explanation</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <header>
+      <p class="small">Sismo architecture note · Linux CPU profiling</p>
+      <h1>Unwinding, module identity, fd retention, and symbolization</h1>
+      <p class="lede">A linear account of what happens in BPF, what happens in runtime userspace, and what happens after recording—and how build IDs, file offsets, inodes, paths, and retained fds fit together.</p>
+    </header>
+
+    <section id="theory" class="theory">
+      <h2>The theory</h2>
+      <ol>
+        <li><strong>BPF captures a call chain and durable coordinates where possible.</strong></li>
+        <li><strong>Runtime userspace improves the unwind and normalizes raw PCs.</strong></li>
+        <li><strong>The trace stores module identity plus coordinates—not symbols or executable bytes.</strong></li>
+        <li><strong>Optional retained fds keep exact local bytes alive until immediate symbolization.</strong></li>
+        <li><strong>Post-processing finds trusted bytes, resolves coordinates, and appends symbols.</strong></li>
+      </ol>
+      <p>The canonical durable user frame is:</p>
+      <pre><strong>(build ID, ELF file offset)</strong></pre>
+      <p>Everything else exists either to produce that pair or to recover safely when it cannot be produced.</p>
+    </section>
+
+    <section id="vocabulary">
+      <h2>Vocabulary: what each identifier means</h2>
+      <div class="glossary">
+        <div><h3>Build ID</h3><p>Portable content identity for a particular binary. It does not contain symbols, locate bytes by itself, or keep a file alive.</p></div>
+        <div><h3>File offset</h3><p>A byte location inside that exact ELF file. Combined with a build ID, it is independent of ASLR and process lifetime.</p></div>
+        <div><h3>Path</h3><p>A display label and artifact-discovery hint. It is mutable, so it is never authoritative identity.</p></div>
+        <div><h3>Device and inode</h3><p>Local identity of the file object mapped by the target. Used to reject a pathname that now names a replacement.</p></div>
+        <div><h3>Retained fd</h3><p>A temporary lease on an inode. It keeps deleted bytes readable through immediate symbolization, but is never stored in the trace.</p></div>
+        <div><h3>Synthetic ID</h3><p>A recording-local stand-in for an id-less module. Useful for deduplication, but not for later artifact retrieval.</p></div>
+      </div>
+      <pre>Build ID   = “which exact binary?”
+File offset = “where inside that binary?”
+Inode       = “which exact local file object?”
+Fd          = “keep that local file object readable”
+Path        = “what should humans see, and where should we look?”</pre>
+    </section>
+
+    <section id="overview">
+      <h2>Lifecycle overview</h2>
+      <div class="flow" aria-label="Lifecycle flow">
+        <div>Launch target and attach perf events/BPF—without scanning mappings</div><div class="arrow">↓</div>
+        <div>First sample creates demand for only the modules it actually observes</div><div class="arrow">↓</div>
+        <div>Resolve that PID’s maps on demand; optionally retain sampled exact inodes</div><div class="arrow">↓</div>
+        <div>BPF captures a typed build-ID fallback and optionally selects an in-kernel lightswitch unwind</div><div class="arrow">↓</div>
+        <div>Runtime worker decodes the selected chain and preserves fallback identities for retention</div><div class="arrow">↓</div>
+        <div>Normalize raw PCs into build-ID/file-offset frames where possible</div><div class="arrow">↓</div>
+        <div>Write Perfetto mappings, frames, and samples</div><div class="arrow">↓</div>
+        <div>Final ring drain; transfer fd-owning registry to the CLI</div><div class="arrow">↓</div>
+        <div>Query unsymbolized frames, locate trusted bytes, resolve symbols</div><div class="arrow">↓</div>
+        <div>Append ModuleSymbols; close retained fds</div>
+      </div>
+    </section>
+
+    <section id="startup">
+      <h2>1. Startup and lazy module inventory</h2>
+      <div class="stage runtime">
+        <h3><span class="tag runtime-tag">Userspace runtime</span>Start without a mapping scan</h3>
+        <p>The target is launched normally. The sample/retention pipeline does not eagerly inventory mappings or retain module files: it requests a mapping snapshot only after an actual sample exposes a new build ID or raw IP, or JIT/Python labeling needs one.</p>
+        <p>The in-kernel unwind-table loader is a separate control plane retained from the lightswitch unwinder: on x86-64 it inventories mappings and converts unwind tables before ticks can use them. That scan prepares unwind metadata only; it does not make any module fd retention-eligible.</p>
+        <p>When demanded, the scan records for each executable file-backed mapping:</p>
+        <ul>
+          <li>mapping start and end;</li>
+          <li>mapping file offset;</li>
+          <li>module base;</li>
+          <li>device major/minor and inode;</li>
+          <li>display path;</li>
+          <li>GNU build ID, when readable.</li>
+        </ul>
+        <p>The parser makes two passes: first to establish module bases and read each file’s build ID once, then to catalog executable mappings with complete metadata. Cataloging a mapping does not make it retention-eligible.</p>
+        <p><strong>Cost:</strong> zero map work before the first relevant sample. A demanded scan is linear in that PID’s <code>/proc/maps</code> lines and executable mappings. Multiple new IDs in one sample share one scan; unresolved identities retry only under sample demand and the ordinary one-second cooldown.</p>
+      </div>
+    </section>
+
+    <section id="retention">
+      <h2>2. Retention policy (executed lazily after a sample)</h2>
+      <div class="stage runtime">
+        <h3><span class="tag runtime-tag">Userspace runtime</span>Preserve bytes independently of frame identity</h3>
+        <p><code>--keep-module-files=none|auto|all</code> controls only fd retention. Build-ID capture remains enabled regardless of this policy. An fd is attempted only after that module appears in a CPU stack; unrelated mapped libraries are never retained merely because a map scan saw them.</p>
+        <table>
+          <thead><tr><th>Policy</th><th>Behavior</th></tr></thead>
+          <tbody>
+            <tr><td><code>none</code></td><td>Retain no module files.</td></tr>
+            <tr><td><code>auto</code></td><td>Retain unstable/local paths; normally skip system prefixes such as <code>/usr</code>, <code>/lib</code>, <code>/bin</code>, and <code>/opt</code>.</td></tr>
+            <tr><td><code>all</code></td><td>Retain every eligible distinct inode.</td></tr>
+          </tbody>
+        </table>
+        <p>The cap is <strong>1,024 distinct inodes per recording</strong>.</p>
+        <h4>Trust sequence</h4>
+        <ol>
+          <li>Prefer opening <code>/proc/&lt;pid&gt;/map_files/&lt;start&gt;-&lt;end&gt;</code>.</li>
+          <li>If denied, accept the display path only while its device/inode matches <code>/proc/maps</code>.</li>
+          <li>After opening, verify device/inode again.</li>
+          <li>When a real build ID is known, verify it through <code>/proc/self/fd/N</code>.</li>
+        </ol>
+        <p>A failed open or identity check remains retryable. Policy refusals are permanent.</p>
+        <pre>ModuleRegistry:
+  (pid, base, device, inode) → settled ID, aliases, retained inode
+
+Held files:
+  (device, inode) → File
+
+Symbolization view:
+  build ID → /proc/self/fd/N</pre>
+        <p>A late real build ID can become an alias for a previously synthetic registry identity—but only after the retained inode and real build ID are successfully reverified.</p>
+      </div>
+      <div class="note"><strong>Key point:</strong> an fd is not identity. It is a temporary mechanism for keeping bytes available. The build ID remains the identity carried by durable frames.</div>
+    </section>
+
+    <section id="bpf-setup">
+      <h2>3. BPF and perf-event setup</h2>
+      <div class="stage runtime">
+        <h3><span class="tag runtime-tag">Userspace runtime</span>Configure bounded kernel work</h3>
+        <ul>
+          <li>up to 12 performance counters;</li>
+          <li>up to 256 CPUs;</li>
+          <li>one 16 MiB ring buffer;</li>
+          <li>per-CPU on-CPU sampler links;</li>
+          <li>optional scheduler/futex/TCP/file off-CPU probes.</li>
+        </ul>
+        <p>The old probe-side module-discovery ring and page-copy path are gone. BPF never parses ELF, scans <code>/proc</code>, resolves symbols, or retains module files.</p>
+      </div>
+    </section>
+
+    <section id="oncpu">
+      <h2>4. On-CPU capture</h2>
+      <div class="stage kernel">
+        <h3><span class="tag kernel-tag">BPF / kernel</span>Capture a fixed, bounded record</h3>
+        <ol>
+          <li>Read and advance at most 12 configured counters.</li>
+          <li>Capture up to 64 raw kernel PCs.</li>
+          <li>Capture up to 64 typed user entries with <code>BPF_F_USER_STACK | BPF_F_USER_BUILD_ID</code>.</li>
+          <li>On default x86-64 capture, initialize the lightswitch-format in-kernel walker from the interrupted registers.</li>
+          <li>Optionally capture up to 16 Python frame IDs.</li>
+          <li>Submit one fixed-size ring record.</li>
+        </ol>
+        <h4>The typed user entry</h4>
+        <pre>status
+20-byte build ID
+file offset or raw IP</pre>
+        <table>
+          <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>VALID</code></td><td>Durable <code>(build ID, file offset)</code>.</td></tr>
+            <tr><td><code>IP</code></td><td>The helper could not produce durable identity; the value is a runtime PC.</td></tr>
+            <tr><td><code>EMPTY</code></td><td>No frame.</td></tr>
+          </tbody>
+        </table>
+        <p>Raw-IP fallback covers anonymous/JIT memory, missing notes, mapping contention, and other helper limitations.</p>
+        <h4>Dual-chain in-kernel unwind</h4>
+        <p>The typed helper chain is always preserved as durable fallback identity. When the lightswitch-format walker completes—or a failed partial walk gets farther than the helper chain—BPF emits its selected raw PCs alongside that fallback. No user-stack byte snapshot is copied to userspace.</p>
+        <table>
+          <thead><tr><th>Bound</th><th>Value</th></tr></thead>
+          <tbody>
+            <tr><td>Typed user frames</td><td>64 × 32 B = 2,048 B</td></tr>
+            <tr><td>Kernel PCs</td><td>64</td></tr>
+            <tr><td>Python frames</td><td>16</td></tr>
+            <tr><td>Plain record</td><td>2,768 B</td></tr>
+            <tr><td>Dual-chain unwind record</td><td>3,288 B</td></tr>
+            <tr><td>Selected raw unwind PCs</td><td>at most 64</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="offcpu">
+      <h2>5. Off-CPU capture</h2>
+      <div class="stage kernel">
+        <h3><span class="tag kernel-tag">BPF / kernel</span>Capture at block; emit at wake</h3>
+        <p>At voluntary switch-out, BPF stores:</p>
+        <ul>
+          <li>timestamp and blocking identity;</li>
+          <li>up to 64 typed build-ID user frames;</li>
+          <li>up to 64 raw kernel PCs.</li>
+        </ul>
+        <p>At switch-in it computes blocked duration and emits intervals of at least 10 μs. Pending states live in a 10,240-entry LRU map.</p>
+        <p>Off-CPU capture uses the typed helper chain directly. The lightswitch tail-call walker remains on-CPU-only because an off-CPU interval is captured from scheduler context and emitted later at wake.</p>
+      </div>
+    </section>
+
+    <section id="runtime">
+      <h2>6. Runtime worker and in-kernel unwind result</h2>
+      <div class="stage runtime">
+        <h3><span class="tag runtime-tag">Userspace runtime</span>Validate and decode the chain already selected in BPF</h3>
+        <p>A single Rust worker polls the ring, validates event type and exact record size, and decodes at most 64 typed entries:</p>
+        <pre>VALID → BuildIdOffset(build_id, file_offset)
+IP    → RawIp(pc)
+EMPTY → discard</pre>
+        <p>Plain and off-CPU samples proceed directly to frame normalization. For an in-kernel unwind result, userspace first observes every build ID in the embedded typed fallback so first-sample retention remains possible. It then emits the selected raw chain from BPF through the same normalization path.</p>
+        <pre>completed lightswitch walk       → selected raw chain
+failed walk farther than helper  → selected partial raw chain
+otherwise                        → typed helper fallback</pre>
+        <p>These authority rules are applied in BPF, not reconsidered by userspace. Build-ID/file-offset entries remain fallback identity and are never used as unwind inputs.</p>
+      </div>
+    </section>
+
+    <section id="normalize">
+      <h2>7. Normalize every user frame</h2>
+      <div class="stage runtime">
+        <h3><span class="tag runtime-tag">Userspace runtime</span>Converge on one durable representation</h3>
+        <h4>Already a build-ID frame</h4>
+        <p>No live mapping is required. Sismo stores <code>Frame.rel_pc = file offset</code> under a process-independent build-ID mapping.</p>
+        <h4>Raw PC in a 20-byte-build-ID ELF</h4>
+        <pre>file_offset = mapping_file_offset + (pc - mapping_start)</pre>
+        <p>The frame is converted to the same canonical build-ID/file-offset representation.</p>
+        <h4>Raw PC in an id-less or nonstandard-ID file</h4>
+        <p>The frame retains virtual-address semantics and receives a real nonstandard or recording-local synthetic identity.</p>
+        <h4>Anonymous, JIT, or unmapped PC</h4>
+        <p>Sismo may use residual mappings such as <code>[jit:node]</code>, <code>[anon]</code>, or <code>[unmapped]</code>, with optional perf-map function names.</p>
+        <p>If no path is known for a real build ID, the durable display label is:</p>
+        <pre>[buildid:&lt;full 40-hex-character ID&gt;]</pre>
+      </div>
+    </section>
+
+    <section id="trace">
+      <h2>8. Perfetto representation</h2>
+      <div class="stage runtime">
+        <h3><span class="tag runtime-tag">Userspace runtime</span>Intern mappings, frames, and callstacks</h3>
+        <p>Sismo hash-interns path strings, build IDs, function names, mappings, frames, and complete callstacks. On-CPU and off-CPU streams use separate IID namespaces.</p>
+        <h4>Durable whole-file mapping</h4>
+        <pre>mapping identity: build ID
+address_kind:     FILE_OFFSET
+start/end/bias:   0
+Frame.rel_pc:     original ELF file offset</pre>
+        <h4>Fallback virtual mapping</h4>
+        <pre>mapping identity: range + offset + base + path + ID
+address_kind:     VIRTUAL_ADDRESS
+Frame.rel_pc:     runtime virtual coordinate</pre>
+        <p>The explicit address kind prevents a numeric file offset from being silently interpreted as a virtual address. A reused virtual range cannot inherit an old mapping IID because its full mapping identity participates in interning.</p>
+        <p>Per sample, native interning work is bounded by at most 64 user frames, 64 kernel frames, and 16 Python frames.</p>
+      </div>
+    </section>
+
+    <section id="shutdown">
+      <h2>9. Shutdown and fd lifetime</h2>
+      <div class="stage runtime">
+        <h3><span class="tag runtime-tag">Userspace runtime</span>Drain first; preserve the registry through symbolization</h3>
+        <ol>
+          <li>Perform a final ring consume.</li>
+          <li>Complete pending flush/stop acknowledgements.</li>
+          <li>Join the worker.</li>
+          <li>Destroy BPF links and close perf fds.</li>
+          <li>Free the ring and BPF object.</li>
+          <li>Return the fd-owning <code>ModuleRegistry</code> to the CLI.</li>
+        </ol>
+        <p>The registry deliberately outlives BPF capture so retained module fds remain valid during immediate post-record symbolization.</p>
+      </div>
+    </section>
+
+    <section id="symbolization">
+      <h2>10. Post-record symbolization</h2>
+      <div class="stage post">
+        <h3><span class="tag post-tag">Post-processing</span>Query unique unsymbolized addresses</h3>
+        <p>Sismo opens the trace in a fresh TraceProcessor and queries unsymbolized frames for:</p>
+        <pre>mapping path
+build ID
+Frame.rel_pc
+load bias
+address kind</pre>
+        <p>Rows are grouped by <code>(path, build ID, load bias, address kind)</code>. Repeated samples at the same address collapse to one lookup.</p>
+        <p>If <code>T</code> is the number of frame rows and <code>U</code> is the number of unique module/address pairs:</p>
+        <pre>trace collection: O(T)
+symbol lookups:  O(U)</pre>
+      </div>
+
+      <div class="stage post">
+        <h3><span class="tag post-tag">Post-processing</span>Select trusted executable and debug bytes</h3>
+        <ol>
+          <li><strong>Matching recorded path.</strong> Preferred so adjacent <code>.gnu_debuglink</code>, split-DWARF, and dSYM discovery remains available.</li>
+          <li><strong>Retained fd.</strong> Used when the original path is gone or replaced.</li>
+          <li><strong>Conventional build-ID locations.</strong> Such as <code>/usr/lib/.build-id/xx/rest</code> and <code>/usr/lib/debug/.build-id/xx/rest</code>.</li>
+          <li><strong>Debuginfod.</strong> Available when configured through <code>DEBUGINFOD_URLS</code>.</li>
+          <li><strong>Fail safely.</strong> A mismatching existing path is refused rather than mis-symbolized.</li>
+        </ol>
+        <h4>Executable bytes versus debug bytes</h4>
+        <table>
+          <thead><tr><th>Source</th><th>Responsibility</th></tr></thead>
+          <tbody>
+            <tr><td>Exact executable bytes</td><td>Translate file offsets through <code>PT_LOAD</code>; provide executable layout and format fallbacks.</td></tr>
+            <tr><td>Debug artifact</td><td>Provide names, inline frames, source files, and line numbers.</td></tr>
+          </tbody>
+        </table>
+        <p>A separate debug file is never used to interpret captured file offsets because its layout may differ from the executable.</p>
+      </div>
+
+      <div class="stage post">
+        <h3><span class="tag post-tag">Post-processing</span>Translate only for lookup</h3>
+        <p>For a FILE_OFFSET frame, Sismo finds the file-backed <code>PT_LOAD</code> containing the offset:</p>
+        <pre>lookup_vaddr = segment.p_vaddr + (file_offset - segment.p_offset)</pre>
+        <p>The translated vaddr is used only by the symbolizer. The trace coordinate remains the original file offset.</p>
+        <div class="note"><strong>Current cost detail:</strong> file-offset conversion currently constructs an ELF read view per unique sampled offset. Wholesym is loaded once per module, but ELF header/layout work is currently closer to once per unique FILE_OFFSET address. Parsing the layout once per module would be a straightforward future optimization.</div>
+      </div>
+    </section>
+
+    <section id="attachment">
+      <h2>11. Append and attach ModuleSymbols</h2>
+      <div class="stage post">
+        <h3><span class="tag post-tag">Post-processing</span>Attach names without rewriting frames</h3>
+        <p>For each resolved original address, Sismo appends:</p>
+        <pre>ModuleSymbols.path       = trace mapping path
+ModuleSymbols.build_id   = trace mapping build ID
+AddressSymbols.address   = original Frame.rel_pc</pre>
+        <p>For FILE_OFFSET mappings, <code>AddressSymbols.address</code> is the original file offset—not the translated lookup vaddr.</p>
+        <p>Perfetto later attaches the symbol set by matching the mapping path, build ID, and original address. The captured frame is not replaced.</p>
+        <p>Symbolization is therefore additive: failure leaves the original build-ID/file-offset frame intact.</p>
+      </div>
+      <div class="note"><strong>Disassembly limitation:</strong> FILE_OFFSET mappings currently receive symbolization but not assembly sidecars or static unwind diagnostics. Those paths remain limited to matching VIRTUAL_ADDRESS mappings so they cannot read replacement bytes or misuse coordinate semantics.</div>
+    </section>
+
+    <section id="scenarios">
+      <h2>12. Common scenarios</h2>
+      <h3>Stable system library</h3>
+      <pre>BPF → build ID + file offset
+auto policy → usually no retained fd
+post-processing → matching system path or build-ID cache</pre>
+
+      <h3>Local binary deleted after launch</h3>
+      <pre>first sampled build ID → on-demand map resolution → retain exact inode fd
+BPF → build ID + file offset
+path deleted
+post-processing → build ID selects /proc/self/fd/N
+fd closes after symbolization</pre>
+
+      <h3>Binary rebuilt at the same path</h3>
+      <pre>target mapping → old inode
+path → new inode
+device/inode check rejects replacement
+old retained fd remains valid, if already obtained
+otherwise exact build-ID artifact is required</pre>
+
+      <h3>Build-ID helper returns a raw IP</h3>
+      <pre>BPF → RawIp
+runtime map lookup → build ID + mapping file offset
+runtime conversion → durable build ID + file offset</pre>
+
+      <h3>Anonymous JIT frame</h3>
+      <pre>BPF → RawIp
+no file-backed ELF identity
+runtime → residual/JIT virtual mapping
+optional perf-map name</pre>
+
+      <h3>Build ID is known but no bytes are available</h3>
+      <pre>trace → [buildid:&lt;full-id&gt;] + file offset
+post-processing → no ModuleSymbols
+UI still exposes durable identity and offset</pre>
+    </section>
+
+    <section id="work">
+      <h2>13. Where the work happens</h2>
+      <table>
+        <thead><tr><th>Stage</th><th>Frequency</th><th>Main work</th></tr></thead>
+        <tbody>
+          <tr><td>Module inventory</td><td>On first sample demand, then miss-driven</td><td>Parse only the sampled PID’s <code>/proc/maps</code>; catalog all mappings but verify/open only sampled identities for retention.</td></tr>
+          <tr><td>BPF setup</td><td>Once</td><td>Load object and attach up to 256 CPU sampler links plus optional off-CPU probes.</td></tr>
+          <tr><td>On-CPU BPF</td><td>Every sample</td><td>≤12 counters, ≤64 typed fallback frames, ≤64 kernel PCs, and optional ≤64 selected lightswitch PCs.</td></tr>
+          <tr><td>Off-CPU BPF</td><td>Every voluntary block/wake</td><td>Capture typed stack at block and duration at wake.</td></tr>
+          <tr><td>Unwind-table control plane</td><td>Startup and mapping changes</td><td>Convert ELF/Go unwind metadata off the ring-drain thread and load bounded lightswitch tables into BPF maps.</td></tr>
+          <tr><td>Runtime normalization</td><td>Every selected frame</td><td>Interner lookup; live map lookup only for raw PCs.</td></tr>
+          <tr><td>Real map refresh</td><td>Throttled</td><td>Normally no more than about once per second; one forced refresh per unknown ID.</td></tr>
+          <tr><td>Trace query</td><td>Once per symbolization pass</td><td>Parse trace and enumerate unsymbolized rows.</td></tr>
+          <tr><td>Symbol lookup</td><td>Per unique address</td><td>Select trusted bytes, translate offset, perform wholesym lookup.</td></tr>
+          <tr><td>ModuleSymbols append</td><td>Per resolved unique address</td><td>Serialize names, inline frames, and source locations.</td></tr>
+          <tr><td>Fd retention</td><td>Recording through immediate symbolization</td><td>Keep at most 1,024 distinct local inodes readable.</td></tr>
+        </tbody>
+      </table>
+      <p>The architectural intent is that kernel work is fixed and bounded, runtime work is bounded per sample, and artifact discovery/symbol lookup happens after recording.</p>
+    </section>
+
+    <section id="invariants">
+      <h2>14. Design invariants</h2>
+      <div class="invariant"><strong>1. Capture coordinates, not symbols.</strong> BPF captures identity and location; symbols are a post-processing concern.</div>
+      <div class="invariant"><strong>2. Prefer durable coordinates.</strong> Normal ELF frames should converge on <code>(build ID, file offset)</code>.</div>
+      <div class="invariant"><strong>3. Unwind quality and identity are separate.</strong> Unwinding chooses which frames exist; normalization chooses how they are represented.</div>
+      <div class="invariant"><strong>4. An fd is an optimization, not identity.</strong> It preserves local bytes; the build ID remains the trace identity.</div>
+      <div class="invariant"><strong>5. Paths are hints, never authority.</strong> A path is trusted only after identity verification.</div>
+      <div class="invariant"><strong>6. Executable layout and debug information are separate.</strong> Executable bytes translate offsets; debug bytes provide names and lines.</div>
+      <div class="invariant"><strong>7. Trace coordinates never change during symbolization.</strong> Lookup may use a translated vaddr, but attachment uses the original <code>Frame.rel_pc</code>.</div>
+      <div class="invariant"><strong>8. Coordinate semantics are explicit.</strong> Every mapping says whether its frame coordinate is a virtual address or file offset.</div>
+      <div class="invariant"><strong>9. Symbolization is additive.</strong> Failure does not destroy or rewrite captured identity.</div>
+      <div class="invariant"><strong>10. Identity mismatches fail closed.</strong> No symbol is better than a confident symbol from the wrong binary.</div>
+    </section>
+
+    <section id="summary">
+      <h2>15. The short explanation</h2>
+      <blockquote>
+        On Linux, Sismo asks the kernel for a durable build-ID/file-offset helper chain. On x86 the in-kernel lightswitch-format walker may select a more authoritative raw chain, while preserving the typed helper chain for fallback identity and first-sample retention. Userspace maps selected raw PCs back to build-ID/file-offset pairs where possible and stores those coordinates with an explicit FILE_OFFSET mapping type. Separately, the recorder may retain verified module fds so deleted or replaced local binaries remain readable until immediate symbolization. After recording, Sismo finds trusted executable and debug bytes by build ID, converts file offsets through the executable’s PT_LOAD layout for symbol lookup, and appends ModuleSymbols keyed by the original path, build ID, and unchanged file offset. The fd is temporary; the build ID and offset are the durable trace identity.
+      </blockquote>
+      <p class="small">This document describes the current uncommitted Linux implementation. Privileged runtime validation of all kernel and <code>map_files</code> configurations remains environment-dependent.</p>
+    </section>
+  </main>
+</div>
+</body>
+</html>

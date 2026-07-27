@@ -1,7 +1,7 @@
 // Copyright 2026 The Sismo Authors. All rights reserved.
 // Licensed under the MIT License.
 
-//! CAP-3(b): the registry of module files a recording sampled, so a binary
+//! Userspace-only registry of module files a recording sampled, so a binary
 //! rebuilt or deleted mid-run still symbolizes.
 //!
 //! The registry is platform-neutral: it settles each sampled module's trace
@@ -11,12 +11,11 @@
 //! readable until the post-record symbolize pass. How a capture *names* a
 //! module is the capture's business, expressed as a [`ModuleKey`]:
 //!
-//! - The Linux bpf capture keys by mapping (`pid`, `base`), because identity
-//!   arrives from two threads that only share those coordinates: a dedicated
-//!   capture thread drains the `module_hints` ringbuf and registers each
-//!   module promptly (in-band build-id, fd pinned), while the main drain —
-//!   which backlogs under load — looks the id up when it interns the mapping.
-//!   Whichever thread reaches a module first mints the id and both then agree.
+//! - After a module first appears in a CPU sample, the Linux capture resolves
+//!   its executable mapping in userspace, keys it by `(pid, base, device,
+//!   inode)`, and preferably transfers an already-open
+//!   `/proc/<pid>/map_files/<start>-<end>` fd so it names the exact mapped inode
+//!   rather than whatever a pathname names later.
 //! - The macOS kperf snapshotter keys by file ([`ModuleKey::for_file`]),
 //!   registering each dyld image with the LC_UUID it read from the task.
 //!
@@ -31,7 +30,11 @@ use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 
-use crate::symbolize::proc_maps::synthetic_build_id;
+use crate::symbolize::proc_maps::{file_build_id, synthetic_build_id};
+
+/// Conservative per-recording limit. A miss only loses retained bytes; the
+/// build-id/file-offset identity in the trace remains durable.
+const DEFAULT_FD_CAP: usize = 1024;
 
 /// Which sampled module files to hold an fd open for, from `--keep-module-files`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,7 +44,7 @@ pub enum KeepPolicy {
     None,
     /// Hold fds only for modules on unstable paths (the default).
     Auto,
-    /// Hold an fd for every sampled module (bounded by RLIMIT_NOFILE).
+    /// Hold an fd for every sampled module (bounded by the registry fd cap).
     All,
 }
 
@@ -87,8 +90,16 @@ fn path_hash(path: &str) -> u64 {
 /// capture must use the same key every time it reaches the same module.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ModuleKey {
-    /// A per-process mapping, for captures whose events carry `(pid, base)`.
-    Mapping { pid: u32, base: u64 },
+    /// A per-process mapping plus its kernel-reported file identity. Including
+    /// the inode prevents a later dlopen at a reused base from inheriting the
+    /// previous module's synthetic id or pin state.
+    Mapping {
+        pid: u32,
+        base: u64,
+        dev_major: u32,
+        dev_minor: u32,
+        ino: u64,
+    },
     /// A file identity, for captures that enumerate images by path.
     File { dev: u64, ino: u64 },
 }
@@ -110,10 +121,14 @@ struct Entry {
     // the capture read one, else a synthetic magic+random id minted on first
     // sight.
     build_id: Vec<u8>,
+    // Additional real IDs verified against this held inode. This matters when
+    // a first observation minted a synthetic ID and a retry later recovered
+    // the ELF build ID used by kernel BuildIdOffset frames.
+    aliases: Vec<Vec<u8>>,
     // The (dev, inode) whose fd (in `fds`) backs this module, if one was held.
     inode: Option<(u64, u64)>,
-    // Whether a `register` call already decided the pin for this module, so
-    // re-registrations don't re-stat or re-open the file.
+    // Whether pinning succeeded or policy permanently declined it. Transient
+    // open/verification failures leave this false so a later maps refresh can retry.
     pin_done: bool,
 }
 
@@ -124,6 +139,8 @@ pub struct ModuleRegistry {
     entries: HashMap<ModuleKey, Entry>,
     fds: HashMap<(u64, u64), File>, // (dev, inode) -> held fd, deduped
     rng: u64,                       // splitmix64 state for synthetic ids
+    fd_cap: usize,
+    paths_by_id: HashMap<Vec<u8>, String>,
 }
 
 impl ModuleRegistry {
@@ -132,7 +149,14 @@ impl ModuleRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        ModuleRegistry { policy, entries: HashMap::new(), fds: HashMap::new(), rng: seed }
+        ModuleRegistry {
+            policy,
+            entries: HashMap::new(),
+            fds: HashMap::new(),
+            rng: seed,
+            fd_cap: DEFAULT_FD_CAP,
+            paths_by_id: HashMap::new(),
+        }
     }
 
     fn next_rand(&mut self) -> u64 {
@@ -153,7 +177,15 @@ impl ModuleRegistry {
             return e.build_id.clone();
         }
         let build_id = self.mint(id_hint);
-        self.entries.insert(key, Entry { build_id: build_id.clone(), inode: None, pin_done: false });
+        self.entries.insert(
+            key,
+            Entry {
+                build_id: build_id.clone(),
+                aliases: Vec::new(),
+                inode: None,
+                pin_done: false,
+            },
+        );
         build_id
     }
 
@@ -163,15 +195,125 @@ impl ModuleRegistry {
     ///
     /// [`id_for`]: ModuleRegistry::id_for
     pub fn register(&mut self, key: ModuleKey, id_hint: &[u8], path: &str) -> Vec<u8> {
-        let build_id = self.id_for(key, id_hint);
-        let e = self.entries.get(&key).expect("id_for interned it");
-        if !e.pin_done {
-            let inode = self.pin_fd(path);
-            let e = self.entries.get_mut(&key).expect("id_for interned it");
-            e.inode = inode;
-            e.pin_done = true;
+        self.register_open_path(key, id_hint, path, path, false)
+    }
+
+    /// Linux mapping registration. `open_path` may be a target `map_files`
+    /// symlink; a non-empty real build ID is verified against the opened inode
+    /// before it is retained.
+    pub fn register_exact(
+        &mut self,
+        key: ModuleKey,
+        id_hint: &[u8],
+        display_path: &str,
+        open_path: &str,
+    ) -> Vec<u8> {
+        self.register_open_path(key, id_hint, display_path, open_path, true)
+    }
+
+    /// Linux mapping registration using an fd the caller already opened from
+    /// `map_files` (or from an inode-verified pathname). Ownership transfers
+    /// directly into the registry, avoiding an unmap/reuse race between
+    /// identity inspection and reopening the file for retention.
+    pub fn register_exact_file(
+        &mut self,
+        key: ModuleKey,
+        id_hint: &[u8],
+        display_path: &str,
+        file: File,
+    ) -> Vec<u8> {
+        let build_id = self.prepare_registration(key, id_hint, display_path, true);
+        let need_alias = self.needs_alias(key, &build_id, id_hint, true);
+        let pin_done = self.entries.get(&key).expect("id_for interned it").pin_done;
+        if !pin_done || need_alias {
+            let hold = self.should_hold(display_path);
+            let inode = if hold {
+                // `id_hint` was read through this same fd by the capture; only
+                // the mapping identity must be rechecked before ownership moves.
+                self.pin_open_file(key, file, id_hint, true, false)
+            } else {
+                None
+            };
+            self.finish_registration(key, id_hint, need_alias, hold, inode);
         }
         build_id
+    }
+
+    fn register_open_path(
+        &mut self,
+        key: ModuleKey,
+        id_hint: &[u8],
+        display_path: &str,
+        open_path: &str,
+        verify_elf_id: bool,
+    ) -> Vec<u8> {
+        let build_id = self.prepare_registration(key, id_hint, display_path, verify_elf_id);
+        let need_alias = self.needs_alias(key, &build_id, id_hint, verify_elf_id);
+        let pin_done = self.entries.get(&key).expect("id_for interned it").pin_done;
+        if !pin_done || need_alias {
+            let hold = self.should_hold(display_path);
+            let inode = if hold {
+                self.pin_fd(key, open_path, id_hint, verify_elf_id)
+            } else {
+                None
+            };
+            self.finish_registration(key, id_hint, need_alias, hold, inode);
+        }
+        build_id
+    }
+
+    fn prepare_registration(
+        &mut self,
+        key: ModuleKey,
+        id_hint: &[u8],
+        display_path: &str,
+        verify_elf_id: bool,
+    ) -> Vec<u8> {
+        let build_id = self.id_for(key, id_hint);
+        if !display_path.is_empty() {
+            self.paths_by_id
+                .entry(build_id.clone())
+                .or_insert_with(|| display_path.to_string());
+            if verify_elf_id && !id_hint.is_empty() {
+                self.paths_by_id
+                    .entry(id_hint.to_vec())
+                    .or_insert_with(|| display_path.to_string());
+            }
+        }
+        build_id
+    }
+
+    fn needs_alias(
+        &self,
+        key: ModuleKey,
+        build_id: &[u8],
+        id_hint: &[u8],
+        verify_elf_id: bool,
+    ) -> bool {
+        let e = self.entries.get(&key).expect("id_for interned it");
+        verify_elf_id
+            && !id_hint.is_empty()
+            && id_hint != build_id
+            && !e.aliases.iter().any(|alias| alias == id_hint)
+    }
+
+    fn finish_registration(
+        &mut self,
+        key: ModuleKey,
+        id_hint: &[u8],
+        need_alias: bool,
+        hold: bool,
+        inode: Option<(u64, u64)>,
+    ) {
+        let e = self.entries.get_mut(&key).expect("id_for interned it");
+        // Keep an already verified fd if an alias-verification retry is
+        // transiently unable to reopen the module.
+        e.inode = inode.or(e.inode);
+        if inode.is_some() && need_alias {
+            e.aliases.push(id_hint.to_vec());
+        }
+        // A policy refusal is permanent; an open/identity failure is not.
+        e.pin_done = e.pin_done || !hold || inode.is_some();
     }
 
     fn mint(&mut self, hint: &[u8]) -> Vec<u8> {
@@ -183,23 +325,88 @@ impl ModuleRegistry {
         }
     }
 
-    /// Pin an fd for `path` per the policy, deduped by `(dev, inode)`. Returns
-    /// the key the fd is held under, or `None` when the policy declined, the
-    /// file is already gone, or the open failed.
-    fn pin_fd(&mut self, path: &str) -> Option<(u64, u64)> {
-        let hold = match self.policy {
+    fn should_hold(&self, display_path: &str) -> bool {
+        match self.policy {
             KeepPolicy::All => true,
-            KeepPolicy::Auto => is_unstable(path),
+            KeepPolicy::Auto => is_unstable(display_path),
             KeepPolicy::None => false,
-        };
-        if !hold {
+        }
+    }
+
+    /// Whether another exact open could still add a retained fd or a verified
+    /// real-ID alias. Capture-side cooldowns may use this without replacing
+    /// the registry's authority over transient versus permanent outcomes.
+    pub fn needs_exact_retry(
+        &self,
+        key: ModuleKey,
+        id_hint: &[u8],
+        display_path: &str,
+    ) -> bool {
+        if !self.should_hold(display_path) {
+            return false;
+        }
+        let Some(e) = self.entries.get(&key) else { return true };
+        let need_alias = !id_hint.is_empty()
+            && id_hint != e.build_id
+            && !e.aliases.iter().any(|alias| alias == id_hint);
+        !e.pin_done || need_alias
+    }
+
+    /// Pin an fd, deduped by `(dev, inode)`. For a Linux mapping, reject a
+    /// pathname fallback that no longer names the inode reported by `/proc/maps`.
+    fn pin_fd(
+        &mut self,
+        module_key: ModuleKey,
+        open_path: &str,
+        id_hint: &[u8],
+        verify_elf_id: bool,
+    ) -> Option<(u64, u64)> {
+        let file = File::open(open_path).ok()?;
+        self.pin_open_file(
+            module_key,
+            file,
+            id_hint,
+            verify_elf_id,
+            verify_elf_id,
+        )
+    }
+
+    fn pin_open_file(
+        &mut self,
+        module_key: ModuleKey,
+        file: File,
+        id_hint: &[u8],
+        verify_mapping: bool,
+        verify_elf_id: bool,
+    ) -> Option<(u64, u64)> {
+        let meta = file.metadata().ok()?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = module_key;
+        #[cfg(target_os = "linux")]
+        if verify_mapping {
+            if let ModuleKey::Mapping { dev_major, dev_minor, ino, .. } = module_key {
+                if libc::major(meta.dev()) as u32 != dev_major
+                    || libc::minor(meta.dev()) as u32 != dev_minor
+                    || meta.ino() != ino
+                {
+                    return None;
+                }
+            }
+        }
+        let key = (meta.dev(), meta.ino());
+        if verify_elf_id && !id_hint.is_empty() {
+            let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+            if file_build_id(&fd_path).as_deref() != Some(id_hint) {
+                return None;
+            }
+        }
+        if self.fds.contains_key(&key) {
+            return Some(key);
+        }
+        if self.fds.len() >= self.fd_cap {
             return None;
         }
-        let meta = std::fs::metadata(path).ok()?;
-        let key = (meta.dev(), meta.ino());
-        if let std::collections::hash_map::Entry::Vacant(e) = self.fds.entry(key) {
-            e.insert(File::open(path).ok()?);
-        }
+        self.fds.insert(key, file);
         Some(key)
     }
 
@@ -220,11 +427,20 @@ impl ModuleRegistry {
             }
             if let Some(inode) = e.inode {
                 if let Some(f) = self.fds.get(&inode) {
-                    out.insert(e.build_id.clone(), format!("{FD_DIR}/{}", f.as_raw_fd()));
+                    let fd_path = format!("{FD_DIR}/{}", f.as_raw_fd());
+                    out.insert(e.build_id.clone(), fd_path.clone());
+                    for alias in &e.aliases {
+                        out.insert(alias.clone(), fd_path.clone());
+                    }
                 }
             }
         }
         out
+    }
+
+    /// Best known original display path for a real build ID.
+    pub fn display_path(&self, build_id: &[u8]) -> Option<&str> {
+        self.paths_by_id.get(build_id).map(String::as_str)
     }
 
     /// Number of distinct files whose fd is held (for stats/logging).
@@ -249,7 +465,13 @@ mod tests {
     #[test]
     fn id_for_mints_once_and_agrees_across_calls() {
         let mut reg = ModuleRegistry::new(KeepPolicy::None);
-        let key = |pid, base| ModuleKey::Mapping { pid, base };
+        let key = |pid, base| ModuleKey::Mapping {
+            pid,
+            base,
+            dev_major: 0,
+            dev_minor: 0,
+            ino: 0,
+        };
         // A real id passes through and is stable.
         let real = [0xde, 0xad, 0xbe, 0xef];
         assert_eq!(reg.id_for(key(7, 0x400000), &real), real);
@@ -260,6 +482,14 @@ mod tests {
         assert!(is_synthetic(&a) && is_synthetic(&b));
         assert_ne!(a, b);
         assert_eq!(reg.id_for(key(7, 0x500000), &[]), a); // stable
+        let reused_base = ModuleKey::Mapping {
+            pid: 7,
+            base: 0x500000,
+            dev_major: 0,
+            dev_minor: 0,
+            ino: 1,
+        };
+        assert_ne!(reg.id_for(reused_base, &[]), a); // a new inode at the same base is new
     }
 
     #[test]
@@ -270,7 +500,13 @@ mod tests {
         std::fs::write(&p, b"\x7fELF-bytes").unwrap();
 
         let mut reg = ModuleRegistry::new(KeepPolicy::Auto);
-        let key = ModuleKey::Mapping { pid: 42, base: 0x400000 };
+        let key = ModuleKey::Mapping {
+            pid: 42,
+            base: 0x400000,
+            dev_major: 0,
+            dev_minor: 0,
+            ino: 0,
+        };
         // No identity in the hint → synthetic id, and a held fd.
         let id = reg.register(key, &[], p.to_str().unwrap());
         assert!(is_synthetic(&id));
@@ -306,8 +542,68 @@ mod tests {
 
         std::fs::remove_file(&p).unwrap(); // deleted, but the held fd keeps it readable
         let paths = reg.held_fd_paths();
-        let fd_path = paths.get(&real[..].to_vec()).expect("held by build-id");
+        let fd_path = paths.get(&real[..]).expect("held by build-id");
         assert_eq!(std::fs::read(fd_path).unwrap(), b"MH-bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_pin_failure_retries_on_later_registration() {
+        let dir = std::env::temp_dir().join(format!("sismo-reg-retry-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("late");
+        let path = p.to_str().unwrap();
+        let key = ModuleKey::File { dev: 0, ino: 42 };
+        let mut reg = ModuleRegistry::new(KeepPolicy::Auto);
+        let id = reg.register(key, &[], path);
+        assert_eq!(reg.held_count(), 0);
+        assert!(reg.needs_exact_retry(key, &[], path));
+        std::fs::write(&p, b"arrived").unwrap();
+        assert_eq!(reg.register(key, &[], path), id);
+        assert_eq!(reg.held_count(), 1);
+        assert!(!reg.needs_exact_retry(key, &[], path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_aliases_a_late_real_build_id_to_the_retained_fd() {
+        let dir = std::env::temp_dir().join(format!(
+            "sismo-reg-late-build-id-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("late-elf");
+        let path = path.to_str().unwrap();
+        let key = ModuleKey::File { dev: 0, ino: 84 };
+        let mut reg = ModuleRegistry::new(KeepPolicy::All);
+        let synthetic = reg.register_exact(key, &[], path, path);
+        assert!(is_synthetic(&synthetic));
+        assert_eq!(reg.held_count(), 0);
+
+        std::fs::copy("/proc/self/exe", path).unwrap();
+        let real = file_build_id(path).unwrap();
+        assert_eq!(reg.register_exact(key, &real, path, path), synthetic);
+        let held = reg.held_fd_paths();
+        assert_eq!(held.get(&synthetic), held.get(&real));
+        assert!(held.get(&real).is_some(), "kernel build-id must find the retained fd");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn held_inode_survives_atomic_path_replacement() {
+        let dir = std::env::temp_dir().join(format!("sismo-reg-replace-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("prog");
+        let new = dir.join("prog.new");
+        std::fs::write(&p, b"original").unwrap();
+        std::fs::write(&new, b"replacement").unwrap();
+        let path = p.to_str().unwrap();
+        let mut reg = ModuleRegistry::new(KeepPolicy::Auto);
+        let id = reg.register(ModuleKey::for_file(path), &[], path);
+        std::fs::rename(&new, &p).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+        let fd_path = reg.held_fd_paths().remove(&id).unwrap();
+        assert_eq!(std::fs::read(fd_path).unwrap(), b"original");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -326,6 +622,107 @@ mod tests {
         assert!(is_synthetic(&ida) && is_synthetic(&idb));
         assert_ne!(ida, idb); // distinct files → distinct ids
         assert_eq!(reg.register(ModuleKey::for_file(pa), &[], pa), ida); // stable per inode
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_open_file_transfers_ownership_after_path_deletion() {
+        let dir = std::env::temp_dir().join(format!(
+            "sismo-reg-open-transfer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("module");
+        std::fs::copy("/proc/self/exe", &path).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let real = file_build_id(path.to_str().unwrap()).unwrap();
+        let file = File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let key = ModuleKey::Mapping {
+            pid: std::process::id(),
+            base: 0x2800,
+            dev_major: libc::major(meta.dev()) as u32,
+            dev_minor: libc::minor(meta.dev()) as u32,
+            ino: meta.ino(),
+        };
+        let mut reg = ModuleRegistry::new(KeepPolicy::All);
+        reg.register_exact_file(key, &real, path.to_str().unwrap(), file);
+        assert_eq!(reg.held_count(), 1);
+        let fd_path = reg.held_fd_paths().remove(&real).expect("real ID alias");
+        assert!(file_build_id(&fd_path).is_some_and(|id| id == real));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_registration_rejects_a_replacement_with_the_same_build_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "sismo-reg-replaced-same-id-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("module");
+        let replacement = dir.join("replacement");
+        std::fs::copy("/proc/self/exe", &path).unwrap();
+        let expected = std::fs::metadata(&path).unwrap();
+        std::fs::copy("/proc/self/exe", &replacement).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let real = file_build_id(path.to_str().unwrap()).unwrap();
+        let key = ModuleKey::Mapping {
+            pid: std::process::id(),
+            base: 0x3000,
+            dev_major: libc::major(expected.dev()) as u32,
+            dev_minor: libc::minor(expected.dev()) as u32,
+            ino: expected.ino(),
+        };
+        let mut reg = ModuleRegistry::new(KeepPolicy::All);
+        reg.register_exact(key, &real, path.to_str().unwrap(), path.to_str().unwrap());
+        assert_eq!(reg.held_count(), 0, "replacement inode must not be retained");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_registration_verifies_real_build_id() {
+        let path = "/proc/self/exe";
+        let real = file_build_id(path).expect("test binary has a build id");
+        let mut reg = ModuleRegistry::new(KeepPolicy::All);
+        let meta = std::fs::metadata(path).unwrap();
+        let mapping_key = |base| ModuleKey::Mapping {
+            pid: std::process::id(),
+            base,
+            dev_major: libc::major(meta.dev()) as u32,
+            dev_minor: libc::minor(meta.dev()) as u32,
+            ino: meta.ino(),
+        };
+        let key = mapping_key(0x1000);
+        reg.register_exact(key, &real, path, path);
+        assert_eq!(reg.held_count(), 1);
+        assert_eq!(reg.display_path(&real), Some(path));
+
+        let mut wrong = real.clone();
+        wrong[0] ^= 0xff;
+        let key2 = mapping_key(0x2000);
+        reg.register_exact(key2, &wrong, path, path);
+        // Same inode was already retained; identity verification is required
+        // before aliases can attach to it, so the wrong id gets no fd path.
+        assert!(!reg.held_fd_paths().contains_key(&wrong));
+    }
+
+    #[test]
+    fn fd_cap_is_explicit_and_deterministic() {
+        let dir = std::env::temp_dir().join(format!("sismo-reg-cap-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let mut reg = ModuleRegistry::new(KeepPolicy::All);
+        reg.fd_cap = 1;
+        reg.register(ModuleKey::for_file(a.to_str().unwrap()), &[], a.to_str().unwrap());
+        reg.register(ModuleKey::for_file(b.to_str().unwrap()), &[], b.to_str().unwrap());
+        assert_eq!(reg.held_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

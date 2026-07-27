@@ -21,6 +21,9 @@ struct Line<'a> {
     start: u64,
     end: u64,
     offset: u64,
+    dev_major: u32,
+    dev_minor: u32,
+    inode: u64,
     exec: bool,
     path: &'a str,
 }
@@ -32,6 +35,9 @@ pub struct Mapping {
     pub end: u64,
     pub offset: u64,
     pub base_avma: u64,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+    pub inode: u64,
     pub path: String,
     pub build_id: Vec<u8>,
 }
@@ -44,9 +50,19 @@ pub struct ProcMaps {
 }
 
 impl ProcMaps {
-    /// Parse `/proc/<pid>/maps`, or None on failure.
+    /// Parse `/proc/<pid>/maps` and read displayed-path build IDs, or None on
+    /// failure. Callers that establish identity from exact opened inodes should
+    /// use [`ProcMaps::parse_layout`] to avoid duplicate ELF reads.
     pub fn parse(pid: u32) -> Option<ProcMaps> {
         from_pid(pid)
+    }
+
+    /// Parse only mapping layout and path metadata. Build IDs are left empty so
+    /// the caller can resolve only sampled identities through exact fds.
+    pub fn parse_layout(pid: u32) -> Option<ProcMaps> {
+        let raw = crate::maps_common::read_maps_text(pid)?;
+        let mappings = parse_text(&raw, |_| Vec::new());
+        Some(ProcMaps { mappings })
     }
 
     /// The executable file-backed mapping containing `addr`, if any.
@@ -55,7 +71,7 @@ impl ProcMaps {
     }
 
     /// Every executable file-backed mapping, ascending by start — for callers
-    /// that need the raw segments (e.g. registering unwind-table ranges).
+    /// that need raw segments for unwind tables or sample-driven retention.
     pub fn mappings(&self) -> &[Mapping] {
         &self.mappings
     }
@@ -227,8 +243,8 @@ fn parse_line(line: &str) -> Option<Line<'_>> {
     let range = it.next()?;
     let perms = it.next()?;
     let offset_s = it.next()?;
-    it.next()?; // dev
-    it.next()?; // inode
+    let dev_s = it.next()?;
+    let inode_s = it.next()?;
     let path = it.next()?; // pathname (absent -> skip)
 
     if perms.len() < 3 {
@@ -242,10 +258,17 @@ fn parse_line(line: &str) -> Option<Line<'_>> {
     let start = u64::from_str_radix(start_s, 16).ok()?;
     let end = u64::from_str_radix(end_s, 16).ok()?;
     let offset = u64::from_str_radix(offset_s, 16).ok()?;
+    let (major_s, minor_s) = dev_s.split_once(':')?;
+    let dev_major = u32::from_str_radix(major_s, 16).ok()?;
+    let dev_minor = u32::from_str_radix(minor_s, 16).ok()?;
+    let inode = inode_s.parse().ok()?;
     Some(Line {
         start,
         end,
         offset,
+        dev_major,
+        dev_minor,
+        inode,
         exec: perms.as_bytes()[2] == b'x',
         path,
     })
@@ -297,6 +320,9 @@ fn parse_text(raw: &str, mut build_id_for: impl FnMut(&str) -> Vec<u8>) -> Vec<M
             end: m.end,
             offset: m.offset,
             base_avma: fi.base_avma,
+            dev_major: m.dev_major,
+            dev_minor: m.dev_minor,
+            inode: m.inode,
             path: m.path.to_owned(),
             build_id: fi.build_id.clone(),
         });
@@ -409,9 +435,8 @@ fn build_id_from_notes(notes: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Parse the GNU build-id from the *mapped image prefix* of an ELF — the leading
-/// bytes of the module as they sit in the target's address space, which is what
-/// BPF copies from mapped memory at sample time (CAP-2). Unlike
+/// Parse the GNU build-id from a mapped-image prefix of an ELF. This parser is
+/// retained as a standalone utility/test for memory-image readers. Unlike
 /// `build_id_from_elf` it needs no section table and no complete file: it reads
 /// the ELF header, walks the program headers, and reads each `PT_NOTE` at its
 /// vaddr offset within the prefix. `prefix` starts at the image base (the first
@@ -476,6 +501,7 @@ mod tests {
         assert_eq!(l.start, 0x7f1234500000);
         assert_eq!(l.end, 0x7f1234600000);
         assert_eq!(l.offset, 0x12000);
+        assert_eq!((l.dev_major, l.dev_minor, l.inode), (0xfd, 1, 1234));
         assert!(l.exec);
         assert_eq!(l.path, "/usr/lib/libc.so.6");
     }
@@ -615,7 +641,7 @@ mod tests {
         assert!(!is_synthetic(b"SISMO")); // too short to carry the magic
     }
 
-    // CAP-2: the build-id parsed from a *mapped image prefix* (what BPF copies
+    // The build-id parsed from a mapped-image prefix
     // from the target's memory) must equal the build-id read from the whole
     // file. For a PIE the first PT_LOAD maps at file offset 0, so the file's
     // leading bytes equal the mapped prefix — read the running test binary and
@@ -639,6 +665,14 @@ mod tests {
     // Exercises the real path end to end (live /proc read + ELF build-id
     // extraction against on-disk binaries), which the fixture tests can't.
     #[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_layout_skips_elf_identity_io() {
+        let maps = ProcMaps::parse_layout(std::process::id()).unwrap();
+        assert!(maps.mappings().first().is_some());
+        assert!(maps.mappings().iter().all(|m| m.build_id.is_empty()));
+    }
+
     #[test]
     fn from_pid_self_is_sane() {
         let maps = from_pid(std::process::id()).expect("parse self maps");
@@ -665,8 +699,10 @@ mod tests {
         let maps = ProcMaps {
             mappings: vec![
                 Mapping { start: 0x1000, end: 0x2000, offset: 0, base_avma: 0x1000,
+                          dev_major: 1, dev_minor: 2, inode: 3,
                           path: "a".into(), build_id: vec![] },
                 Mapping { start: 0x3000, end: 0x4000, offset: 0, base_avma: 0x3000,
+                          dev_major: 1, dev_minor: 2, inode: 4,
                           path: "b".into(), build_id: vec![] },
             ],
         };

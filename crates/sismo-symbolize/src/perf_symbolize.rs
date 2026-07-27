@@ -13,9 +13,10 @@
 //!
 //! Runs on both record paths — Linux bpf and macOS kperf — and offline via
 //! `sismo symbolize`. The address convention is shared: both captures emit
-//! mappings whose `load_bias` is the value to subtract from a frame's
-//! `rel_pc` to reach the symbolizer's module-relative space (the ELF
-//! link-time vaddr on Linux, the offset from the `__TEXT` base on macOS).
+//! virtual mappings whose `load_bias` is subtracted from `rel_pc`, plus Linux
+//! whole-file mappings whose `rel_pc` is an explicit ELF file offset. File
+//! offsets are translated through executable PT_LOAD headers only for lookup;
+//! ModuleSymbols keeps the original file offset so Perfetto matches it exactly.
 //! The trace query is bound to the C++ shim; the symbolizer, disassembler,
 //! and proto writer are Rust siblings (direct calls, no FFI round-trip).
 //! POSIX-only (file append).
@@ -29,7 +30,7 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::os::raw::{c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---- Field tags (protos/perfetto/trace/{trace_packet,profiling/profile_common}) ----
 const TP_FIELD_TRACE_PACKET: u32 = 1;
@@ -53,6 +54,7 @@ type RowCb = extern "C" fn(
     build_id_len: usize,
     rel_pc: u64,
     load_bias: u64,
+    address_kind: u32,
 );
 
 type StackQualityCb = extern "C" fn(
@@ -62,6 +64,7 @@ type StackQualityCb = extern "C" fn(
     build_id: *const u8,
     build_id_len: usize,
     load_bias: u64,
+    address_kind: u32,
     total: u64,
     single_frame: u64,
 );
@@ -98,10 +101,27 @@ unsafe extern "C" fn sismo_trace_query_stack_quality(
 
 // ---- Module collection -----------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddressKind {
+    VirtualAddress,
+    FileOffset,
+}
+
+impl AddressKind {
+    fn from_raw(value: u32) -> Self {
+        if value == 1 {
+            Self::FileOffset
+        } else {
+            Self::VirtualAddress
+        }
+    }
+}
+
 struct Module {
     name: Vec<u8>,
     build_id_hex: Vec<u8>,
     load_bias: u64,
+    address_kind: AddressKind,
     rel_pcs: Vec<u64>,
     seen: HashSet<u64>,
 }
@@ -111,7 +131,7 @@ struct Collector {
     modules: Vec<Module>,
 }
 
-/// Per-row callback: rows arrive grouped by (name, build_id, load_bias), so the
+/// Per-row callback: rows arrive grouped by (name, build_id, load_bias, kind), so the
 /// trailing module is extended while the key matches and a new one starts when
 /// it changes. Duplicate rel_pcs (many samples hitting one address) collapse via
 /// `seen`.
@@ -123,19 +143,25 @@ extern "C" fn on_row(
     build_id_len: usize,
     rel_pc: u64,
     load_bias: u64,
+    address_kind: u32,
 ) {
     let self_ = unsafe { &mut *(ctx as *mut Collector) };
     let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
     let build_id = unsafe { std::slice::from_raw_parts(build_id_ptr, build_id_len) };
 
+    let address_kind = AddressKind::from_raw(address_kind);
     let same = self_.modules.last().is_some_and(|m| {
-        m.load_bias == load_bias && m.name == name && m.build_id_hex == build_id
+        m.load_bias == load_bias
+            && m.address_kind == address_kind
+            && m.name == name
+            && m.build_id_hex == build_id
     });
     if !same {
         self_.modules.push(Module {
             name: name.to_vec(),
             build_id_hex: build_id.to_vec(),
             load_bias,
+            address_kind,
             rel_pcs: Vec::new(),
             seen: HashSet::new(),
         });
@@ -154,7 +180,7 @@ extern "C" fn on_row(
 /// never loses a recording.
 ///
 /// `held_fds` maps a module build-id to a `/proc/self/fd/<n>` path the recorder
-/// kept open for it (CAP-3(b)); it is the byte source for a module whose file was
+/// kept open for it; it is the byte source for a module whose file was
 /// deleted since recording. Empty for an offline pass with no held fds.
 pub fn symbolize_trace(trace_path: &str, held_fds: &HashMap<Vec<u8>, String>) {
     let mut path_z: Vec<u8> = trace_path.as_bytes().to_vec();
@@ -203,18 +229,28 @@ pub fn symbolize_trace(trace_path: &str, held_fds: &HashMap<Vec<u8>, String>) {
             continue;
         }
         let mut stat = ModuleStat::new(m.name.clone(), m.build_id_hex.clone());
-        let ms = build_module_symbols(&mut sym, m, &mut stat, &mut src_set, &mut src_seen, held_fds);
+        let ms = build_module_symbols(
+            &mut sym,
+            m,
+            &mut stat,
+            &mut src_set,
+            &mut src_seen,
+            held_fds,
+        );
         n_addrs += stat.n_addrs;
         n_funcs += stat.n_real();
         stats.push(stat);
-        // Disassemble this module's hot functions while `sym` is scoped exactly
-        // as build_module_symbols saw it (line resolution reuses the lookups).
-        if let Some(arch) = host_arch {
-            collect_module_disasm(&sym, m, arch, &mut asm_records);
+        // Disassembly and static unwind diagnostics read the recorded path
+        // directly. Run them only when it still names the sampled binary; the
+        // symbolizer may otherwise have loaded the exact bytes through a held fd.
+        let recorded_bytes_match =
+            m.address_kind == AddressKind::VirtualAddress && recorded_path_matches(m);
+        if recorded_bytes_match {
+            if let Some(arch) = host_arch {
+                collect_module_disasm(&sym, m, arch, &mut asm_records);
+            }
+            report_missing_unwind_tables(&sym, m);
         }
-        // FLAG-noeh: warn when this module's own code has neither unwind tables
-        // nor frame pointers (sym now has it registered, so fn starts resolve).
-        report_missing_unwind_tables(&sym, m);
         if ms.is_empty() {
             continue;
         }
@@ -255,6 +291,7 @@ extern "C" fn on_stack_row(
     _build_id_ptr: *const u8,
     _build_id_len: usize,
     _load_bias: u64,
+    _address_kind: u32,
     total: u64,
     single_frame: u64,
 ) {
@@ -438,6 +475,36 @@ fn resolve(sym: &Symbolizer, avma: u64) -> Resolved {
 
 // ---- ModuleSymbols building ------------------------------------------------
 
+fn recorded_path_matches(module: &Module) -> bool {
+    let Ok(path) = std::str::from_utf8(&module.name) else {
+        return false;
+    };
+    let mut raw = [0u8; 64];
+    let build_id = hex_to_bytes(&module.build_id_hex, &mut raw);
+    Path::new(path).is_file() && crate::byte_source::matches(path, build_id)
+}
+
+fn conventional_build_id_paths(build_id: &[u8]) -> (Option<PathBuf>, Option<PathBuf>) {
+    if build_id.len() < 2 {
+        return (None, None);
+    }
+    let first = format!("{:02x}", build_id[0]);
+    let rest: String = build_id[1..].iter().map(|b| format!("{b:02x}")).collect();
+    let mut executable = None;
+    let mut debug = None;
+    for root in ["/usr/lib/.build-id", "/usr/lib/debug/.build-id"] {
+        let base = Path::new(root).join(&first).join(&rest);
+        if executable.is_none() && base.exists() {
+            executable = Some(base.clone());
+        }
+        let dbg = base.with_file_name(format!("{rest}.debug"));
+        if debug.is_none() && dbg.exists() {
+            debug = Some(dbg);
+        }
+    }
+    (executable, debug)
+}
+
 /// Build one ModuleSymbols message for `m`, or return an empty vec if no address
 /// resolved. Field order (path, build_id, then the repeated AddressSymbols).
 fn build_module_symbols(
@@ -448,13 +515,23 @@ fn build_module_symbols(
     src_seen: &mut HashSet<Vec<u8>>,
     held_fds: &HashMap<Vec<u8>, String>,
 ) -> Vec<u8> {
-    // base_avma = load_bias so the bridge's `rel = avma - base_avma` equals
-    // `rel_pc - load_bias`. end_avma just has to be past every rel_pc.
-    let mut max_pc = m.load_bias;
-    for &pc in &m.rel_pcs {
-        max_pc = max_pc.max(pc);
-    }
-    let end_avma = max_pc + 1;
+    // Resolve each module in an isolated address space. FILE_OFFSET modules
+    // are deliberately zero-based, so a prior module's overlapping vaddrs
+    // must not resolve through the wrong symbol map.
+    sym.clear_modules();
+    stat.n_addrs += m.rel_pcs.len();
+    // Trace coordinates and lookup coordinates are identical for virtual
+    // mappings. FILE_OFFSET mappings replace these lookup values below after
+    // selecting the exact executable whose PT_LOAD layout defines conversion.
+    let mut lookup_pcs: Vec<Option<u64>> = m.rel_pcs.iter().copied().map(Some).collect();
+    let mut range_base = m.load_bias;
+    let mut end_avma = m
+        .rel_pcs
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(m.load_bias)
+        .saturating_add(1);
 
     // The kernel is a names-only module: frames carry [kernel.kallsyms]-relative
     // rel_pcs (load_bias 0) and resolve from /proc/kallsyms, with no on-disk
@@ -499,29 +576,28 @@ fn build_module_symbols(
         #[cfg(not(target_os = "linux"))]
         sym.add_range_no_symbols(m.load_bias, end_avma);
     } else {
-        // CAP-3(b): choose the byte source for this module's symbols, in order:
-        //  1. The recorded path when it still holds the same file (build-id matches).
-        //     Preferred over a held fd so wholesym can resolve sidecar debug info —
-        //     .gnu_debuglink / split-dwarf .dwo are found relative to the real path,
-        //     which a /proc/self/fd/<n> path defeats.
-        //  2. A held fd (--keep-module-files) — the exact inode we sampled — when the
-        //     path is gone (deleted) or now holds a different file (rebuilt).
-        //  3. Neither: if the path holds a *changed* file we did not keep, refuse it
-        //     (register the range empty) rather than emit the wrong build's symbols.
+        // Byte identity is independent of the trace display path. Prefer a
+        // matching recorded path (so adjacent debug artifacts remain visible),
+        // then the exact retained inode, then a conventional build-id executable.
+        // A `.debug` file is deliberately
+        // never used for PT_LOAD conversion because its layout may differ.
         let recorded = Path::new(OsStr::from_bytes(&m.name));
         let recorded_str = std::str::from_utf8(&m.name).ok();
         let mut build_id_raw = [0u8; 64];
         let bid = hex_to_bytes(&m.build_id_hex, &mut build_id_raw);
-        let path_matches = recorded.exists()
-            && recorded_str.is_some_and(|p| crate::byte_source::matches(p, bid));
-        let held = held_fds.get(bid);
-        let byte_source = if path_matches {
-            recorded
-        } else if let Some(p) = held {
-            Path::new(p.as_str())
+        let path_matches =
+            recorded.exists() && recorded_str.is_some_and(|p| crate::byte_source::matches(p, bid));
+        let (cached_executable, cached_debug) = conventional_build_id_paths(bid);
+        let byte_source: PathBuf = if path_matches {
+            // Preserve adjacency-based dSYM/.gnu_debuglink/split-DWARF lookup
+            // when the original path still names the sampled binary.
+            recorded.to_path_buf()
+        } else if let Some(p) = held_fds.get(bid) {
+            PathBuf::from(p)
+        } else if let Some(p) = cached_executable {
+            p
         } else if recorded.exists() {
-            // Present but the build-id changed, and we kept no fd → don't trust it.
-            sym.add_range_no_symbols(m.load_bias, end_avma);
+            sym.add_range_no_symbols(range_base, end_avma);
             stat.symbols_loaded = false;
             stat.err = b"on-disk file changed since recording (build-id mismatch)".to_vec();
             eprintln!(
@@ -530,10 +606,43 @@ fn build_module_symbols(
             );
             return Vec::new();
         } else {
-            recorded // gone and not held: let add_module fail gracefully
+            recorded.to_path_buf()
         };
+
+        if m.address_kind == AddressKind::FileOffset {
+            if !byte_source.exists() {
+                stat.err = b"executable artifact unavailable for captured build ID".to_vec();
+                return Vec::new();
+            }
+            let Some(path) = byte_source.to_str() else {
+                stat.err = b"non-UTF8 executable path cannot translate file offsets".to_vec();
+                return Vec::new();
+            };
+            lookup_pcs = m
+                .rel_pcs
+                .iter()
+                .map(|&off| {
+                    crate::elf::with_elf_at_path(path, |elf| elf.file_offset_to_vaddr(off))
+                        .flatten()
+                })
+                .collect();
+            let Some(max_lookup) = lookup_pcs.iter().flatten().copied().max() else {
+                stat.err = b"no sampled file offset belongs to an executable PT_LOAD".to_vec();
+                return Vec::new();
+            };
+            range_base = 0;
+            end_avma = max_lookup.saturating_add(1);
+        }
+
         let uuid = crate::byte_source::uuid_disambiguator(bid);
-        let load = sym.add_module(m.load_bias, end_avma, byte_source, uuid, None);
+        let load = sym.add_module_with_symbol_path(
+            range_base,
+            end_avma,
+            &byte_source,
+            cached_debug.as_deref(),
+            uuid,
+            None,
+        );
         stat.symbols_loaded = load.error.is_none();
         stat.symbol_count = load.symbol_count;
         stat.err = load.error.unwrap_or_default().into_bytes();
@@ -541,9 +650,9 @@ fn build_module_symbols(
 
     // Accumulate the repeated AddressSymbols bodies; emit nothing if none match.
     let mut address_symbols: Vec<Vec<u8>> = Vec::new();
-    for &rel_pc in &m.rel_pcs {
-        stat.n_addrs += 1;
-        let resolved = match sym.resolve(rel_pc) {
+    for (&rel_pc, lookup_pc) in m.rel_pcs.iter().zip(lookup_pcs.iter()) {
+        let Some(lookup_pc) = *lookup_pc else { continue };
+        let resolved = match sym.resolve(lookup_pc) {
             Some(r) => r,
             None => continue,
         };
@@ -1328,6 +1437,134 @@ fn read_whole_file(path: &[u8], max: u64) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_offset_lookup_emits_the_original_trace_offset() {
+        use object::{Object, ObjectSymbol};
+        use sismo_proto::{ProtoReader, WireValue};
+
+        let path = "/proc/self/exe";
+        let bytes = std::fs::read(path).unwrap();
+        let obj = object::File::parse(bytes.as_slice()).unwrap();
+        let symbol = obj
+            .symbols()
+            .find(|s| {
+                s.kind() == object::SymbolKind::Text
+                    && s.address() != 0
+                    && s.size() > 0
+                    && s.name().is_ok()
+            })
+            .expect("a symbol in the test executable");
+        let elf = crate::elf::Elf::parse(bytes.as_slice()).unwrap();
+        let file_offset = elf.vaddr_to_offset(symbol.address(), 1).unwrap();
+        let build_id = crate::proc_maps::file_build_id(path).unwrap();
+        let build_id_hex = build_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let module = Module {
+            name: path.as_bytes().to_vec(),
+            build_id_hex: build_id_hex.into_bytes(),
+            load_bias: 0,
+            address_kind: AddressKind::FileOffset,
+            rel_pcs: vec![file_offset],
+            seen: [file_offset].into_iter().collect(),
+        };
+        let mut sym = Symbolizer::new().unwrap();
+        let mut stat = ModuleStat::new(module.name.clone(), module.build_id_hex.clone());
+        // A matching recorded path must outrank a held-fd fallback; otherwise
+        // adjacent debug artifacts (dSYM/.gnu_debuglink/split DWARF) disappear.
+        let held = HashMap::from([(build_id, "/definitely/not/a/held-fd".to_string())]);
+        let ms = build_module_symbols(
+            &mut sym,
+            &module,
+            &mut stat,
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &held,
+        );
+        assert!(
+            !ms.is_empty(),
+            "file offset resolved through PT_LOAD: {}",
+            String::from_utf8_lossy(&stat.err)
+        );
+        let address = ProtoReader::new(&ms).find_map(|(field, value)| match (field, value) {
+            (MS_FIELD_ADDRESS_SYMBOLS, WireValue::Len(body)) => {
+                ProtoReader::new(body).find_map(|(f, v)| match (f, v) {
+                    (AS_FIELD_ADDRESS, WireValue::Varint(a)) => Some(a),
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        assert_eq!(address, Some(file_offset));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_offset_module_install_clears_an_overlapping_previous_range() {
+        use object::{Object, ObjectSymbol};
+
+        let path = "/proc/self/exe";
+        let bytes = std::fs::read(path).unwrap();
+        let obj = object::File::parse(bytes.as_slice()).unwrap();
+        let symbol = obj
+            .symbols()
+            .find(|s| {
+                s.kind() == object::SymbolKind::Text
+                    && s.address() != 0
+                    && s.size() > 0
+                    && s.name().is_ok()
+            })
+            .expect("a text symbol");
+        let file_offset = crate::elf::Elf::parse(bytes.as_slice())
+            .unwrap()
+            .vaddr_to_offset(symbol.address(), 1)
+            .unwrap();
+        let build_id = crate::proc_maps::file_build_id(path).unwrap();
+        let build_id_hex = build_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let module = Module {
+            name: path.as_bytes().to_vec(),
+            build_id_hex: build_id_hex.into_bytes(),
+            load_bias: 0,
+            address_kind: AddressKind::FileOffset,
+            rel_pcs: vec![file_offset],
+            seen: [file_offset].into_iter().collect(),
+        };
+
+        let mut sym = Symbolizer::new().unwrap();
+        // Every build-id/file-offset module occupies a zero-based lookup range.
+        // A stale earlier range would win Symbolizer::resolve's first match.
+        sym.add_range_no_symbols(0, u64::MAX);
+        let mut stat = ModuleStat::new(module.name.clone(), module.build_id_hex.clone());
+        let ms = build_module_symbols(
+            &mut sym,
+            &module,
+            &mut stat,
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(!ms.is_empty(), "stale zero-based range was not cleared");
+    }
+
+    #[test]
+    fn collector_keeps_coordinate_kinds_separate() {
+        let mut collector = Collector::default();
+        let name = b"/tmp/a";
+        let id = b"1111111111111111111111111111111111111111";
+        let ctx = &mut collector as *mut Collector as *mut c_void;
+        on_row(ctx, name.as_ptr(), name.len(), id.as_ptr(), id.len(), 0x1000, 0, 0);
+        on_row(ctx, name.as_ptr(), name.len(), id.as_ptr(), id.len(), 0x1000, 0, 1);
+        assert_eq!(collector.modules.len(), 2);
+        assert_eq!(collector.modules[0].address_kind, AddressKind::VirtualAddress);
+        assert_eq!(collector.modules[1].address_kind, AddressKind::FileOffset);
+        assert_eq!(collector.modules[1].rel_pcs, vec![0x1000]);
+    }
 
     #[test]
     fn strip_offset_removes_trailing_offset() {

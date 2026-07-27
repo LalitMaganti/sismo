@@ -4,8 +4,8 @@
 //! `sismo symbolize <trace>`: run the post-record symbolization pass over a
 //! trace on its own — the deferred half of the record/symbolize split (CAP-3).
 //!
-//! `sismo record --no-symbolize` leaves the trace's native frames as
-//! `{build-id, file-offset}` coordinates. This resolves them to names offline —
+//! `sismo record --no-symbolize` leaves native coordinates in the trace
+//! (Linux build-id/file-offset; macOS UUID/PC). This resolves them offline —
 //! later, or on a different machine — reading the module files from disk (not a
 //! live process) and appending the symbols in place, exactly as the inline
 //! post-record pass does. It is the same `symbolize_trace` the recorder runs,
@@ -27,9 +27,9 @@ pub fn run(args: SymbolizeArgs) -> i32 {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // Offline pass: no held fds (the recorder's are long gone), so a binary
-        // deleted before this runs is a fundamental limitation — record with
-        // --keep-module-files to preserve it in-process instead.
+        // Offline pass: recorder-held fds are gone. Linux frames retain durable
+        // build-id/file-offset identity and can still resolve from matching paths
+        // or conventional .build-id files; otherwise they stay unresolved.
         let held = std::collections::HashMap::new();
         sismo_core::symbolize::perf_symbolize::symbolize_trace(&args.trace, &held);
         0

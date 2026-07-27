@@ -290,7 +290,7 @@ pub fn run(config: &RecordConfig) -> c_int {
         }
         if had_bpf && !no_symbolize {
             // `modules` stays alive across this call: it owns the fds the held-open
-            // paths point at (CAP-3(b)).
+            // paths point at.
             sismo_core::symbolize::perf_symbolize::symbolize_trace(
                 output_path_str, &modules.lock().unwrap().held_fd_paths());
         }

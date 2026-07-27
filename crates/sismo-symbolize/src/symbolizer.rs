@@ -129,6 +129,13 @@ impl Symbolizer {
         })
     }
 
+    /// Forget registered address ranges while retaining wholesym's artifact
+    /// caches. The post-record pass resolves one module at a time; file-offset
+    /// mappings all use a zero-based lookup range and would otherwise overlap.
+    pub fn clear_modules(&mut self) {
+        self.modules.clear();
+    }
+
     /// Register a module by path so AVMAs in `[base_avma, end_avma)` resolve to
     /// symbols within it. `uuid` (when non-zero) is the preferred disambiguator;
     /// `arch` is the fallback when a UUID isn't available.
@@ -146,6 +153,21 @@ impl Symbolizer {
         uuid: Option<[u8; 16]>,
         arch: Option<&str>,
     ) -> ModuleLoad {
+        self.add_module_with_symbol_path(base_avma, end_avma, path, None, uuid, arch)
+    }
+
+    /// Register executable layout from `path`, optionally loading symbols from
+    /// a verified identity-derived separate debug file. The executable remains
+    /// the source for format fallbacks and file-offset PT_LOAD conversion.
+    pub fn add_module_with_symbol_path(
+        &mut self,
+        base_avma: u64,
+        end_avma: u64,
+        path: &Path,
+        symbol_path: Option<&Path>,
+        uuid: Option<[u8; 16]>,
+        arch: Option<&str>,
+    ) -> ModuleLoad {
         // Prefer UUID-based disambiguation. samply-symbols' fat-archive `arch`
         // field reports both arm64 and arm64e entries as "arm64", so an
         // Arch("arm64e") disambiguator never matches arm64e slices; UUID
@@ -159,7 +181,7 @@ impl Symbolizer {
 
         let load = self.rt.block_on(
             self.manager
-                .load_symbol_map_for_binary_at_path(path, disambiguator),
+                .load_symbol_map_for_binary_at_path(symbol_path.unwrap_or(path), disambiguator),
         );
         let (map, mut result) = match load {
             Ok(m) => {
